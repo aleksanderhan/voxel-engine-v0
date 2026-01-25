@@ -1,0 +1,12 @@
+[package]
+name = "svo_mvp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.29"
+wgpu = "0.20"
+pollster = "0.3"
+glam = "0.27"
+bytemuck = { version = "1.15", features = ["derive"] }
+noise = "0.9"
