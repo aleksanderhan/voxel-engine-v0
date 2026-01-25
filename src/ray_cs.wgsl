@@ -136,7 +136,12 @@ fn svo_lookup(v: vec3<u32>) -> u32 {
       return 0u;
     }
 
-    idx = n.child_base + ci;
+    let bit = 1u << ci;
+    if ((n.child_mask & bit) == 0u) { return 0u; }
+
+    let lower = n.child_mask & (bit - 1u);
+    let rank  = countOneBits(lower);          // number of present children with index < ci
+    idx = n.child_base + rank;
   }
 
   return 0u;
@@ -208,7 +213,12 @@ fn trace(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
   let inv_rd = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
   
   // tMax/tDelta using inv_rd
-  var tMax   = (next_boundary - ro) * inv_rd;
+  var tMax = vec3<f32>(
+    (next_boundary.x - p.x) * inv_rd.x,
+    (next_boundary.y - p.y) * inv_rd.y,
+    (next_boundary.z - p.z) * inv_rd.z
+  ) + vec3<f32>(tcur);
+
   var tDelta = abs(inv_rd); // because voxel size = 1
 
   // Tracks which axis we last stepped (for a cheap face normal).

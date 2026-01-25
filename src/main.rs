@@ -643,38 +643,28 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
 /// Then build a full SVO by recursive uniformity testing.
 fn build_simple_svo_chunk() -> Vec<NodeGpu> {
     fn material_at(x: i32, y: i32, z: i32) -> u32 {
-        // Flat 1-voxel-thick floor
-        if y == 0 {
-            return 1;
-        }
-
-        // A few blocks above the floor
+        if y == 0 { return 1; }
         if (x == 8 && z == 8 && (y == 1 || y == 2 || y == 3))
             || (x == 12 && z == 10 && (y == 1 || y == 2))
             || (x == 16 && z == 14 && y == 1)
             || (x == 10 && z == 18 && (y == 1 || y == 2 || y == 3 || y == 4))
-        {
-            return 2;
-        }
-
+        { return 2; }
         0
     }
 
-    // Build node **into a pre-existing slot** at `idx`.
-    // This is what makes child roots contiguous at child_base+ci.
-    fn build_into(
+    fn is_empty_leaf(n: &NodeGpu) -> bool {
+        n.child_base == 0xFFFF_FFFF && n.material == 0
+    }
+
+    fn build_node(
         nodes: &mut Vec<NodeGpu>,
-        idx: u32,
-        ox: i32,
-        oy: i32,
-        oz: i32,
+        ox: i32, oy: i32, oz: i32,
         size: i32,
-        mat_fn: &dyn Fn(i32, i32, i32) -> u32,
-    ) {
-        // Test uniformity for this region
+        mat_fn: &dyn Fn(i32,i32,i32)->u32,
+    ) -> NodeGpu {
+        // Uniformity test
         let first = mat_fn(ox, oy, oz);
         let mut uniform = true;
-
         'outer: for z in oz..(oz + size) {
             for y in oy..(oy + size) {
                 for x in ox..(ox + size) {
@@ -686,62 +676,60 @@ fn build_simple_svo_chunk() -> Vec<NodeGpu> {
             }
         }
 
-        // Leaf case (or voxel-sized)
         if uniform || size == 1 {
-            nodes[idx as usize] = NodeGpu {
+            return NodeGpu {
                 child_base: 0xFFFF_FFFF,
                 child_mask: 0,
                 material: first,
                 _pad: 0,
             };
-            return;
         }
 
-        // Internal node: reserve 8 child ROOT slots contiguously
         let half = size / 2;
-        let child_base = nodes.len() as u32;
 
-        nodes.extend((0..8).map(|_| NodeGpu {
-            child_base: 0xFFFF_FFFF,
-            child_mask: 0,
-            material: 0,
-            _pad: 0,
-        }));
-
-        let mut mask: u32 = 0;
+        // Build the 8 child ROOT structs first (their subtrees get appended during recursion)
+        let mut child_roots: [NodeGpu; 8] = [NodeGpu {
+            child_base: 0xFFFF_FFFF, child_mask: 0, material: 0, _pad: 0
+        }; 8];
 
         for ci in 0..8 {
             let dx = if (ci & 1) != 0 { half } else { 0 };
             let dy = if (ci & 2) != 0 { half } else { 0 };
             let dz = if (ci & 4) != 0 { half } else { 0 };
 
-            build_into(
-                nodes,
-                child_base + ci,
-                ox + dx,
-                oy + dy,
-                oz + dz,
-                half,
-                mat_fn,
-            );
+            child_roots[ci] = build_node(nodes, ox + dx, oy + dy, oz + dz, half, mat_fn);
+        }
 
-            let child = nodes[(child_base + ci) as usize];
-            let child_is_empty_leaf = child.child_base == 0xFFFF_FFFF && child.material == 0;
+        // Compact: append only present children roots contiguously (in ci order)
+        let mut mask: u32 = 0;
+        let base = nodes.len() as u32;
 
-            if !child_is_empty_leaf {
+        for ci in 0..8 {
+            if !is_empty_leaf(&child_roots[ci]) {
                 mask |= 1u32 << ci;
+                nodes.push(child_roots[ci]);
             }
         }
 
-        nodes[idx as usize] = NodeGpu {
-            child_base,
+        // If everything was empty, collapse to empty leaf
+        if mask == 0 {
+            return NodeGpu {
+                child_base: 0xFFFF_FFFF,
+                child_mask: 0,
+                material: 0,
+                _pad: 0,
+            };
+        }
+
+        NodeGpu {
+            child_base: base,
             child_mask: mask,
             material: 0,
             _pad: 0,
-        };
+        }
     }
 
-    // Root slot
+    // Root at index 0 must exist for GPU
     let mut nodes = vec![NodeGpu {
         child_base: 0xFFFF_FFFF,
         child_mask: 0,
@@ -749,15 +737,7 @@ fn build_simple_svo_chunk() -> Vec<NodeGpu> {
         _pad: 0,
     }];
 
-    build_into(
-        &mut nodes,
-        0,
-        0,
-        0,
-        0,
-        CHUNK_SIZE as i32,
-        &material_at,
-    );
-
+    let root = build_node(&mut nodes, 0, 0, 0, CHUNK_SIZE as i32, &material_at);
+    nodes[0] = root;
     nodes
 }
