@@ -1,3 +1,4 @@
+// worldgen.rs
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
 
 /// Material IDs (keep these in sync with your WGSL palette).
