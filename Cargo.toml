@@ -9,4 +9,4 @@ wgpu = "0.20"
 pollster = "0.3"
 glam = "0.27"
 bytemuck = { version = "1.15", features = ["derive"] }
-noise = "0.9"
+noise = "0.9.0"

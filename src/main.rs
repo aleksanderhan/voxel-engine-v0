@@ -26,6 +26,13 @@ use winit::{
     window::{CursorGrabMode, Fullscreen, WindowBuilder},
 };
 
+mod worldgen;
+mod svo;
+
+use worldgen::WorldGen;
+use svo::build_chunk_svo_sparse;
+
+
 /// Chunk edge length in voxels (must be a power of two for a balanced octree).
 /// 32 keeps the MVP fast and the octree small.
 const CHUNK_SIZE: u32 = 32;
@@ -187,8 +194,13 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
     };
     surface.configure(&device, &config);
 
-    // --- CPU builds the SVO (simple floor + a few voxels) ----------------------
-    let nodes = build_simple_svo_chunk();
+    // --- CPU builds the SVO ----------------------
+    let gen = WorldGen::new(12345);
+
+    // One chunk for now. Later: origin = [chunk_x * CHUNK_SIZE as i32, 0, chunk_z * ...]
+    let chunk_origin = [0, 0, 0];
+    let nodes = build_chunk_svo_sparse(&gen, chunk_origin, CHUNK_SIZE);
+
     let node_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("svo_nodes"),
         contents: bytemuck::cast_slice(&nodes),
@@ -551,7 +563,7 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
                         view_inv: view.inverse().to_cols_array_2d(),
                         proj_inv: proj.inverse().to_cols_array_2d(),
                         cam_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 1.0],
-                        chunk_origin: [0, 0, 0, 0],
+                        chunk_origin: [chunk_origin[0], chunk_origin[1], chunk_origin[2], 0],
                         chunk_size: CHUNK_SIZE,
                         max_steps: 512,
                         _pad0: 0,
