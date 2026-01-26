@@ -1,3 +1,4 @@
+// src/camera.rs
 use glam::{Mat4, Vec3};
 
 use crate::{config, input::InputState};
@@ -39,6 +40,16 @@ impl Camera {
 
     pub fn position(&self) -> Vec3 {
         self.pos
+    }
+
+    pub fn forward(&self) -> glam::Vec3 {
+        let (yaw, pitch) = (self.yaw, self.pitch);
+        glam::Vec3::new(
+            yaw.sin() * pitch.cos(),
+            pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        )
+        .normalize()
     }
 
     pub fn integrate_input(&mut self, input: &mut InputState) {

@@ -1,6 +1,9 @@
 # voxel-engine-v0
 SVO ray tracing engine
 
+![Demo](assets/demo.gif)
+
+
 ## layout
     src/
         main.rs

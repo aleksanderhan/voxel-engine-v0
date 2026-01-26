@@ -1,3 +1,4 @@
+// src/config.rs
 pub const CHUNK_SIZE: u32 = 128;
 
 pub const ACTIVE_RADIUS: i32 = 3;

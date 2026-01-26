@@ -1,3 +1,4 @@
+// src/svo/mips.rs
 pub struct MinMaxMip {
     pub root_side: u32,
     pub min_levels: Vec<Vec<i32>>,

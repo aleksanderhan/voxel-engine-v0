@@ -1,3 +1,4 @@
+// src/world/hash.rs
 #[inline]
 pub fn hash_u32(mut v: u32) -> u32 {
     v ^= v >> 16;

@@ -1,3 +1,4 @@
+// src/input.rs
 use winit::{
     event::{DeviceEvent, ElementState, KeyEvent, WindowEvent},
     keyboard::{KeyCode, PhysicalKey},

@@ -1,3 +1,4 @@
+// src/streaming/mod.rs
 pub mod manager;
 pub mod node_arena;
 

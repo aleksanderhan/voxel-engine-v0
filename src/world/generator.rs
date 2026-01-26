@@ -1,3 +1,4 @@
+// src/world/generator.rs
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
 
 use crate::config;

@@ -1,3 +1,5 @@
+// src/render/resources.rs
+
 pub struct OutputTex {
     pub view: wgpu::TextureView,
 }

@@ -1,3 +1,4 @@
+// src/render/gpu_types.rs
 use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]

@@ -1,3 +1,4 @@
+// src/world/materials.rs
 pub const AIR: u32 = 0;
 pub const GRASS: u32 = 1;
 pub const DIRT: u32 = 2;

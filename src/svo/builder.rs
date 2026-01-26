@@ -1,3 +1,7 @@
+// src/svo/builder.rs
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::{
     config,
     render::NodeGpu,
@@ -19,11 +23,32 @@ fn is_empty_leaf(n: &NodeGpu) -> bool {
     n.child_base == LEAF && n.material == AIR
 }
 
+#[inline]
+fn should_cancel(cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Relaxed)
+}
+
 /// Builds a single chunk SVO with sparse (compact) child allocation.
 ///
 /// - `chunk_origin`: world voxel coordinates of the chunk min corner.
 /// - `chunk_size`: must be power of two (balanced octree).
 pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size: u32) -> Vec<NodeGpu> {
+    static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
+    build_chunk_svo_sparse_cancelable(gen, chunk_origin, chunk_size, &NEVER_CANCEL)
+}
+
+/// Same as `build_chunk_svo_sparse`, but periodically checks `cancel`.
+/// If cancelled, returns an empty vec (caller should drop it).
+pub fn build_chunk_svo_sparse_cancelable(
+    gen: &WorldGen,
+    chunk_origin: [i32; 3],
+    chunk_size: u32,
+    cancel: &AtomicBool,
+) -> Vec<NodeGpu> {
+    if should_cancel(cancel) {
+        return Vec::new();
+    }
+
     let chunk_ox = chunk_origin[0];
     let chunk_oy = chunk_origin[1];
     let chunk_oz = chunk_origin[2];
@@ -34,8 +59,13 @@ pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size
     let vpm = config::VOXELS_PER_METER;
     debug_assert!(vpm > 0);
 
+    // Height cache cover radius
     let margin_m: i32 = 6;
     let margin = margin_m * vpm + (vpm - 1);
+
+    if should_cancel(cancel) {
+        return Vec::new();
+    }
 
     let cache = HeightCache::new(
         gen,
@@ -59,6 +89,9 @@ pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size
     let side = cs_u as usize;
     let mut ground = vec![0i32; side * side];
     for lz in 0..cs_i {
+        if (lz & 15) == 0 && should_cancel(cancel) {
+            return Vec::new();
+        }
         for lx in 0..cs_i {
             let wx = chunk_ox + lx;
             let wz = chunk_oz + lz;
@@ -66,6 +99,10 @@ pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size
         }
     }
     let ground_mip = build_minmax_mip(&ground, cs_u);
+
+    if should_cancel(cancel) {
+        return Vec::new();
+    }
 
     // Tree top height map over chunk footprint
     let mut tree_top = vec![-1i32; side * side];
@@ -77,6 +114,10 @@ pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size
     let zm1 = ((chunk_oz + cs_i).div_euclid(vpm)) + pad_m;
 
     for zm in zm0..=zm1 {
+        if ((zm - zm0) & 3) == 0 && should_cancel(cancel) {
+            return Vec::new();
+        }
+
         for xm in xm0..=xm1 {
             let Some((trunk_h_vox, crown_r_vox)) = gen.tree_instance_at_meter(xm, zm) else {
                 continue;
@@ -112,6 +153,7 @@ pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size
                 }
             }
 
+            // Ensure trunk column included even if crown is tiny.
             let lx = tx - chunk_ox;
             let lz = tz - chunk_oz;
             if lx >= 0 && lx < cs_i && lz >= 0 && lz < cs_i {
@@ -122,6 +164,10 @@ pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size
     }
 
     let tree_mip = build_max_mip(&tree_top, cs_u);
+
+    if should_cancel(cancel) {
+        return Vec::new();
+    }
 
     let dirt_depth = 3 * vpm;
 
@@ -136,8 +182,20 @@ pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size
         ground_mip: &MinMaxMip,
         tree_mip: &MaxMip,
         dirt_depth: i32,
+        cancel: &AtomicBool,
     ) -> NodeGpu {
         debug_assert!(size > 0);
+
+        if should_cancel(cancel) {
+            // Returning AIR leaf is fine; caller will likely drop whole build.
+            return NodeGpu {
+                child_base: LEAF,
+                child_mask: 0,
+                material: AIR,
+                _pad: 0,
+            };
+        }
+
         let size_u = size as u32;
 
         let (gmin, gmax) = ground_mip.query(ox, oz, size_u);
@@ -146,25 +204,53 @@ pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size
         let y0 = chunk_oy + oy;
         let y1 = y0 + size - 1;
 
+        // Entirely above both terrain and trees => AIR
         let top_solid = gmax.max(tmax);
         if y0 > top_solid {
-            return NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 };
+            return NodeGpu {
+                child_base: LEAF,
+                child_mask: 0,
+                material: AIR,
+                _pad: 0,
+            };
         }
 
+        // Entirely deep underground everywhere => STONE
         if y1 < gmin - dirt_depth {
-            return NodeGpu { child_base: LEAF, child_mask: 0, material: STONE, _pad: 0 };
+            return NodeGpu {
+                child_base: LEAF,
+                child_mask: 0,
+                material: STONE,
+                _pad: 0,
+            };
         }
 
+        // Voxel resolution: exact material
         if size == 1 {
             let m = mat_fn(ox, oy, oz);
-            return NodeGpu { child_base: LEAF, child_mask: 0, material: m, _pad: 0 };
+            return NodeGpu {
+                child_base: LEAF,
+                child_mask: 0,
+                material: m,
+                _pad: 0,
+            };
         }
 
+        // Subdivide
         let half = size / 2;
         let mut child_roots: [NodeGpu; 8] =
             [NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 }; 8];
 
         for ci in 0..8 {
+            if (ci & 3) == 0 && should_cancel(cancel) {
+                return NodeGpu {
+                    child_base: LEAF,
+                    child_mask: 0,
+                    material: AIR,
+                    _pad: 0,
+                };
+            }
+
             let dx = if (ci & 1) != 0 { half } else { 0 };
             let dy = if (ci & 2) != 0 { half } else { 0 };
             let dz = if (ci & 4) != 0 { half } else { 0 };
@@ -180,9 +266,11 @@ pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size
                 ground_mip,
                 tree_mip,
                 dirt_depth,
+                cancel,
             );
         }
 
+        // Compact children: append only non-empty child roots contiguously in increasing `ci`.
         let base = nodes.len() as u32;
         let mut mask: u32 = 0;
 
@@ -194,13 +282,29 @@ pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size
         }
 
         if mask == 0 {
-            return NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 };
+            return NodeGpu {
+                child_base: LEAF,
+                child_mask: 0,
+                material: AIR,
+                _pad: 0,
+            };
         }
 
-        NodeGpu { child_base: base, child_mask: mask, material: 0, _pad: 0 }
+        NodeGpu {
+            child_base: base,
+            child_mask: mask,
+            material: 0,
+            _pad: 0,
+        }
     }
 
-    let mut nodes = vec![NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 }];
+    // Root must be at index 0 for GPU.
+    let mut nodes = vec![NodeGpu {
+        child_base: LEAF,
+        child_mask: 0,
+        material: AIR,
+        _pad: 0,
+    }];
 
     let root = build_node(
         &mut nodes,
@@ -213,8 +317,14 @@ pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size
         &ground_mip,
         &tree_mip,
         dirt_depth,
+        cancel,
     );
-    nodes[0] = root;
 
+    // If we cancelled mid-build, return empty and let caller drop it.
+    if should_cancel(cancel) {
+        return Vec::new();
+    }
+
+    nodes[0] = root;
     nodes
 }

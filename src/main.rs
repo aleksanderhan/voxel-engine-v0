@@ -1,3 +1,4 @@
+// src/main.rs
 mod app;
 mod camera;
 mod config;

@@ -1,3 +1,5 @@
+// src/app/mod.rs
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -160,7 +162,8 @@ impl App {
 
         // 2) streaming update
         let cam_pos = self.camera.position();
-        self.chunks.update(&self.world, cam_pos);
+        let cam_fwd = self.camera.forward();
+        self.chunks.update(&self.world, cam_pos, cam_fwd);
         self.renderer.write_chunk_grid(self.chunks.chunk_grid());
 
         // 3) camera matrices -> CameraGpu
