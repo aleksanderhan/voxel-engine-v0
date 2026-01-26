@@ -66,9 +66,15 @@ fn query_leaf_at(
   return LeafQuery(bmin, size, 0u);
 }
 
-fn exit_time_from_cube(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, size: f32) -> f32 {
+// Return t where the ray exits this axis-aligned cube, using a precomputed inv direction.
+fn exit_time_from_cube_inv(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  inv: vec3<f32>,
+  bmin: vec3<f32>,
+  size: f32
+) -> f32 {
   let bmax = bmin + vec3<f32>(size);
-  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
 
   let tx = (select(bmin.x, bmax.x, rd.x > 0.0) - ro.x) * inv.x;
   let ty = (select(bmin.y, bmax.y, rd.y > 0.0) - ro.y) * inv.y;
@@ -77,6 +83,7 @@ fn exit_time_from_cube(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, size: f32)
   return min(tx, min(ty, tz));
 }
 
+
 struct HitGeom {
   hit : bool,
   t   : f32,
@@ -84,23 +91,25 @@ struct HitGeom {
   n   : vec3<f32>,
 };
 
-fn trace_chunk_hybrid(ro: vec3<f32>, rd: vec3<f32>, ch: ChunkMeta) -> HitGeom {
+fn trace_chunk_hybrid_interval(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  ch: ChunkMeta,
+  t_enter: f32,
+  t_exit: f32
+) -> HitGeom {
+  // chunk-local constants
   let voxel_size = cam.voxel_params.x;
 
   let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
   let root_bmin = root_bmin_vox * voxel_size;
   let root_size = f32(cam.chunk_size) * voxel_size;
-  let root_bmax = root_bmin + vec3<f32>(root_size);
 
-  let rt = intersect_aabb(ro, rd, root_bmin, root_bmax);
-  let t_enter = max(rt.x, 0.0);
-  let t_exit  = rt.y;
+  // We *trust* interval from grid DDA. Just clamp + nudge.
+  var tcur = max(t_enter, 0.0) + 1e-4;
 
-  if (t_exit < t_enter) {
-    return HitGeom(false, BIG_F32, 0u, vec3<f32>(0.0));
-  }
-
-  var tcur = t_enter + 1e-4;
+  // Precompute inv once (3D)
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
 
   for (var step_i: u32 = 0u; step_i < cam.max_steps; step_i = step_i + 1u) {
     if (tcur > t_exit) { break; }
@@ -126,19 +135,23 @@ fn trace_chunk_hybrid(ro: vec3<f32>, rd: vec3<f32>, ch: ChunkMeta) -> HitGeom {
           return HitGeom(true, h2.t, 5u, h2.n);
         }
 
-        let t_leave = exit_time_from_cube(ro, rd, q.bmin, q.size);
+        // Displaced cube missed: treat as empty and keep marching.
+        let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
         tcur = max(t_leave, tcur) + 1e-4;
         continue;
       }
 
+      // Other materials: shade static cube face normal at current sample.
       let hp = ro + tcur * rd;
       let nn = cube_normal(hp, q.bmin, q.size);
       return HitGeom(true, tcur, q.mat, nn);
     }
 
-    let t_leave = exit_time_from_cube(ro, rd, q.bmin, q.size);
+    // Skip empty region.
+    let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
     tcur = max(t_leave, tcur) + 1e-4;
   }
 
   return HitGeom(false, BIG_F32, 0u, vec3<f32>(0.0));
 }
+

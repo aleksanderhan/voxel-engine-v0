@@ -160,7 +160,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let ch = chunks[slot];
 
       // trace chunk SVO (still does its own chunk AABB intersect; OK for now)
-      let h = trace_chunk_hybrid(ro, rd, ch);
+      let cell_enter = tcur;
+      let cell_exit  = min(tNext, t_exit);
+
+      let h = trace_chunk_hybrid_interval(ro, rd, ch, cell_enter, cell_exit);
       if (h.hit && h.t < best.t) {
         best = h;
       }
