@@ -161,3 +161,128 @@ fn cube_normal(hp: vec3<f32>, bmin: vec3<f32>, size: f32) -> vec3<f32> {
 
   return n;
 }
+
+// --- Sun / sky ---
+const SUN_COLOR     : vec3<f32> = vec3<f32>(1.0, 0.98, 0.90);
+const SUN_INTENSITY : f32 = 4.0;
+
+// Sun disc tuning
+const SUN_DISC_ANGULAR_RADIUS : f32 = 0.009;   // ~0.5° in radians (0.0087) + a touch
+const SUN_DISC_SOFTNESS       : f32 = 0.004;
+
+// --- Fog / volumetrics ---
+// Use cam.voxel_params.w as fog density (you said unused).
+// Suggested values: 0.0 .. 0.03 depending on your meter scale.
+fn fog_density_base() -> f32 { return max(cam.voxel_params.w, 0.0); }
+
+const FOG_HEIGHT_FALLOFF : f32 = 0.08;   // larger = fog dies faster with height
+const FOG_MAX_DIST       : f32 = 120.0;  // meters, cap so we don't overdo far marching
+
+// Godrays (volumetric light shafts)
+const GODRAY_STEPS       : u32 = 5u;     // keep small
+const GODRAY_MAX_DIST    : f32 = 40.0;
+const GODRAY_STRENGTH    : f32 = 2.0;
+
+// Simple hash for jitter (pixel+time)
+fn hash12(p: vec2<f32>) -> f32 {
+  let h = dot(p, vec2<f32>(127.1, 311.7));
+  return fract(sin(h) * 43758.5453);
+}
+
+// Henyey-Greenstein-ish phase approximation (cheap)
+fn phase_mie(costh: f32) -> f32 {
+  // g in [0..1): forward scattering; 0.6 looks “godray-ish”
+  let g = 0.6;
+  let gg = g * g;
+  // (1 - g^2) / (1 + g^2 - 2 g cosθ)^(3/2)
+  let denom = pow(1.0 + gg - 2.0 * g * costh, 1.5);
+  return (1.0 - gg) / max(denom, 1e-3);
+}
+
+// Sky with sun disc (no atmosphere sim, just clean + cheap)
+fn sky_color(rd: vec3<f32>) -> vec3<f32> {
+  let tsky = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
+  let base = mix(
+    vec3<f32>(0.05, 0.08, 0.12),
+    vec3<f32>(0.6, 0.8, 1.0),
+    tsky
+  );
+
+  // Sun disc
+  let mu = dot(rd, SUN_DIR); // cos(angle to sun)
+  let ang = acos(clamp(mu, -1.0, 1.0));
+  let disc = 1.0 - smoothstep(SUN_DISC_ANGULAR_RADIUS, SUN_DISC_ANGULAR_RADIUS + SUN_DISC_SOFTNESS, ang);
+
+  // Small halo
+  let halo = exp(-ang * 30.0) * 0.15;
+
+  return base + SUN_COLOR * SUN_INTENSITY * (disc + halo);
+}
+
+// Optical depth for exponential height fog along segment [0..t]
+// density(y) = base * exp(-falloff * y)  (assuming y is in meters and >= 0 is “up”)
+fn fog_optical_depth(ro: vec3<f32>, rd: vec3<f32>, t: f32) -> f32 {
+  let base = fog_density_base();
+  if (base <= 0.0) { return 0.0; }
+
+  let k = FOG_HEIGHT_FALLOFF;
+  let y0 = ro.y;
+  let dy = rd.y;
+
+  // Integral: ∫ base * exp(-k (y0 + s dy)) ds from 0..t
+  // If dy ~ 0: base * exp(-k y0) * t
+  if (abs(dy) < 1e-4) {
+    return base * exp(-k * y0) * t;
+  }
+
+  let a = exp(-k * y0);
+  let b = exp(-k * (y0 + dy * t));
+  return base * (a - b) / (k * dy);
+}
+
+fn fog_transmittance(ro: vec3<f32>, rd: vec3<f32>, t: f32) -> f32 {
+  let od = max(fog_optical_depth(ro, rd, t), 0.0);
+  return exp(-od);
+}
+
+// Volumetric single-scattering (godrays) along view ray segment [0..t_end].
+fn godray_inscatter(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, px: vec2<f32>) -> vec3<f32> {
+  let base = fog_density_base();
+  if (base <= 0.0) { return vec3<f32>(0.0); }
+
+  let tmax = min(t_end, GODRAY_MAX_DIST);
+  if (tmax <= 0.0) { return vec3<f32>(0.0); }
+
+  let steps = GODRAY_STEPS;
+  let dt = tmax / f32(steps);
+
+  // jitter to reduce banding
+  let j = hash12(px + cam.voxel_params.y) - 0.5;
+
+  let costh = dot(rd, SUN_DIR);
+  let phase = phase_mie(costh);
+
+  var sum = vec3<f32>(0.0);
+
+  for (var i: u32 = 0u; i < steps; i = i + 1u) {
+    let ti = (f32(i) + 0.5 + j) * dt;
+    if (ti <= 0.0) { continue; }
+
+    let p  = ro + rd * ti;
+
+    // view transmittance to sample (fog-only)
+    let Tv = fog_transmittance(ro, rd, ti);
+
+    // sun visibility at sample (fast, leaves partially transmit)
+    let Ts = sun_transmittance(p, SUN_DIR);
+
+    // local density is already baked into fog_transmittance via your height model,
+    // but we still need an extinction->scattering term; approximate with height density:
+    // (match your fog_optical_depth's height law)
+    let dens = base * exp(-FOG_HEIGHT_FALLOFF * p.y);
+
+    sum += (SUN_COLOR * SUN_INTENSITY) * (dens * dt) * Tv * Ts * phase;
+  }
+
+  return sum * GODRAY_STRENGTH;
+}

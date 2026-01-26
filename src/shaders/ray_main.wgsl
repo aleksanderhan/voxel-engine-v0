@@ -2,6 +2,22 @@
 //
 // Entry point: per-pixel ray, traverse chunk grid with 3D DDA,
 // only tracing chunks the ray actually passes through.
+//
+// This version assumes you added these helpers/constants in common.wgsl:
+//   - sky_color(rd)
+//   - fog_transmittance(ro, rd, t)
+//   - phase_mie(costh)
+//   - sun_transmittance(p, SUN_DIR)   (from ray_shadow.wgsl)
+//   - fog_density_base()
+//   - FOG_MAX_DIST, GODRAY_MAX_DIST, GODRAY_STEPS, GODRAY_STRENGTH
+//
+// And that the following are already available (as in your current codebase):
+//   - safe_inv, EPS_INV, BIG_F32
+//   - intersect_aabb, ray_dir_from_pixel
+//   - trace_chunk_hybrid_interval, HitGeom
+//   - shade_hit
+//   - SUN_DIR, SUN_COLOR, SUN_INTENSITY
+//   - hash12 (or replace jitter with 0.0)
 
 const INVALID_U32 : u32 = 0xFFFFFFFFu;
 
@@ -16,9 +32,7 @@ fn grid_lookup_slot(cx: i32, cy: i32, cz: i32) -> u32 {
   let iy_i = cy - oy;
   let iz_i = cz - oz;
 
-  if (ix_i < 0 || iy_i < 0 || iz_i < 0) {
-    return INVALID_U32;
-  }
+  if (ix_i < 0 || iy_i < 0 || iz_i < 0) { return INVALID_U32; }
 
   let nx = cam.grid_dims.x;
   let ny = cam.grid_dims.y;
@@ -28,9 +42,7 @@ fn grid_lookup_slot(cx: i32, cy: i32, cz: i32) -> u32 {
   let iy = u32(iy_i);
   let iz = u32(iz_i);
 
-  if (ix >= nx || iy >= ny || iz >= nz) {
-    return INVALID_U32;
-  }
+  if (ix >= nx || iy >= ny || iz >= nz) { return INVALID_U32; }
 
   let idx = (iz * ny * nx) + (iy * nx) + ix;
   return chunk_grid[idx];
@@ -56,21 +68,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ro = cam.cam_pos.xyz;
   let rd = ray_dir_from_pixel(px, res);
 
-  // Background sky gradient
-  let tsky = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
-  let sky = mix(
-    vec3<f32>(0.05, 0.08, 0.12),
-    vec3<f32>(0.6, 0.8, 1.0),
-    tsky
-  );
+  // Sky (with sun disc)
+  let sky = sky_color(rd);
 
-  // If no chunks, just write sky.
+  // If no chunks, just fog the sky a bit (optional) and return.
   if (cam.chunk_count == 0u) {
     textureStore(out_img, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(sky, 1.0));
     return;
   }
 
-  let voxel_size = cam.voxel_params.x;
+  let voxel_size   = cam.voxel_params.x;
   let chunk_size_m = f32(cam.chunk_size) * voxel_size;
 
   // Grid AABB in meters
@@ -90,7 +97,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   );
 
   // Intersect ray with the grid bounds so DDA stays in-range.
-  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  let rtg    = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
   var t_enter = max(rtg.x, 0.0);
   let t_exit  = rtg.y;
 
@@ -140,33 +147,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var best = HitGeom(false, BIG_F32, 0u, vec3<f32>(0.0));
 
   // Conservative upper bound on how many chunk cells we might traverse in the grid.
-  // (Good enough; this is just to keep the loop bounded.)
   let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 1024u);
 
   // DDA loop through chunk cells
   var tcur = start_t;
 
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
-    // Stop once we leave the grid AABB interval.
     if (tcur > t_exit) { break; }
 
-    // Early-out: next chunk boundary is farther than our best hit.
     let tNext = min(tMaxX, min(tMaxY, tMaxZ));
     if (best.hit && tNext >= best.t) { break; }
 
-    // Lookup chunk slot; trace if loaded
     let slot = grid_lookup_slot(cx, cy, cz);
     if (slot != INVALID_U32 && slot < cam.chunk_count) {
       let ch = chunks[slot];
 
-      // trace chunk SVO (still does its own chunk AABB intersect; OK for now)
       let cell_enter = tcur;
       let cell_exit  = min(tNext, t_exit);
 
       let h = trace_chunk_hybrid_interval(ro, rd, ch, cell_enter, cell_exit);
-      if (h.hit && h.t < best.t) {
-        best = h;
-      }
+      if (h.hit && h.t < best.t) { best = h; }
     }
 
     // Step to next cell
@@ -192,8 +192,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
     }
 
-    // Optional: quick bounds check to exit early once chunk coords leave grid.
-    // (grid_lookup_slot would return INVALID, but this avoids extra work.)
+    // Quick bounds check
     let ox = cam.grid_origin_chunk.x;
     let oy = cam.grid_origin_chunk.y;
     let oz = cam.grid_origin_chunk.z;
@@ -207,6 +206,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  let col = select(sky, shade_hit(ro, rd, best), best.hit);
+  // Surface / background
+  let surface = select(sky, shade_hit(ro, rd, best), best.hit);
+
+  // Apply fog up to hit distance (or up to grid exit if no hit)
+  let t_end = select(min(t_exit, FOG_MAX_DIST), min(best.t, FOG_MAX_DIST), best.hit);
+
+  let T = fog_transmittance(ro, rd, t_end);
+
+  // Use sky as the fog color for consistency (cheap “aerial perspective”)
+  let fog_col = sky;
+
+  // Godrays (single scattering)
+  let ins = godray_inscatter(ro, rd, t_end, px);
+
+  let col = surface * T + fog_col * (1.0 - T) + ins;
+
   textureStore(out_img, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
 }

@@ -20,8 +20,8 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
   let base = color_for_material(hg.mat);
 
   let shadow = select(1.0, 0.0, in_shadow(hp, SUN_DIR));
-
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
+
   let ambient = select(0.22, 0.28, hg.mat == 5u);
 
   var dapple = 1.0;
@@ -32,5 +32,8 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
     dapple = 0.90 + 0.10 * (0.6 * d0 + 0.4 * d1);
   }
 
-  return base * (ambient + (1.0 - ambient) * diff * shadow) * dapple;
+  let direct = SUN_COLOR * SUN_INTENSITY * diff * shadow;
+  let lit = base * (ambient + (1.0 - ambient) * direct) * dapple;
+
+  return lit;
 }

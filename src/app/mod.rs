@@ -182,7 +182,7 @@ impl App {
             max_steps: config::MAX_STEPS,
             _pad0: 0,
 
-            voxel_params: [config::VOXEL_SIZE_M_F32, t, 1.8, 0.0],
+            voxel_params: [config::VOXEL_SIZE_M_F32, t, 2.0, 0.005],
 
             grid_origin_chunk: [
                 self.chunks.grid_origin()[0],
