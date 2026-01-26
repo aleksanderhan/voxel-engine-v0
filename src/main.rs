@@ -40,12 +40,12 @@ use worldgen::WorldGen;
 use svo::{build_chunk_svo_sparse, NodeGpu};
 
 /// Chunk edge length in voxels (power of two).
-const CHUNK_SIZE: u32 = 128;
+const CHUNK_SIZE: u32 = 64;
 
 /// Active chunk radius in X/Z:
 /// 1 => 3x3 chunks
 /// 2 => 5x5 chunks
-const ACTIVE_RADIUS: i32 = 1;
+const ACTIVE_RADIUS: i32 = 2;
 
 /// Keep a larger ring cached to prevent "holes" while chunks build.
 const KEEP_RADIUS: i32 = ACTIVE_RADIUS + 2;
@@ -53,7 +53,7 @@ const KEEP_RADIUS: i32 = ACTIVE_RADIUS + 2;
 const VOXEL_SIZE_M: f32 = 0.10; // 10 cm voxels
 
 /// Worker threads (SVO building).
-const WORKER_THREADS: usize = 2;
+const WORKER_THREADS: usize = 4;
 
 /// Max jobs in flight (limits memory + CPU spikes).
 const MAX_IN_FLIGHT: usize = 8;

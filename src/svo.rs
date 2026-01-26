@@ -241,7 +241,11 @@ pub fn build_chunk_svo_sparse(
     // margin 4m worth of voxels is a safe bound.
     let vpm = crate::worldgen::VOXELS_PER_METER;
     debug_assert!(vpm > 0);
-    let margin = 4 * vpm;
+
+    // Worldgen scans +/-4 meter cells and meter-grid alignment can add up to (vpm-1) extra.
+    // Add a little headroom for branches/canopy.
+    let margin_m: i32 = 6; // meters
+    let margin = margin_m * vpm + (vpm - 1);
 
     let cache = HeightCache::new(
         gen,
@@ -252,12 +256,14 @@ pub fn build_chunk_svo_sparse(
     );
     let height_at = |wx: i32, wz: i32| -> i32 { cache.get(wx, wz) };
 
+    let tree_cache = gen.build_tree_cache(chunk_ox, chunk_oz, cs_i, &height_at);
+
     // Exact material query (only used at voxel resolution).
     let mat_at_local = |lx: i32, ly: i32, lz: i32| -> u32 {
         let wx = chunk_ox + lx;
         let wy = chunk_oy + ly;
         let wz = chunk_oz + lz;
-        gen.material_at_world_cached(wx, wy, wz, &height_at)
+        gen.material_at_world_cached_with_trees(wx, wy, wz, &height_at, &tree_cache)
     };
 
     // --------------------------------------------------------
@@ -281,8 +287,8 @@ pub fn build_chunk_svo_sparse(
     // --------------------------------------------------------
     let mut tree_top = vec![-1i32; side * side];
 
-    // Iterate meter-cells around this chunk (+/-3m).
-    let pad_m = 3;
+    // Iterate meter-cells around this chunk (+/-4m).
+    let pad_m = 4;
     let xm0 = (chunk_ox.div_euclid(vpm)) - pad_m;
     let xm1 = ((chunk_ox + cs_i).div_euclid(vpm)) + pad_m;
     let zm0 = (chunk_oz.div_euclid(vpm)) - pad_m;
@@ -300,10 +306,14 @@ pub fn build_chunk_svo_sparse(
             let g = height_at(tx, tz);
             let trunk_base = g + vpm; // 1m above ground
             let trunk_top = trunk_base + trunk_h_vox;
-            let top_y = trunk_top + crown_r_vox;
+            // Must be CONSERVATIVE for SVO early-outs, otherwise leaves flicker/missing.
+            // canopy_h in your worldgen is ~2.5..4.5m, so approximate conservatively here.
+            let canopy_h_vox = (5 * vpm); // ~5m conservative cap
+            let top_y = trunk_top + canopy_h_vox + 2 * vpm;
 
-            // Stamp crown projection into per-column max
-            let r = crown_r_vox;
+            // canopy clumps can push a bit wider than crown_r; add margin
+            let r = crown_r_vox + 2 * vpm;
+
             for dz in -r..=r {
                 for dx in -r..=r {
                     if dx * dx + dz * dz > r * r {
