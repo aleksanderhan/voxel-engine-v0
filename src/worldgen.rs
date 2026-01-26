@@ -126,7 +126,7 @@ impl WorldGen {
         let r = hash2(self.seed, xm, zm);
 
         // density per 1m cell
-        if (r % 128) != 0 {
+        if (r % 256) != 0 {
             return None;
         }
 
@@ -370,21 +370,13 @@ impl WorldGen {
 
     #[inline]
     fn is_branch_leaf(&self, tree: &Tree, x: i32, y: i32, z: i32) -> bool {
-        // Add the SAME “sparsity budget” concept as canopy:
-        // - first, gate most voxels out
-        // - then do the tuft checks
-        //
-        // This reduces leaf density on branch tufts and saves time.
-        let gate = hash3(self.seed ^ 0xB1A9_1EA5, x, y, z) & 3; // keep 1/4
-        if gate != 0 {
-            return false;
-        }
-
         let px = x as f32;
         let py = y as f32;
         let pz = z as f32;
 
-        let top_y = tree.base_y + tree.trunk_h;
+        let vpm_f = VOXELS_PER_METER as f32;
+
+        // 4 branches in upper trunk
         let starts = [
             tree.base_y + (tree.trunk_h * 5) / 10,
             tree.base_y + (tree.trunk_h * 6) / 10,
@@ -392,14 +384,23 @@ impl WorldGen {
             tree.base_y + (tree.trunk_h * 8) / 10,
         ];
 
+        // Coarse cell size for clump noise (~0.4m)
+        let cell: i32 = ((0.4 * vpm_f).round() as i32).max(2);
+
         for (i, sy) in starts.iter().copied().enumerate() {
-            let r = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
-            let ang = u01(r) * std::f32::consts::TAU;
+            // Per-branch leaf presence (rarely a naked branch)
+            let br_seed = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
+            if (hash_u32(br_seed ^ 0x55AA_1234) & 31) == 0 {
+                continue; // ~1/32 branches have no leaves
+            }
 
-            let len = (1.8 * VOXELS_PER_METER as f32)
-                + u01(hash_u32(r ^ 0x1111)) * (1.7 * VOXELS_PER_METER as f32);
-            let pitch = 0.15 + u01(hash_u32(r ^ 0x2222)) * 0.30;
+            let ang = u01(br_seed) * std::f32::consts::TAU;
 
+            // length 1.8..3.5m, pitch 0.15..0.45
+            let len = (1.8 * vpm_f) + u01(hash_u32(br_seed ^ 0x1111)) * (1.7 * vpm_f);
+            let pitch = 0.15 + u01(hash_u32(br_seed ^ 0x2222)) * 0.30;
+
+            // start at trunk center (with wobble)
             let (wx, wz) = self.trunk_wobble(tree, sy);
             let ax = tree.tx as f32 + wx;
             let ay = sy as f32;
@@ -409,38 +410,78 @@ impl WorldGen {
             let by = ay + pitch * len;
             let bz = az + ang.sin() * len;
 
-            // Smaller tufts than before (less leaves overall): ~0.55..0.95m
-            let tuft_r = (0.55 * VOXELS_PER_METER as f32)
-                + u01(hash_u32(r ^ 0x4444)) * (0.40 * VOXELS_PER_METER as f32);
+            // Distance to branch centerline + parameter t along branch
+            let (d2, t) = Self::dist2_point_segment(px, py, pz, ax, ay, az, bx, by, bz);
 
-            // Mostly at the tip, one mid-branch
+            // Leaves mainly on the outer half of the branch (prevents trunk-area fuzz)
+            if t < 0.55 {
+                continue;
+            }
+
+            // --- Guaranteed attachment sleeve near the tip (keeps "connected canopy") ---
+            // No randomness here, so every branch can visibly have leaves.
+            if t > 0.78 {
+                let sleeve_r = (0.20 * vpm_f).max(1.0);
+                if d2 <= sleeve_r * sleeve_r {
+                    return true;
+                }
+            }
+
+            // Smaller tufts: ~0.55..0.90m
+            let tuft_r = (0.55 * vpm_f) + u01(hash_u32(br_seed ^ 0x4444)) * (0.35 * vpm_f);
+
+            // Two clump centers: tip + outer-mid
             let centers = [
-                (bx, by, bz),
-                (ax + 0.70 * (bx - ax), ay + 0.70 * (by - ay), az + 0.70 * (bz - az)),
+                (bx, by, bz, tuft_r),
+                (
+                    ax + 0.72 * (bx - ax),
+                    ay + 0.72 * (by - ay),
+                    az + 0.72 * (bz - az),
+                    tuft_r * 0.85,
+                ),
             ];
 
-            for (cx, cy, cz) in centers {
+            for (cx, cy, cz, r) in centers {
+                // Ellipsoid-ish (flatter vertically)
                 let dx = px - cx;
                 let dy = (py - cy) * 1.25;
                 let dz = pz - cz;
 
-                if dx * dx + dy * dy + dz * dz <= tuft_r * tuft_r {
-                    // Stronger porosity on branch tufts (sparser)
-                    let n = hash3(self.seed ^ 0x1EE7_1EAF, x, y, z);
-                    if (n & 31) == 0 {
-                        continue; // drop 1/32
-                    }
+                let dd2 = dx * dx + dy * dy + dz * dz;
+                if dd2 > r * r {
+                    continue;
+                }
 
-                    // avoid leaves inside trunk volume near branch start
-                    if y > top_y - VOXELS_PER_METER {
-                        return true;
+                // Coarse clump noise (connected pockets)
+                let gx = (x).div_euclid(cell);
+                let gy = (y).div_euclid(cell);
+                let gz = (z).div_euclid(cell);
+                let n = hash3(self.seed ^ br_seed ^ 0x1EE7_1EAF, gx, gy, gz);
+
+                // Hollow-ish clumps: keep mostly shell
+                let nd = (dd2.sqrt() / r).clamp(0.0, 1.0);
+                if nd < 0.72 {
+                    if (n & 63) != 0 {
+                        continue; // keep ~1/64 interior cells
                     }
+                } else {
+                    if (n & 7) == 0 {
+                        continue; // drop 1/8 of shell cells
+                    }
+                }
+
+                // Final: stay near branch line so tufts don't float
+                let max_line_r = (0.40 * vpm_f).max(1.0);
+                if d2 <= max_line_r * max_line_r {
+                    return true;
                 }
             }
         }
 
         false
     }
+
+
 
     #[inline]
     fn is_canopy_leaf(&self, tree: &Tree, x: i32, y: i32, z: i32) -> bool {
