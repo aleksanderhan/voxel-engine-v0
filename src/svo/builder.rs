@@ -95,8 +95,8 @@ pub fn build_chunk_svo_sparse_cancelable(
     // Conservative cave band relative to ground: [ground - 40m .. ground - 6m]
     let side = cs_u as usize; // <— add this
 
-    let cave_depth = 40 * vpm;
-    let cave_ceiling = 6 * vpm;
+    let cave_depth   = 80 * vpm;  // bottom
+    let cave_ceiling = 1 * vpm;   // top (1m below ground)
 
     let mut carve_bottom = vec![i32::MAX; side * side];
     let mut carve_top    = vec![i32::MIN; side * side];

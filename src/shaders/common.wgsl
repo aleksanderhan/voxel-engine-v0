@@ -55,8 +55,8 @@ const LEAF_U32 : u32 = 0xFFFFFFFFu;
 const BIG_F32  : f32 = 1e30;
 const EPS_INV  : f32 = 1e-8;
 
-// Directional sun at 45° elevation.
-const SUN_DIR : vec3<f32> = vec3<f32>(0.5, 0.70710678, 0.5);
+// Directional sun at 30° elevation (azimuth 45°; x=z).
+const SUN_DIR : vec3<f32> = vec3<f32>(0.61237244, 0.5, 0.61237244);
 
 // Shadow tuning
 const SHADOW_BIAS  : f32 = 2e-4;

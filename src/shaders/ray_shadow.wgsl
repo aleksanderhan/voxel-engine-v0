@@ -299,7 +299,7 @@ fn sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
 // --- Fast shadow transmittance for volumetrics ---
 // Leaves are semi-transparent, solids are opaque.
 const VSM_STEPS : u32 = 24u;           // smaller than SHADOW_STEPS
-const LEAF_LIGHT_TRANSMIT : f32 = 0.55; // 0..1, lower = darker canopy
+const LEAF_LIGHT_TRANSMIT : f32 = 0.50; // 0..1, lower = darker canopy
 const MIN_TRANS : f32 = 0.03;
 
 fn trace_chunk_shadow_trans_interval(

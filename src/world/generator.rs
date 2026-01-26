@@ -68,13 +68,16 @@ impl WorldGen {
         };
 
         // ---- carve: only bother below ground-ish ----
-        if m != super::materials::AIR && y < ground - 1 * vpm {
-            // noise caves
-            if self.cave_density(x, y, z) < 0.0 {
-                m = super::materials::AIR;
-            } else if tunnels.contains_point(x, y, z) {
-                m = super::materials::AIR;
-            }
+        let ground = height_at(x, z);
+        let vpm = config::VOXELS_PER_METER;
+
+        // carve only in a band below ground
+        let carve_y0 = ground - 80 * vpm;   // bottom: 80m
+        let carve_y1 = ground - 1 * vpm;    // top: 1m below ground (was ~8m)
+
+        if m != AIR && y >= carve_y0 && y <= carve_y1 {
+            if self.cave_density(x, y, z) < 0.0 { return AIR; }
+            if tunnels.contains_point(x, y, z) { return AIR; }
         }
 
         m
