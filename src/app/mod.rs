@@ -161,6 +161,7 @@ impl App {
         // 2) streaming update
         let cam_pos = self.camera.position();
         self.chunks.update(&self.world, cam_pos);
+        self.renderer.write_chunk_grid(self.chunks.chunk_grid());
 
         // 3) camera matrices -> CameraGpu
         let aspect = self.config.width as f32 / self.config.height as f32;
@@ -172,11 +173,26 @@ impl App {
             view_inv: cf.view_inv.to_cols_array_2d(),
             proj_inv: cf.proj_inv.to_cols_array_2d(),
             cam_pos: [cf.pos.x, cf.pos.y, cf.pos.z, 1.0],
+
             chunk_size: config::CHUNK_SIZE,
             chunk_count: self.chunks.chunk_count(),
             max_steps: config::MAX_STEPS,
             _pad0: 0,
+
             voxel_params: [config::VOXEL_SIZE_M_F32, t, 1.8, 0.0],
+
+            grid_origin_chunk: [
+                self.chunks.grid_origin()[0],
+                self.chunks.grid_origin()[1],
+                self.chunks.grid_origin()[2],
+                0,
+            ],
+            grid_dims: [
+                self.chunks.grid_dims()[0],
+                self.chunks.grid_dims()[1],
+                self.chunks.grid_dims()[2],
+                0,
+            ],
         };
         self.renderer.write_camera(&cam_gpu);
 
@@ -199,11 +215,7 @@ impl App {
         self.renderer.write_overlay(&overlay);
 
         // 5) update scene buffers if changed
-        self.renderer.update_scene_storage(
-            self.chunks.changed(),
-            self.chunks.packed_meta(),
-            self.chunks.packed_nodes(),
-        );
+        self.renderer.apply_chunk_uploads(self.chunks.take_uploads());
 
         // 6) acquire frame + encode passes
         let frame = match self.surface.get_current_texture() {

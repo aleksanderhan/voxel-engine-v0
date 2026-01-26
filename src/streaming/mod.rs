@@ -1,6 +1,5 @@
-pub mod chunk;
 pub mod manager;
-pub mod workers;
+pub mod node_arena;
 
-pub use chunk::*;
-pub use manager::ChunkManager;
+pub use manager::{ChunkManager, ChunkUpload};
+pub use node_arena::NodeArena;

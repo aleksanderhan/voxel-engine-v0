@@ -1,11 +1,25 @@
-use wgpu::util::DeviceExt;
+// src/render/state.rs
+//
+// Renderer with persistent GPU storage buffers:
+// - node_buf is a big “arena” (COPY_DST) and we write subranges as chunks stream in.
+// - chunk_buf is a fixed-capacity ChunkMetaGpu array (COPY_DST) and we write per-slot.
+// - chunk_grid_buf is fixed-capacity and rewritten each frame (or whenever it changes).
+//
+// Bindings (compute):
+// 0 = Camera uniform
+// 1 = ChunkMeta storage (read-only)
+// 2 = Node storage (read-only)
+// 3 = Chunk grid storage (read-only)
+// 4 = Output storage texture
 
 use crate::{
+    config,
     render::{
         gpu_types::{CameraGpu, ChunkMetaGpu, NodeGpu, OverlayGpu},
         resources::{create_output_texture, OutputTex},
         shaders,
     },
+    streaming::ChunkUpload,
 };
 
 pub struct Renderer {
@@ -29,13 +43,20 @@ pub struct Renderer {
     camera_buf: wgpu::Buffer,
     overlay_buf: wgpu::Buffer,
 
+    // persistent storage buffers
     node_buf: wgpu::Buffer,
     chunk_buf: wgpu::Buffer,
+    chunk_grid_buf: wgpu::Buffer,
 
     compute_bg: wgpu::BindGroup,
     blit_bg: wgpu::BindGroup,
 
-    // dummies (kept so we can rebuild buffers with non-zero size)
+    // capacity bookkeeping (in elements)
+    node_capacity: u32,
+    chunk_capacity: u32,
+    grid_capacity: u32,
+
+    // dummies (only used if you ever choose to write a placeholder)
     dummy_node: NodeGpu,
     dummy_chunk: ChunkMetaGpu,
 }
@@ -104,7 +125,7 @@ impl Renderer {
                     },
                     count: None,
                 },
-                // packed nodes
+                // nodes arena
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -115,9 +136,20 @@ impl Renderer {
                     },
                     count: None,
                 },
-                // output storage texture
+                // chunk grid
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // output storage texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
@@ -234,7 +266,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        // dummies + storage buffers
+        // dummies (kept around; not required for persistent buffers)
         let dummy_node = NodeGpu {
             child_base: 0xFFFF_FFFF,
             child_mask: 0,
@@ -249,19 +281,39 @@ impl Renderer {
             _pad1: 0,
         };
 
-        let node_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("svo_nodes_dummy"),
-            contents: bytemuck::bytes_of(&dummy_node),
-            usage: wgpu::BufferUsages::STORAGE,
+        // ---------------------------------------------------------------------
+        // Persistent node arena buffer (2A)
+        // ---------------------------------------------------------------------
+        let node_capacity =
+            (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
+        let node_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("svo_nodes_arena"),
+            size: (node_capacity as u64) * (std::mem::size_of::<NodeGpu>() as u64),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
-        let chunk_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("chunk_meta_dummy"),
-            contents: bytemuck::bytes_of(&dummy_chunk),
-            usage: wgpu::BufferUsages::STORAGE,
+        // Persistent chunk meta buffer capacity = max possible resident chunks in KEEP box
+        let chunk_capacity =
+            (2 * config::KEEP_RADIUS + 1) as u32 * 4u32 * (2 * config::KEEP_RADIUS + 1) as u32;
+
+        let chunk_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk_meta_persistent"),
+            size: (chunk_capacity as u64) * (std::mem::size_of::<ChunkMetaGpu>() as u64),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
-        // bind groups
+        // Chunk grid buffer (fixed-capacity)
+        let grid_capacity = chunk_capacity; // same dims: nx * ny * nz
+        let chunk_grid_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk_grid_buf"),
+            size: (grid_capacity as u64) * (std::mem::size_of::<u32>() as u64),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // bind groups (compute BG references persistent buffers; only rebuilt on resize)
         let compute_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("compute_bg"),
             layout: &compute_bgl,
@@ -280,6 +332,10 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
+                    resource: chunk_grid_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: wgpu::BindingResource::TextureView(&output.view),
                 },
             ],
@@ -308,17 +364,28 @@ impl Renderer {
             device,
             queue,
             output,
+
             compute_pipeline,
             blit_pipeline,
+
             compute_bgl,
             blit_bgl,
+
             sampler,
             camera_buf,
             overlay_buf,
+
             node_buf,
             chunk_buf,
+            chunk_grid_buf,
+
             compute_bg,
             blit_bg,
+
+            node_capacity,
+            chunk_capacity,
+            grid_capacity,
+
             dummy_node,
             dummy_chunk,
         }
@@ -373,10 +440,20 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
+                    resource: self.chunk_grid_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
                     resource: wgpu::BindingResource::TextureView(&self.output.view),
                 },
             ],
         });
+    }
+
+    pub fn write_chunk_grid(&self, grid: &[u32]) {
+        // Safety: clamp to capacity (avoid accidental overruns)
+        let n = grid.len().min(self.grid_capacity as usize);
+        self.queue.write_buffer(&self.chunk_grid_buf, 0, bytemuck::cast_slice(&grid[..n]));
     }
 
     pub fn write_camera(&self, cam: &CameraGpu) {
@@ -389,67 +466,32 @@ impl Renderer {
             .write_buffer(&self.overlay_buf, 0, bytemuck::bytes_of(ov));
     }
 
-    /// Rebuild storage buffers only when contents changed.
-    pub fn update_scene_storage(&mut self, changed: bool, chunks_meta: &[ChunkMetaGpu], nodes: &[NodeGpu]) {
-        if !changed {
-            return;
+    // -------------------------------------------------------------------------
+    // 2A: apply chunk uploads into persistent buffers (no buffer rebuilds)
+    // -------------------------------------------------------------------------
+    pub fn apply_chunk_uploads(&self, uploads: Vec<ChunkUpload>) {
+        let node_stride = std::mem::size_of::<NodeGpu>() as u64;
+        let meta_stride = std::mem::size_of::<ChunkMetaGpu>() as u64;
+
+        for u in uploads {
+            // meta write (always)
+            if u.slot < self.chunk_capacity {
+                let meta_off = (u.slot as u64) * meta_stride;
+                self.queue
+                    .write_buffer(&self.chunk_buf, meta_off, bytemuck::bytes_of(&u.meta));
+            }
+
+            // nodes write (only if provided)
+            if !u.nodes.is_empty() {
+                // bounds check: avoid writing past arena
+                let needed = u.nodes.len() as u32;
+                if u.node_base <= self.node_capacity && u.node_base + needed <= self.node_capacity {
+                    let node_off = (u.node_base as u64) * node_stride;
+                    self.queue
+                        .write_buffer(&self.node_buf, node_off, bytemuck::cast_slice(&u.nodes));
+                }
+            }
         }
-
-        // nodes (non-zero)
-        let node_bytes: &[u8];
-        let tmp_node: [NodeGpu; 1];
-        if nodes.is_empty() {
-            tmp_node = [self.dummy_node];
-            node_bytes = bytemuck::cast_slice(&tmp_node);
-        } else {
-            node_bytes = bytemuck::cast_slice(nodes);
-        }
-
-        self.node_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("svo_nodes_packed"),
-            contents: node_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        // chunk meta (non-zero)
-        let meta_bytes: &[u8];
-        let tmp_meta: [ChunkMetaGpu; 1];
-        if chunks_meta.is_empty() {
-            tmp_meta = [self.dummy_chunk];
-            meta_bytes = bytemuck::cast_slice(&tmp_meta);
-        } else {
-            meta_bytes = bytemuck::cast_slice(chunks_meta);
-        }
-
-        self.chunk_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("chunk_meta"),
-            contents: meta_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        // compute bind group references the storage buffers, so rebuild it
-        self.compute_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("compute_bg"),
-            layout: &self.compute_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.camera_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.chunk_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.node_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self.output.view),
-                },
-            ],
-        });
     }
 
     pub fn encode_compute(&self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {

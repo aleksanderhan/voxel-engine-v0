@@ -29,6 +29,9 @@ struct Camera {
   // z = wind_strength
   // w = unused
   voxel_params : vec4<f32>,
+
+  grid_origin_chunk : vec4<i32>,
+  grid_dims         : vec4<u32>,
 };
 
 struct ChunkMeta {
@@ -42,7 +45,8 @@ struct ChunkMeta {
 @group(0) @binding(0) var<uniform> cam : Camera;
 @group(0) @binding(1) var<storage, read> chunks : array<ChunkMeta>;
 @group(0) @binding(2) var<storage, read> nodes  : array<Node>;
-@group(0) @binding(3) var out_img : texture_storage_2d<rgba16float, write>;
+@group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
+@group(0) @binding(4) var out_img : texture_storage_2d<rgba16float, write>;
 
 // ------------------------------------------------------------
 // Constants

@@ -1,3 +1,5 @@
+// src/streaming/manager.rs
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -6,14 +8,90 @@ use glam::Vec3;
 
 use crate::{
     config,
-    render::{ChunkMetaGpu, NodeGpu},
+    render::gpu_types::{ChunkMetaGpu, NodeGpu},
+    svo::build_chunk_svo_sparse,
     world::WorldGen,
 };
 
-use super::{
-    chunk::{ChunkCpu, ChunkKey, ChunkState},
-    workers::{spawn_workers, BuildDone, BuildJob},
-};
+use super::NodeArena;
+
+const INVALID_U32: u32 = 0xFFFF_FFFF;
+
+// Vertical band dy in [-1..=2]
+const GRID_Y_MIN_DY: i32 = -1;
+const GRID_Y_COUNT: u32 = 4;
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+struct ChunkKey {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+enum ChunkState {
+    Missing,
+    Queued,
+    Building,
+    Resident(Resident),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Resident {
+    slot: u32,       // index into chunk_meta (dense)
+    node_base: u32,  // base index into global node arena
+    node_count: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BuildJob {
+    key: ChunkKey,
+}
+
+struct BuildDone {
+    key: ChunkKey,
+    nodes: Vec<NodeGpu>,
+}
+
+pub struct ChunkUpload {
+    pub slot: u32,
+    pub meta: ChunkMetaGpu,
+
+    pub node_base: u32,
+    pub nodes: Vec<NodeGpu>,
+}
+
+fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender<BuildDone>) {
+    for _ in 0..config::WORKER_THREADS {
+        let gen = gen.clone();
+        let rx_job = rx_job.clone();
+        let tx_done = tx_done.clone();
+
+        std::thread::spawn(move || {
+            while let Ok(job) = rx_job.recv() {
+                let k = job.key;
+                let origin = [
+                    k.x * config::CHUNK_SIZE as i32,
+                    k.y * config::CHUNK_SIZE as i32,
+                    k.z * config::CHUNK_SIZE as i32,
+                ];
+
+                let nodes = build_chunk_svo_sparse(&gen, origin, config::CHUNK_SIZE);
+
+                if tx_done.send(BuildDone { key: k, nodes }).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+fn sort_queue_near_first(queue: &mut VecDeque<ChunkKey>, center: ChunkKey) {
+    let mut v: Vec<ChunkKey> = queue.drain(..).collect();
+    v.sort_by_key(|k| {
+        (k.x - center.x).abs() + (k.z - center.z).abs() + 2 * (k.y - center.y).abs()
+    });
+    queue.extend(v);
+}
 
 pub struct ChunkManager {
     gen: Arc<WorldGen>,
@@ -25,10 +103,19 @@ pub struct ChunkManager {
     rx_done: Receiver<BuildDone>,
     in_flight: usize,
 
-    nodes_packed: Vec<NodeGpu>,
-    chunks_meta: Vec<ChunkMetaGpu>,
+    // Dense slots for resident chunks
+    slot_to_key: Vec<ChunkKey>,              // slot -> key
+    chunk_meta: Vec<ChunkMetaGpu>,           // slot -> meta
+    uploads: Vec<ChunkUpload>,               // pending GPU writes this frame
+    changed: bool,                           // still useful for other systems
 
-    changed: bool,
+    // Node arena (in units of NodeGpu elements)
+    arena: NodeArena,
+
+    // Chunk grid for GPU lookup (same as before)
+    grid_origin_chunk: [i32; 3],
+    grid_dims: [u32; 3],
+    chunk_grid: Vec<u32>,
 }
 
 impl ChunkManager {
@@ -37,6 +124,15 @@ impl ChunkManager {
         let (tx_done, rx_done) = unbounded::<BuildDone>();
         spawn_workers(gen.clone(), rx_job, tx_done);
 
+        // Arena capacity in NodeGpu elements
+        let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
+
+        // Grid size (KEEP box)
+        let nx = (2 * config::KEEP_RADIUS + 1) as u32;
+        let nz = nx;
+        let ny = GRID_Y_COUNT;
+        let grid_len = (nx * ny * nz) as usize;
+
         Self {
             gen,
             chunks: HashMap::new(),
@@ -44,34 +140,60 @@ impl ChunkManager {
             tx_job,
             rx_done,
             in_flight: 0,
-            nodes_packed: Vec::new(),
-            chunks_meta: Vec::new(),
-            changed: true,
+
+            slot_to_key: Vec::new(),
+            chunk_meta: Vec::new(),
+            uploads: Vec::new(),
+            changed: false,
+
+            arena: NodeArena::new(node_capacity),
+
+            grid_origin_chunk: [0, 0, 0],
+            grid_dims: [nx, ny, nz],
+            chunk_grid: vec![INVALID_U32; grid_len],
         }
     }
 
-    pub fn changed(&self) -> bool {
-        self.changed
-    }
-
-    pub fn packed_nodes(&self) -> &[NodeGpu] {
-        &self.nodes_packed
-    }
-
-    pub fn packed_meta(&self) -> &[ChunkMetaGpu] {
-        &self.chunks_meta
-    }
+    // -------- public API --------
 
     pub fn chunk_count(&self) -> u32 {
-        self.chunks_meta.len() as u32
+        self.slot_to_key.len() as u32
     }
 
-    pub fn update(&mut self, world: &WorldGen, camera_pos_m: Vec3) {
-        self.changed = false;
+    pub fn chunk_meta(&self) -> &[ChunkMetaGpu] {
+        &self.chunk_meta
+    }
 
-        // --- ground-anchored center chunk (matches your original) ---
-        let cam_vx = (camera_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
-        let cam_vz = (camera_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
+    pub fn grid_origin(&self) -> [i32; 3] {
+        self.grid_origin_chunk
+    }
+
+    pub fn grid_dims(&self) -> [u32; 3] {
+        self.grid_dims
+    }
+
+    pub fn chunk_grid(&self) -> &[u32] {
+        &self.chunk_grid
+    }
+
+    pub fn take_uploads(&mut self) -> Vec<ChunkUpload> {
+        std::mem::take(&mut self.uploads)
+    }
+
+    pub fn changed(&mut self) -> bool {
+        let c = self.changed;
+        self.changed = false;
+        c
+    }
+
+    // -------- update --------
+
+    pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3) {
+        self.uploads.clear();
+
+        // center chunk (ground-anchored)
+        let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
+        let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
 
         let ccx = cam_vx.div_euclid(config::CHUNK_SIZE as i32);
         let ccz = cam_vz.div_euclid(config::CHUNK_SIZE as i32);
@@ -79,17 +201,13 @@ impl ChunkManager {
         let ground_y_vox = world.ground_height(cam_vx, cam_vz);
         let ground_cy = ground_y_vox.div_euclid(config::CHUNK_SIZE as i32);
 
-        let center = ChunkKey {
-            x: ccx,
-            y: ground_cy,
-            z: ccz,
-        };
+        let center = ChunkKey { x: ccx, y: ground_cy, z: ccz };
 
-        let desired = desired_chunks(center, config::ACTIVE_RADIUS);
-        let keep = desired_chunks(center, config::KEEP_RADIUS);
+        let desired = Self::desired_chunks(center, config::ACTIVE_RADIUS);
+        let keep = Self::desired_chunks(center, config::KEEP_RADIUS);
         let keep_set: HashSet<ChunkKey> = keep.iter().copied().collect();
 
-        // --- queue missing desired chunks ---
+        // queue missing desired
         for k in &desired {
             match self.chunks.get(k) {
                 None | Some(ChunkState::Missing) => {
@@ -100,24 +218,17 @@ impl ChunkManager {
             }
         }
 
-        // --- unload outside keep ---
-        let keys_snapshot: Vec<ChunkKey> = self.chunks.keys().copied().collect();
-        for k in keys_snapshot {
-            if !keep_set.contains(&k) {
-                match self.chunks.get(&k) {
-                    Some(ChunkState::Ready(_)) => {
-                        self.chunks.insert(k, ChunkState::Missing);
-                        self.changed = true;
-                    }
-                    Some(ChunkState::Queued) | Some(ChunkState::Building) => {
-                        self.chunks.insert(k, ChunkState::Missing);
-                    }
-                    _ => {}
+        // unload outside keep
+        {
+            let keys_snapshot: Vec<ChunkKey> = self.chunks.keys().copied().collect();
+            for k in keys_snapshot {
+                if !keep_set.contains(&k) {
+                    self.unload_chunk(k);
                 }
             }
         }
 
-        // --- worker dispatch ---
+        // dispatch builds
         sort_queue_near_first(&mut self.build_queue, center);
 
         while self.in_flight < config::MAX_IN_FLIGHT {
@@ -139,84 +250,193 @@ impl ChunkManager {
             }
         }
 
-        // --- harvest done ---
+        // harvest done
         while let Ok(done) = self.rx_done.try_recv() {
             if self.in_flight > 0 {
                 self.in_flight -= 1;
             }
 
             if !keep_set.contains(&done.key) {
+                // drop build result
                 self.chunks.insert(done.key, ChunkState::Missing);
                 continue;
             }
 
-            self.chunks.insert(
-                done.key,
-                ChunkState::Ready(ChunkCpu { nodes: done.nodes }),
-            );
-            self.changed = true;
+            self.on_build_done(done.key, done.nodes);
         }
 
-        // --- pack KEEP chunks every frame (so chunk_count is always correct) ---
-        self.pack_keep(&keep);
+        // rebuild grid mapping for current KEEP region
+        self.rebuild_grid(center);
     }
 
-    fn pack_keep(&mut self, keep: &[ChunkKey]) {
-        self.nodes_packed.clear();
-        self.chunks_meta.clear();
-
-        let node_stride = std::mem::size_of::<NodeGpu>();
-        let mut used_bytes: usize = 0;
-
-        for k in keep {
-            let Some(ChunkState::Ready(cpu)) = self.chunks.get(k) else { continue; };
-
-            let chunk_bytes = cpu.nodes.len() * node_stride;
-            if used_bytes + chunk_bytes > config::NODE_BUDGET_BYTES {
-                continue;
+    fn desired_chunks(center: ChunkKey, radius: i32) -> Vec<ChunkKey> {
+        let mut out = Vec::new();
+        for dy in GRID_Y_MIN_DY..=(GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1) {
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    out.push(ChunkKey {
+                        x: center.x + dx,
+                        y: center.y + dy,
+                        z: center.z + dz,
+                    });
+                }
             }
+        }
+        out
+    }
 
-            let origin = [
-                k.x * config::CHUNK_SIZE as i32,
-                k.y * config::CHUNK_SIZE as i32,
-                k.z * config::CHUNK_SIZE as i32,
-            ];
+    fn on_build_done(&mut self, key: ChunkKey, nodes: Vec<NodeGpu>) {
+        // allocate node range
+        let need = nodes.len() as u32;
+        let Some(node_base) = self.arena.alloc(need) else {
+            // out of arena budget; drop (could keep queued/backoff)
+            self.chunks.insert(key, ChunkState::Queued);
+            self.build_queue.push_back(key);
+            return;
+        };
 
-            let node_base = self.nodes_packed.len() as u32;
-            self.nodes_packed.extend_from_slice(&cpu.nodes);
-            used_bytes += chunk_bytes;
+        // allocate slot (dense)
+        let slot = self.slot_to_key.len() as u32;
+        self.slot_to_key.push(key);
 
-            self.chunks_meta.push(ChunkMetaGpu {
-                origin: [origin[0], origin[1], origin[2], 0],
+        let origin_vox = [
+            key.x * config::CHUNK_SIZE as i32,
+            key.y * config::CHUNK_SIZE as i32,
+            key.z * config::CHUNK_SIZE as i32,
+        ];
+
+        let meta = ChunkMetaGpu {
+            origin: [origin_vox[0], origin_vox[1], origin_vox[2], 0],
+            node_base,
+            node_count: need,
+            _pad0: 0,
+            _pad1: 0,
+        };
+
+        self.chunk_meta.push(meta);
+
+        // mark resident
+        self.chunks.insert(
+            key,
+            ChunkState::Resident(Resident {
+                slot,
                 node_base,
-                node_count: cpu.nodes.len() as u32,
-                _pad0: 0,
-                _pad1: 0,
-            });
+                node_count: need,
+            }),
+        );
+
+        // schedule GPU upload (nodes + meta)
+        self.uploads.push(ChunkUpload {
+            slot,
+            meta,
+            node_base,
+            nodes,
+        });
+
+        self.changed = true;
+    }
+
+    fn unload_chunk(&mut self, key: ChunkKey) {
+        let Some(state) = self.chunks.get(&key) else { return; };
+
+        match *state {
+            ChunkState::Resident(res) => {
+                // free node arena range
+                self.arena.free(res.node_base, res.node_count);
+
+                // remove slot densely by swap-remove
+                let dead_slot = res.slot as usize;
+                let last_slot = self.slot_to_key.len().saturating_sub(1);
+
+                if dead_slot != last_slot {
+                    let moved_key = self.slot_to_key[last_slot];
+                    self.slot_to_key[dead_slot] = moved_key;
+
+                    // move meta
+                    let moved_meta = self.chunk_meta[last_slot];
+                    self.chunk_meta[dead_slot] = moved_meta;
+
+                    // update moved chunk's Resident.slot
+                    if let Some(state) = self.chunks.get_mut(&moved_key) {
+                        if let ChunkState::Resident(mr) = state {
+                            mr.slot = dead_slot as u32;
+                        }
+                    }
+
+                    // schedule meta rewrite for moved slot
+                    self.uploads.push(ChunkUpload {
+                        slot: dead_slot as u32,
+                        meta: self.chunk_meta[dead_slot],
+                        node_base: 0,
+                        nodes: Vec::new(), // meta-only update (Renderer will ignore empty nodes)
+                    });
+                }
+
+                self.slot_to_key.pop();
+                self.chunk_meta.pop();
+
+                self.chunks.insert(key, ChunkState::Missing);
+                self.changed = true;
+            }
+
+            ChunkState::Queued | ChunkState::Building => {
+                self.chunks.insert(key, ChunkState::Missing);
+                self.changed = true;
+            }
+
+            _ => {}
         }
     }
-}
 
-// --------------------- helpers ---------------------
+    fn rebuild_grid(&mut self, center: ChunkKey) {
+        let nx = (2 * config::KEEP_RADIUS + 1) as u32;
+        let nz = nx;
+        let ny = GRID_Y_COUNT;
 
-fn desired_chunks(center: ChunkKey, radius: i32) -> Vec<ChunkKey> {
-    let mut out = Vec::new();
-    for dy in -1..=2 {
-        for dz in -radius..=radius {
-            for dx in -radius..=radius {
-                out.push(ChunkKey {
-                    x: center.x + dx,
-                    y: center.y + dy,
-                    z: center.z + dz,
-                });
+        self.grid_dims = [nx, ny, nz];
+
+        let ox = center.x - config::KEEP_RADIUS;
+        let oz = center.z - config::KEEP_RADIUS;
+        let oy = center.y + GRID_Y_MIN_DY;
+
+        self.grid_origin_chunk = [ox, oy, oz];
+
+        let needed = (nx * ny * nz) as usize;
+        if self.chunk_grid.len() != needed {
+            self.chunk_grid.resize(needed, INVALID_U32);
+        }
+        self.chunk_grid.fill(INVALID_U32);
+
+        // Fill grid from resident chunks (slot -> key)
+        for (slot, &k) in self.slot_to_key.iter().enumerate() {
+            if let Some(idx) = self.grid_index_for_chunk(k) {
+                self.chunk_grid[idx] = slot as u32;
             }
         }
     }
-    out
-}
 
-fn sort_queue_near_first(queue: &mut VecDeque<ChunkKey>, center: ChunkKey) {
-    let mut v: Vec<ChunkKey> = queue.drain(..).collect();
-    v.sort_by_key(|k| (k.x - center.x).abs() + (k.z - center.z).abs() + 2 * (k.y - center.y).abs());
-    queue.extend(v);
+    #[inline]
+    fn grid_index_for_chunk(&self, k: ChunkKey) -> Option<usize> {
+        let [ox, oy, oz] = self.grid_origin_chunk;
+        let [nx, ny, nz] = self.grid_dims;
+
+        let ix = k.x - ox;
+        let iy = k.y - oy;
+        let iz = k.z - oz;
+
+        if ix < 0 || iy < 0 || iz < 0 {
+            return None;
+        }
+
+        let ix = ix as u32;
+        let iy = iy as u32;
+        let iz = iz as u32;
+
+        if ix >= nx || iy >= ny || iz >= nz {
+            return None;
+        }
+
+        let idx = (iz * ny * nx) + (iy * nx) + ix;
+        Some(idx as usize)
+    }
 }

@@ -32,6 +32,9 @@ pub struct CameraGpu {
     pub _pad0: u32,
 
     pub voxel_params: [f32; 4],
+
+    pub grid_origin_chunk: [i32; 4], // (cx0, cy0, cz0, unused)
+    pub grid_dims: [u32; 4],         // (nx, ny, nz, unused)
 }
 
 #[repr(C)]
