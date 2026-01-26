@@ -9,6 +9,10 @@ pub const STONE: u32 = 3;
 pub const WOOD: u32 = 4;
 pub const LEAF: u32 = 5;
 
+pub const VOXEL_SIZE_M: f64 = 0.10;          // 10 cm
+pub const VOXELS_PER_METER: i32 = 10;        // 1.0 / 0.10
+
+
 #[inline]
 fn hash_u32(mut v: u32) -> u32 {
     v ^= v >> 16;
@@ -46,33 +50,46 @@ impl WorldGen {
     }
 
     /// Uncached height query (fine for gameplay; chunk builder should cache).
-    pub fn ground_height(&self, x: i32, z: i32) -> i32 {
-        let xf = x as f64;
-        let zf = z as f64;
+    pub fn ground_height(&self, x_vox: i32, z_vox: i32) -> i32 {
+        let xm = x_vox as f64 * VOXEL_SIZE_M;
+        let zm = z_vox as f64 * VOXEL_SIZE_M;
 
-        let h0 = self.height.get([xf, zf]) as f32;
-        let h1 = self.detail.get([xf, zf]) as f32;
+        let h0 = self.height.get([xm, zm]) as f32;
+        let h1 = self.detail.get([xm, zm]) as f32;
 
-        let base = 10.0;
-        let amp = 18.0;
-        let hills = h0 * amp + h1 * 3.0;
+        // These are METERS now:
+        let base_m = 10.0;
+        let amp_m  = 18.0;
+        let hills_m = h0 * amp_m + h1 * 3.0;
 
-        (base + hills).round() as i32
+        // Convert meters -> voxels:
+        ((base_m + hills_m) * (VOXELS_PER_METER as f32)).round() as i32
     }
 
-    #[inline]
-    fn tree_params(&self, x: i32, z: i32) -> Option<(i32, i32, u32)> {
-        let r = hash2(self.seed, x, z);
 
-        // Density (tune): ~1 in 24 columns become trees.
+    #[inline]
+    fn tree_params(&self, x_vox: i32, z_vox: i32) -> Option<(i32, i32, u32)> {
+        let xm = x_vox.div_euclid(VOXELS_PER_METER);
+        let zm = z_vox.div_euclid(VOXELS_PER_METER);
+
+        let r = hash2(self.seed, xm, zm);
+
+        // density per 1m cell
         if (r % 96) != 0 {
             return None;
         }
 
-        let trunk_h = 4 + (hash_u32(r) % 4) as i32; // 4..7
-        let crown_r = 2 + (hash_u32(r ^ 0xBEEF) % 2) as i32; // 2..3
-        Some((trunk_h, crown_r, r))
+        // meter-scale dimensions (same “shape” as before)
+        let trunk_h_m = 4 + (hash_u32(r) % 4) as i32;        // 4..7 meters
+        let crown_r_m = 2 + (hash_u32(r ^ 0xBEEF) % 2) as i32; // 2..3 meters
+
+        // scale to voxels (more detail)
+        let trunk_h_vox = trunk_h_m * VOXELS_PER_METER;
+        let crown_r_vox = crown_r_m * VOXELS_PER_METER;
+
+        Some((trunk_h_vox, crown_r_vox, r))
     }
+
 
     /// Cached version: pass a height function (typically a chunk-local cache).
     pub fn material_at_world_cached<F: Fn(i32, i32) -> i32>(
@@ -97,9 +114,10 @@ impl WorldGen {
         if y == ground {
             return GRASS;
         }
-        if y >= ground - 3 {
+        if y >= ground - 3 * VOXELS_PER_METER {
             return DIRT;
         }
+
         STONE
     }
 
@@ -111,26 +129,29 @@ impl WorldGen {
         z: i32,
         height_at: &F,
     ) -> u32 {
-        // Max crown radius = 3 in our params, so search +/-3.
-        for tz in (z - 3)..=(z + 3) {
-            for tx in (x - 3)..=(x + 3) {
+        let xm = x.div_euclid(VOXELS_PER_METER);
+        let zm = z.div_euclid(VOXELS_PER_METER);
+
+        // max crown radius is 3m => search +/-3 meter cells
+        for tz_m in (zm - 3)..=(zm + 3) {
+            for tx_m in (xm - 3)..=(xm + 3) {
+                let tx = tx_m * VOXELS_PER_METER;
+                let tz = tz_m * VOXELS_PER_METER;
+
                 let Some((trunk_h, crown_r, _r)) = self.tree_params(tx, tz) else { continue; };
 
                 let ground = height_at(tx, tz);
-                let trunk_base_y = ground + 1;
+                let trunk_base_y = ground + VOXELS_PER_METER; // +1m above ground (matches old “+1 voxel” intent)
                 let trunk_top_y = trunk_base_y + trunk_h;
 
-                // Trunk column at (tx,tz)
                 if x == tx && z == tz && y >= trunk_base_y && y <= trunk_top_y {
                     return WOOD;
                 }
 
-                // Leaves: sphere-ish around (tx, trunk_top_y, tz)
                 let dx = x - tx;
                 let dy = y - trunk_top_y;
                 let dz = z - tz;
-                if dx * dx + dy * dy + dz * dz <= crown_r * crown_r {
-                    // Don't overwrite trunk
+                if dx*dx + dy*dy + dz*dz <= crown_r*crown_r {
                     if !(x == tx && z == tz && y >= trunk_base_y && y <= trunk_top_y) {
                         return LEAF;
                     }
@@ -140,4 +161,16 @@ impl WorldGen {
 
         AIR
     }
+
+    pub fn tree_instance_at_meter(&self, xm: i32, zm: i32) -> Option<(i32, i32)> {
+        let r = hash2(self.seed, xm, zm);
+        if (r % 96) != 0 { return None; }
+
+        let trunk_h_m = 4 + (hash_u32(r) % 4) as i32;          // 4..7 m
+        let crown_r_m = 2 + (hash_u32(r ^ 0xBEEF) % 2) as i32; // 2..3 m
+
+        let vpm = VOXELS_PER_METER;
+        Some((trunk_h_m * vpm, crown_r_m * vpm))
+    }
+
 }

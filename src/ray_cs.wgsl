@@ -31,26 +31,21 @@ struct Node {
 };
 
 struct Camera {
-  // Inverse matrices so the shader can reconstruct per-pixel world rays:
-  // - proj_inv : clip/NDC -> view space
-  // - view_inv : view -> world space
-  view_inv     : mat4x4<f32>,
-  proj_inv     : mat4x4<f32>,
+  view_inv    : mat4x4<f32>,
+  proj_inv    : mat4x4<f32>,
+  cam_pos     : vec4<f32>,
 
-  // Camera position in world space (xyz used).
-  cam_pos      : vec4<f32>,
+  chunk_size  : u32,
+  chunk_count : u32,
+  max_steps   : u32,
+  _pad0       : u32,
 
-  // Chunk edge length in voxels (power of two). All chunks share this size.
-  chunk_size   : u32,
-
-  // Number of valid entries in `chunks`.
-  chunk_count  : u32,
-
-  // Safety cap: max number of skip-iterations per chunk (NOT voxel steps).
-  max_steps    : u32,
-
-  _pad0        : u32,
+  // pack voxel_size into x; yzw unused
+  voxel_params : vec4<f32>,
 };
+
+
+
 
 struct ChunkMeta {
   origin    : vec4<i32>, // chunk min corner in world voxel coords
@@ -210,41 +205,54 @@ fn safe_inv(x: f32) -> f32 {
   return select(1.0 / x, BIG_F32, abs(x) < EPS_INV);
 }
 
-struct LeafQuery {
-  bmin : vec3<f32>, // world-space cube min
-  size : f32,       // cube edge length
-  mat  : u32,       // 0 for empty
-};
-
 // Point-descent into the SVO to find the leaf (or missing child => empty leaf) that contains p.
 // p must be inside the chunk root cube.
 //
 // Multi-chunk change:
 // - `node_base` offsets into the packed node buffer.
 // - Root of this chunk is always at `node_base + 0`.
+struct LeafQuery {
+  bmin : vec3<f32>, // world-space cube min (meters)
+  size : f32,       // cube edge length (meters)
+  mat  : u32,       // 0 for empty / air
+};
+
+// Point-descent into the SVO to find the leaf (or missing child => empty leaf) that contains p.
+// p must be inside the chunk root cube.
+//
+// IMPORTANT: sizes here are in METERS (because root_size = chunk_size * voxel_size).
+// So the minimum leaf size is cam.voxel_params.x (voxel_size), not 1.0.
 fn query_leaf_at(
   p: vec3<f32>,
   root_bmin: vec3<f32>,
   root_size: f32,
   node_base: u32
 ) -> LeafQuery {
-  var idx: u32 = node_base;
+  var idx: u32 = node_base;          // root is node_base + 0
   var bmin: vec3<f32> = root_bmin;
   var size: f32 = root_size;
 
+  let min_leaf: f32 = cam.voxel_params.x; // voxel_size in meters
+  let eps: f32 = 1e-7;
+
+  // Descend until we hit a leaf node OR we reach voxel resolution.
+  // 32 is enough for chunk_size up to 2^32 voxels (way beyond practical).
   for (var d: u32 = 0u; d < 32u; d = d + 1u) {
     let n = nodes[idx];
 
+    // Normal leaf: return its material.
     if (n.child_base == LEAF_U32) {
       return LeafQuery(bmin, size, n.material);
     }
 
-    if (size <= 1.0) {
+    // If we've reached voxel-sized cubes, stop descending.
+    // If we don't have an explicit leaf at this depth, treat as empty.
+    if (size <= min_leaf + eps) {
       return LeafQuery(bmin, size, 0u);
     }
 
     let half = size * 0.5;
-    let mid = bmin + vec3<f32>(half);
+    let mid  = bmin + vec3<f32>(half);
 
     let hx = select(0u, 1u, p.x >= mid.x);
     let hy = select(0u, 1u, p.y >= mid.y);
@@ -258,30 +266,26 @@ fn query_leaf_at(
     );
 
     let bit = 1u << ci;
+
+    // Missing child => empty leaf region.
     if ((n.child_mask & bit) == 0u) {
       return LeafQuery(child_bmin, half, 0u);
     }
 
-    // IMPORTANT: `n.child_base` is also relative to the packed `nodes` array,
-    // because CPU stored absolute indices inside the packed buffer.
-    //
-    // Your CPU builder currently builds per-chunk nodes starting at 0.
-    // When packing chunks, you must add `node_base` to any internal `child_base`.
-    //
-    // If you DID NOT patch child_base during packing, then you MUST treat child_base as
-    // relative-to-chunk and add node_base here. We do that (safe) version below.
-
+    // Compact children addressing: base + rank among set bits.
     let rank = child_rank(n.child_mask, ci);
 
-    // Treat child_base as chunk-relative:
+    // CPU stores child_base as CHUNK-RELATIVE. So add node_base here.
     idx = node_base + (n.child_base + rank);
 
     bmin = child_bmin;
     size = half;
   }
 
+  // Failsafe: treat as empty.
   return LeafQuery(bmin, size, 0u);
 }
+
 
 // Compute the ray parameter t at which the ray exits a cube AABB,
 // assuming the current point is inside the cube.
@@ -306,13 +310,12 @@ struct Hit {
 // Trace one chunk using hybrid skip-empty traversal.
 // Returns a Hit with the ray parameter t of the accepted hit (for nearest selection).
 fn trace_chunk_hybrid(ro: vec3<f32>, rd: vec3<f32>, ch: ChunkMeta) -> Hit {
-  let root_bmin = vec3<f32>(
-    f32(ch.origin.x),
-    f32(ch.origin.y),
-    f32(ch.origin.z)
-  );
-  let root_size = f32(cam.chunk_size);
+  let voxel_size = cam.voxel_params.x;
+  let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
+  let root_bmin = root_bmin_vox * voxel_size;
+  let root_size = f32(cam.chunk_size) * voxel_size;
   let root_bmax = root_bmin + vec3<f32>(root_size);
+
 
   let rt = intersect_aabb(ro, rd, root_bmin, root_bmax);
   let t_enter = max(rt.x, 0.0);
@@ -355,7 +358,6 @@ fn trace_chunk_hybrid(ro: vec3<f32>, rd: vec3<f32>, ch: ChunkMeta) -> Hit {
 // ------------------------------------------------------------
 // Entry point: loop over chunks and keep nearest hit
 // ------------------------------------------------------------
-
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dims = textureDimensions(out_img);
@@ -367,10 +369,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ro = cam.cam_pos.xyz;
   let rd = ray_dir_from_pixel(px, res);
 
-  var best_t: f32 = BIG_F32;
-  var best_col: vec3<f32> = vec3<f32>(0.0);
+  // Default to sky (so even chunk_count == 0 writes something non-black)
+  let tsky = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
+  var best_col: vec3<f32> = mix(
+    vec3<f32>(0.05, 0.08, 0.12), // horizon/dark
+    vec3<f32>(0.6, 0.8, 1.0),    // zenith/light
+    tsky
+  );
 
-  // NOTE: chunks is a runtime-sized array; looping by cam.chunk_count is ok.
+  var best_t: f32 = BIG_F32;
+
+  // Test chunks and override sky with nearest hit
   for (var i: u32 = 0u; i < cam.chunk_count; i = i + 1u) {
     let h = trace_chunk_hybrid(ro, rd, chunks[i]);
     if (h.hit && h.t < best_t) {
@@ -379,6 +388,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  let out_col = vec4<f32>(best_col, 1.0);
-  textureStore(out_img, vec2<i32>(i32(gid.x), i32(gid.y)), out_col);
+  textureStore(out_img, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(best_col, 1.0));
 }
+

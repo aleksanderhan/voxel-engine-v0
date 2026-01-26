@@ -2,16 +2,20 @@
 //!
 //! Multi-chunk Sparse Voxel Octree (SVO) + GPU ray traversal MVP.
 //!
-//! What changed vs your 1-chunk version:
-//! - CPU builds SVOs for an ACTIVE GRID of chunks around the camera (e.g. 3x3).
-//! - CPU packs ALL chunk node arrays into ONE big GPU storage buffer.
-//! - CPU uploads a chunk metadata list (origin + node_base) to the GPU.
-//! - GPU traces multiple chunks and picks the nearest hit (your WGSL must match the bindings/structs).
+//! Streaming + off-thread build change:
+//! - Maintain chunk states + build queue.
+//! - Every frame computes desired ACTIVE set (ground-anchored Y).
+//! - Add KEEP_RADIUS hysteresis so ground chunks don't vanish while new ones build.
+//! - Missing chunks are queued and dispatched to worker threads (priority: near-first).
+//! - Worker threads build SVO nodes and send results back.
+//! - Main thread repacks READY chunks into GPU buffers when changed.
+//! - Compute dispatch ALWAYS runs; sky fallback handles chunk_count==0.
 //!
 //! Notes on abbreviations (first use):
 //! - SVO  = Sparse Voxel Octree
 //! - DDA  = Digital Differential Analyzer
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,6 +29,9 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Fullscreen, WindowBuilder},
 };
+
+// Off-thread messaging
+use crossbeam_channel::{unbounded, Receiver, Sender};
 
 mod worldgen;
 mod svo;
@@ -40,29 +47,32 @@ const CHUNK_SIZE: u32 = 128;
 /// 2 => 5x5 chunks
 const ACTIVE_RADIUS: i32 = 1;
 
+/// Keep a larger ring cached to prevent "holes" while chunks build.
+const KEEP_RADIUS: i32 = ACTIVE_RADIUS + 2;
+
+const VOXEL_SIZE_M: f32 = 0.10; // 10 cm voxels
+
+/// Worker threads (SVO building).
+const WORKER_THREADS: usize = 2;
+
+/// Max jobs in flight (limits memory + CPU spikes).
+const MAX_IN_FLIGHT: usize = 8;
+
+const NODE_BUDGET_BYTES: usize = 120 * 1024 * 1024; // 120 MiB safety
+
+
 /// Chunk metadata passed to GPU (must match WGSL struct).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ChunkMetaGpu {
-    /// Chunk origin in world voxel coords (x,y,z) + padding.
-    origin: [i32; 4],
-    /// Base index into packed nodes buffer.
-    node_base: u32,
-    /// Node count (optional; useful for debugging).
-    node_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    origin: [i32; 4],   // 16 bytes
+    node_base: u32,     // +4
+    node_count: u32,    // +4
+    _pad0: u32,         // +4
+    _pad1: u32,         // +4  => total 32 bytes
 }
 
 /// Camera / scene parameters passed to the compute shader.
-///
-/// We pass inverse matrices so WGSL can reconstruct rays:
-/// - proj_inv: clip/NDC -> view
-/// - view_inv: view -> world
-///
-/// Multi-chunk change:
-/// - no single chunk_origin here anymore
-/// - chunk_count tells WGSL how many entries are in the chunk meta buffer
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraGpu {
@@ -74,6 +84,8 @@ struct CameraGpu {
     chunk_count: u32,
     max_steps: u32,
     _pad0: u32,
+
+    voxel_params: [f32; 4],
 }
 
 #[repr(C)]
@@ -133,19 +145,104 @@ fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> OutputTex {
     OutputTex { tex, view }
 }
 
+// ------------------------------------------------------------
+// Chunk streaming state
+// ------------------------------------------------------------
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+struct ChunkKey {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+struct ChunkCpu {
+    nodes: Vec<NodeGpu>, // per-chunk nodes; child_base is chunk-relative (WGSL does node_base + child_base)
+}
+
+enum ChunkState {
+    Missing,
+    Queued,
+    Building,
+    Ready(ChunkCpu),
+}
+
+/// Desired chunk list around a center. Vertical band is tuned for terrain+trees.
+fn desired_chunks(center: ChunkKey, radius: i32) -> Vec<ChunkKey> {
+    let mut out = Vec::new();
+
+    // Terrain world: keep some below, and enough above for crowns.
+    for dy in -1..=2 {
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                out.push(ChunkKey {
+                    x: center.x + dx,
+                    y: center.y + dy,
+                    z: center.z + dz,
+                });
+            }
+        }
+    }
+    out
+}
+
+// Job + result messages
+#[derive(Clone, Copy, Debug)]
+struct BuildJob {
+    key: ChunkKey,
+}
+
+struct BuildDone {
+    key: ChunkKey,
+    nodes: Vec<NodeGpu>,
+}
+
+fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender<BuildDone>) {
+    for _ in 0..WORKER_THREADS {
+        let gen = gen.clone();
+        let rx_job = rx_job.clone();
+        let tx_done = tx_done.clone();
+
+        std::thread::spawn(move || {
+            while let Ok(job) = rx_job.recv() {
+                let k = job.key;
+                let origin = [
+                    k.x * CHUNK_SIZE as i32,
+                    k.y * CHUNK_SIZE as i32,
+                    k.z * CHUNK_SIZE as i32,
+                ];
+
+                let nodes = build_chunk_svo_sparse(&gen, origin, CHUNK_SIZE);
+
+                if tx_done.send(BuildDone { key: k, nodes }).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+fn sort_queue_near_first(queue: &mut VecDeque<ChunkKey>, center: ChunkKey) {
+    let mut v: Vec<ChunkKey> = queue.drain(..).collect();
+    v.sort_by_key(|k| {
+        // prioritize XZ strongly; Y moderately
+        (k.x - center.x).abs() + (k.z - center.z).abs() + 2 * (k.y - center.y).abs()
+    });
+    queue.extend(v);
+}
+
 fn main() {
     let event_loop = EventLoop::new().unwrap();
 
     let window = Arc::new(
         WindowBuilder::new()
-            .with_title("SVO MVP (multi-chunk)")
+            .with_title("SVO MVP (multi-chunk, streaming, workers)")
             .with_inner_size(PhysicalSize::new(1280, 720))
             .build(&event_loop)
             .unwrap(),
     );
 
     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-
     pollster::block_on(run(event_loop, window));
 }
 
@@ -153,7 +250,6 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
     // --- WGPU init ------------------------------------------------------------
     let size = window.inner_size();
     let instance = wgpu::Instance::default();
-
     let surface_window = window.clone();
     let surface = instance.create_surface(surface_window.as_ref()).unwrap();
 
@@ -166,17 +262,27 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
         .await
         .unwrap();
 
+    let adapter_limits = adapter.limits();
+
+    // Request as much as the adapter supports (within reason).
+    let required_limits = wgpu::Limits {
+        max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+        max_buffer_size: adapter_limits.max_buffer_size,
+        ..wgpu::Limits::default()
+    };
+
     let (device, queue) = adapter
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits,
             },
             None,
         )
         .await
         .unwrap();
+
 
     let device = Arc::new(device);
     let queue = Arc::new(queue);
@@ -196,33 +302,55 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
     };
     surface.configure(&device, &config);
 
-    // --- World + chunk state --------------------------------------------------
-    let gen = WorldGen::new(12345);
+    // --- World + streaming chunk state ---------------------------------------
+    let gen = Arc::new(WorldGen::new(12345));
 
-    // Center chunk coordinate currently loaded (cx, cz).
-    let mut active_center = (i32::MIN, i32::MIN);
+    let mut chunks: HashMap<ChunkKey, ChunkState> = HashMap::new();
+    let mut build_queue: VecDeque<ChunkKey> = VecDeque::new();
 
-    // Packed nodes and chunk metadata for ACTIVE grid.
     let mut nodes_packed: Vec<NodeGpu> = Vec::new();
     let mut chunks_meta: Vec<ChunkMetaGpu> = Vec::new();
 
-    // Dummy buffers (replaced on first chunk build).
-    let mut node_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("svo_nodes_packed"),
-        size: 4,
+    // Dummy node buffer (non-zero)
+    let dummy_node = NodeGpu {
+        child_base: 0xFFFF_FFFF,
+        child_mask: 0,
+        material: 0,
+        _pad: 0,
+    };
+    let mut node_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("svo_nodes_dummy_1"),
+        contents: bytemuck::bytes_of(&dummy_node),
         usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
     });
 
-    let mut chunk_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("chunk_meta"),
-        size: 4,
+    // Dummy chunk meta buffer (non-zero)
+    let dummy_chunk = ChunkMetaGpu {
+        origin: [0, 0, 0, 0],
+        node_base: 0,
+        node_count: 0,
+        _pad0: 0,
+        _pad1: 0,
+    };
+    let mut chunk_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("chunk_meta_dummy_1"),
+        contents: bytemuck::bytes_of(&dummy_chunk),
         usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
     });
+
+    // Worker messaging
+    let (tx_job, rx_job) = unbounded::<BuildJob>();
+    let (tx_done, rx_done) = unbounded::<BuildDone>();
+    spawn_workers(gen.clone(), rx_job, tx_done);
+    let mut in_flight: usize = 0;
 
     // --- Camera state ---------------------------------------------------------
-    let mut camera_pos = Vec3::new(CHUNK_SIZE as f32 * 0.5, 20.0, -20.0);
+    let mut camera_pos = Vec3::new(
+        (CHUNK_SIZE as f32 * VOXEL_SIZE_M) * 0.5,
+        20.0,
+        -20.0,
+    );
+
     let mut yaw: f32 = 0.0;
     let mut pitch: f32 = 0.15;
     let mut focused = false;
@@ -259,13 +387,6 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
     });
 
     // --- Bind group layouts ---------------------------------------------------
-    //
-    // IMPORTANT: This assumes your WGSL bindings are:
-    //   @group(0) @binding(0) cam uniform
-    //   @group(0) @binding(1) chunks meta storage (read)
-    //   @group(0) @binding(2) nodes storage (read)
-    //   @group(0) @binding(3) output storage texture (write)
-    //
     let compute_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("compute_bgl"),
         entries: &[
@@ -476,10 +597,8 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
                         config.height = new_size.height.max(1);
                         surface.configure(&device, &config);
 
-                        // IMPORTANT: recreate output texture on resize
                         output = create_output_texture(&device, config.width, config.height);
 
-                        // Rebuild blit bind group with new output view
                         blit_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("blit_bg"),
                             layout: &blit_bgl,
@@ -499,7 +618,6 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
                             ],
                         });
 
-                        // Rebuild compute bind group with new output view (buffers unchanged)
                         compute_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("compute_bg"),
                             layout: &compute_bgl,
@@ -580,56 +698,196 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
                         1000.0,
                     );
 
-                    // Which chunk are we centered in?
-                    let ccx = (camera_pos.x.floor() as i32).div_euclid(CHUNK_SIZE as i32);
-                    let ccz = (camera_pos.z.floor() as i32).div_euclid(CHUNK_SIZE as i32);
+                    // Camera position in VOXELS for chunk selection / height queries
+                    let cam_vx = (camera_pos.x / VOXEL_SIZE_M).floor() as i32;
+                    let cam_vy = (camera_pos.y / VOXEL_SIZE_M).floor() as i32;
+                    let cam_vz = (camera_pos.z / VOXEL_SIZE_M).floor() as i32;
 
-                    // Rebuild the ACTIVE grid only when center chunk changes.
-                    if (ccx, ccz) != active_center {
-                        active_center = (ccx, ccz);
+                    let ccx = cam_vx.div_euclid(CHUNK_SIZE as i32);
+                    let ccz = cam_vz.div_euclid(CHUNK_SIZE as i32);
 
+                    // Ground-anchored streaming Y
+                    let ground_y_vox = gen.ground_height(cam_vx, cam_vz);
+                    let ground_cy = ground_y_vox.div_euclid(CHUNK_SIZE as i32);
+
+                    // Two rings: desired (ACTIVE) + keep (hysteresis)
+                    let center = ChunkKey { x: ccx, y: ground_cy, z: ccz };
+                    let desired = desired_chunks(center, ACTIVE_RADIUS);
+                    let keep = desired_chunks(center, KEEP_RADIUS);
+
+                    let desired_set: HashSet<ChunkKey> = desired.iter().copied().collect();
+                    let keep_set: HashSet<ChunkKey> = keep.iter().copied().collect();
+
+                    let mut changed = false;
+
+                    // Queue missing chunks in desired first (high priority)
+                    for k in &desired {
+                        match chunks.get(k) {
+                            None | Some(ChunkState::Missing) => {
+                                chunks.insert(*k, ChunkState::Queued);
+                                build_queue.push_back(*k);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Optionally queue the keep ring too (low priority)
+                    nodes_packed.clear();
+                    chunks_meta.clear();
+
+                    let mut used_bytes: usize = 0;
+                    let node_stride = std::mem::size_of::<NodeGpu>();
+
+                    for k in &keep {
+                        let Some(ChunkState::Ready(cpu)) = chunks.get(k) else { continue; };
+
+                        let chunk_bytes = cpu.nodes.len() * node_stride;
+                        if used_bytes + chunk_bytes > NODE_BUDGET_BYTES {
+                            continue; // skip this chunk for this frame's packed buffer
+                        }
+
+                        let origin = [
+                            k.x * CHUNK_SIZE as i32,
+                            k.y * CHUNK_SIZE as i32,
+                            k.z * CHUNK_SIZE as i32,
+                        ];
+
+                        let node_base = nodes_packed.len() as u32;
+                        nodes_packed.extend_from_slice(&cpu.nodes);
+                        used_bytes += chunk_bytes;
+
+                        chunks_meta.push(ChunkMetaGpu {
+                            origin: [origin[0], origin[1], origin[2], 0],
+                            node_base,
+                            node_count: cpu.nodes.len() as u32,
+                            _pad0: 0,
+                            _pad1: 0,
+                        });
+                    }
+
+
+                    // Only unload chunks that are OUTSIDE keep_set.
+                    let keys_snapshot: Vec<ChunkKey> = chunks.keys().copied().collect();
+                    for k in keys_snapshot {
+                        if !keep_set.contains(&k) {
+                            match chunks.get(&k) {
+                                Some(ChunkState::Ready(_)) => {
+                                    chunks.insert(k, ChunkState::Missing);
+                                    changed = true;
+                                }
+                                Some(ChunkState::Queued) | Some(ChunkState::Building) => {
+                                    chunks.insert(k, ChunkState::Missing);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    // Reorder queue to build near-first (helps prevent holes)
+                    sort_queue_near_first(&mut build_queue, center);
+
+                    // Dispatch queued work up to MAX_IN_FLIGHT
+                    while in_flight < MAX_IN_FLIGHT {
+                        let Some(k) = build_queue.pop_front() else { break; };
+
+                        // If not even in keep_set anymore, drop it.
+                        if !keep_set.contains(&k) {
+                            chunks.insert(k, ChunkState::Missing);
+                            continue;
+                        }
+
+                        match chunks.get(&k) {
+                            Some(ChunkState::Queued) => {
+                                chunks.insert(k, ChunkState::Building);
+                                if tx_job.send(BuildJob { key: k }).is_ok() {
+                                    in_flight += 1;
+                                } else {
+                                    chunks.insert(k, ChunkState::Queued);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Harvest finished builds (non-blocking)
+                    while let Ok(done) = rx_done.try_recv() {
+                        if in_flight > 0 {
+                            in_flight -= 1;
+                        }
+
+                        // If it finished but is no longer in keep_set, drop it.
+                        if !keep_set.contains(&done.key) {
+                            chunks.insert(done.key, ChunkState::Missing);
+                            continue;
+                        }
+
+                        chunks.insert(done.key, ChunkState::Ready(ChunkCpu { nodes: done.nodes }));
+                        changed = true;
+                    }
+
+                    // Repack READY chunks into GPU buffers if changed.
+                    // IMPORTANT: pack from KEEP set, not only desired, to prevent gaps.
+                    if changed {
                         nodes_packed.clear();
                         chunks_meta.clear();
 
-                        for dz in -ACTIVE_RADIUS..=ACTIVE_RADIUS {
-                            for dx in -ACTIVE_RADIUS..=ACTIVE_RADIUS {
-                                let cx = ccx + dx;
-                                let cz = ccz + dz;
-
+                        for k in &keep {
+                            if let Some(ChunkState::Ready(cpu)) = chunks.get(k) {
                                 let origin = [
-                                    cx * CHUNK_SIZE as i32,
-                                    0,
-                                    cz * CHUNK_SIZE as i32,
+                                    k.x * CHUNK_SIZE as i32,
+                                    k.y * CHUNK_SIZE as i32,
+                                    k.z * CHUNK_SIZE as i32,
                                 ];
 
                                 let node_base = nodes_packed.len() as u32;
-                                let nodes = build_chunk_svo_sparse(&gen, origin, CHUNK_SIZE);
-
-                                nodes_packed.extend_from_slice(&nodes);
+                                nodes_packed.extend_from_slice(&cpu.nodes);
 
                                 chunks_meta.push(ChunkMetaGpu {
                                     origin: [origin[0], origin[1], origin[2], 0],
                                     node_base,
-                                    node_count: nodes.len() as u32,
+                                    node_count: cpu.nodes.len() as u32,
                                     _pad0: 0,
                                     _pad1: 0,
                                 });
                             }
                         }
 
+                        // Node buffer: ensure non-zero sized
+                        let node_bytes: &[u8];
+                        let tmp_node: [NodeGpu; 1];
+
+                        if nodes_packed.is_empty() {
+                            tmp_node = [dummy_node];
+                            node_bytes = bytemuck::cast_slice(&tmp_node);
+                        } else {
+                            node_bytes = bytemuck::cast_slice(&nodes_packed);
+                        }
+
                         node_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some("svo_nodes_packed"),
-                            contents: bytemuck::cast_slice(&nodes_packed),
+                            contents: node_bytes,
                             usage: wgpu::BufferUsages::STORAGE,
                         });
+
+                        // Chunk meta buffer: ensure non-zero sized
+                        let meta_bytes: &[u8];
+                        let tmp_meta: [ChunkMetaGpu; 1];
+
+                        if chunks_meta.is_empty() {
+                            tmp_meta = [dummy_chunk];
+                            meta_bytes = bytemuck::cast_slice(&tmp_meta);
+                        } else {
+                            meta_bytes = bytemuck::cast_slice(&chunks_meta);
+                        }
 
                         chunk_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some("chunk_meta"),
-                            contents: bytemuck::cast_slice(&chunks_meta),
+                            contents: meta_bytes,
                             usage: wgpu::BufferUsages::STORAGE,
                         });
 
-                        // Rebuild compute bind group because node_buf/chunk_buf changed
+                        // Rebuild compute bind group because buffers changed
                         compute_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("compute_bg"),
                             layout: &compute_bgl,
@@ -649,9 +907,11 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
                         cam_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 1.0],
 
                         chunk_size: CHUNK_SIZE,
-                        chunk_count: chunks_meta.len() as u32,
-                        max_steps: 128, // multi-chunk: keep this lower; increase if you miss hits
+                        chunk_count: chunks_meta.len() as u32, // READY chunks packed (keep ring)
+                        max_steps: 128,
                         _pad0: 0,
+
+                        voxel_params: [VOXEL_SIZE_M, 0.0, 0.0, 0.0],
                     };
                     queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cam_gpu));
 
@@ -692,7 +952,7 @@ async fn run(event_loop: EventLoop<()>, window: Arc<winit::window::Window>) {
                         label: Some("encoder"),
                     });
 
-                    // Compute pass: raycast into output texture
+                    // Compute pass: ALWAYS dispatch (sky fallback covers chunk_count==0)
                     {
                         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                             label: Some("ray_pass"),
