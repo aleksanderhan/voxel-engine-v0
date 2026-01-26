@@ -46,7 +46,6 @@ struct ChunkMeta {
 @group(0) @binding(1) var<storage, read> chunks : array<ChunkMeta>;
 @group(0) @binding(2) var<storage, read> nodes  : array<Node>;
 @group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
-@group(0) @binding(4) var out_img : texture_storage_2d<rgba16float, write>;
 
 // ------------------------------------------------------------
 // Constants
@@ -179,8 +178,7 @@ const FOG_HEIGHT_FALLOFF : f32 = 0.08;   // larger = fog dies faster with height
 const FOG_MAX_DIST       : f32 = 120.0;  // meters, cap so we don't overdo far marching
 
 // Godrays (volumetric light shafts)
-const GODRAY_STEPS       : u32 = 5u;     // keep small
-const GODRAY_MAX_DIST    : f32 = 40.0;
+const GODRAY_MAX_DIST    : f32 = 60.0;
 const GODRAY_STRENGTH    : f32 = 2.0;
 
 // Simple hash for jitter (pixel+time)
@@ -243,46 +241,4 @@ fn fog_optical_depth(ro: vec3<f32>, rd: vec3<f32>, t: f32) -> f32 {
 fn fog_transmittance(ro: vec3<f32>, rd: vec3<f32>, t: f32) -> f32 {
   let od = max(fog_optical_depth(ro, rd, t), 0.0);
   return exp(-od);
-}
-
-// Volumetric single-scattering (godrays) along view ray segment [0..t_end].
-fn godray_inscatter(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, px: vec2<f32>) -> vec3<f32> {
-  let base = fog_density_base();
-  if (base <= 0.0) { return vec3<f32>(0.0); }
-
-  let tmax = min(t_end, GODRAY_MAX_DIST);
-  if (tmax <= 0.0) { return vec3<f32>(0.0); }
-
-  let steps = GODRAY_STEPS;
-  let dt = tmax / f32(steps);
-
-  // jitter to reduce banding
-  let j = hash12(px + cam.voxel_params.y) - 0.5;
-
-  let costh = dot(rd, SUN_DIR);
-  let phase = phase_mie(costh);
-
-  var sum = vec3<f32>(0.0);
-
-  for (var i: u32 = 0u; i < steps; i = i + 1u) {
-    let ti = (f32(i) + 0.5 + j) * dt;
-    if (ti <= 0.0) { continue; }
-
-    let p  = ro + rd * ti;
-
-    // view transmittance to sample (fog-only)
-    let Tv = fog_transmittance(ro, rd, ti);
-
-    // sun visibility at sample (fast, leaves partially transmit)
-    let Ts = sun_transmittance(p, SUN_DIR);
-
-    // local density is already baked into fog_transmittance via your height model,
-    // but we still need an extinction->scattering term; approximate with height density:
-    // (match your fog_optical_depth's height law)
-    let dens = base * exp(-FOG_HEIGHT_FALLOFF * p.y);
-
-    sum += (SUN_COLOR * SUN_INTENSITY) * (dens * dt) * Tv * Ts * phase;
-  }
-
-  return sum * GODRAY_STRENGTH;
 }

@@ -40,7 +40,7 @@ impl WorldGen {
         let r = hash2(self.seed, xm, zm);
 
         // density per 1m cell
-        if (r % 256) != 0 {
+        if (r % 128) != 0 {
             return None;
         }
 

@@ -59,19 +59,10 @@ fn leaf_displaced_cube_hit(
 ) -> LeafCubeHit {
   let off   = leaf_cube_offset(bmin, size, time_s, strength);
   let bmin2 = bmin + off;
-  let bmax2 = bmin2 + vec3<f32>(size);
 
-  let rt = intersect_aabb(ro, rd, bmin2, bmax2);
-  var t0 = rt.x;
-  let t1 = rt.y;
+  // Use slab-style AABB (axis-aligned bounding box) hit normal to avoid edge/face flipping artifacts.
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let bh  = aabb_hit_normal_inv(ro, rd, inv, bmin2, size, t_min, t_max);
 
-  if (t1 < t0) { return LeafCubeHit(false, BIG_F32, vec3<f32>(0.0)); }
-
-  t0 = max(t0, t_min);
-  if (t0 > min(t1, t_max)) { return LeafCubeHit(false, BIG_F32, vec3<f32>(0.0)); }
-
-  let hp = ro + t0 * rd;
-  let nn = cube_normal(hp, bmin2, size);
-
-  return LeafCubeHit(true, t0, nn);
+  return LeafCubeHit(bh.hit, bh.t, bh.n);
 }

@@ -19,7 +19,11 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
   let hp = ro + hg.t * rd;
   let base = color_for_material(hg.mat);
 
-  let shadow = select(1.0, 0.0, in_shadow(hp, SUN_DIR));
+  // Start the shadow query clearly off the surface to avoid acne / grid-striping.
+  let voxel_size = cam.voxel_params.x;
+  let hp_shadow  = hp + hg.n * (0.75 * voxel_size); // tune: 0.5..1.5 voxels
+
+  let shadow = select(1.0, 0.0, in_shadow(hp_shadow, SUN_DIR));
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
   let ambient = select(0.22, 0.28, hg.mat == 5u);

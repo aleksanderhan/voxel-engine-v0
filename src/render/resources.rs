@@ -1,10 +1,16 @@
 // src/render/resources.rs
 
 pub struct OutputTex {
+    pub tex: wgpu::Texture,
     pub view: wgpu::TextureView,
+    pub w: u32,
+    pub h: u32,
 }
 
 pub fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> OutputTex {
+    let w = w.max(1);
+    let h = h.max(1);
+
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("output_tex"),
         size: wgpu::Extent3d {
@@ -20,7 +26,7 @@ pub fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> OutputTex
         view_formats: &[],
     });
 
-    OutputTex {
-        view: tex.create_view(&Default::default()),
-    }
+    let view = tex.create_view(&Default::default());
+
+    OutputTex { tex, view, w, h }
 }

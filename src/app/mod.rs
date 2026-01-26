@@ -172,6 +172,7 @@ impl App {
 
         let t = self.start_time.elapsed().as_secs_f32();
 
+        let max_steps = (config::CHUNK_SIZE * 2).clamp(48, 96);
         let cam_gpu = CameraGpu {
             view_inv: cf.view_inv.to_cols_array_2d(),
             proj_inv: cf.proj_inv.to_cols_array_2d(),
@@ -179,7 +180,7 @@ impl App {
 
             chunk_size: config::CHUNK_SIZE,
             chunk_count: self.chunks.chunk_count(),
-            max_steps: config::MAX_STEPS,
+            max_steps,
             _pad0: 0,
 
             voxel_params: [config::VOXEL_SIZE_M_F32, t, 2.0, 0.005],
