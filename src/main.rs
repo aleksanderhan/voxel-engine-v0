@@ -56,7 +56,8 @@ const WORKER_THREADS: usize = 4;
 const MAX_IN_FLIGHT: usize = 8;
 
 /// Safety budget for packed nodes uploaded to GPU each frame.
-const NODE_BUDGET_BYTES: usize = 120 * 1024 * 1024; // 120 MiB
+const NODE_BUDGET_BYTES: usize = 512 * 1024 * 1024; // 120 MiB
+
 
 // -----------------------------------------------------------------------------
 // GPU structs (must match WGSL)

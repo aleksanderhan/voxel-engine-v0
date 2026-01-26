@@ -8,18 +8,31 @@
 // - Traverse each chunk with a hybrid “DDA-like” loop:
 //     * sample the SVO at the current ray position to get a leaf region (cube AABB + material)
 //     * if material is empty -> jump to the exit of that cube (big skips through air)
-//     * if material is solid -> shade and return the hit
+//     * if material is solid -> report a hit (no shading yet)
 //
 // Leaf wind (voxel cubes that move)
-// - Leaves are still voxel cubes, but their cube AABB is displaced by a stable wind field.
-// - When we query a leaf voxel cube, we intersect the ray against the *displaced* cube.
-//   If it hits, we shade using the displaced cube normal.
-//   If it misses (because the cube moved away), we treat it as empty and keep marching.
+// - Leaves remain cubes, but their cube AABB is displaced by a stable wind field.
+// - When we hit a LEAF voxel, we intersect against the displaced cube.
+//   If the displaced cube is missed, we treat that voxel as “empty for this ray” and keep marching.
+//
+// Sun shadows (hard shadows)
+// - After we find the nearest surface hit (across ALL chunks), we cast ONE shadow ray toward the sun.
+// - If any voxel blocks that ray (within loaded chunks), the point is in shadow.
+//
+// Performance choices
+// - Nearest-hit selection is done before any shading or shadowing.
+// - Chunk AABB is tested in main() to skip chunks that can't beat the current best hit.
+// - Shadow rays are capped to fewer steps.
+// - Optional: let leaves cast shadows using their undisplaced voxel cube (much faster).
 //
 // Notes on abbreviations (first use)
 // - SVO  = Sparse Voxel Octree
 // - AABB = Axis-Aligned Bounding Box
 // - NDC  = Normalized Device Coordinates
+
+// ------------------------------------------------------------
+// GPU structs (must match Rust side layouts)
+// ------------------------------------------------------------
 
 struct Node {
   // If internal: index of first child in a compact child list.
@@ -74,19 +87,30 @@ struct ChunkMeta {
 @group(0) @binding(2) var<storage, read> nodes  : array<Node>;
 @group(0) @binding(3) var out_img : texture_storage_2d<rgba16float, write>;
 
+// ------------------------------------------------------------
+// Constants
+// ------------------------------------------------------------
+
 const LEAF_U32 : u32 = 0xFFFFFFFFu;
 const BIG_F32  : f32 = 1e30;
 const EPS_INV  : f32 = 1e-8;
 
+// Directional sun at 45° elevation, pointing roughly toward +X,+Z.
+// (1, sqrt(2), 1) normalized => length 2 => (0.5, 0.70710678, 0.5)
+const SUN_DIR : vec3<f32> = vec3<f32>(0.5, 0.70710678, 0.5);
+
+// Shadow tuning
+const SHADOW_BIAS  : f32 = 2e-4; // meters; reduces self-shadow acne
+const SHADOW_STEPS : u32 = 32u;  // cheaper than primary ray
+
+// If false: leaves cast shadows using their undisplaced voxel cube (faster).
+// If true: shadows match displaced leaf cubes (slower, more consistent).
+const SHADOW_DISPLACED_LEAVES : bool = true;
+
 // ------------------------------------------------------------
 // Ray reconstruction (pixel -> world ray direction)
 // ------------------------------------------------------------
-//
-// We reconstruct a ray by:
-// 1) mapping pixel coords to NDC
-// 2) unprojecting with inverse projection
-// 3) transforming with inverse view to world space
-//
+
 fn ray_dir_from_pixel(px: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
   let ndc = vec4<f32>(
     2.0 * px.x / res.x - 1.0,
@@ -105,8 +129,7 @@ fn ray_dir_from_pixel(px: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
 // ------------------------------------------------------------
 // Ray / AABB intersection (slab method)
 // ------------------------------------------------------------
-//
-// Returns (t_enter, t_exit). If t_exit < t_enter -> no hit.
+// Returns (t_enter, t_exit). If t_exit < t_enter => no hit.
 //
 fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
   let eps = 1e-8;
@@ -151,7 +174,7 @@ fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>
 }
 
 // ------------------------------------------------------------
-// Sparse children addressing
+// Sparse children addressing (compact child list)
 // ------------------------------------------------------------
 //
 // Children are stored compactly. To index child ci:
@@ -183,6 +206,7 @@ fn color_for_material(m: u32) -> vec3<f32> {
   return vec3<f32>(1.0, 0.0, 1.0); // unknown => magenta
 }
 
+// Normal of the closest cube face at hit point hp.
 fn cube_normal(hp: vec3<f32>, bmin: vec3<f32>, size: f32) -> vec3<f32> {
   let bmax = bmin + vec3<f32>(size);
 
@@ -210,12 +234,7 @@ fn cube_normal(hp: vec3<f32>, bmin: vec3<f32>, size: f32) -> vec3<f32> {
 // ------------------------------------------------------------
 // Leaf wind field (stable grouping to avoid shimmer)
 // ------------------------------------------------------------
-//
-// Design goals:
-// - Nearby leaves should move together (avoid "sparkle").
-// - Motion increases with height (less motion near ground).
-// - Combine a slow gust + faster flutter.
-//
+
 fn hash1(p: vec3<f32>) -> f32 {
   let h = dot(p, vec3<f32>(127.1, 311.7, 74.7));
   return fract(sin(h) * 43758.5453);
@@ -230,7 +249,7 @@ fn wind_field(pos_m: vec3<f32>, t: f32) -> vec3<f32> {
   // Predominantly horizontal wind direction in XZ.
   let dir = normalize(vec2<f32>(0.9, 0.4));
 
-  // More motion higher up (tuned for your tree scale).
+  // More motion higher up.
   let h = clamp((pos_m.y - 2.0) / 12.0, 0.0, 1.0);
 
   // Two layered waves: gust (slow) + flutter (fast).
@@ -247,19 +266,14 @@ fn wind_field(pos_m: vec3<f32>, t: f32) -> vec3<f32> {
 // ------------------------------------------------------------
 // Leaf cubes that move: displaced AABB hit test
 // ------------------------------------------------------------
-//
-// Leaves remain cubes. We displace the cube AABB by a wind offset,
-// intersect the ray against the displaced cube, and shade if it hits.
-//
-// Important: displacement is clamped to < ~0.5 * cube size so it still
-// reads as "voxel cubes" and doesn't detach too far from the canopy.
-//
+
 fn clamp_len(v: vec3<f32>, max_len: f32) -> vec3<f32> {
   let l2 = dot(v, v);
   if (l2 <= max_len * max_len) { return v; }
   return v * (max_len / sqrt(l2));
 }
 
+// Compute a per-cube wind offset (meters), clamped so cubes still read as voxels.
 fn leaf_cube_offset(bmin: vec3<f32>, size: f32, time_s: f32, strength: f32) -> vec3<f32> {
   let center = bmin + vec3<f32>(0.5 * size);
 
@@ -267,7 +281,7 @@ fn leaf_cube_offset(bmin: vec3<f32>, size: f32, time_s: f32, strength: f32) -> v
   var w = wind_field(center, time_s) * strength;
   w = vec3<f32>(w.x, 0.15 * w.y, w.z);
 
-  // Amplitude relative to cube size. Tune this first.
+  // Amplitude relative to cube size.
   let amp = 0.35 * size;
 
   // Clamp prevents cubes drifting too far and breaking the voxel look.
@@ -278,7 +292,6 @@ struct LeafCubeHit {
   hit  : bool,
   t    : f32,
   n    : vec3<f32>,
-  bmin : vec3<f32>, // displaced bmin used for normal
 };
 
 fn leaf_displaced_cube_hit(
@@ -291,41 +304,29 @@ fn leaf_displaced_cube_hit(
   t_min: f32,
   t_max: f32
 ) -> LeafCubeHit {
-  let off  = leaf_cube_offset(bmin, size, time_s, strength);
+  let off   = leaf_cube_offset(bmin, size, time_s, strength);
   let bmin2 = bmin + off;
   let bmax2 = bmin2 + vec3<f32>(size);
 
-  // Intersect the displaced cube.
   let rt = intersect_aabb(ro, rd, bmin2, bmax2);
   var t0 = rt.x;
   let t1 = rt.y;
 
-  if (t1 < t0) {
-    return LeafCubeHit(false, BIG_F32, vec3<f32>(0.0), bmin2);
-  }
+  if (t1 < t0) { return LeafCubeHit(false, BIG_F32, vec3<f32>(0.0)); }
 
-  // Clamp against the caller's valid interval for this chunk.
   t0 = max(t0, t_min);
-  if (t0 > min(t1, t_max)) {
-    return LeafCubeHit(false, BIG_F32, vec3<f32>(0.0), bmin2);
-  }
+  if (t0 > min(t1, t_max)) { return LeafCubeHit(false, BIG_F32, vec3<f32>(0.0)); }
 
   let hp = ro + t0 * rd;
   let nn = cube_normal(hp, bmin2, size);
 
-  return LeafCubeHit(true, t0, nn, bmin2);
+  return LeafCubeHit(true, t0, nn);
 }
 
 // ------------------------------------------------------------
-// Hybrid “skip-empty leaf” traversal (per chunk)
+// Hybrid traversal utilities
 // ------------------------------------------------------------
-//
-// We iterate along the ray and repeatedly query the SVO at the current position.
-// The query returns the *leaf region cube* that contains the point.
-// If that leaf region is empty, we jump to its exit face.
-//
-// This gives large steps through air, but still hits solid voxels precisely.
-//
+
 fn safe_inv(x: f32) -> f32 {
   return select(1.0 / x, BIG_F32, abs(x) < EPS_INV);
 }
@@ -337,7 +338,7 @@ struct LeafQuery {
 };
 
 // Query the SVO to find the leaf region containing point p.
-// If the child octant is missing, we return "empty leaf cube" for that space.
+// If a child octant is missing, that sub-cube is empty.
 fn query_leaf_at(
   p: vec3<f32>,
   root_bmin: vec3<f32>,
@@ -348,7 +349,7 @@ fn query_leaf_at(
   var bmin: vec3<f32> = root_bmin;
   var size: f32 = root_size;
 
-  // Stop descending once we're at voxel resolution.
+  // Stop descending once we're at voxel resolution (in meters).
   let min_leaf: f32 = cam.voxel_params.x;
   let eps: f32 = 1e-7;
 
@@ -395,12 +396,12 @@ fn query_leaf_at(
     size = half;
   }
 
-  // If we somehow exceed max depth, treat as empty.
+  // If we exceed max depth, treat as empty.
   return LeafQuery(bmin, size, 0u);
 }
 
-// Compute the parametric t where the ray exits a cube.
-// Used to "skip" empty leaf regions efficiently.
+// Return the parametric t where the ray exits this axis-aligned cube.
+// Used to jump across empty space quickly.
 fn exit_time_from_cube(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, size: f32) -> f32 {
   let bmax = bmin + vec3<f32>(size);
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
@@ -412,50 +413,126 @@ fn exit_time_from_cube(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, size: f32)
   return min(tx, min(ty, tz));
 }
 
-struct Hit {
-  hit : bool,
-  t   : f32,
-  col : vec3<f32>,
-};
+// ------------------------------------------------------------
+// Shadow ray traversal (cheap occlusion query)
+// ------------------------------------------------------------
 
-fn trace_chunk_hybrid(ro: vec3<f32>, rd: vec3<f32>, ch: ChunkMeta) -> Hit {
+// Per-chunk occlusion test: returns true if anything blocks the ray inside this chunk.
+fn trace_chunk_shadow(ro: vec3<f32>, rd: vec3<f32>, ch: ChunkMeta, t_min: f32) -> bool {
   let voxel_size = cam.voxel_params.x;
 
-  // Chunk root cube in world meters.
   let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
   let root_bmin = root_bmin_vox * voxel_size;
   let root_size = f32(cam.chunk_size) * voxel_size;
   let root_bmax = root_bmin + vec3<f32>(root_size);
 
-  // Early reject: ray misses the chunk AABB.
+  let rt = intersect_aabb(ro, rd, root_bmin, root_bmax);
+  var t_enter = max(rt.x, t_min);
+  let t_exit  = rt.y;
+
+  if (t_exit < t_enter) { return false; }
+
+  var tcur = t_enter;
+
+  for (var step_i: u32 = 0u; step_i < SHADOW_STEPS; step_i = step_i + 1u) {
+    if (tcur > t_exit) { break; }
+
+    let p = ro + tcur * rd;
+    let q = query_leaf_at(p, root_bmin, root_size, ch.node_base);
+
+    if (q.mat != 0u) {
+      // Leaves: optional fast shadows (undisplaced).
+      if (q.mat == 5u) {
+        if (!SHADOW_DISPLACED_LEAVES) {
+          return true;
+        }
+
+        // Accurate (slower) displaced-leaf shadowing.
+        let time_s   = cam.voxel_params.y;
+        let strength = cam.voxel_params.z;
+
+        let h2 = leaf_displaced_cube_hit(
+          ro, rd,
+          q.bmin, q.size,
+          time_s, strength,
+          tcur - 1e-5,
+          t_exit
+        );
+
+        if (h2.hit) { return true; }
+
+        // Displaced leaf missed: skip using the undisplaced leaf region.
+        let t_leave = exit_time_from_cube(ro, rd, q.bmin, q.size);
+        tcur = max(t_leave, tcur) + 1e-4;
+        continue;
+      }
+
+      // Any other solid voxel blocks the sun.
+      return true;
+    }
+
+    // Skip empty region.
+    let t_leave = exit_time_from_cube(ro, rd, q.bmin, q.size);
+    tcur = max(t_leave, tcur) + 1e-4;
+  }
+
+  return false;
+}
+
+// Scene-level hard shadow: if any chunk blocks toward the sun, the point is shadowed.
+fn in_shadow(p: vec3<f32>, sun_dir: vec3<f32>) -> bool {
+  let ro = p + sun_dir * SHADOW_BIAS;
+  let rd = sun_dir;
+
+  for (var i: u32 = 0u; i < cam.chunk_count; i = i + 1u) {
+    if (trace_chunk_shadow(ro, rd, chunks[i], 0.0)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ------------------------------------------------------------
+// Primary ray traversal (geometry-only hit)
+// ------------------------------------------------------------
+
+struct HitGeom {
+  hit : bool,
+  t   : f32,
+  mat : u32,
+  n   : vec3<f32>,
+};
+
+fn trace_chunk_hybrid(ro: vec3<f32>, rd: vec3<f32>, ch: ChunkMeta) -> HitGeom {
+  let voxel_size = cam.voxel_params.x;
+
+  let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
+  let root_bmin = root_bmin_vox * voxel_size;
+  let root_size = f32(cam.chunk_size) * voxel_size;
+  let root_bmax = root_bmin + vec3<f32>(root_size);
+
   let rt = intersect_aabb(ro, rd, root_bmin, root_bmax);
   let t_enter = max(rt.x, 0.0);
   let t_exit  = rt.y;
 
   if (t_exit < t_enter) {
-    return Hit(false, BIG_F32, vec3<f32>(0.0));
+    return HitGeom(false, BIG_F32, 0u, vec3<f32>(0.0));
   }
 
-  // Start slightly inside to avoid self-intersection at boundaries.
   var tcur = t_enter + 1e-4;
 
   for (var step_i: u32 = 0u; step_i < cam.max_steps; step_i = step_i + 1u) {
     if (tcur > t_exit) { break; }
 
-    // Query SVO leaf region containing current point.
     let p = ro + tcur * rd;
     let q = query_leaf_at(p, root_bmin, root_size, ch.node_base);
 
-    // Non-empty material: shade (with special path for leaves).
     if (q.mat != 0u) {
-      let sun = normalize(vec3<f32>(0.6, 1.0, 0.2));
-
-      // Leaves: intersect displaced cube to get visible cube motion.
+      // Leaves: intersect displaced cube for visible cube motion.
       if (q.mat == 5u) {
         let time_s   = cam.voxel_params.y;
         let strength = cam.voxel_params.z;
 
-        // Use a small backstep so "starting on the face" still counts as a hit.
         let h2 = leaf_displaced_cube_hit(
           ro, rd,
           q.bmin, q.size,
@@ -465,43 +542,52 @@ fn trace_chunk_hybrid(ro: vec3<f32>, rd: vec3<f32>, ch: ChunkMeta) -> Hit {
         );
 
         if (h2.hit) {
-          let hp = ro + h2.t * rd;
-          let base = color_for_material(5u);
-
-          // Lighting from displaced cube normal.
-          let diff = max(dot(h2.n, sun), 0.0);
-
-          // Small moving dapple helps show motion even under flat lighting.
-          let d0 = sin(dot(hp.xz, vec2<f32>(3.0, 2.2)) + time_s * 3.5);
-          let d1 = sin(dot(hp.xz, vec2<f32>(6.5, 4.1)) - time_s * 6.0);
-          let dapple = 0.90 + 0.10 * (0.6 * d0 + 0.4 * d1);
-
-          let col = base * (0.22 + 0.78 * diff) * dapple;
-          return Hit(true, h2.t, col);
+          return HitGeom(true, h2.t, 5u, h2.n);
         }
 
-        // Leaf cube moved away from the ray at this sample point: treat as empty and continue.
+        // Displaced cube missed: treat as empty and keep marching.
         let t_leave = exit_time_from_cube(ro, rd, q.bmin, q.size);
         tcur = max(t_leave, tcur) + 1e-4;
         continue;
       }
 
-      // Everything else: shade the static cube face we’re currently inside.
+      // Other materials: shade the static cube face normal at current sample.
       let hp = ro + tcur * rd;
-      let base = color_for_material(q.mat);
       let nn = cube_normal(hp, q.bmin, q.size);
-
-      let diff = max(dot(nn, sun), 0.0);
-      let col = base * (0.25 + 0.75 * diff);
-      return Hit(true, tcur, col);
+      return HitGeom(true, tcur, q.mat, nn);
     }
 
-    // Empty leaf region: skip to the exit face and continue.
     let t_leave = exit_time_from_cube(ro, rd, q.bmin, q.size);
     tcur = max(t_leave, tcur) + 1e-4;
   }
 
-  return Hit(false, BIG_F32, vec3<f32>(0.0));
+  return HitGeom(false, BIG_F32, 0u, vec3<f32>(0.0));
+}
+
+// ------------------------------------------------------------
+// Shading (done once per pixel, after nearest hit is selected)
+// ------------------------------------------------------------
+
+fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
+  let hp = ro + hg.t * rd;
+  let base = color_for_material(hg.mat);
+
+  // One shadow ray total (not per candidate chunk).
+  let shadow = select(1.0, 0.0, in_shadow(hp, SUN_DIR));
+
+  let diff = max(dot(hg.n, SUN_DIR), 0.0);
+  let ambient = select(0.22, 0.28, hg.mat == 5u);
+
+  // Optional foliage dapple (only runs if the final hit is a leaf).
+  var dapple = 1.0;
+  if (hg.mat == 5u) {
+    let time_s = cam.voxel_params.y;
+    let d0 = sin(dot(hp.xz, vec2<f32>(3.0, 2.2)) + time_s * 3.5);
+    let d1 = sin(dot(hp.xz, vec2<f32>(6.5, 4.1)) - time_s * 6.0);
+    dapple = 0.90 + 0.10 * (0.6 * d0 + 0.4 * d1);
+  }
+
+  return base * (ambient + (1.0 - ambient) * diff * shadow) * dapple;
 }
 
 // ------------------------------------------------------------
@@ -521,21 +607,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // Background (simple sky gradient).
   let tsky = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
-  var best_col: vec3<f32> = mix(
+  let sky = mix(
     vec3<f32>(0.05, 0.08, 0.12),
     vec3<f32>(0.6, 0.8, 1.0),
     tsky
   );
-  var best_t: f32 = BIG_F32;
 
-  // Test all resident chunks and keep the closest hit.
+  // Nearest geometry hit across all chunks.
+  var best = HitGeom(false, BIG_F32, 0u, vec3<f32>(0.0));
+
+  // Chunk AABB early-out in main(): skip chunks that can't beat current best.t.
+  let voxel_size = cam.voxel_params.x;
+  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
+
   for (var i: u32 = 0u; i < cam.chunk_count; i = i + 1u) {
-    let h = trace_chunk_hybrid(ro, rd, chunks[i]);
-    if (h.hit && h.t < best_t) {
-      best_t = h.t;
-      best_col = h.col;
+    let ch = chunks[i];
+
+    let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * voxel_size;
+    let root_bmax = root_bmin + vec3<f32>(chunk_size_m);
+
+    let rt = intersect_aabb(ro, rd, root_bmin, root_bmax);
+    let t_enter = max(rt.x, 0.0);
+    let t_exit  = rt.y;
+
+    if (t_exit < t_enter) { continue; }
+    if (t_enter >= best.t) { continue; }
+
+    let h = trace_chunk_hybrid(ro, rd, ch);
+    if (h.hit && h.t < best.t) {
+      best = h;
     }
   }
 
-  textureStore(out_img, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(best_col, 1.0));
+  let col = select(sky, shade_hit(ro, rd, best), best.hit);
+  textureStore(out_img, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
 }
