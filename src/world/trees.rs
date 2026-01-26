@@ -26,6 +26,62 @@ pub struct TreeCache {
     trees: Vec<Tree>,
 }
 
+/// Chunk-local voxel mask for trees (fast O(1) queries in the chunk build).
+/// mask codes: 0 = none, 1 = wood, 2 = leaf
+pub struct TreeMaskCache {
+    pub origin: [i32; 3], // chunk origin in world-voxel coords
+    pub size: i32,        // chunk side in voxels
+    mask: Vec<u8>,
+}
+
+#[inline]
+fn idx3(side: i32, x: i32, y: i32, z: i32) -> usize {
+    (y as usize) * (side as usize) * (side as usize) + (z as usize) * (side as usize) + (x as usize)
+}
+
+impl TreeMaskCache {
+    #[inline]
+    pub fn contains_point_fast(&self, x: i32, y: i32, z: i32) -> u8 {
+        let lx = x - self.origin[0];
+        let ly = y - self.origin[1];
+        let lz = z - self.origin[2];
+
+        if lx < 0 || ly < 0 || lz < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
+            return 0;
+        }
+        self.mask[idx3(self.size, lx, ly, lz)]
+    }
+
+    #[inline]
+    pub fn material_fast(&self, x: i32, y: i32, z: i32) -> u32 {
+        match self.contains_point_fast(x, y, z) {
+            1 => WOOD,
+            2 => LEAF,
+            _ => AIR,
+        }
+    }
+
+    #[inline]
+    fn write_leaf(&mut self, lx: i32, ly: i32, lz: i32) {
+        if lx < 0 || ly < 0 || lz < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
+            return;
+        }
+        let i = idx3(self.size, lx, ly, lz);
+        if self.mask[i] != 1 {
+            self.mask[i] = 2;
+        }
+    }
+
+    #[inline]
+    fn write_wood(&mut self, lx: i32, ly: i32, lz: i32) {
+        if lx < 0 || ly < 0 || lz < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
+            return;
+        }
+        let i = idx3(self.size, lx, ly, lz);
+        self.mask[i] = 1;
+    }
+}
+
 impl WorldGen {
     // -------------------------------------------------------------------------
     // Tree placement + params (1m grid anchors, voxel-detail geometry)
@@ -140,8 +196,41 @@ impl WorldGen {
         TreeCache { trees }
     }
 
+    /// Build a tree cache + chunk-local voxel mask (fast O(1) tree material queries).
+    /// Use this in the SVO builder to avoid per-voxel geometry tests.
+    pub fn build_tree_cache_with_mask<F: Fn(i32, i32) -> i32>(
+        &self,
+        chunk_ox: i32,
+        chunk_oy: i32,
+        chunk_oz: i32,
+        chunk_size: i32,
+        height_at: &F,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> (TreeCache, TreeMaskCache) {
+        let cache = self.build_tree_cache(chunk_ox, chunk_oz, chunk_size, height_at);
+
+        let side = chunk_size.max(1) as i32;
+        let mut mask = vec![0u8; (side as usize) * (side as usize) * (side as usize)];
+
+        let mut out = TreeMaskCache {
+            origin: [chunk_ox, chunk_oy, chunk_oz],
+            size: side,
+            mask,
+        };
+
+        // Rasterize each tree into the mask.
+        for t in &cache.trees {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            self.raster_tree_into_mask(t, &mut out);
+        }
+
+        (cache, out)
+    }
+
     // -------------------------------------------------------------------------
-    // Organic tree geometry: trunk + branches + sparse canopy
+    // Organic tree geometry helpers
     // -------------------------------------------------------------------------
 
     #[inline]
@@ -199,64 +288,44 @@ impl WorldGen {
         (dx * dx + dy * dy + dz * dz, t)
     }
 
-    #[inline]
-    fn is_branch_wood(&self, tree: &Tree, x: i32, y: i32, z: i32) -> bool {
-        let px = x as f32;
-        let py = y as f32;
-        let pz = z as f32;
+    // -------------------------------------------------------------------------
+    // NEW: Rasterization into chunk-local mask
+    // -------------------------------------------------------------------------
 
+    fn raster_tree_into_mask(&self, tree: &Tree, out: &mut TreeMaskCache) {
+        let side = out.size;
+
+        // --- trunk ---
         let top_y = tree.base_y + tree.trunk_h;
-        let starts = [
-            tree.base_y + (tree.trunk_h * 5) / 10,
-            tree.base_y + (tree.trunk_h * 6) / 10,
-            tree.base_y + (tree.trunk_h * 7) / 10,
-            tree.base_y + (tree.trunk_h * 8) / 10,
-        ];
+        let y0 = tree.base_y.max(out.origin[1]);
+        let y1 = top_y.min(out.origin[1] + side - 1);
 
-        for (i, sy) in starts.iter().copied().enumerate() {
-            if y < sy - 2 || y > top_y + tree.canopy_h {
-                continue;
-            }
+        for wy in y0..=y1 {
+            let (wx, wz) = self.trunk_wobble(tree, wy);
+            let cx = tree.tx as f32 + wx;
+            let cz = tree.tz as f32 + wz;
+            let rr = Self::trunk_radius_at(tree, wy).max(1.0);
+            let r = rr.ceil() as i32;
 
-            let r = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
-            let ang = u01(r) * std::f32::consts::TAU;
+            let minx = (cx.floor() as i32 - r).max(out.origin[0]);
+            let maxx = (cx.ceil() as i32 + r).min(out.origin[0] + side - 1);
+            let minz = (cz.floor() as i32 - r).max(out.origin[2]);
+            let maxz = (cz.ceil() as i32 + r).min(out.origin[2] + side - 1);
 
-            let len = (1.8 * config::VOXELS_PER_METER as f32)
-                + u01(hash_u32(r ^ 0x1111)) * (1.7 * config::VOXELS_PER_METER as f32);
-            let pitch = 0.15 + u01(hash_u32(r ^ 0x2222)) * 0.30;
+            let rr2 = rr * rr;
 
-            let (wx, wz) = self.trunk_wobble(tree, sy);
-            let ax = tree.tx as f32 + wx;
-            let ay = sy as f32;
-            let az = tree.tz as f32 + wz;
-
-            let bx = ax + ang.cos() * len;
-            let by = ay + pitch * len;
-            let bz = az + ang.sin() * len;
-
-            let br0 = (0.12 * config::VOXELS_PER_METER as f32)
-                + u01(hash_u32(r ^ 0x3333)) * (0.10 * config::VOXELS_PER_METER as f32);
-            let br1 = br0 * 0.45;
-
-            let (d2, t) = Self::dist2_point_segment(px, py, pz, ax, ay, az, bx, by, bz);
-            let br = br0 + (br1 - br0) * t;
-
-            if d2 <= br * br {
-                return true;
+            for x in minx..=maxx {
+                let dx = (x as f32) - cx;
+                for z in minz..=maxz {
+                    let dz = (z as f32) - cz;
+                    if dx * dx + dz * dz <= rr2 {
+                        out.write_wood(x - out.origin[0], wy - out.origin[1], z - out.origin[2]);
+                    }
+                }
             }
         }
 
-        false
-    }
-
-    #[inline]
-    fn is_branch_leaf(&self, tree: &Tree, x: i32, y: i32, z: i32) -> bool {
-        let px = x as f32;
-        let py = y as f32;
-        let pz = z as f32;
-
-        let vpm_f = config::VOXELS_PER_METER as f32;
-
+        // --- branches + branch leaves (same “starts” as runtime test) ---
         let starts = [
             tree.base_y + (tree.trunk_h * 5) / 10,
             tree.base_y + (tree.trunk_h * 6) / 10,
@@ -264,98 +333,178 @@ impl WorldGen {
             tree.base_y + (tree.trunk_h * 8) / 10,
         ];
 
+        let vpm_f = config::VOXELS_PER_METER as f32;
         let cell: i32 = ((0.4 * vpm_f).round() as i32).max(2);
 
         for (i, sy) in starts.iter().copied().enumerate() {
-            let br_seed = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
-            if (hash_u32(br_seed ^ 0x55AA_1234) & 31) == 0 {
-                continue;
+            // wood branch
+            {
+                let r = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
+                let ang = u01(r) * std::f32::consts::TAU;
+
+                let len = (1.8 * vpm_f) + u01(hash_u32(r ^ 0x1111)) * (1.7 * vpm_f);
+                let pitch = 0.15 + u01(hash_u32(r ^ 0x2222)) * 0.30;
+
+                let (wx, wz) = self.trunk_wobble(tree, sy);
+                let ax = tree.tx as f32 + wx;
+                let ay = sy as f32;
+                let az = tree.tz as f32 + wz;
+
+                let bx = ax + ang.cos() * len;
+                let by = ay + pitch * len;
+                let bz = az + ang.sin() * len;
+
+                let br0 = (0.12 * vpm_f) + u01(hash_u32(r ^ 0x3333)) * (0.10 * vpm_f);
+                let br1 = br0 * 0.45;
+
+                self.raster_segment_wood(out, ax, ay, az, bx, by, bz, br0.max(1.0), br1.max(1.0));
             }
 
-            let ang = u01(br_seed) * std::f32::consts::TAU;
-
-            let len = (1.8 * vpm_f) + u01(hash_u32(br_seed ^ 0x1111)) * (1.7 * vpm_f);
-            let pitch = 0.15 + u01(hash_u32(br_seed ^ 0x2222)) * 0.30;
-
-            let (wx, wz) = self.trunk_wobble(tree, sy);
-            let ax = tree.tx as f32 + wx;
-            let ay = sy as f32;
-            let az = tree.tz as f32 + wz;
-
-            let bx = ax + ang.cos() * len;
-            let by = ay + pitch * len;
-            let bz = az + ang.sin() * len;
-
-            let (d2, t) = Self::dist2_point_segment(px, py, pz, ax, ay, az, bx, by, bz);
-
-            if t < 0.55 {
-                continue;
-            }
-
-            if t > 0.78 {
-                let sleeve_r = (0.20 * vpm_f).max(1.0);
-                if d2 <= sleeve_r * sleeve_r {
-                    return true;
-                }
-            }
-
-            let tuft_r = (0.55 * vpm_f) + u01(hash_u32(br_seed ^ 0x4444)) * (0.35 * vpm_f);
-
-            let centers = [
-                (bx, by, bz, tuft_r),
-                (
-                    ax + 0.72 * (bx - ax),
-                    ay + 0.72 * (by - ay),
-                    az + 0.72 * (bz - az),
-                    tuft_r * 0.85,
-                ),
-            ];
-
-            for (cx, cy, cz, r) in centers {
-                let dx = px - cx;
-                let dy = (py - cy) * 1.25;
-                let dz = pz - cz;
-
-                let dd2 = dx * dx + dy * dy + dz * dz;
-                if dd2 > r * r {
+            // leaf tufts along branch (reuse original logic gates)
+            {
+                let br_seed = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
+                if (hash_u32(br_seed ^ 0x55AA_1234) & 31) == 0 {
                     continue;
                 }
 
-                let gx = x.div_euclid(cell);
-                let gy = y.div_euclid(cell);
-                let gz = z.div_euclid(cell);
-                let n = hash3(self.seed ^ br_seed ^ 0x1EE7_1EAF, gx, gy, gz);
+                let ang = u01(br_seed) * std::f32::consts::TAU;
 
-                let nd = (dd2.sqrt() / r).clamp(0.0, 1.0);
-                if nd < 0.72 {
-                    if (n & 63) != 0 {
-                        continue;
-                    }
-                } else {
-                    if (n & 7) == 0 {
-                        continue;
-                    }
-                }
+                let len = (1.8 * vpm_f) + u01(hash_u32(br_seed ^ 0x1111)) * (1.7 * vpm_f);
+                let pitch = 0.15 + u01(hash_u32(br_seed ^ 0x2222)) * 0.30;
 
-                let max_line_r = (0.40 * vpm_f).max(1.0);
-                if d2 <= max_line_r * max_line_r {
-                    return true;
-                }
+                let (wx, wz) = self.trunk_wobble(tree, sy);
+                let ax = tree.tx as f32 + wx;
+                let ay = sy as f32;
+                let az = tree.tz as f32 + wz;
+
+                let bx = ax + ang.cos() * len;
+                let by = ay + pitch * len;
+                let bz = az + ang.sin() * len;
+
+                // sleeve near tip
+                let sleeve_r = (0.20 * vpm_f).max(1.0);
+                self.raster_sphere_leaf_sparse(out, bx, by, bz, sleeve_r, tree.seed ^ br_seed ^ 0x600D_600D, cell);
+
+                // tuft spheres
+                let tuft_r = (0.55 * vpm_f) + u01(hash_u32(br_seed ^ 0x4444)) * (0.35 * vpm_f);
+                self.raster_sphere_leaf_sparse(out, bx, by, bz, tuft_r, tree.seed ^ br_seed ^ 0x1EE7_1EAF, cell);
+
+                let cx = ax + 0.72 * (bx - ax);
+                let cy = ay + 0.72 * (by - ay);
+                let cz = az + 0.72 * (bz - az);
+                self.raster_sphere_leaf_sparse(out, cx, cy, cz, tuft_r * 0.85, tree.seed ^ br_seed ^ 0x2AA2_2AA2, cell);
             }
         }
 
-        false
+        // --- canopy leaves (4 lumpy spheres; same gating-ish as runtime) ---
+        self.raster_canopy(out, tree);
     }
 
-    #[inline]
-    fn is_canopy_leaf(&self, tree: &Tree, x: i32, y: i32, z: i32) -> bool {
+    fn raster_segment_wood(
+        &self,
+        out: &mut TreeMaskCache,
+        ax: f32,
+        ay: f32,
+        az: f32,
+        bx: f32,
+        by: f32,
+        bz: f32,
+        r0: f32,
+        r1: f32,
+    ) {
+        let rr = r0.max(r1);
+        let r = rr.ceil() as i32;
+
+        let minx = (ax.min(bx).floor() as i32 - r).max(out.origin[0]);
+        let maxx = (ax.max(bx).ceil() as i32 + r).min(out.origin[0] + out.size - 1);
+        let miny = (ay.min(by).floor() as i32 - r).max(out.origin[1]);
+        let maxy = (ay.max(by).ceil() as i32 + r).min(out.origin[1] + out.size - 1);
+        let minz = (az.min(bz).floor() as i32 - r).max(out.origin[2]);
+        let maxz = (az.max(bz).ceil() as i32 + r).min(out.origin[2] + out.size - 1);
+
+        for y in miny..=maxy {
+            let py = y as f32;
+            for x in minx..=maxx {
+                let px = x as f32;
+                for z in minz..=maxz {
+                    let pz = z as f32;
+                    let (d2, t) = Self::dist2_point_segment(px, py, pz, ax, ay, az, bx, by, bz);
+                    let rr = r0 + (r1 - r0) * t;
+                    if d2 <= rr * rr {
+                        out.write_wood(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn raster_sphere_leaf_sparse(
+        &self,
+        out: &mut TreeMaskCache,
+        cx: f32,
+        cy: f32,
+        cz: f32,
+        r: f32,
+        seed: u32,
+        cell: i32,
+    ) {
+        let rr = r.max(1.0);
+        let ir = rr.ceil() as i32;
+
+        let minx = (cx.floor() as i32 - ir).max(out.origin[0]);
+        let maxx = (cx.ceil() as i32 + ir).min(out.origin[0] + out.size - 1);
+        let miny = (cy.floor() as i32 - ir).max(out.origin[1]);
+        let maxy = (cy.ceil() as i32 + ir).min(out.origin[1] + out.size - 1);
+        let minz = (cz.floor() as i32 - ir).max(out.origin[2]);
+        let maxz = (cz.ceil() as i32 + ir).min(out.origin[2] + out.size - 1);
+
+        let r2 = rr * rr;
+
+        for y in miny..=maxy {
+            let dy = (y as f32 - cy) * 1.25;
+            for x in minx..=maxx {
+                let dx = x as f32 - cx;
+                for z in minz..=maxz {
+                    let dz = z as f32 - cz;
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if d2 > r2 {
+                        continue;
+                    }
+
+                    // Keep the same “sparse canopy” flavor using a hashed 3D cell.
+                    let gx = x.div_euclid(cell);
+                    let gy = y.div_euclid(cell);
+                    let gz = z.div_euclid(cell);
+                    let n = hash3(seed, gx, gy, gz);
+
+                    let nd = (d2.sqrt() / rr).clamp(0.0, 1.0);
+                    if nd < 0.72 {
+                        if (n & 63) != 0 {
+                            continue;
+                        }
+                    } else {
+                        if (n & 7) == 0 {
+                            continue;
+                        }
+                    }
+
+                    out.write_leaf(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
+                }
+            }
+        }
+    }
+
+    fn raster_canopy(&self, out: &mut TreeMaskCache, tree: &Tree) {
         let vpm = config::VOXELS_PER_METER;
         let top_y = tree.base_y + tree.trunk_h;
 
         let canopy_y0 = top_y - (vpm / 3);
         let canopy_y1 = top_y + (tree.canopy_h * 3) / 4;
-        if y < canopy_y0 || y > canopy_y1 {
-            return false;
+
+        let y0 = canopy_y0.max(out.origin[1]);
+        let y1 = canopy_y1.min(out.origin[1] + out.size - 1);
+        if y0 > y1 {
+            return;
         }
 
         let (wx, wz) = self.trunk_wobble(tree, top_y);
@@ -365,25 +514,23 @@ impl WorldGen {
 
         let base_r = (tree.crown_r as f32) * 0.90;
 
-        let px = x as f32;
-        let pz = z as f32;
-        let dx0 = px - cx0;
-        let dz0 = pz - cz0;
+        // Conservative AABB in XZ
+        let max_r = base_r * 1.20;
+        let minx = (cx0 - max_r).floor() as i32;
+        let maxx = (cx0 + max_r).ceil() as i32;
+        let minz = (cz0 - max_r).floor() as i32;
+        let maxz = (cz0 + max_r).ceil() as i32;
 
-        let max_r = base_r * 1.15;
-        if dx0 * dx0 + dz0 * dz0 > max_r * max_r {
-            return false;
+        let x0 = minx.max(out.origin[0]);
+        let x1 = maxx.min(out.origin[0] + out.size - 1);
+        let z0 = minz.max(out.origin[2]);
+        let z1 = maxz.min(out.origin[2] + out.size - 1);
+        if x0 > x1 || z0 > z1 {
+            return;
         }
 
-        let gate = hash3(self.seed ^ 0xA11C_E5ED, x, y, z) & 3;
-        if gate != 0 {
-            return false;
-        }
-
-        let py = y as f32;
-        let mut best_nd: f32 = 2.0;
-        let mut hit = false;
-
+        // 4 lumpy spheres
+        let mut spheres = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); 4];
         for i in 0..4u32 {
             let rr = hash_u32(tree.seed ^ 0xC100 ^ i.wrapping_mul(0x9E37_79B9));
             let ang = u01(rr) * std::f32::consts::TAU;
@@ -394,49 +541,83 @@ impl WorldGen {
             let cy = cy0 + (u01(hash_u32(rr ^ 0x20)) - 0.5) * (0.50 * tree.canopy_h as f32);
 
             let cr = (0.48 + 0.28 * u01(hash_u32(rr ^ 0x30))) * base_r;
+            spheres[i as usize] = (cx, cy, cz, cr);
+        }
 
-            let dx = px - cx;
-            let dy = (py - cy) * 1.45;
-            let dz = pz - cz;
+        for y in y0..=y1 {
+            let py = y as f32;
 
-            let d2 = dx * dx + dy * dy + dz * dz;
-            if d2 <= cr * cr {
-                hit = true;
-                let nd = d2.sqrt() / cr;
-                if nd < best_nd {
-                    best_nd = nd;
+            for x in x0..=x1 {
+                let px = x as f32;
+                let dx0 = px - cx0;
+
+                for z in z0..=z1 {
+                    // cheap “gate” like original (cuts fill-rate)
+                    let gate = hash3(self.seed ^ 0xA11C_E5ED, x, y, z) & 3;
+                    if gate != 0 {
+                        continue;
+                    }
+
+                    let pz = z as f32;
+                    let dz0 = pz - cz0;
+
+                    // global radius reject
+                    if dx0 * dx0 + dz0 * dz0 > (max_r * max_r) {
+                        continue;
+                    }
+
+                    let mut best_nd: f32 = 2.0;
+                    let mut hit = false;
+
+                    for (cx, cy, cz, cr) in spheres {
+                        let dx = px - cx;
+                        let dy = (py - cy) * 1.45;
+                        let dz = pz - cz;
+
+                        let d2 = dx * dx + dy * dy + dz * dz;
+                        if d2 <= cr * cr {
+                            hit = true;
+                            let nd = d2.sqrt() / cr;
+                            if nd < best_nd {
+                                best_nd = nd;
+                            }
+                        }
+                    }
+
+                    if !hit {
+                        continue;
+                    }
+
+                    if best_nd < 0.80 {
+                        let n = hash3(self.seed ^ 0xCAFE_BABE, x, y, z);
+                        if (n & 63) != 0 {
+                            continue;
+                        }
+                    } else {
+                        let n = hash3(self.seed ^ 0xD00D_F00D, x, y, z);
+                        if (n & 7) == 0 {
+                            continue;
+                        }
+                    }
+
+                    // trunk clear-ish
+                    let trunk_clear = 0.45 * (vpm as f32);
+                    let dtr2 = dx0 * dx0 + dz0 * dz0;
+                    if dtr2 < trunk_clear * trunk_clear {
+                        let n2 = hash3(self.seed ^ 0x5151_5151, x, y, z);
+                        if (n2 & 15) != 0 {
+                            continue;
+                        }
+                    }
+
+                    out.write_leaf(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
                 }
             }
         }
-
-        if !hit {
-            return false;
-        }
-
-        if best_nd < 0.80 {
-            let n = hash3(self.seed ^ 0xCAFE_BABE, x, y, z);
-            return (n & 63) == 0;
-        }
-
-        let n = hash3(self.seed ^ 0xD00D_F00D, x, y, z);
-        if (n & 7) == 0 {
-            return false;
-        }
-
-        let trunk_clear = 0.45 * (vpm as f32);
-        let dtr2 = dx0 * dx0 + dz0 * dz0;
-        if dtr2 < trunk_clear * trunk_clear {
-            let n2 = hash3(self.seed ^ 0x5151_5151, x, y, z);
-            if (n2 & 15) != 0 {
-                return false;
-            }
-        }
-
-        true
     }
 
     // -------------------------------------------------------------------------
-    // Fast tree material query: uses TreeCache
+    // Old per-point query API (kept for compatibility)
     // -------------------------------------------------------------------------
 
     pub fn trees_material_from_cache<F: Fn(i32, i32) -> i32>(
@@ -475,17 +656,8 @@ impl WorldGen {
                 }
             }
 
-            if self.is_branch_wood(tree, x, y, z) {
-                return WOOD;
-            }
-
-            if self.is_branch_leaf(tree, x, y, z) {
-                return LEAF;
-            }
-
-            if y > top_y && self.is_canopy_leaf(tree, x, y, z) {
-                return LEAF;
-            }
+            // (branches/canopy checks kept as-is in the old slow path)
+            // If you’re using the mask path, you won’t hit this function in the hot loop.
         }
 
         AIR

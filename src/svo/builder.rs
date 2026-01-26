@@ -11,10 +11,7 @@ use crate::{
     },
 };
 
-use super::{
-    height_cache::HeightCache,
-    mips::{build_max_mip_inplace, build_minmax_mip_inplace, MaxMipView, MinMaxMipView},
-};
+use super::mips::{build_max_mip_inplace, build_minmax_mip_inplace, MaxMipView, MinMaxMipView};
 
 const LEAF: u32 = 0xFFFF_FFFF;
 
@@ -149,7 +146,6 @@ fn prefix_sum_cube(prefix: &[u32], side: usize, x0: usize, y0: usize, z0: usize,
     s as u32
 }
 
-
 /// Builds a single chunk SVO with sparse (compact) child allocation.
 pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size: u32) -> Vec<NodeGpu> {
     static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
@@ -188,40 +184,63 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     debug_assert!(cs_u.is_power_of_two());
 
     let side = cs_u as usize;
-    let vpm = config::VOXELS_PER_METER;
+    let vpm: i32 = config::VOXELS_PER_METER as i32;
+    debug_assert!(vpm > 0);
 
-    // Height cache
+    // -------------------------------------------------------------------------
+    // Height cache (local array, no HeightCache dependency)
+    // -------------------------------------------------------------------------
     let margin_m: i32 = 6;
-    let margin = margin_m * vpm + (vpm - 1);
-
-    let cache = HeightCache::new(
-        gen,
-        chunk_ox - margin,
-        chunk_oz - margin,
-        chunk_ox + cs_i + margin + 1,
-        chunk_oz + cs_i + margin + 1,
-    );
+    let margin: i32 = margin_m * vpm + (vpm - 1);
 
     let cache_x0 = chunk_ox - margin;
     let cache_z0 = chunk_oz - margin;
-    let cache_x1 = chunk_ox + cs_i + margin;
-    let cache_z1 = chunk_oz + cs_i + margin;
+    let cache_x1 = chunk_ox + cs_i + margin; // inclusive
+    let cache_z1 = chunk_oz + cs_i + margin; // inclusive
+
+    let cache_w = (cache_x1 - cache_x0 + 1) as usize;
+    let cache_h = (cache_z1 - cache_z0 + 1) as usize;
+
+    let mut height_cache: Vec<i32> = vec![0; cache_w * cache_h];
+    for z in 0..cache_h {
+        if (z & 15) == 0 && should_cancel(cancel) {
+            return Vec::new();
+        }
+        let wz = cache_z0 + z as i32;
+        for x in 0..cache_w {
+            let wx = cache_x0 + x as i32;
+            height_cache[z * cache_w + x] = gen.ground_height(wx, wz);
+        }
+    }
 
     let height_at = |wx: i32, wz: i32| -> i32 {
         if wx < cache_x0 || wx > cache_x1 || wz < cache_z0 || wz > cache_z1 {
             gen.ground_height(wx, wz)
         } else {
-            cache.get(wx, wz)
+            let ix = (wx - cache_x0) as usize;
+            let iz = (wz - cache_z0) as usize;
+            height_cache[iz * cache_w + ix]
         }
     };
 
-    let tree_cache = gen.build_tree_cache(chunk_ox, chunk_oz, cs_i, &height_at);
+    // -------------------------------------------------------------------------
+    // Fast tree mask (O(1) lookup) and tunnel cache with mask (O(1) membership)
+    // -------------------------------------------------------------------------
+    let (_tree_cache_unused, tree_mask) = gen.build_tree_cache_with_mask(
+        chunk_ox,
+        chunk_oy,
+        chunk_oz,
+        cs_i,
+        &height_at,
+        cancel,
+    );
 
-    // NEW: tunnel cache that also builds a chunk-local mask for O(1) membership tests
     let tunnel_cache =
         gen.build_tunnel_cache_with_mask(chunk_ox, chunk_oy, chunk_oz, cs_i, &height_at, cancel);
 
-    // 2D maps
+    // -------------------------------------------------------------------------
+    // 2D maps (ground + conservative carve)
+    // -------------------------------------------------------------------------
     BuildScratch::ensure_2d(&mut scratch.ground, side, 0);
     BuildScratch::ensure_2d(&mut scratch.carve_bottom, side, i32::MAX);
     BuildScratch::ensure_2d(&mut scratch.carve_top, side, i32::MIN);
@@ -248,7 +267,13 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         }
     }
 
-    tunnel_cache.stamp_carve_bounds(chunk_ox, chunk_oz, cs_i, &mut scratch.carve_bottom, &mut scratch.carve_top);
+    tunnel_cache.stamp_carve_bounds(
+        chunk_ox,
+        chunk_oz,
+        cs_i,
+        &mut scratch.carve_bottom,
+        &mut scratch.carve_top,
+    );
 
     let ground_mip: MinMaxMipView<'_> = build_minmax_mip_inplace(
         &scratch.ground,
@@ -267,7 +292,10 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     let carve_top_mip: MaxMipView<'_> =
         build_max_mip_inplace(&scratch.carve_top, cs_u, &mut scratch.carve_top_levels);
 
-    // Tree top stamp (2D)
+    // -------------------------------------------------------------------------
+    // Tree top stamp (2D) for fast “above everything” pruning
+    // (cheap; independent of per-voxel tree material)
+    // -------------------------------------------------------------------------
     BuildScratch::ensure_2d(&mut scratch.tree_top, side, -1);
 
     let pad_m = 4;
@@ -316,6 +344,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
                 }
             }
 
+            // ensure trunk column included
             let lx = tx - chunk_ox;
             let lz = tz - chunk_oz;
             if lx >= 0 && lx < cs_i && lz >= 0 && lz < cs_i {
@@ -327,7 +356,9 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     let tree_mip: MaxMipView<'_> = build_max_mip_inplace(&scratch.tree_top, cs_u, &mut scratch.tree_levels);
 
-    // Precompute materials + occupancy
+    // -------------------------------------------------------------------------
+    // Precompute per-voxel material + occupancy (tree work is O(1) via mask)
+    // -------------------------------------------------------------------------
     BuildScratch::ensure_3d_u32(&mut scratch.material, side, AIR);
     BuildScratch::ensure_3d_u8(&mut scratch.solid, side, 0);
 
@@ -348,17 +379,19 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
                 let col = idx2(side, lx as usize, lz as usize);
                 let g = scratch.ground[col];
 
+                // base terrain + trees (FAST)
                 let mut m: u32;
                 if wy < g {
                     m = if wy >= g - dirt_depth { DIRT } else { STONE };
                 } else if wy == g {
-                    let tm = gen.trees_material_from_cache(wx, wy, wz, &height_at, &tree_cache);
+                    let tm = tree_mask.material_fast(wx, wy, wz);
                     m = if tm == WOOD { WOOD } else { GRASS };
                 } else {
-                    let tm = gen.trees_material_from_cache(wx, wy, wz, &height_at, &tree_cache);
+                    let tm = tree_mask.material_fast(wx, wy, wz);
                     m = if tm != AIR { tm } else { AIR };
                 }
 
+                // carve band below ground
                 if m != AIR {
                     let carve_y0 = g - 80 * vpm;
                     let carve_y1 = g - 1 * vpm;
@@ -367,6 +400,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
                         let cb = scratch.carve_bottom[col];
                         let ct = scratch.carve_top[col];
 
+                        // only test expensive stuff if within conservative per-column carve bounds
                         if wy >= cb && wy <= ct {
                             if gen.cave_density(wx, wy, wz) < 0.0 {
                                 m = AIR;
@@ -384,7 +418,9 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         }
     }
 
-    // Prefix sum
+    // -------------------------------------------------------------------------
+    // Prefix sum over solid occupancy
+    // -------------------------------------------------------------------------
     BuildScratch::ensure_prefix(&mut scratch.prefix, side);
     let dim = side + 1;
 
@@ -405,7 +441,6 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
                 let p = a + b - c + (run as i64);
                 debug_assert!(p >= 0);
                 scratch.prefix[pidx(dim, x, y, z)] = p as u32;
-
             }
         }
     }
@@ -519,6 +554,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         NodeGpu { child_base: base, child_mask: mask, material: 0, _pad: 0 }
     }
 
+    // Root must be at index 0 for GPU.
     let mut nodes = vec![NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 }];
 
     let root = build_node(
