@@ -8,6 +8,7 @@ use crate::{
     world::{
         materials::{AIR, STONE},
         WorldGen,
+        tunnels::TunnelCache,
     },
 };
 
@@ -66,7 +67,6 @@ pub fn build_chunk_svo_sparse_cancelable(
     if should_cancel(cancel) {
         return Vec::new();
     }
-
     let cache = HeightCache::new(
         gen,
         chunk_ox - margin,
@@ -74,16 +74,61 @@ pub fn build_chunk_svo_sparse_cancelable(
         chunk_ox + cs_i + margin + 1,
         chunk_oz + cs_i + margin + 1,
     );
-    let height_at = |wx: i32, wz: i32| -> i32 { cache.get(wx, wz) };
+
+    let cache_x0 = chunk_ox - margin;
+    let cache_z0 = chunk_oz - margin;
+    let cache_x1 = chunk_ox + cs_i + margin; // inclusive max valid x
+    let cache_z1 = chunk_oz + cs_i + margin; // inclusive max valid z
+
+    let height_at = |wx: i32, wz: i32| -> i32 {
+        if wx < cache_x0 || wx > cache_x1 || wz < cache_z0 || wz > cache_z1 {
+            gen.ground_height(wx, wz)
+        } else {
+            cache.get(wx, wz)
+        }
+    };
+
 
     let tree_cache = gen.build_tree_cache(chunk_ox, chunk_oz, cs_i, &height_at);
+    let tunnel_cache = gen.build_tunnel_cache(chunk_ox, chunk_oz, cs_i, &height_at);
+
+    // Conservative cave band relative to ground: [ground - 40m .. ground - 6m]
+    let side = cs_u as usize; // <— add this
+
+    let cave_depth = 40 * vpm;
+    let cave_ceiling = 6 * vpm;
+
+    let mut carve_bottom = vec![i32::MAX; side * side];
+    let mut carve_top    = vec![i32::MIN; side * side];
+
+    for lz in 0..cs_i {
+        for lx in 0..cs_i {
+            let wx = chunk_ox + lx;
+            let wz = chunk_oz + lz;
+            let g = height_at(wx, wz);
+
+            let b = g - cave_depth;
+            let t = g - cave_ceiling;
+
+            let idx = (lz as usize) * side + (lx as usize);
+            carve_bottom[idx] = carve_bottom[idx].min(b);
+            carve_top[idx] = carve_top[idx].max(t);
+        }
+    }
+
+    // Stamp tunnels (conservative AABB in XZ)
+    tunnel_cache.stamp_carve_bounds(chunk_ox, chunk_oz, cs_i, &mut carve_bottom, &mut carve_top);
+
+    let carve_bottom_mip = build_minmax_mip(&carve_bottom, cs_u);
+    let carve_top_mip = build_max_mip(&carve_top, cs_u);
 
     let mat_at_local = |lx: i32, ly: i32, lz: i32| -> u32 {
         let wx = chunk_ox + lx;
         let wy = chunk_oy + ly;
         let wz = chunk_oz + lz;
-        gen.material_at_world_cached_with_trees(wx, wy, wz, &height_at, &tree_cache)
+        gen.material_at_world_cached_with_features(wx, wy, wz, &height_at, &tree_cache, &tunnel_cache)
     };
+
 
     // Ground height map over chunk footprint
     let side = cs_u as usize;
@@ -181,6 +226,8 @@ pub fn build_chunk_svo_sparse_cancelable(
         mat_fn: &dyn Fn(i32, i32, i32) -> u32,
         ground_mip: &MinMaxMip,
         tree_mip: &MaxMip,
+        carve_bottom_mip: &MinMaxMip,
+        carve_top_mip: &MaxMip,
         dirt_depth: i32,
         cancel: &AtomicBool,
     ) -> NodeGpu {
@@ -216,14 +263,22 @@ pub fn build_chunk_svo_sparse_cancelable(
         }
 
         // Entirely deep underground everywhere => STONE
+        // BUT only if we are outside any possible carve range (caves/tunnels) for this footprint.
         if y1 < gmin - dirt_depth {
-            return NodeGpu {
-                child_base: LEAF,
-                child_mask: 0,
-                material: STONE,
-                _pad: 0,
-            };
+            let (cmin, _cmax_unused) = carve_bottom_mip.query(ox, oz, size_u);
+            let carve_tmax = carve_top_mip.query_max(ox, oz, size_u);
+
+            // no overlap between node y-range and conservative carve range
+            if y1 < cmin || y0 > carve_tmax {
+                return NodeGpu {
+                    child_base: LEAF,
+                    child_mask: 0,
+                    material: STONE,
+                    _pad: 0,
+                };
+            }
         }
+
 
         // Voxel resolution: exact material
         if size == 1 {
@@ -265,6 +320,8 @@ pub fn build_chunk_svo_sparse_cancelable(
                 mat_fn,
                 ground_mip,
                 tree_mip,
+                carve_bottom_mip,
+                carve_top_mip,
                 dirt_depth,
                 cancel,
             );
@@ -316,6 +373,8 @@ pub fn build_chunk_svo_sparse_cancelable(
         &mat_at_local,
         &ground_mip,
         &tree_mip,
+        &carve_bottom_mip,
+        &carve_top_mip,
         dirt_depth,
         cancel,
     );
