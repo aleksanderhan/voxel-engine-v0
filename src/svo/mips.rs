@@ -1,66 +1,105 @@
 // src/svo/mips.rs
-pub struct MinMaxMip {
+
+pub struct MinMaxMipView<'a> {
     pub root_side: u32,
-    pub min_levels: Vec<Vec<i32>>,
-    pub max_levels: Vec<Vec<i32>>,
+    pub min_levels: &'a [Vec<i32>],
+    pub max_levels: &'a [Vec<i32>],
 }
 
-pub fn build_minmax_mip(base: &[i32], side: u32) -> MinMaxMip {
+pub fn build_minmax_mip_inplace<'a>(
+    base: &[i32],
+    side: u32,
+    min_levels: &'a mut Vec<Vec<i32>>,
+    max_levels: &'a mut Vec<Vec<i32>>,
+) -> MinMaxMipView<'a> {
     debug_assert!(side.is_power_of_two());
     debug_assert_eq!(base.len(), (side * side) as usize);
 
-    let mut min_levels = Vec::new();
-    let mut max_levels = Vec::new();
+    let levels = side.trailing_zeros() as usize + 1;
 
-    min_levels.push(base.to_vec());
-    max_levels.push(base.to_vec());
+    if min_levels.len() != levels {
+        min_levels.resize_with(levels, Vec::new);
+    }
+    if max_levels.len() != levels {
+        max_levels.resize_with(levels, Vec::new);
+    }
+
+    // lvl 0
+    min_levels[0].clear();
+    min_levels[0].extend_from_slice(base);
+
+    max_levels[0].clear();
+    max_levels[0].extend_from_slice(base);
 
     let mut cur_side = side;
-    while cur_side > 1 {
+
+    for lvl in 1..levels {
         let next_side = cur_side / 2;
-        let mut mn = vec![0i32; (next_side * next_side) as usize];
-        let mut mx = vec![0i32; (next_side * next_side) as usize];
+        let need = (next_side * next_side) as usize;
 
-        let cur_min = min_levels.last().unwrap();
-        let cur_max = max_levels.last().unwrap();
+        // --- min: borrow prev + out without aliasing
+        {
+            let (prev, rest) = min_levels.split_at_mut(lvl);
+            let cur_min: &[i32] = &prev[lvl - 1];
+            let mn: &mut Vec<i32> = &mut rest[0];
+            mn.resize(need, 0);
 
-        for z in 0..next_side {
-            for x in 0..next_side {
-                let i00 = ((2 * z) * cur_side + (2 * x)) as usize;
-                let i10 = ((2 * z) * cur_side + (2 * x + 1)) as usize;
-                let i01 = ((2 * z + 1) * cur_side + (2 * x)) as usize;
-                let i11 = ((2 * z + 1) * cur_side + (2 * x + 1)) as usize;
+            for z in 0..next_side {
+                for x in 0..next_side {
+                    let i00 = ((2 * z) * cur_side + (2 * x)) as usize;
+                    let i10 = ((2 * z) * cur_side + (2 * x + 1)) as usize;
+                    let i01 = ((2 * z + 1) * cur_side + (2 * x)) as usize;
+                    let i11 = ((2 * z + 1) * cur_side + (2 * x + 1)) as usize;
 
-                let o = (z * next_side + x) as usize;
+                    let o = (z * next_side + x) as usize;
 
-                let a0 = cur_min[i00];
-                let a1 = cur_min[i10];
-                let a2 = cur_min[i01];
-                let a3 = cur_min[i11];
+                    let a0 = cur_min[i00];
+                    let a1 = cur_min[i10];
+                    let a2 = cur_min[i01];
+                    let a3 = cur_min[i11];
 
-                let b0 = cur_max[i00];
-                let b1 = cur_max[i10];
-                let b2 = cur_max[i01];
-                let b3 = cur_max[i11];
-
-                mn[o] = a0.min(a1).min(a2).min(a3);
-                mx[o] = b0.max(b1).max(b2).max(b3);
+                    mn[o] = a0.min(a1).min(a2).min(a3);
+                }
             }
         }
 
-        min_levels.push(mn);
-        max_levels.push(mx);
+        // --- max: borrow prev + out without aliasing
+        {
+            let (prev, rest) = max_levels.split_at_mut(lvl);
+            let cur_max: &[i32] = &prev[lvl - 1];
+            let mx: &mut Vec<i32> = &mut rest[0];
+            mx.resize(need, 0);
+
+            for z in 0..next_side {
+                for x in 0..next_side {
+                    let i00 = ((2 * z) * cur_side + (2 * x)) as usize;
+                    let i10 = ((2 * z) * cur_side + (2 * x + 1)) as usize;
+                    let i01 = ((2 * z + 1) * cur_side + (2 * x)) as usize;
+                    let i11 = ((2 * z + 1) * cur_side + (2 * x + 1)) as usize;
+
+                    let o = (z * next_side + x) as usize;
+
+                    let b0 = cur_max[i00];
+                    let b1 = cur_max[i10];
+                    let b2 = cur_max[i01];
+                    let b3 = cur_max[i11];
+
+                    mx[o] = b0.max(b1).max(b2).max(b3);
+                }
+            }
+        }
+
         cur_side = next_side;
     }
 
-    MinMaxMip {
+    MinMaxMipView {
         root_side: side,
-        min_levels,
-        max_levels,
+        min_levels: &min_levels[..],
+        max_levels: &max_levels[..],
     }
 }
 
-impl MinMaxMip {
+impl<'a> MinMaxMipView<'a> {
     #[inline]
     pub fn query(&self, x0: i32, z0: i32, size: u32) -> (i32, i32) {
         debug_assert!(size.is_power_of_two());
@@ -79,24 +118,40 @@ impl MinMaxMip {
     }
 }
 
-pub struct MaxMip {
+pub struct MaxMipView<'a> {
     pub root_side: u32,
-    pub levels: Vec<Vec<i32>>,
+    pub levels: &'a [Vec<i32>],
 }
 
-pub fn build_max_mip(base: &[i32], side: u32) -> MaxMip {
+pub fn build_max_mip_inplace<'a>(
+    base: &[i32],
+    side: u32,
+    levels: &'a mut Vec<Vec<i32>>,
+) -> MaxMipView<'a> {
     debug_assert!(side.is_power_of_two());
     debug_assert_eq!(base.len(), (side * side) as usize);
 
-    let mut levels = Vec::new();
-    levels.push(base.to_vec());
+    let nlevels = side.trailing_zeros() as usize + 1;
+
+    if levels.len() != nlevels {
+        levels.resize_with(nlevels, Vec::new);
+    }
+
+    // lvl 0
+    levels[0].clear();
+    levels[0].extend_from_slice(base);
 
     let mut cur_side = side;
-    while cur_side > 1 {
-        let next_side = cur_side / 2;
-        let mut mx = vec![0i32; (next_side * next_side) as usize];
 
-        let cur = levels.last().unwrap();
+    for lvl in 1..nlevels {
+        let next_side = cur_side / 2;
+        let need = (next_side * next_side) as usize;
+
+        let (prev, rest) = levels.split_at_mut(lvl);
+        let cur: &[i32] = &prev[lvl - 1];
+        let out: &mut Vec<i32> = &mut rest[0];
+        out.resize(need, 0);
+
         for z in 0..next_side {
             for x in 0..next_side {
                 let i00 = ((2 * z) * cur_side + (2 * x)) as usize;
@@ -105,18 +160,20 @@ pub fn build_max_mip(base: &[i32], side: u32) -> MaxMip {
                 let i11 = ((2 * z + 1) * cur_side + (2 * x + 1)) as usize;
 
                 let o = (z * next_side + x) as usize;
-                mx[o] = cur[i00].max(cur[i10]).max(cur[i01]).max(cur[i11]);
+                out[o] = cur[i00].max(cur[i10]).max(cur[i01]).max(cur[i11]);
             }
         }
 
-        levels.push(mx);
         cur_side = next_side;
     }
 
-    MaxMip { root_side: side, levels }
+    MaxMipView {
+        root_side: side,
+        levels: &levels[..],
+    }
 }
 
-impl MaxMip {
+impl<'a> MaxMipView<'a> {
     #[inline]
     pub fn query_max(&self, x0: i32, z0: i32, size: u32) -> i32 {
         debug_assert!(size.is_power_of_two());

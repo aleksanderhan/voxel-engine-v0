@@ -12,9 +12,10 @@ use glam::{Vec2, Vec3};
 use crate::{
     config,
     render::gpu_types::{ChunkMetaGpu, NodeGpu},
-    svo::build_chunk_svo_sparse_cancelable,
+    svo::{build_chunk_svo_sparse_cancelable_with_scratch, BuildScratch},
     world::WorldGen,
 };
+
 
 use super::NodeArena;
 
@@ -72,6 +73,9 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
         let tx_done = tx_done.clone();
 
         std::thread::spawn(move || {
+            // One reusable scratch per worker thread: removes most per-chunk allocations.
+            let mut scratch = BuildScratch::new();
+
             while let Ok(job) = rx_job.recv() {
                 if job.cancel.load(Ordering::Relaxed) {
                     continue;
@@ -84,8 +88,13 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                     k.z * config::CHUNK_SIZE as i32,
                 ];
 
-                let nodes =
-                    build_chunk_svo_sparse_cancelable(&gen, origin, config::CHUNK_SIZE, &job.cancel);
+                let nodes = build_chunk_svo_sparse_cancelable_with_scratch(
+                    &gen,
+                    origin,
+                    config::CHUNK_SIZE,
+                    job.cancel.as_ref(),
+                    &mut scratch,
+                );
 
                 // If we got cancelled mid-build, drop it (don’t send, saves main-thread work).
                 if job.cancel.load(Ordering::Relaxed) {
@@ -291,7 +300,7 @@ impl ChunkManager {
             }
         }
 
-        // dispatch builds (A3: forward-cone priority)
+        // dispatch builds (forward-cone priority)
         sort_queue_near_first(&mut self.build_queue, center, cam_fwd);
 
         while self.in_flight < config::MAX_IN_FLIGHT {
@@ -468,7 +477,7 @@ impl ChunkManager {
                         slot: dead_slot as u32,
                         meta: self.chunk_meta[dead_slot],
                         node_base: 0,
-                        nodes: Vec::new(), // meta-only update (Renderer will ignore empty nodes)
+                        nodes: Vec::new(), // meta-only update
                     });
                 }
 
@@ -480,7 +489,7 @@ impl ChunkManager {
             }
 
             ChunkState::Queued | ChunkState::Building => {
-                // cancel work in-flight (A1)
+                // cancel work in-flight
                 self.cancel_token(key).store(true, Ordering::Relaxed);
 
                 self.chunks.insert(key, ChunkState::Missing);

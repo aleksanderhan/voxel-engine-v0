@@ -1,4 +1,7 @@
 // src/world/tunnels.rs
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::config;
 use super::{
     generator::WorldGen,
@@ -13,6 +16,55 @@ struct TunnelSeg {
     r1: f32,
 }
 
+/// Simple chunk-local bitmask (voxel resolution).
+/// Stores occupancy for a single chunk volume [ox..ox+side), [oy..oy+side), [oz..oz+side).
+#[derive(Clone, Debug)]
+struct ChunkMask {
+    ox: i32,
+    oy: i32,
+    oz: i32,
+    side: i32,
+    bits: Vec<u32>, // bitset: 1 = tunnel-carved
+}
+
+impl ChunkMask {
+    fn new(ox: i32, oy: i32, oz: i32, side: i32) -> Self {
+        let n = (side as usize) * (side as usize) * (side as usize);
+        let words = (n + 31) / 32;
+        Self { ox, oy, oz, side, bits: vec![0u32; words] }
+    }
+
+    #[inline]
+    fn idx(&self, x: i32, y: i32, z: i32) -> Option<usize> {
+        let lx = x - self.ox;
+        let ly = y - self.oy;
+        let lz = z - self.oz;
+        if lx < 0 || ly < 0 || lz < 0 || lx >= self.side || ly >= self.side || lz >= self.side {
+            return None;
+        }
+        let side = self.side as usize;
+        let i = (ly as usize) * side * side + (lz as usize) * side + (lx as usize);
+        Some(i)
+    }
+
+    #[inline]
+    fn set(&mut self, x: i32, y: i32, z: i32) {
+        if let Some(i) = self.idx(x, y, z) {
+            let w = i >> 5;
+            let b = i & 31;
+            self.bits[w] |= 1u32 << b;
+        }
+    }
+
+    #[inline]
+    fn get(&self, x: i32, y: i32, z: i32) -> bool {
+        let Some(i) = self.idx(x, y, z) else { return false; };
+        let w = i >> 5;
+        let b = i & 31;
+        (self.bits[w] >> b) & 1u32 == 1u32
+    }
+}
+
 /// Per-chunk cache of tunnel segments that might affect material queries.
 pub struct TunnelCache {
     segs: Vec<TunnelSeg>,
@@ -22,6 +74,9 @@ pub struct TunnelCache {
     cell: i32,               // world vox per cell
     dims: [i32; 3],          // number of cells in each axis
     bins: Vec<Vec<u16>>,     // bins[i] holds indices into segs
+
+    // Optional chunk-local mask for O(1) contains tests
+    mask: Option<ChunkMask>,
 }
 
 impl TunnelCache {
@@ -70,6 +125,7 @@ impl TunnelCache {
         }
     }
 
+    /// Exact test using spatial bins (your old behavior).
     #[inline]
     pub fn contains_point(&self, x: i32, y: i32, z: i32) -> bool {
         let [ox, oy, oz] = self.grid_origin;
@@ -85,14 +141,13 @@ impl TunnelCache {
         }
 
         let idx = (iz * dy * dx + iy * dx + ix) as usize;
-        let px = x as f32;
-        let py = y as f32;
-        let pz = z as f32;
+        let px = x as f32 + 0.5;
+        let py = y as f32 + 0.5;
+        let pz = z as f32 + 0.5;
 
         for &si in &self.bins[idx] {
             let s = &self.segs[si as usize];
 
-            // Exact distance test
             let (d2, t) = dist2_point_segment(px, py, pz, s.ax, s.ay, s.az, s.bx, s.by, s.bz);
             let rr = s.r0 + (s.r1 - s.r0) * t;
             if d2 <= rr * rr {
@@ -101,6 +156,80 @@ impl TunnelCache {
         }
 
         false
+    }
+
+    /// Fast test: if we have a chunk-local mask, use it; else fallback to exact bins.
+    #[inline]
+    pub fn contains_point_fast(&self, x: i32, y: i32, z: i32) -> bool {
+        if let Some(m) = &self.mask {
+            return m.get(x, y, z);
+        }
+        self.contains_point(x, y, z)
+    }
+
+    /// Build a chunk-local voxel mask for tunnels (expensive once, cheap queries later).
+    fn build_mask_for_chunk(&self, chunk_ox: i32, chunk_oy: i32, chunk_oz: i32, chunk_size: i32, cancel: Option<&AtomicBool>) -> ChunkMask {
+        let mut mask = ChunkMask::new(chunk_ox, chunk_oy, chunk_oz, chunk_size);
+
+        let cx0 = chunk_ox;
+        let cy0 = chunk_oy;
+        let cz0 = chunk_oz;
+        let cx1 = chunk_ox + chunk_size - 1;
+        let cy1 = chunk_oy + chunk_size - 1;
+        let cz1 = chunk_oz + chunk_size - 1;
+
+        for (si, s) in self.segs.iter().enumerate() {
+            if let Some(c) = cancel {
+                if (si & 7) == 0 && c.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+
+            let rr = s.r0.max(s.r1);
+
+            // segment AABB expanded by radius (in voxel coords)
+            let minx = (s.ax.min(s.bx) - rr).floor() as i32;
+            let maxx = (s.ax.max(s.bx) + rr).ceil() as i32;
+            let miny = (s.ay.min(s.by) - rr).floor() as i32;
+            let maxy = (s.ay.max(s.by) + rr).ceil() as i32;
+            let minz = (s.az.min(s.bz) - rr).floor() as i32;
+            let maxz = (s.az.max(s.bz) + rr).ceil() as i32;
+
+            let x0 = minx.max(cx0);
+            let x1 = maxx.min(cx1);
+            let y0 = miny.max(cy0);
+            let y1 = maxy.min(cy1);
+            let z0 = minz.max(cz0);
+            let z1 = maxz.min(cz1);
+
+            if x0 > x1 || y0 > y1 || z0 > z1 {
+                continue;
+            }
+
+            for z in z0..=z1 {
+                if let Some(c) = cancel {
+                    if (z & 15) == 0 && c.load(Ordering::Relaxed) {
+                        return mask;
+                    }
+                }
+                let pz = z as f32 + 0.5;
+                for y in y0..=y1 {
+                    let py = y as f32 + 0.5;
+                    for x in x0..=x1 {
+                        let px = x as f32 + 0.5;
+
+                        let (d2, t) = dist2_point_segment(px, py, pz, s.ax, s.ay, s.az, s.bx, s.by, s.bz);
+                        let rad = s.r0 + (s.r1 - s.r0) * t;
+
+                        if d2 <= rad * rad {
+                            mask.set(x, y, z);
+                        }
+                    }
+                }
+            }
+        }
+
+        mask
     }
 }
 
@@ -136,13 +265,39 @@ fn dist2_point_segment(
 }
 
 impl WorldGen {
-    /// Build a per-chunk tunnel cache (like TreeCache): deterministic segments that may intersect chunk.
+    /// Old API: builds segs + bins only (no voxel mask).
     pub fn build_tunnel_cache<F: Fn(i32, i32) -> i32>(
         &self,
         chunk_ox: i32,
         chunk_oz: i32,
         chunk_size: i32,
         height_at: &F,
+    ) -> TunnelCache {
+        self.build_tunnel_cache_impl(chunk_ox, 0, chunk_oz, chunk_size, height_at, None, false)
+    }
+
+    /// New API: builds segs + bins + chunk-local voxel mask (fast queries).
+    pub fn build_tunnel_cache_with_mask<F: Fn(i32, i32) -> i32>(
+        &self,
+        chunk_ox: i32,
+        chunk_oy: i32,
+        chunk_oz: i32,
+        chunk_size: i32,
+        height_at: &F,
+        cancel: &AtomicBool,
+    ) -> TunnelCache {
+        self.build_tunnel_cache_impl(chunk_ox, chunk_oy, chunk_oz, chunk_size, height_at, Some(cancel), true)
+    }
+
+    fn build_tunnel_cache_impl<F: Fn(i32, i32) -> i32>(
+        &self,
+        chunk_ox: i32,
+        chunk_oy: i32,
+        chunk_oz: i32,
+        chunk_size: i32,
+        height_at: &F,
+        cancel: Option<&AtomicBool>,
+        want_mask: bool,
     ) -> TunnelCache {
         let vpm = config::VOXELS_PER_METER;
         let pad_m = 10; // include starts nearby
@@ -167,6 +322,12 @@ impl WorldGen {
         let mut segs: Vec<TunnelSeg> = Vec::new();
 
         for zm in zm0..=zm1 {
+            if let Some(c) = cancel {
+                if ((zm - zm0) & 7) == 0 && c.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+
             for xm in xm0..=xm1 {
                 let r = hash2(self.seed ^ 0x6A09_E667, xm, zm);
 
@@ -184,10 +345,8 @@ impl WorldGen {
                 let mut x = xm * vpm;
                 let mut z = zm * vpm;
 
-                // segments
                 let steps = 8 + (hash_u32(r ^ 0x1234) % 9) as i32;
 
-                // initial yaw
                 let mut yaw = u01(hash_u32(r ^ 0x2222)) * std::f32::consts::TAU;
 
                 for i in 0..steps {
@@ -218,15 +377,13 @@ impl WorldGen {
                     let r_m = 0.9 + u01(hash_u32(s1 ^ 0x3333)) * 1.5;
                     let rad = (r_m * vpm as f32).max(2.0);
 
-                    // keep underground bias: clamp to [ground-55m .. ground-4m]
+                    // keep underground bias: clamp to [ground-70m .. ground-0.5m] (or 4m if not open)
                     let ground_here = height_at(x, z);
                     let open = (hash_u32(s0 ^ 0x0FEC_1A7E) & 3) == 0;
 
                     let ceiling = if open { ground_here - (vpm / 2) } else { ground_here - 4 * vpm };
                     let floor   = ground_here - 70 * vpm;
                     let clamped_by = by.clamp(floor as f32, ceiling as f32);
-
-
 
                     let seg = TunnelSeg {
                         ax, ay, az,
@@ -269,8 +426,7 @@ impl WorldGen {
         let gz0 = roam_z0;
         let gz1 = roam_z1;
 
-        // Vertical band for tunnels: clamp around plausible underground space
-        // (if your world is mostly near ground heights ~[0..300] vox, this is plenty)
+        // Vertical band for tunnels
         let gy0: i32 = -2048;
         let gy1: i32 =  2048;
 
@@ -286,7 +442,6 @@ impl WorldGen {
         };
 
         for (si, s) in segs.iter().enumerate() {
-            // seg AABB expanded by radius
             let rr = s.r0.max(s.r1).ceil() as i32;
             let minx = s.ax.min(s.bx).floor() as i32 - rr;
             let maxx = s.ax.max(s.bx).ceil() as i32 + rr;
@@ -311,12 +466,21 @@ impl WorldGen {
             }
         }
 
-        TunnelCache {
+        let mut cache = TunnelCache {
             segs,
             grid_origin: [gx0, gy0, gz0],
             cell,
             dims: [dim_x, dim_y, dim_z],
             bins,
+            mask: None,
+        };
+
+        if want_mask {
+            // Build voxel mask for this chunk volume.
+            let m = cache.build_mask_for_chunk(chunk_ox, chunk_oy, chunk_oz, chunk_size, cancel);
+            cache.mask = Some(m);
         }
+
+        cache
     }
 }
