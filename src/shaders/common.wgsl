@@ -163,7 +163,7 @@ fn cube_normal(hp: vec3<f32>, bmin: vec3<f32>, size: f32) -> vec3<f32> {
 
 // --- Sun / sky ---
 const SUN_COLOR     : vec3<f32> = vec3<f32>(1.0, 0.98, 0.90);
-const SUN_INTENSITY : f32 = 4.0;
+const SUN_INTENSITY : f32 = 3.0;
 
 // Sun disc tuning
 const SUN_DISC_ANGULAR_RADIUS : f32 = 0.009;   // ~0.5° in radians (0.0087) + a touch
@@ -178,8 +178,8 @@ const FOG_HEIGHT_FALLOFF : f32 = 0.08;   // larger = fog dies faster with height
 const FOG_MAX_DIST       : f32 = 120.0;  // meters, cap so we don't overdo far marching
 
 // Godrays (volumetric light shafts)
-const GODRAY_MAX_DIST    : f32 = 60.0;
-const GODRAY_STRENGTH    : f32 = 2.0;
+const GODRAY_MAX_DIST    : f32 = 80.0;
+const GODRAY_STRENGTH    : f32 = 3.0;
 
 // Simple hash for jitter (pixel+time)
 fn hash12(p: vec2<f32>) -> f32 {
