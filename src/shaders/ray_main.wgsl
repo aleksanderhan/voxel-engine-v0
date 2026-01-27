@@ -79,11 +79,11 @@ const J3_F : vec2<f32> = vec2<f32>(0.53, 0.59);
 
 // Godray integration
 const GODRAY_TV_CUTOFF : f32 = 0.02;     // stop integrating when view transmittance is very low
-const GODRAY_STEPS_FAST : u32 = 5u;      // cheap fixed step count
+const GODRAY_STEPS_FAST : u32 = 6u;      // cheap fixed step count
 
 // Composite pass
 const COMPOSITE_SHARPEN : f32 = 0.35;    // unsharp-mask amount (0.2..0.6)
-const COMPOSITE_GOD_SCALE : f32 = 1.5;   // overall beam contribution into final color
+const COMPOSITE_GOD_SCALE : f32 = 1.9;   // overall beam contribution into final color
 const COMPOSITE_BEAM_COMPRESS : bool = true; // apply 1-exp(-x) compression to beams
 
 // -----------------------------------------------------------------------------

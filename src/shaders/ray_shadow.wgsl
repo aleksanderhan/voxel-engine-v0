@@ -32,7 +32,7 @@ const SHADOW_STEPS : u32 = 32u; // Max leaf-cube "skips" per chunk interval (har
 
 // If false: leaves cast shadows using their *undisplaced* voxel cube (faster, less accurate).
 // If true : shadows match displaced leaf cubes (slower, but consistent with animated leaf hits).
-const SHADOW_DISPLACED_LEAVES : bool = true;
+const SHADOW_DISPLACED_LEAVES : bool = false;
 
 // -----------------------------------------------------------------------------
 // Per-chunk shadow query (boolean occlusion)
