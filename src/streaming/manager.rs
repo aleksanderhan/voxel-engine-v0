@@ -11,9 +11,11 @@
 // - Always send a BuildDone for every BuildJob that is received by a worker, even if it was canceled.
 //   Otherwise `in_flight` can get "stuck" at MAX_IN_FLIGHT and chunk streaming will halt.
 //
-// Additional perf fix (requested):
+// Additional perf / stall fixes:
 // - Deduplicate and purge stale entries in build_queue.
 // - Only (purge + sort) the queue when the center chunk changes.
+// - Never leave chunks stuck in Building when a job is canceled.
+// - On node arena pressure, evict farthest resident chunks and avoid infinite rebuild/requeue loops.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -38,6 +40,9 @@ const INVALID_U32: u32 = 0xFFFF_FFFF;
 // Vertical band dy in [-1..=2]
 const GRID_Y_MIN_DY: i32 = -1;
 const GRID_Y_COUNT: u32 = 4;
+
+// How many eviction attempts to make when we can't fit a chunk's nodes contiguously.
+const EVICT_ATTEMPTS: usize = 8;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 struct ChunkKey {
@@ -409,12 +414,9 @@ impl ChunkManager {
             // If the job was canceled (either before start or mid-build),
             // the chunk MUST NOT stay in Building forever.
             if done.canceled || done.cancel.load(Ordering::Relaxed) {
-                // If it still exists and is Building, clear it.
-                // (Missing is fine; desired() will re-queue if needed.)
                 if matches!(self.chunks.get(&done.key), Some(ChunkState::Building)) {
                     self.chunks.insert(done.key, ChunkState::Missing);
                 } else if self.chunks.get(&done.key).is_some() {
-                    // Conservative: ensure we don't leave it in a non-retryable state.
                     self.chunks.insert(done.key, ChunkState::Missing);
                 }
                 continue;
@@ -428,9 +430,8 @@ impl ChunkManager {
             }
 
             // Still relevant.
-            self.on_build_done(done.key, done.nodes);
+            self.on_build_done(center, done.key, done.nodes);
         }
-
 
         // If the keep-grid origin would shift, the lookup mapping changes.
         if self.keep_origin_for(center) != self.grid_origin_chunk {
@@ -474,7 +475,37 @@ impl ChunkManager {
         out
     }
 
-    fn on_build_done(&mut self, key: ChunkKey, nodes: Vec<NodeGpu>) {
+    fn evict_one_farthest(&mut self, center: ChunkKey, protect: ChunkKey) -> bool {
+        if self.slot_to_key.is_empty() {
+            return false;
+        }
+
+        let mut best: Option<(f32, ChunkKey)> = None;
+        for &k in &self.slot_to_key {
+            if k == protect {
+                continue;
+            }
+            let dx = (k.x - center.x) as f32;
+            let dz = (k.z - center.z) as f32;
+            let dy = (k.y - center.y) as f32;
+
+            // Weighted distance (favor keeping vertical neighbors).
+            let d = dx * dx + dz * dz + 4.0 * dy * dy;
+
+            if best.map_or(true, |(bd, _)| d > bd) {
+                best = Some((d, k));
+            }
+        }
+
+        if let Some((_, k)) = best {
+            self.unload_chunk(k);
+            return true;
+        }
+
+        false
+    }
+
+    fn on_build_done(&mut self, center: ChunkKey, key: ChunkKey, nodes: Vec<NodeGpu>) {
         // If this chunk got cancelled while the result was in flight, drop it.
         if let Some(c) = self.cancels.get(&key) {
             if c.load(Ordering::Relaxed) {
@@ -483,18 +514,27 @@ impl ChunkManager {
             }
         }
 
-        // Allocate node range.
         let need = nodes.len() as u32;
-        let Some(node_base) = self.arena.alloc(need) else {
-            // Out of arena budget; requeue (make sure it isn't cancelled).
-            self.cancel_token(key).store(false, Ordering::Relaxed);
 
-            self.chunks.insert(key, ChunkState::Queued);
-
-            // Dedup-safe requeue.
-            if self.queued_set.insert(key) {
-                self.build_queue.push_back(key);
+        // Try allocate; if fails, evict farthest chunks and retry a few times.
+        let mut node_base = self.arena.alloc(need);
+        if node_base.is_none() {
+            for _ in 0..EVICT_ATTEMPTS {
+                // If we can't evict anything, stop.
+                if !self.evict_one_farthest(center, key) {
+                    break;
+                }
+                node_base = self.arena.alloc(need);
+                if node_base.is_some() {
+                    break;
+                }
             }
+        }
+
+        let Some(node_base) = node_base else {
+            // Important: do NOT requeue and spin forever rebuilding.
+            // Mark Missing; desired() will re-queue naturally once the system has room.
+            self.chunks.insert(key, ChunkState::Missing);
             return;
         };
 
