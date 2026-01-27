@@ -1,8 +1,8 @@
 // src/config.rs
 pub const CHUNK_SIZE: u32 = 128;
 
-pub const ACTIVE_RADIUS: i32 = 2;
-pub const KEEP_RADIUS: i32 = ACTIVE_RADIUS + 5;
+pub const ACTIVE_RADIUS: i32 = 3;
+pub const KEEP_RADIUS: i32 = ACTIVE_RADIUS + 8;
 
 pub const VOXEL_SIZE_M_F32: f32 = 0.10;
 pub const VOXEL_SIZE_M_F64: f64 = 0.10;

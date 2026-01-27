@@ -31,32 +31,52 @@ pub struct BuildScratch {
     ground: Vec<i32>,
     tree_top: Vec<i32>,
 
-    // 3D (side^3)
-    material: Vec<u32>, // per-voxel material (AIR means empty)
-    solid: Vec<u8>,     // 0/1 occupancy
+    // --- add this ---
+    height_cache: Vec<i32>,
+    height_cache_w: usize,
+    height_cache_h: usize,
 
-    // 3D prefix sum over `solid` with dims=(side+1)^3
+    // 3D (side^3)
+    material: Vec<u32>,
     prefix: Vec<u32>,
 
-    // mip storage (in-place builders)
+    // mip storage
     ground_min_levels: Vec<Vec<i32>>,
     ground_max_levels: Vec<Vec<i32>>,
     tree_levels: Vec<Vec<i32>>,
 }
+
 
 impl BuildScratch {
     pub fn new() -> Self {
         Self {
             ground: Vec::new(),
             tree_top: Vec::new(),
+
+            height_cache: Vec::new(),
+            height_cache_w: 0,
+            height_cache_h: 0,
+
             material: Vec::new(),
-            solid: Vec::new(),
             prefix: Vec::new(),
             ground_min_levels: Vec::new(),
             ground_max_levels: Vec::new(),
             tree_levels: Vec::new(),
         }
     }
+
+    #[inline]
+    fn ensure_height_cache(&mut self, w: usize, h: usize) {
+        let need = w * h;
+        if self.height_cache.len() != need {
+            self.height_cache.resize(need, 0);
+        } else {
+            self.height_cache.fill(0);
+        }
+        self.height_cache_w = w;
+        self.height_cache_h = h;
+    }
+
 
     #[inline]
     fn ensure_2d(v: &mut Vec<i32>, side: usize, fill: i32) {
@@ -70,16 +90,6 @@ impl BuildScratch {
 
     #[inline]
     fn ensure_3d_u32(v: &mut Vec<u32>, side: usize, fill: u32) {
-        let need = side * side * side;
-        if v.len() != need {
-            v.resize(need, fill);
-        } else {
-            v.fill(fill);
-        }
-    }
-
-    #[inline]
-    fn ensure_3d_u8(v: &mut Vec<u8>, side: usize, fill: u8) {
         let need = side * side * side;
         if v.len() != need {
             v.resize(need, fill);
@@ -174,15 +184,16 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     let cache_w = (cache_x1 - cache_x0 + 1) as usize;
     let cache_h = (cache_z1 - cache_z0 + 1) as usize;
 
-    let mut height_cache: Vec<i32> = vec![0; cache_w * cache_h];
+    scratch.ensure_height_cache(cache_w, cache_h);
     for z in 0..cache_h {
         if (z & 15) == 0 && should_cancel(cancel) {
             return Vec::new();
         }
         let wz = cache_z0 + z as i32;
+        let row = z * cache_w;
         for x in 0..cache_w {
             let wx = cache_x0 + x as i32;
-            height_cache[z * cache_w + x] = gen.ground_height(wx, wz);
+            scratch.height_cache[row + x] = gen.ground_height(wx, wz);
         }
     }
 
@@ -192,9 +203,10 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         } else {
             let ix = (wx - cache_x0) as usize;
             let iz = (wz - cache_z0) as usize;
-            height_cache[iz * cache_w + ix]
+            scratch.height_cache[iz * scratch.height_cache_w + ix]
         }
     };
+
 
     // -------------------------------------------------------------------------
     // Tree cache/mask (fast O(1) material lookup)
@@ -302,7 +314,6 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     // Precompute per-voxel material + occupancy (terrain + trees only)
     // -------------------------------------------------------------------------
     BuildScratch::ensure_3d_u32(&mut scratch.material, side, AIR);
-    BuildScratch::ensure_3d_u8(&mut scratch.solid, side, 0);
 
     let dirt_depth = 3 * vpm;
 
@@ -334,7 +345,6 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
                 let i3 = idx3(side, lx as usize, ly as usize, lz as usize);
                 scratch.material[i3] = m;
-                scratch.solid[i3] = if m == AIR { 0 } else { 1 };
             }
         }
     }
@@ -352,7 +362,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         for y in 1..=side {
             let mut run: u32 = 0;
             for x in 1..=side {
-                let v = scratch.solid[idx3(side, x - 1, y - 1, z - 1)] as u32;
+                let v = (scratch.material[idx3(side, x - 1, y - 1, z - 1)] != AIR) as u32;
                 run += v;
 
                 let a = scratch.prefix[pidx(dim, x, y, z - 1)] as i64;

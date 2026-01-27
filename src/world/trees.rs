@@ -1045,17 +1045,7 @@ impl WorldGen {
             let rr0 = b.r0 + (b.r1 - b.r0) * (((i - 1) as f32) * inv);
             let rr1 = b.r0 + (b.r1 - b.r0) * t;
 
-            self.raster_segment_wood(
-                out,
-                px,
-                py,
-                pz,
-                qx,
-                qy,
-                qz,
-                rr0.max(BRANCH_RADIUS_MIN_VOX),
-                rr1.max(BRANCH_RADIUS_MIN_VOX),
-            );
+            Self::raster_segment_wood_capsule_stamps(out, px, py, pz, qx, qy, qz, rr0, rr1);
 
             px = qx;
             py = qy;
@@ -1063,43 +1053,68 @@ impl WorldGen {
         }
     }
 
-    fn raster_segment_wood(
-        &self,
+    fn raster_segment_wood_capsule_stamps(
         out: &mut TreeMaskCache,
-        ax: f32,
-        ay: f32,
-        az: f32,
-        bx: f32,
-        by: f32,
-        bz: f32,
-        r0: f32,
-        r1: f32,
+        ax: f32, ay: f32, az: f32,
+        bx: f32, by: f32, bz: f32,
+        r0: f32, r1: f32,
     ) {
-        let rr = r0.max(r1);
-        let r = rr.ceil() as i32;
+        let vx = bx - ax;
+        let vy = by - ay;
+        let vz = bz - az;
 
-        let minx = (ax.min(bx).floor() as i32 - r).max(out.origin[0]);
-        let maxx = (ax.max(bx).ceil() as i32 + r).min(out.origin[0] + out.size - 1);
-        let miny = (ay.min(by).floor() as i32 - r).max(out.origin[1]);
-        let maxy = (ay.max(by).ceil() as i32 + r).min(out.origin[1] + out.size - 1);
-        let minz = (az.min(bz).floor() as i32 - r).max(out.origin[2]);
-        let maxz = (az.max(bz).ceil() as i32 + r).min(out.origin[2] + out.size - 1);
+        let len2 = vx*vx + vy*vy + vz*vz;
+        if len2 <= 1e-8 {
+            Self::stamp_sphere_wood(out, ax, ay, az, r0.max(r1));
+            return;
+        }
+        let len = len2.sqrt();
+
+        // Step size in voxels. 0.75 tends to be safe (no holes) but not too expensive.
+        let step = 0.75_f32;
+        let n = (len / step).ceil() as i32;
+
+        let inv_n = 1.0 / (n as f32);
+
+        for i in 0..=n {
+            let t = (i as f32) * inv_n;
+            let cx = ax + vx * t;
+            let cy = ay + vy * t;
+            let cz = az + vz * t;
+
+            let r = r0 + (r1 - r0) * t;
+            Self::stamp_sphere_wood(out, cx, cy, cz, r);
+        }
+    }
+
+    fn stamp_sphere_wood(out: &mut TreeMaskCache, cx: f32, cy: f32, cz: f32, r: f32) {
+        let rr = r.max(1.0);
+        let ir = rr.ceil() as i32;
+        let r2 = rr * rr;
+
+        let minx = (cx.floor() as i32 - ir).max(out.origin[0]);
+        let maxx = (cx.ceil()  as i32 + ir).min(out.origin[0] + out.size - 1);
+        let miny = (cy.floor() as i32 - ir).max(out.origin[1]);
+        let maxy = (cy.ceil()  as i32 + ir).min(out.origin[1] + out.size - 1);
+        let minz = (cz.floor() as i32 - ir).max(out.origin[2]);
+        let maxz = (cz.ceil()  as i32 + ir).min(out.origin[2] + out.size - 1);
 
         for y in miny..=maxy {
-            let py = y as f32;
+            let dy = (y as f32) - cy;
+            let dy2 = dy * dy;
             for x in minx..=maxx {
-                let px = x as f32;
+                let dx = (x as f32) - cx;
+                let dx2 = dx * dx;
                 for z in minz..=maxz {
-                    let pz = z as f32;
-                    let (d2, t) = Self::dist2_point_segment(px, py, pz, ax, ay, az, bx, by, bz);
-                    let rr = r0 + (r1 - r0) * t;
-                    if d2 <= rr * rr {
+                    let dz = (z as f32) - cz;
+                    if dx2 + dy2 + dz*dz <= r2 {
                         out.write_wood(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
                     }
                 }
             }
         }
     }
+
 
     // -------------------------------------------------------------------------
     // Leaf rasterization
@@ -1140,10 +1155,6 @@ impl WorldGen {
                 let dx2 = dx * dx;
 
                 for z in minz..=maxz {
-                    if (hash3(seed ^ 0xA11C_E5ED, x, y, z) & gate_mask) != 0 {
-                        continue;
-                    }
-
                     let pz = z as f32;
                     let dz = pz - cz;
                     let d2 = dx2 + dy2 + dz * dz;
@@ -1151,15 +1162,19 @@ impl WorldGen {
                         continue;
                     }
 
-                    let nd = (d2.sqrt() / rr).clamp(0.0, 1.0);
-                    if nd < LEAF_SHELL_THRESH {
-                        // interior: keep only 1/(mask+1)
+                    // gate AFTER sphere test
+                    if (hash3(seed ^ 0xA11C_E5ED, x, y, z) & gate_mask) != 0 {
+                        continue;
+                    }
+
+                    // only now do sqrt + interior/shell hashing
+                    let shell2 = (LEAF_SHELL_THRESH * rr) * (LEAF_SHELL_THRESH * rr);
+                    if d2 < shell2 {
                         let n = hash3(seed ^ 0xCAFE_BABE, x, y, z);
                         if (n & interior_keep_mask) != 0 {
                             continue;
                         }
                     } else {
-                        // shell: drop only 1/(mask+1)
                         let n = hash3(seed ^ 0xD00D_F00D, x, y, z);
                         if (n & shell_drop_mask) == 0 {
                             continue;
