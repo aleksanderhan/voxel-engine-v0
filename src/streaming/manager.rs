@@ -1,4 +1,11 @@
 // src/streaming/manager.rs
+//
+// Chunk streaming + background SVO building.
+//
+// Key perf change (for the renderer optimization pass):
+// - update(...) now returns `bool grid_changed` so the app can skip uploading `chunk_grid`
+//   every frame. We track a `grid_dirty` flag and only rebuild the GPU lookup grid when
+//   something that affects it actually changed (origin shift or resident set / slot moves).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -15,7 +22,6 @@ use crate::{
     svo::{build_chunk_svo_sparse_cancelable_with_scratch, BuildScratch},
     world::WorldGen,
 };
-
 
 use super::NodeArena;
 
@@ -96,7 +102,7 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                     &mut scratch,
                 );
 
-                // If we got cancelled mid-build, drop it (don’t send, saves main-thread work).
+                // If we got cancelled mid-build, drop it (don’t send; saves main-thread work).
                 if job.cancel.load(Ordering::Relaxed) {
                     continue;
                 }
@@ -119,7 +125,7 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
 fn sort_queue_near_first(queue: &mut VecDeque<ChunkKey>, center: ChunkKey, cam_fwd: Vec3) {
     let mut v: Vec<ChunkKey> = queue.drain(..).collect();
 
-    // Horizontal forward (XZ) for “look direction”
+    // Horizontal forward (XZ) for “look direction”.
     let mut f = Vec2::new(cam_fwd.x, cam_fwd.z);
     if f.length_squared() > 1e-6 {
         f = f.normalize();
@@ -139,10 +145,10 @@ fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
     let dz = (k.z - c.z) as f32;
     let dy = (k.y - c.y) as f32;
 
-    // base distance (prefer close)
+    // Base distance (prefer close). Penalize vertical moves more.
     let dist = dx.abs() + dz.abs() + 2.0 * dy.abs();
 
-    // prefer in front (ahead in XZ)
+    // Prefer chunks in front (ahead in XZ).
     let dir = Vec2::new(dx, dz);
     let ahead = if dir.length_squared() > 1e-6 {
         dir.normalize().dot(fwd_xz) // [-1..1]
@@ -150,7 +156,7 @@ fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
         1.0
     };
 
-    // lower score = higher priority
+    // Lower score = higher priority.
     dist - 1.75 * ahead
 }
 
@@ -160,7 +166,7 @@ pub struct ChunkManager {
     chunks: HashMap<ChunkKey, ChunkState>,
     build_queue: VecDeque<ChunkKey>,
 
-    // Per-chunk cancel tokens (A1)
+    // Per-chunk cancel tokens
     cancels: HashMap<ChunkKey, Arc<AtomicBool>>,
 
     tx_job: Sender<BuildJob>,
@@ -171,12 +177,19 @@ pub struct ChunkManager {
     slot_to_key: Vec<ChunkKey>,    // slot -> key
     chunk_meta: Vec<ChunkMetaGpu>, // slot -> meta
     uploads: Vec<ChunkUpload>,     // pending GPU writes this frame
-    changed: bool,                 // still useful for other systems
+
+    // General “something changed” flag (kept for other systems).
+    changed: bool,
+
+    // Grid dirty flag:
+    // - true when the GPU lookup grid needs rebuilding (origin shift or resident slot mapping changed)
+    // - update() returns this so the renderer can skip `write_chunk_grid()` on most frames.
+    grid_dirty: bool,
 
     // Node arena (in units of NodeGpu elements)
     arena: NodeArena,
 
-    // Chunk grid for GPU lookup (same as before)
+    // Chunk grid for GPU lookup: maps grid cell -> resident slot index (or INVALID_U32).
     grid_origin_chunk: [i32; 3],
     grid_dims: [u32; 3],
     chunk_grid: Vec<u32>,
@@ -188,10 +201,10 @@ impl ChunkManager {
         let (tx_done, rx_done) = unbounded::<BuildDone>();
         spawn_workers(gen.clone(), rx_job, tx_done);
 
-        // Arena capacity in NodeGpu elements
+        // Arena capacity in NodeGpu elements.
         let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
 
-        // Grid size (KEEP box)
+        // Grid size (KEEP box).
         let nx = (2 * config::KEEP_RADIUS + 1) as u32;
         let nz = nx;
         let ny = GRID_Y_COUNT;
@@ -210,6 +223,7 @@ impl ChunkManager {
             chunk_meta: Vec::new(),
             uploads: Vec::new(),
             changed: false,
+            grid_dirty: true, // first update should build + upload the grid
 
             arena: NodeArena::new(node_capacity),
 
@@ -219,7 +233,9 @@ impl ChunkManager {
         }
     }
 
-    // -------- public API --------
+    // -------------------------------------------------------------------------
+    // Public API
+    // -------------------------------------------------------------------------
 
     pub fn chunk_count(&self) -> u32 {
         self.slot_to_key.len() as u32
@@ -241,12 +257,18 @@ impl ChunkManager {
         std::mem::take(&mut self.uploads)
     }
 
-    // -------- update --------
+    // -------------------------------------------------------------------------
+    // Streaming update
+    // -------------------------------------------------------------------------
+    //
+    // Returns:
+    // - true  if the chunk_grid mapping changed (origin shift and/or resident slot mapping changed)
+    // - false if chunk_grid is identical to last frame (safe to skip GPU upload)
 
-    pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) {
+    pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
         self.uploads.clear();
 
-        // center chunk (ground-anchored)
+        // Center chunk (ground-anchored).
         let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
         let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
 
@@ -262,11 +284,12 @@ impl ChunkManager {
             z: ccz,
         };
 
+        // Desired vs keep sets.
         let desired = Self::desired_chunks(center, config::ACTIVE_RADIUS);
         let keep = Self::desired_chunks(center, config::KEEP_RADIUS);
         let keep_set: HashSet<ChunkKey> = keep.iter().copied().collect();
 
-        // queue missing desired (reset cancel token to false)
+        // Queue missing desired (reset cancel token to false).
         for k in &desired {
             match self.chunks.get(k) {
                 None | Some(ChunkState::Missing) => {
@@ -280,7 +303,7 @@ impl ChunkManager {
             }
         }
 
-        // unload outside keep (also cancel queued/building)
+        // Unload outside keep (also cancel queued/building).
         {
             let keys_snapshot: Vec<ChunkKey> = self.chunks.keys().copied().collect();
             for k in keys_snapshot {
@@ -290,14 +313,14 @@ impl ChunkManager {
             }
         }
 
-        // dispatch builds (forward-cone priority)
+        // Dispatch builds (forward-cone priority).
         sort_queue_near_first(&mut self.build_queue, center, cam_fwd);
 
         while self.in_flight < config::MAX_IN_FLIGHT {
             let Some(k) = self.build_queue.pop_front() else { break; };
 
             if !keep_set.contains(&k) {
-                // cancel if it was pending
+                // Cancel if it was pending.
                 self.cancel_token(k).store(true, Ordering::Relaxed);
                 self.chunks.insert(k, ChunkState::Missing);
                 continue;
@@ -319,37 +342,53 @@ impl ChunkManager {
                 {
                     self.in_flight += 1;
                 } else {
+                    // Channel closed; keep it queued.
                     self.chunks.insert(k, ChunkState::Queued);
                     break;
                 }
             }
         }
 
-        // harvest done
+        // Harvest done builds.
         while let Ok(done) = self.rx_done.try_recv() {
             if self.in_flight > 0 {
                 self.in_flight -= 1;
             }
 
-            // if cancelled after completion, drop
+            // If cancelled after completion, drop.
             if done.cancel.load(Ordering::Relaxed) {
                 continue;
             }
 
             if !keep_set.contains(&done.key) {
-                // drop build result, also mark cancelled to avoid late reuse
+                // Drop build result, also mark cancelled to avoid late reuse.
                 self.cancel_token(done.key).store(true, Ordering::Relaxed);
                 self.chunks.insert(done.key, ChunkState::Missing);
                 continue;
             }
 
-            // still relevant
+            // Still relevant.
             self.on_build_done(done.key, done.nodes);
         }
 
-        // rebuild grid mapping for current KEEP region
-        self.rebuild_grid(center);
+        // If the keep-grid origin would shift, the lookup mapping changes.
+        if self.keep_origin_for(center) != self.grid_origin_chunk {
+            self.grid_dirty = true;
+        }
+
+        // Rebuild grid mapping for current KEEP region only when needed.
+        let grid_changed = self.grid_dirty;
+        if self.grid_dirty {
+            self.rebuild_grid(center);
+            self.grid_dirty = false;
+        }
+
+        grid_changed
     }
+
+    // -------------------------------------------------------------------------
+    // Internals
+    // -------------------------------------------------------------------------
 
     fn cancel_token(&mut self, key: ChunkKey) -> Arc<AtomicBool> {
         self.cancels
@@ -375,7 +414,7 @@ impl ChunkManager {
     }
 
     fn on_build_done(&mut self, key: ChunkKey, nodes: Vec<NodeGpu>) {
-        // if this chunk got cancelled while the result was in flight, drop it
+        // If this chunk got cancelled while the result was in flight, drop it.
         if let Some(c) = self.cancels.get(&key) {
             if c.load(Ordering::Relaxed) {
                 self.chunks.insert(key, ChunkState::Missing);
@@ -383,10 +422,10 @@ impl ChunkManager {
             }
         }
 
-        // allocate node range
+        // Allocate node range.
         let need = nodes.len() as u32;
         let Some(node_base) = self.arena.alloc(need) else {
-            // out of arena budget; requeue (make sure it isn't cancelled)
+            // Out of arena budget; requeue (make sure it isn't cancelled).
             self.cancel_token(key).store(false, Ordering::Relaxed);
 
             self.chunks.insert(key, ChunkState::Queued);
@@ -394,7 +433,7 @@ impl ChunkManager {
             return;
         };
 
-        // allocate slot (dense)
+        // Allocate slot (dense).
         let slot = self.slot_to_key.len() as u32;
         self.slot_to_key.push(key);
 
@@ -414,7 +453,7 @@ impl ChunkManager {
 
         self.chunk_meta.push(meta);
 
-        // mark resident
+        // Mark resident.
         self.chunks.insert(
             key,
             ChunkState::Resident(Resident {
@@ -424,7 +463,7 @@ impl ChunkManager {
             }),
         );
 
-        // schedule GPU upload (nodes + meta)
+        // Schedule GPU upload (nodes + meta).
         self.uploads.push(ChunkUpload {
             slot,
             meta,
@@ -432,6 +471,8 @@ impl ChunkManager {
             nodes,
         });
 
+        // Resident set changed => grid mapping may change.
+        self.grid_dirty = true;
         self.changed = true;
     }
 
@@ -440,10 +481,10 @@ impl ChunkManager {
 
         match *state {
             ChunkState::Resident(res) => {
-                // free node arena range
+                // Free node arena range.
                 self.arena.free(res.node_base, res.node_count);
 
-                // remove slot densely by swap-remove
+                // Remove slot densely by swap-remove.
                 let dead_slot = res.slot as usize;
                 let last_slot = self.slot_to_key.len().saturating_sub(1);
 
@@ -451,18 +492,18 @@ impl ChunkManager {
                     let moved_key = self.slot_to_key[last_slot];
                     self.slot_to_key[dead_slot] = moved_key;
 
-                    // move meta
+                    // Move meta.
                     let moved_meta = self.chunk_meta[last_slot];
                     self.chunk_meta[dead_slot] = moved_meta;
 
-                    // update moved chunk's Resident.slot
+                    // Update moved chunk's Resident.slot.
                     if let Some(state) = self.chunks.get_mut(&moved_key) {
                         if let ChunkState::Resident(mr) = state {
                             mr.slot = dead_slot as u32;
                         }
                     }
 
-                    // schedule meta rewrite for moved slot
+                    // Schedule meta rewrite for moved slot (GPU needs updated slot meta).
                     self.uploads.push(ChunkUpload {
                         slot: dead_slot as u32,
                         meta: self.chunk_meta[dead_slot],
@@ -475,14 +516,21 @@ impl ChunkManager {
                 self.chunk_meta.pop();
 
                 self.chunks.insert(key, ChunkState::Missing);
+
+                // Slot mapping changed => grid mapping changed.
+                self.grid_dirty = true;
                 self.changed = true;
             }
 
             ChunkState::Queued | ChunkState::Building => {
-                // cancel work in-flight
+                // Cancel work in-flight.
                 self.cancel_token(key).store(true, Ordering::Relaxed);
 
                 self.chunks.insert(key, ChunkState::Missing);
+
+                // Even though it wasn't resident, this often correlates with resident churn;
+                // mark dirty conservatively (cheap).
+                self.grid_dirty = true;
                 self.changed = true;
             }
 
@@ -490,6 +538,19 @@ impl ChunkManager {
         }
     }
 
+    /// Compute the KEEP-grid origin for a given center (helper so we can detect origin shifts).
+    #[inline]
+    fn keep_origin_for(&self, center: ChunkKey) -> [i32; 3] {
+        let ox = center.x - config::KEEP_RADIUS;
+        let oz = center.z - config::KEEP_RADIUS;
+        let oy = center.y + GRID_Y_MIN_DY;
+        [ox, oy, oz]
+    }
+
+    /// Rebuild the chunk_grid mapping for the current KEEP volume.
+    ///
+    /// This is intentionally called only when `grid_dirty` is set, because it is O(ncells + nchunks)
+    /// and it forces a full GPU upload if you do it every frame.
     fn rebuild_grid(&mut self, center: ChunkKey) {
         let nx = (2 * config::KEEP_RADIUS + 1) as u32;
         let nz = nx;
@@ -497,11 +558,7 @@ impl ChunkManager {
 
         self.grid_dims = [nx, ny, nz];
 
-        let ox = center.x - config::KEEP_RADIUS;
-        let oz = center.z - config::KEEP_RADIUS;
-        let oy = center.y + GRID_Y_MIN_DY;
-
-        self.grid_origin_chunk = [ox, oy, oz];
+        self.grid_origin_chunk = self.keep_origin_for(center);
 
         let needed = (nx * ny * nz) as usize;
         if self.chunk_grid.len() != needed {
@@ -509,7 +566,7 @@ impl ChunkManager {
         }
         self.chunk_grid.fill(INVALID_U32);
 
-        // Fill grid from resident chunks (slot -> key)
+        // Fill grid from resident chunks (slot -> key).
         for (slot, &k) in self.slot_to_key.iter().enumerate() {
             if let Some(idx) = self.grid_index_for_chunk(k) {
                 self.chunk_grid[idx] = slot as u32;
