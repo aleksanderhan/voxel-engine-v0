@@ -1,148 +1,86 @@
 // ray_core.wgsl
 //
-// Core SVO queries + primary traversal helpers.
-//
-// This file provides the "inner loop" building blocks for ray traversal through a chunk:
-// - safe inverse for ray directions (avoid INF/NaN on near-zero components)
-// - point query into an SVO (query_leaf_at): returns the leaf cell containing a point
-// - fast "skip" step: compute when a ray exits the current cell (exit_time_from_cube_inv)
-// - chunk tracing loop over a trusted [t_enter, t_exit] interval
-// - AABB hit with stable normal selection (aabb_hit_normal_inv)
-//
-// Assumptions / dependencies:
-// - Uses globals from common.wgsl: BIG_F32, EPS_INV, LEAF_U32, cam, nodes, child_rank, ChunkMeta.
-// - Uses leaf_displaced_cube_hit() for animated/displaced materials (material id 5).
-// - All distances are in world meters; voxel_size comes from cam.voxel_params.x.
+// Consolidated core:
+// - SVO queries + hybrid traversal
+// - Leaf wind + displaced hit
+// - Shadows + sun transmittance
+// - Material palette + shading
 
-// -----------------------------------------------------------------------------
-// Numeric helpers
-// -----------------------------------------------------------------------------
+// Depends on: common.wgsl (constants, structs, bindings, helpers)
 
-/// Safe reciprocal for ray directions.
-///
-/// If |x| is extremely small, return a large finite value instead of 1/x.
-/// This avoids INF/NaN in subsequent multiply-based intersection math.
 fn safe_inv(x: f32) -> f32 {
   return select(1.0 / x, BIG_F32, abs(x) < EPS_INV);
 }
 
-// -----------------------------------------------------------------------------
+// ------------------------------------------------------------
 // Leaf query: point -> leaf cell in SVO
-// -----------------------------------------------------------------------------
+// ------------------------------------------------------------
 
-/// Result of querying the SVO at a point.
-///
-/// bmin/size describe the axis-aligned cube that contains the point.
-/// mat is the leaf material (0 means empty).
 struct LeafQuery {
-  bmin : vec3<f32>, // cube minimum corner in world meters
-  size : f32,       // cube edge length in world meters
-  mat  : u32,       // material id; 0 = empty/air
+  bmin : vec3<f32>,
+  size : f32,
+  mat  : u32,
 };
 
-/// Walk the SVO to find the leaf cell that contains point `p_in`.
-///
-/// Inputs:
-/// - p_in       : query point in world meters
-/// - root_bmin  : chunk root cube minimum in world meters
-/// - root_size  : chunk root cube size in world meters
-/// - node_base  : base index into the global `nodes` arena for this chunk
-///
-/// Behavior:
-/// - Descends up to 32 levels.
-/// - Uses a half-open split rule so points on split planes go to the "lower" child
-///   (helps prevent flicker due to tie ambiguity).
-/// - If a desired child doesn't exist in child_mask, returns that child cell as empty.
-/// - If the cell becomes smaller than `min_leaf` (voxel_size), returns empty as a guard.
 fn query_leaf_at(
   p_in: vec3<f32>,
   root_bmin: vec3<f32>,
   root_size: f32,
   node_base: u32
 ) -> LeafQuery {
-  // Current node index in the nodes arena.
   var idx: u32 = node_base;
-
-  // Current cube bounds as we descend.
   var bmin: vec3<f32> = root_bmin;
   var size: f32 = root_size;
 
-  // Minimum leaf size (one voxel in world meters).
   let min_leaf: f32 = cam.voxel_params.x;
-
-  // Local copy (we sometimes tweak the point slightly to avoid ties).
   var p = p_in;
 
-  // Hard cap depth to avoid infinite loops on corrupt data.
   for (var d: u32 = 0u; d < 32u; d = d + 1u) {
     let n = nodes[idx];
 
-    // Leaf node: material stored directly in node.
     if (n.child_base == LEAF_U32) {
       return LeafQuery(bmin, size, n.material);
     }
 
-    // Safety: if we got smaller than a voxel, stop descending and treat as empty.
     if (size <= min_leaf) {
-      return LeafQuery(bmin, size, 0u);
+      return LeafQuery(bmin, size, MAT_AIR);
     }
 
-    // Split cube into 8 octants.
     let half = size * 0.5;
     let mid  = bmin + vec3<f32>(half);
 
-    // Epsilon proportional to cell size to stabilize comparisons near split planes.
     let e = 1e-6 * size;
 
-    // HALF-OPEN child selection:
-    // Only strictly greater than mid + e goes to the "upper" half; ties stay in lower.
     let hx = select(0u, 1u, p.x > mid.x + e);
     let hy = select(0u, 1u, p.y > mid.y + e);
     let hz = select(0u, 1u, p.z > mid.z + e);
-    let ci = hx | (hy << 1u) | (hz << 2u); // child index 0..7
+    let ci = hx | (hy << 1u) | (hz << 2u);
 
-    // Compute selected child cube minimum.
     let child_bmin = bmin + vec3<f32>(
       select(0.0, half, hx != 0u),
       select(0.0, half, hy != 0u),
       select(0.0, half, hz != 0u)
     );
 
-    // If this child doesn't exist, it's empty.
     let bit = 1u << ci;
     if ((n.child_mask & bit) == 0u) {
-      return LeafQuery(child_bmin, half, 0u);
+      return LeafQuery(child_bmin, half, MAT_AIR);
     }
 
-    // Compact child list addressing:
-    // rank = number of set bits below ci, giving offset into compact array.
     let rank = child_rank(n.child_mask, ci);
-
-    // Move to the child node:
-    // idx = node_base + (child_base + rank)
-    // (child_base is stored relative to node_base for this chunk.)
     idx = node_base + (n.child_base + rank);
 
-    // Update cube bounds for next iteration.
     bmin = child_bmin;
     size = half;
   }
 
-  // If we hit the depth cap, treat as empty.
-  return LeafQuery(bmin, size, 0u);
+  return LeafQuery(bmin, size, MAT_AIR);
 }
 
-// -----------------------------------------------------------------------------
-// Fast stepping: "skip to exit" time for the current cube
-// -----------------------------------------------------------------------------
+// ------------------------------------------------------------
+// Fast stepping: cube exit time with inv dir
+// ------------------------------------------------------------
 
-/// Compute the parametric t where the ray exits an axis-aligned cube.
-///
-/// Uses precomputed inv direction for speed and numerical consistency.
-/// This is used as a "skip" step when the current cell is empty (or misses).
-///
-/// Note:
-/// - This returns the *earliest* crossing among x/y/z exit planes along the ray direction.
 fn exit_time_from_cube_inv(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -152,161 +90,23 @@ fn exit_time_from_cube_inv(
 ) -> f32 {
   let bmax = bmin + vec3<f32>(size);
 
-  // For each axis, choose the far plane in the direction we travel.
-  // If rd.x > 0 => exiting plane is bmax.x else bmin.x, etc.
   let tx = (select(bmin.x, bmax.x, rd.x > 0.0) - ro.x) * inv.x;
   let ty = (select(bmin.y, bmax.y, rd.y > 0.0) - ro.y) * inv.y;
   let tz = (select(bmin.z, bmax.z, rd.z > 0.0) - ro.z) * inv.z;
 
-  // Earliest exit among axes.
   return min(tx, min(ty, tz));
 }
 
-// -----------------------------------------------------------------------------
-// Chunk tracing: hybrid point-query + interval stepping
-// -----------------------------------------------------------------------------
-
-/// Hit record returned by tracing within a chunk.
-struct HitGeom {
-  hit : bool,      // true if a surface was hit
-  t   : f32,       // ray parameter at hit
-  mat : u32,       // material id
-  n   : vec3<f32>, // geometric normal (axis-aligned for cubes; custom for displaced)
-};
-
-/// Trace a ray through a single chunk over a trusted interval [t_enter, t_exit].
-///
-/// Strategy:
-/// - March along the ray, but at each step query the SVO leaf cell containing the point.
-/// - If the cell is empty, jump directly to the cell's exit time (fast skip).
-/// - If the cell is solid, compute a stable AABB entry time + normal within the trusted interval.
-/// - Special case: material 5 is "displaced cube" (animated surface) and uses a specialized hit test.
-///
-/// Why "trusted interval":
-/// Typically you first intersect the ray with the chunk's root AABB, yielding [t_enter, t_exit].
-/// All subsequent hits are constrained to that interval to prevent neighbors/precision issues.
-fn trace_chunk_hybrid_interval(
-  ro: vec3<f32>,
-  rd: vec3<f32>,
-  ch: ChunkMeta,
-  t_enter: f32,
-  t_exit: f32
-) -> HitGeom {
-  // World-space size of one voxel.
-  let voxel_size = cam.voxel_params.x;
-
-  // Chunk root cube in world meters.
-  let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
-  let root_bmin = root_bmin_vox * voxel_size;
-  let root_size = f32(cam.chunk_size) * voxel_size;
-
-  // Small positive nudge along the ray to avoid getting stuck on boundaries.
-  // Must be tiny; too large pushes you into neighbor cells.
-  let eps_step = 1e-4 * voxel_size;
-
-  // Start at the interval entry, clamped to t>=0, with a small forward nudge.
-  var tcur = max(t_enter, 0.0) + eps_step;
-
-  // Precompute inv direction for intersection/exit math.
-  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
-
-  // Main stepping loop: bounded by cam.max_steps.
-  for (var step_i: u32 = 0u; step_i < cam.max_steps; step_i = step_i + 1u) {
-    if (tcur > t_exit) { break; }
-
-    // Current point on ray.
-    // We query a slightly-forward point (pq) to avoid split-plane ties.
-    let p  = ro + tcur * rd;
-    let pq = p + rd * (1e-4 * voxel_size);
-
-    // SVO point query: which leaf cell are we in, and what is its material?
-    let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base);
-
-    // Non-empty cell: try to produce an actual surface hit.
-    if (q.mat != 0u) {
-      // ----- Special material: displaced cube (animated surface) -----
-      //
-      // Instead of using the undisplaced AABB, we delegate to a function that
-      // models displacement over time and returns hit time and normal.
-      if (q.mat == 5u) {
-        let time_s   = cam.voxel_params.y;
-        let strength = cam.voxel_params.z;
-
-        // Use the full trusted interval, not just local tcur, for robust intersection.
-        let h2 = leaf_displaced_cube_hit(
-          ro, rd,
-          q.bmin, q.size,
-          time_s, strength,
-          t_enter,
-          t_exit
-        );
-
-        if (h2.hit) {
-          return HitGeom(true, h2.t, 5u, h2.n);
-        }
-
-        // Displaced surface missed inside this cell. Treat it as empty and skip out.
-        let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
-        tcur = max(t_leave, tcur) + eps_step;
-        continue;
-      }
-
-      // ----- Solid (undisplaced) cube hit -----
-      //
-      // Compute entry time and a stable face normal within [t_enter, t_exit].
-      let bh = aabb_hit_normal_inv(
-        ro, rd, inv,
-        q.bmin, q.size,
-        t_enter,
-        t_exit
-      );
-
-      if (bh.hit) {
-        return HitGeom(true, bh.t, q.mat, bh.n);
-      }
-
-      // If we didn't get a valid hit in the trusted interval (should be rare),
-      // treat it like empty and skip out of the cell to keep forward progress.
-      let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
-      tcur = max(t_leave, tcur) + eps_step;
-      continue;
-    }
-
-    // Empty cell: skip directly to the cell exit time (fast traversal).
-    let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
-    tcur = max(t_leave, tcur) + eps_step;
-  }
-
-  // No hit within step budget / interval.
-  return HitGeom(false, BIG_F32, 0u, vec3<f32>(0.0));
-}
-
-// -----------------------------------------------------------------------------
+// ------------------------------------------------------------
 // AABB hit + stable normal selection
-// -----------------------------------------------------------------------------
+// ------------------------------------------------------------
 
-/// Box hit record used for solid cube intersection.
 struct BoxHit {
   hit : bool,
-  t   : f32,       // entry time (clamped to t_min)
-  n   : vec3<f32>, // chosen face normal
+  t   : f32,
+  n   : vec3<f32>,
 };
 
-/// AABB intersection using precomputed inv direction, plus a stable normal.
-///
-/// Inputs:
-/// - ro/rd/inv: ray origin, direction, and safe inverse direction
-/// - bmin/size: cube definition
-/// - t_min/t_max: trusted interval clamp
-///
-/// Returns:
-/// - hit=false if the AABB interval does not overlap [t_min, t_max]
-/// - otherwise hit=true, t = clamped entry time, n = stable face normal
-///
-/// Normal stability:
-/// - In edge/corner hits, multiple slabs can produce the same t_enter.
-/// - We choose the axis most aligned with the ray (largest |rd|) among tied slabs,
-///   which tends to reduce flickery axis switching when grazing edges.
 fn aabb_hit_normal_inv(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -318,7 +118,6 @@ fn aabb_hit_normal_inv(
 ) -> BoxHit {
   let bmax = bmin + vec3<f32>(size);
 
-  // Slab times along each axis (two planes per axis).
   let tx0 = (bmin.x - ro.x) * inv.x;
   let tx1 = (bmax.x - ro.x) * inv.x;
   let ty0 = (bmin.y - ro.y) * inv.y;
@@ -333,47 +132,561 @@ fn aabb_hit_normal_inv(
   let tminz = min(tz0, tz1);
   let tmaxz = max(tz0, tz1);
 
-  // Combined interval across axes.
   let t_enter = max(tminx, max(tminy, tminz));
   let t_exit  = min(tmaxx, min(tmaxy, tmaxz));
 
-  // Clamp entry time to trusted interval start.
   let t0 = max(t_enter, t_min);
 
-  // Reject if the AABB interval doesn't overlap the trusted [t_min, t_max].
   if (t_exit < t0 || t0 > t_max) {
     return BoxHit(false, BIG_F32, vec3<f32>(0.0));
   }
 
-  // Pick which slab produced t_enter with epsilon and a stable tie-break.
   let eps = 1e-6 * size;
 
-  var n = vec3<f32>(0.0);
-
-  // best_abs tracks the largest |rd.axis| among tied candidate slabs.
   var best_abs = -1.0;
-  var pick: u32 = 0u; // 0=x, 1=y, 2=z
+  var pick: u32 = 0u;
 
-  // Candidate: X slab
   if (abs(t_enter - tminx) <= eps) {
     let a = abs(rd.x);
     if (a > best_abs) { best_abs = a; pick = 0u; }
   }
-  // Candidate: Y slab
   if (abs(t_enter - tminy) <= eps) {
     let a = abs(rd.y);
     if (a > best_abs) { best_abs = a; pick = 1u; }
   }
-  // Candidate: Z slab
   if (abs(t_enter - tminz) <= eps) {
     let a = abs(rd.z);
     if (a > best_abs) { best_abs = a; pick = 2u; }
   }
 
-  // Normal points against the ray direction (entering face).
+  var n = vec3<f32>(0.0);
   if (pick == 0u) { n = vec3<f32>(select( 1.0, -1.0, rd.x > 0.0), 0.0, 0.0); }
   if (pick == 1u) { n = vec3<f32>(0.0, select( 1.0, -1.0, rd.y > 0.0), 0.0); }
   if (pick == 2u) { n = vec3<f32>(0.0, 0.0, select( 1.0, -1.0, rd.z > 0.0)); }
 
   return BoxHit(true, t0, n);
+}
+
+// ------------------------------------------------------------
+// Leaf wind field + displaced cube hit
+// ------------------------------------------------------------
+
+fn hash1(p: vec3<f32>) -> f32 {
+  let h = dot(p, vec3<f32>(127.1, 311.7, 74.7));
+  return fract(sin(h) * 43758.5453);
+}
+
+fn wind_field(pos_m: vec3<f32>, t: f32) -> vec3<f32> {
+  let cell = floor(pos_m * WIND_CELL_FREQ);
+
+  let ph0 = hash1(cell);
+  let ph1 = hash1(cell + WIND_PHASE_OFF_1);
+
+  let dir = normalize(WIND_DIR_XZ);
+
+  let h = clamp((pos_m.y - WIND_RAMP_Y0) / max(WIND_RAMP_Y1 - WIND_RAMP_Y0, 1e-3), 0.0, 1.0);
+
+  let gust = sin(
+    t * WIND_GUST_TIME_FREQ +
+    dot(pos_m.xz, WIND_GUST_XZ_FREQ) +
+    ph0 * TAU
+  );
+
+  let flutter = sin(
+    t * WIND_FLUTTER_TIME_FREQ +
+    dot(pos_m.xz, WIND_FLUTTER_XZ_FREQ) +
+    ph1 * TAU
+  );
+
+  let xz = dir * (WIND_GUST_WEIGHT * gust + WIND_FLUTTER_WEIGHT * flutter) * h;
+  let y  = WIND_VERTICAL_SCALE * flutter * h;
+
+  return vec3<f32>(xz.x, y, xz.y);
+}
+
+fn clamp_len(v: vec3<f32>, max_len: f32) -> vec3<f32> {
+  let l2 = dot(v, v);
+  if (l2 <= max_len * max_len) { return v; }
+  return v * (max_len / sqrt(l2));
+}
+
+fn leaf_cube_offset(bmin: vec3<f32>, size: f32, time_s: f32, strength: f32) -> vec3<f32> {
+  let center = bmin + vec3<f32>(0.5 * size);
+
+  var w = wind_field(center, time_s) * strength;
+  w = vec3<f32>(w.x, LEAF_VERTICAL_REDUCE * w.y, w.z);
+
+  let amp = LEAF_OFFSET_AMP * size;
+  return clamp_len(w * amp, LEAF_OFFSET_MAX_FRAC * size);
+}
+
+struct LeafCubeHit {
+  hit  : bool,
+  t    : f32,
+  n    : vec3<f32>,
+};
+
+fn leaf_displaced_cube_hit(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  bmin: vec3<f32>,
+  size: f32,
+  time_s: f32,
+  strength: f32,
+  t_min: f32,
+  t_max: f32
+) -> LeafCubeHit {
+  let off   = leaf_cube_offset(bmin, size, time_s, strength);
+  let bmin2 = bmin + off;
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let bh  = aabb_hit_normal_inv(ro, rd, inv, bmin2, size, t_min, t_max);
+
+  return LeafCubeHit(bh.hit, bh.t, bh.n);
+}
+
+// ------------------------------------------------------------
+// Chunk tracing: hybrid point-query + interval stepping
+// ------------------------------------------------------------
+
+struct HitGeom {
+  hit : bool,
+  t   : f32,
+  mat : u32,
+  n   : vec3<f32>,
+};
+
+fn trace_chunk_hybrid_interval(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  ch: ChunkMeta,
+  t_enter: f32,
+  t_exit: f32
+) -> HitGeom {
+  let voxel_size = cam.voxel_params.x;
+
+  let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
+  let root_bmin = root_bmin_vox * voxel_size;
+  let root_size = f32(cam.chunk_size) * voxel_size;
+
+  let eps_step = 1e-4 * voxel_size;
+
+  var tcur = max(t_enter, 0.0) + eps_step;
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  for (var step_i: u32 = 0u; step_i < cam.max_steps; step_i = step_i + 1u) {
+    if (tcur > t_exit) { break; }
+
+    let p  = ro + tcur * rd;
+    let pq = p + rd * (1e-4 * voxel_size);
+
+    let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base);
+
+    if (q.mat != MAT_AIR) {
+      if (q.mat == MAT_LEAF) {
+        let time_s   = cam.voxel_params.y;
+        let strength = cam.voxel_params.z;
+
+        let h2 = leaf_displaced_cube_hit(
+          ro, rd,
+          q.bmin, q.size,
+          time_s, strength,
+          t_enter,
+          t_exit
+        );
+
+        if (h2.hit) {
+          return HitGeom(true, h2.t, MAT_LEAF, h2.n);
+        }
+
+        let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
+        tcur = max(t_leave, tcur) + eps_step;
+        continue;
+      }
+
+      let bh = aabb_hit_normal_inv(
+        ro, rd, inv,
+        q.bmin, q.size,
+        t_enter,
+        t_exit
+      );
+
+      if (bh.hit) {
+        return HitGeom(true, bh.t, q.mat, bh.n);
+      }
+
+      let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
+      tcur = max(t_leave, tcur) + eps_step;
+      continue;
+    }
+
+    let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
+    tcur = max(t_leave, tcur) + eps_step;
+  }
+
+  return HitGeom(false, BIG_F32, MAT_AIR, vec3<f32>(0.0));
+}
+
+// ------------------------------------------------------------
+// Shadow traversal
+// ------------------------------------------------------------
+
+fn trace_chunk_shadow_interval(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  ch: ChunkMeta,
+  t_enter: f32,
+  t_exit: f32
+) -> bool {
+  let voxel_size = cam.voxel_params.x;
+  let nudge_s = 0.18 * voxel_size;
+
+  let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
+  let root_bmin = root_bmin_vox * voxel_size;
+  let root_size = f32(cam.chunk_size) * voxel_size;
+
+  var tcur = max(t_enter, 0.0) + nudge_s;
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  for (var step_i: u32 = 0u; step_i < SHADOW_STEPS; step_i = step_i + 1u) {
+    if (tcur > t_exit) { break; }
+
+    let p = ro + tcur * rd;
+    let q = query_leaf_at(p, root_bmin, root_size, ch.node_base);
+
+    if (q.mat != MAT_AIR) {
+      if (q.mat == MAT_LEAF) {
+        if (!SHADOW_DISPLACED_LEAVES) {
+          return true;
+        }
+
+        let time_s   = cam.voxel_params.y;
+        let strength = cam.voxel_params.z;
+
+        let h2 = leaf_displaced_cube_hit(
+          ro, rd,
+          q.bmin, q.size,
+          time_s, strength,
+          tcur - nudge_s,
+          t_exit
+        );
+
+        if (h2.hit) { return true; }
+
+        let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
+        tcur = max(t_leave, tcur) + nudge_s;
+        continue;
+      }
+
+      return true;
+    }
+
+    let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
+    tcur = max(t_leave, tcur) + nudge_s;
+  }
+
+  return false;
+}
+
+fn in_shadow(p: vec3<f32>, sun_dir: vec3<f32>) -> bool {
+  let voxel_size   = cam.voxel_params.x;
+  let nudge_s      = 0.18 * voxel_size;
+  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
+
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+
+  let grid_bmin = vec3<f32>(
+    f32(go.x) * chunk_size_m,
+    f32(go.y) * chunk_size_m,
+    f32(go.z) * chunk_size_m
+  );
+
+  let grid_bmax = grid_bmin + vec3<f32>(
+    f32(gd.x) * chunk_size_m,
+    f32(gd.y) * chunk_size_m,
+    f32(gd.z) * chunk_size_m
+  );
+
+  let bias = max(SHADOW_BIAS, 0.50 * voxel_size);
+  let ro   = p + sun_dir * bias;
+  let rd   = sun_dir;
+
+  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  let t_enter = max(rtg.x, 0.0);
+  let t_exit  = rtg.y;
+  if (t_exit < t_enter) { return false; }
+
+  let start_t = t_enter + nudge_s;
+  let p0 = ro + start_t * rd;
+
+  var t_local: f32 = 0.0;
+  let t_exit_local = max(t_exit - start_t, 0.0);
+
+  var c = chunk_coord_from_pos(p0, chunk_size_m);
+  var cx: i32 = c.x;
+  var cy: i32 = c.y;
+  var cz: i32 = c.z;
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  let step_x: i32 = select(-1, 1, rd.x > 0.0);
+  let step_y: i32 = select(-1, 1, rd.y > 0.0);
+  let step_z: i32 = select(-1, 1, rd.z > 0.0);
+
+  let bx = select(f32(cx) * chunk_size_m, f32(cx + 1) * chunk_size_m, rd.x > 0.0);
+  let by = select(f32(cy) * chunk_size_m, f32(cy + 1) * chunk_size_m, rd.y > 0.0);
+  let bz = select(f32(cz) * chunk_size_m, f32(cz + 1) * chunk_size_m, rd.z > 0.0);
+
+  var tMaxX: f32 = (bx - p0.x) * inv.x;
+  var tMaxY: f32 = (by - p0.y) * inv.y;
+  var tMaxZ: f32 = (bz - p0.z) * inv.z;
+
+  let tDeltaX: f32 = abs(chunk_size_m * inv.x);
+  let tDeltaY: f32 = abs(chunk_size_m * inv.y);
+  let tDeltaZ: f32 = abs(chunk_size_m * inv.z);
+
+  if (abs(rd.x) < EPS_INV) { tMaxX = BIG_F32; }
+  if (abs(rd.y) < EPS_INV) { tMaxY = BIG_F32; }
+  if (abs(rd.z) < EPS_INV) { tMaxZ = BIG_F32; }
+
+  let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 1024u);
+
+  for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
+    if (t_local > t_exit_local) { break; }
+
+    let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
+
+    let slot = grid_lookup_slot(cx, cy, cz);
+    if (slot != INVALID_U32 && slot < cam.chunk_count) {
+      let ch = chunks[slot];
+
+      let cell_enter = start_t + t_local;
+      let cell_exit  = start_t + min(tNextLocal, t_exit_local);
+
+      if (trace_chunk_shadow_interval(ro, rd, ch, cell_enter, cell_exit)) {
+        return true;
+      }
+    }
+
+    if (tMaxX < tMaxY) {
+      if (tMaxX < tMaxZ) { cx += step_x; t_local = tMaxX; tMaxX += tDeltaX; }
+      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
+    } else {
+      if (tMaxY < tMaxZ) { cy += step_y; t_local = tMaxY; tMaxY += tDeltaY; }
+      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
+    }
+
+    let ox = cam.grid_origin_chunk.x;
+    let oy = cam.grid_origin_chunk.y;
+    let oz = cam.grid_origin_chunk.z;
+
+    let nx = i32(cam.grid_dims.x);
+    let ny = i32(cam.grid_dims.y);
+    let nz = i32(cam.grid_dims.z);
+
+    if (cx < ox || cy < oy || cz < oz || cx >= ox + nx || cy >= oy + ny || cz >= oz + nz) {
+      break;
+    }
+  }
+
+  return false;
+}
+
+fn trace_chunk_shadow_trans_interval(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  ch: ChunkMeta,
+  t_enter: f32,
+  t_exit: f32
+) -> f32 {
+  let voxel_size = cam.voxel_params.x;
+  let nudge_s = 0.18 * voxel_size;
+
+  let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
+  let root_bmin = root_bmin_vox * voxel_size;
+  let root_size = f32(cam.chunk_size) * voxel_size;
+
+  var tcur = max(t_enter, 0.0) + nudge_s;
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  var trans = 1.0;
+
+  for (var step_i: u32 = 0u; step_i < VSM_STEPS; step_i = step_i + 1u) {
+    if (tcur > t_exit) { break; }
+    if (trans < MIN_TRANS) { break; }
+
+    let p = ro + tcur * rd;
+    let qeps = 1e-4 * cam.voxel_params.x;
+    let pq   = p + rd * qeps;
+
+    let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base);
+
+    if (q.mat != MAT_AIR) {
+      if (q.mat == MAT_LEAF) {
+        trans *= LEAF_LIGHT_TRANSMIT;
+        let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
+        tcur = max(t_leave, tcur) + nudge_s;
+        continue;
+      }
+      return 0.0;
+    }
+
+    let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
+    tcur = max(t_leave, tcur) + nudge_s;
+  }
+
+  return trans;
+}
+
+fn sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+  let Tc = cloud_sun_transmittance(p, sun_dir);
+
+  let voxel_size   = cam.voxel_params.x;
+  let nudge_s      = 0.18 * voxel_size;
+  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
+
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+
+  let grid_bmin = vec3<f32>(
+    f32(go.x) * chunk_size_m,
+    f32(go.y) * chunk_size_m,
+    f32(go.z) * chunk_size_m
+  );
+
+  let grid_bmax = grid_bmin + vec3<f32>(
+    f32(gd.x) * chunk_size_m,
+    f32(gd.y) * chunk_size_m,
+    f32(gd.z) * chunk_size_m
+  );
+
+  let bias = max(SHADOW_BIAS, 0.50 * voxel_size);
+  let ro   = p + sun_dir * bias;
+  let rd   = sun_dir;
+
+  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  let t_enter = max(rtg.x, 0.0);
+  let t_exit  = rtg.y;
+  if (t_exit < t_enter) { return Tc; }
+
+  let start_t = t_enter + nudge_s;
+  let p0 = ro + start_t * rd;
+
+  var t_local: f32 = 0.0;
+  let t_exit_local = max(t_exit - start_t, 0.0);
+
+  var c = chunk_coord_from_pos(p0, chunk_size_m);
+  var cx: i32 = c.x;
+  var cy: i32 = c.y;
+  var cz: i32 = c.z;
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  let step_x: i32 = select(-1, 1, rd.x > 0.0);
+  let step_y: i32 = select(-1, 1, rd.y > 0.0);
+  let step_z: i32 = select(-1, 1, rd.z > 0.0);
+
+  let bx = select(f32(cx) * chunk_size_m, f32(cx + 1) * chunk_size_m, rd.x > 0.0);
+  let by = select(f32(cy) * chunk_size_m, f32(cy + 1) * chunk_size_m, rd.y > 0.0);
+  let bz = select(f32(cz) * chunk_size_m, f32(cz + 1) * chunk_size_m, rd.z > 0.0);
+
+  var tMaxX: f32 = (bx - p0.x) * inv.x;
+  var tMaxY: f32 = (by - p0.y) * inv.y;
+  var tMaxZ: f32 = (bz - p0.z) * inv.z;
+
+  let tDeltaX: f32 = abs(chunk_size_m * inv.x);
+  let tDeltaY: f32 = abs(chunk_size_m * inv.y);
+  let tDeltaZ: f32 = abs(chunk_size_m * inv.z);
+
+  if (abs(rd.x) < EPS_INV) { tMaxX = BIG_F32; }
+  if (abs(rd.y) < EPS_INV) { tMaxY = BIG_F32; }
+  if (abs(rd.z) < EPS_INV) { tMaxZ = BIG_F32; }
+
+  var trans = 1.0;
+
+  let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 512u);
+
+  for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
+    if (t_local > t_exit_local) { break; }
+    if (trans < MIN_TRANS) { break; }
+
+    let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
+    let slot = grid_lookup_slot(cx, cy, cz);
+
+    if (slot != INVALID_U32 && slot < cam.chunk_count) {
+      let ch = chunks[slot];
+
+      let cell_enter = start_t + t_local;
+      let cell_exit  = start_t + min(tNextLocal, t_exit_local);
+
+      trans *= trace_chunk_shadow_trans_interval(ro, rd, ch, cell_enter, cell_exit);
+      if (trans < MIN_TRANS) { break; }
+    }
+
+    if (tMaxX < tMaxY) {
+      if (tMaxX < tMaxZ) { cx += step_x; t_local = tMaxX; tMaxX += tDeltaX; }
+      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
+    } else {
+      if (tMaxY < tMaxZ) { cy += step_y; t_local = tMaxY; tMaxY += tDeltaY; }
+      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
+    }
+
+    let ox = cam.grid_origin_chunk.x;
+    let oy = cam.grid_origin_chunk.y;
+    let oz = cam.grid_origin_chunk.z;
+
+    let nx = i32(cam.grid_dims.x);
+    let ny = i32(cam.grid_dims.y);
+    let nz = i32(cam.grid_dims.z);
+
+    if (cx < ox || cy < oy || cz < oz || cx >= ox + nx || cy >= oy + ny || cz >= oz + nz) {
+      break;
+    }
+  }
+
+  return trans * Tc;
+}
+
+// ------------------------------------------------------------
+// Shading
+// ------------------------------------------------------------
+
+fn color_for_material(m: u32) -> vec3<f32> {
+  if (m == MAT_AIR)   { return vec3<f32>(0.0); }
+
+  if (m == MAT_GRASS) { return vec3<f32>(0.18, 0.75, 0.18); }
+  if (m == MAT_DIRT)  { return vec3<f32>(0.45, 0.30, 0.15); }
+  if (m == MAT_STONE) { return vec3<f32>(0.50, 0.50, 0.55); }
+  if (m == MAT_WOOD)  { return vec3<f32>(0.38, 0.26, 0.14); }
+  if (m == MAT_LEAF)  { return vec3<f32>(0.10, 0.55, 0.12); }
+
+  return vec3<f32>(1.0, 0.0, 1.0);
+}
+
+fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
+  let hp = ro + hg.t * rd;
+  let base = color_for_material(hg.mat);
+
+  let voxel_size = cam.voxel_params.x;
+  let hp_shadow  = hp + hg.n * (0.75 * voxel_size);
+
+  let shadow = select(1.0, 0.0, in_shadow(hp_shadow, SUN_DIR));
+  let cloud = cloud_sun_transmittance(hp_shadow, SUN_DIR);
+
+  let diff = max(dot(hg.n, SUN_DIR), 0.0);
+
+  let ambient = select(0.22, 0.28, hg.mat == MAT_LEAF);
+
+  var dapple = 1.0;
+  if (hg.mat == MAT_LEAF) {
+    let time_s = cam.voxel_params.y;
+    let d0 = sin(dot(hp.xz, vec2<f32>(3.0, 2.2)) + time_s * 3.5);
+    let d1 = sin(dot(hp.xz, vec2<f32>(6.5, 4.1)) - time_s * 6.0);
+    dapple = 0.90 + 0.10 * (0.6 * d0 + 0.4 * d1);
+  }
+
+  let direct = SUN_COLOR * SUN_INTENSITY * diff * shadow * cloud;
+  return base * (ambient + (1.0 - ambient) * direct) * dapple;
 }

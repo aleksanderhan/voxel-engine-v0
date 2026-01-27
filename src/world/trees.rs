@@ -11,15 +11,14 @@ use super::{
 // TREE TUNING KNOBS
 // ================================================================================================
 // Conventions
-// - vpm = VOXELS_PER_METER (voxels per meter)
+// - vpm = voxels per meter (VOXELS_PER_METER)
 // - Fast probability via bitmask:
 //      (hash & mask) == 0  => true with probability 1/(mask+1)
 //
-// Primary goal (per your note): fewer branches, slightly more leaves.
-// Biggest levers:
-// - PRIMARY_MIN/MAX (how many primary branches)
-// - CHILD_SPAWN_THIN_MASK (thins recursion fan-out by depth)
-// - TIP_GUARANTEED_* masks (tip leaf density so every branch reads “alive”)
+// Notes:
+// - AABB = axis-aligned bounding box
+// - BFS = breadth-first search
+// - SVO = Sparse Voxel Octree
 // ================================================================================================
 
 // Tree density: 1 tree per N meter-cells (lower => more trees)
@@ -29,85 +28,88 @@ const TREE_CELL_MOD: u32 = 256;
 // Primary branches (depth=0)
 // ----------------------------------------
 
-// Fewer primary branches (was 10..26)
-const PRIMARY_MIN: usize = 8;
-const PRIMARY_MAX: usize = 18;
-const PRIMARY_MAX_CLAMP: usize = 24;
+// Fewer primaries, but less “spike crown”
+const PRIMARY_MIN: usize = 6;
+const PRIMARY_MAX: usize = 14;
+const PRIMARY_MAX_CLAMP: usize = 18;
 
 // Start height along trunk (% of trunk height)
-const PRIMARY_START_Y_LO_FRAC: i32 = 32;
-const PRIMARY_START_Y_HI_FRAC: i32 = 93;
-const PRIMARY_START_JITTER_FRAC: f32 = 0.08; // fraction of trunk height
+// IMPORTANT: allow starts right near the top so the trunk doesn't look “pruned”
+const PRIMARY_START_Y_LO_FRAC: i32 = 28;
+const PRIMARY_START_Y_HI_FRAC: i32 = 99; // was 92
+const PRIMARY_START_JITTER_FRAC: f32 = 0.10;
 
 // Shape
-const PRIMARY_ANG_JITTER: f32 = 0.78; // scaled from [-1..1]
-const PRIMARY_LEN_M_MIN: f32 = 2.6;
-const PRIMARY_LEN_M_RAND: f32 = 3.8;
+const PRIMARY_ANG_JITTER: f32 = 1.05; // more irregular azimuth (less radial symmetry)
 
-const PRIMARY_PITCH_BASE: f32 = 0.10; // + h*...
-const PRIMARY_PITCH_H_SCALE: f32 = 0.20;
-const PRIMARY_PITCH_QUAD_BASE: f32 = 0.56;
-const PRIMARY_PITCH_QUAD_H_SCALE: f32 = 0.28;
+// SHORTER primaries (big lever for “branches too long”)
+const PRIMARY_LEN_M_MIN: f32 = 1.40;
+const PRIMARY_LEN_M_RAND: f32 = 2.20;
+
+// More vertical variation + less spear-like
+const PRIMARY_PITCH_BASE: f32 = 0.10;
+const PRIMARY_PITCH_H_SCALE: f32 = 0.18;
+const PRIMARY_PITCH_QUAD_BASE: f32 = 0.44;
+const PRIMARY_PITCH_QUAD_H_SCALE: f32 = 0.22;
 
 const PRIMARY_R0_M_MIN: f32 = 0.13;
 const PRIMARY_R0_M_RAND: f32 = 0.22;
 const PRIMARY_R1_SCALE_MIN: f32 = 0.28;
 const PRIMARY_R1_SCALE_RAND: f32 = 0.22;
 
-const PRIMARY_BEND_M_MIN: f32 = 0.75;
-const PRIMARY_BEND_M_RAND: f32 = 1.05;
-const PRIMARY_C1_T: f32 = 0.33;
-const PRIMARY_C2_T: f32 = 0.70;
-const PRIMARY_C1_BEND_SCALE: f32 = 0.95;
-const PRIMARY_C2_BEND_SCALE: f32 = 0.70;
-const PRIMARY_C1_Y_BEND_SCALE: f32 = 0.32;
-const PRIMARY_C2_Y_BEND_SCALE: f32 = 0.24;
+// More curvature so branches feel “grown”, not extruded
+const PRIMARY_BEND_M_MIN: f32 = 1.05;
+const PRIMARY_BEND_M_RAND: f32 = 1.85;
+const PRIMARY_C1_T: f32 = 0.28;
+const PRIMARY_C2_T: f32 = 0.72;
+const PRIMARY_C1_BEND_SCALE: f32 = 1.10;
+const PRIMARY_C2_BEND_SCALE: f32 = 0.85;
+const PRIMARY_C1_Y_BEND_SCALE: f32 = 0.44;
+const PRIMARY_C2_Y_BEND_SCALE: f32 = 0.34;
 
 // ----------------------------------------
 // Recursion / complexity
 // ----------------------------------------
 
-// Maximum recursion depth for branches (primary is depth=0; children are depth=1..)
 const MAX_BRANCH_DEPTH: u8 = 4;
-
-// Hard cap on total branches per tree (safety)
 const BRANCH_CAP: usize = 520;
 
 // How many child candidates per parent depth: min + uniform(0..rand)
 // Index = parent.depth clamped to 0..3
 const CHILD_COUNT_MIN: [usize; 4] = [3, 3, 2, 1];
-const CHILD_COUNT_RAND: [usize; 4] = [3, 3, 3, 3]; // d0:3..6 d1:3..6 d2:2..5 d3+:1..4
+const CHILD_COUNT_RAND: [usize; 4] = [3, 3, 3, 3];
 
-// Depth-based thinning gate for child spawning (largest “too many branches” lever)
+// Aggressive thinning (keeps overall sparse structure)
 // Keep child only if (sj & mask) == 0
 const CHILD_SPAWN_THIN_MASK: [u32; 4] = [
-    1,  // depth=0: keep ~1/2
-    3,  // depth=1: keep ~1/4
-    7,  // depth=2: keep ~1/8
-    15, // depth>=3: keep ~1/16
+    3,  // depth=0: keep ~1/4
+    7,  // depth=1: keep ~1/8
+    15, // depth=2: keep ~1/16
+    31, // depth>=3: keep ~1/32
 ];
 
-// Child spawn location along parent: t in [min..min+rand]
-const CHILD_SPAWN_T_MIN: f32 = 0.20;
-const CHILD_SPAWN_T_RAND: f32 = 0.70;
+// Spawn position along parent
+const CHILD_SPAWN_T_MIN: f32 = 0.32;
+const CHILD_SPAWN_T_RAND: f32 = 0.58;
 
-// Child length: min + rand, capped by parent.len * (A - B*depth), floored
-const CHILD_LEN_M_MIN: f32 = 0.55;
-const CHILD_LEN_M_RAND: f32 = 1.80;
-const CHILD_LEN_M_FLOOR: f32 = 0.45;
+// SHORTER children
+const CHILD_LEN_M_MIN: f32 = 0.35;
+const CHILD_LEN_M_RAND: f32 = 1.05;
+const CHILD_LEN_M_FLOOR: f32 = 0.28;
 
-const CHILD_MAXLEN_A: f32 = 0.62;
-const CHILD_MAXLEN_B: f32 = 0.16;
+// Clamp children harder vs parent length
+const CHILD_MAXLEN_A: f32 = 0.48;
+const CHILD_MAXLEN_B: f32 = 0.18;
 
-// Child direction shaping (side fan + up bias)
-const CHILD_FAN_AMP_BASE: f32 = 0.75;
-const CHILD_FAN_AMP_DEPTH: f32 = 0.25;
+// Direction shaping
+const CHILD_FAN_AMP_BASE: f32 = 0.95;
+const CHILD_FAN_AMP_DEPTH: f32 = 0.38;
 
-const CHILD_UP_BASE: f32 = 0.16;
-const CHILD_UP_DEPTH: f32 = 0.14;
-const CHILD_UP_RAND: f32 = 0.32;
+const CHILD_UP_BASE: f32 = 0.10;
+const CHILD_UP_DEPTH: f32 = 0.10;
+const CHILD_UP_RAND: f32 = 0.28;
 
-// Radius shrink factor by *child depth* (depth=1..)
+// Radius shrink factor by child depth (depth=1..)
 const CHILD_SHRINK: [f32; 4] = [0.58, 0.52, 0.46, 0.40];
 
 const CHILD_R0_MIN_VOX: f32 = 0.70;
@@ -115,15 +117,15 @@ const CHILD_R1_MIN_VOX: f32 = 0.50;
 const CHILD_R1_SCALE_BASE: f32 = 0.34;
 const CHILD_R1_SCALE_RAND: f32 = 0.16;
 
-// Child curvature
-const CHILD_BEND_M_MIN: f32 = 0.26;
-const CHILD_BEND_M_RAND: f32 = 0.78;
-const CHILD_C1_T: f32 = 0.33;
-const CHILD_C2_T: f32 = 0.70;
-const CHILD_C1_BEND_SCALE: f32 = 0.85;
-const CHILD_C2_BEND_SCALE: f32 = 0.60;
-const CHILD_C1_Y_BEND_SCALE: f32 = 0.22;
-const CHILD_C2_Y_BEND_SCALE: f32 = 0.18;
+// Curvature
+const CHILD_BEND_M_MIN: f32 = 0.45;
+const CHILD_BEND_M_RAND: f32 = 1.25;
+const CHILD_C1_T: f32 = 0.28;
+const CHILD_C2_T: f32 = 0.72;
+const CHILD_C1_BEND_SCALE: f32 = 1.05;
+const CHILD_C2_BEND_SCALE: f32 = 0.78;
+const CHILD_C1_Y_BEND_SCALE: f32 = 0.34;
+const CHILD_C2_Y_BEND_SCALE: f32 = 0.26;
 
 // ----------------------------------------
 // Branch rasterization
@@ -132,52 +134,61 @@ const CHILD_C2_Y_BEND_SCALE: f32 = 0.18;
 const BRANCH_STEPS_MIN: i32 = 8;
 const BRANCH_STEPS_MAX: i32 = 30;
 const BRANCH_STEPS_BASE: f32 = 10.0;
-const BRANCH_STEPS_LEN_DIV_M: f32 = 0.30; // more => fewer steps
+const BRANCH_STEPS_LEN_DIV_M: f32 = 0.30;
 const BRANCH_RADIUS_MIN_VOX: f32 = 0.55;
 
 // ----------------------------------------
 // Leaves
 // ----------------------------------------
 
-// Always place a dense tip tuft for every branch so no branch looks “bare”
 const LEAF_ALWAYS_TIP_FOR_ALL_BRANCHES: bool = true;
-
-// Extremely rare bare branch for variety (keep huge to effectively disable)
 const LEAF_RARE_SKIP_MASK: u32 = 16383;
 
-// Sleeve tufts per branch depth (in addition to tip tuft)
-const LEAF_SLEEVE_N: [usize; 5] = [2, 2, 2, 2, 3];
+// Canopy extent along branches: more sleeves, distributed earlier
+const LEAF_SLEEVE_N: [usize; 5] = [3, 3, 4, 4, 5];
+const LEAF_SLEEVE_T_MIN: f32 = 0.14;
+const LEAF_SLEEVE_T_RAND: f32 = 0.78;
 
-const LEAF_SLEEVE_T_MIN: f32 = 0.62;
-const LEAF_SLEEVE_T_RAND: f32 = 0.30;
+// Disable extra offset tip tuft (tends to create little dense “buttons”)
+const LEAF_OFFSET_TIP_MASK: u32 = 0;
 
-const LEAF_OFFSET_TIP_MASK: u32 = 7; // extra offset tip tuft usually happens when (h & mask) != 0
-const LEAF_OFFSET_M_XZ: f32 = 0.30;
-const LEAF_OFFSET_M_Y: f32 = 0.22;
+// Bigger offsets = wider canopy without adding branches
+const LEAF_OFFSET_M_XZ: f32 = 0.95;
+const LEAF_OFFSET_M_Y: f32 = 0.46;
 
-const LEAF_SLEEVE_OFFSET_M_XZ: f32 = 0.22;
-const LEAF_SLEEVE_OFFSET_M_Y: f32 = 0.18;
+const LEAF_SLEEVE_OFFSET_M_XZ: f32 = 0.62;
+const LEAF_SLEEVE_OFFSET_M_Y: f32 = 0.34;
 
-// Tuft radius in meters: base + rand by branch depth (slightly larger to compensate fewer branches)
-const TUFT_R_BASE: [f32; 5] = [0.18, 0.20, 0.24, 0.25, 0.26];
-const TUFT_R_RAND: [f32; 5] = [0.16, 0.18, 0.30, 0.34, 0.38];
+// Big tufts (canopy size)
+const TUFT_R_BASE: [f32; 5] = [0.42, 0.50, 0.60, 0.66, 0.72];
+const TUFT_R_RAND: [f32; 5] = [0.30, 0.36, 0.52, 0.60, 0.66];
 
-// Leaf fill profile inside tuft sphere
+// Sparse/airy fill
 const LEAF_SPHERE_Y_SCALE: f32 = 1.16;
-const LEAF_SHELL_THRESH: f32 = 0.80;
+const LEAF_SHELL_THRESH: f32 = 0.90;
 
-// TIP (guaranteed visible) — denser than sleeve tufts
-const TIP_GUARANTEED_GATE_MASK: u32 = 0; // 0 => no gate (keep all candidates)
-const TIP_GUARANTEED_INTERIOR_KEEP_MASK: u32 = 7; // keep 1/8 interior (denser)
-const TIP_GUARANTEED_SHELL_DROP_MASK: u32 = 31; // drop 1/32 near shell (airy)
+// TIP: visible but airy
+const TIP_GUARANTEED_GATE_MASK: u32 = 1;           // keep ~1/2 candidates
+const TIP_GUARANTEED_INTERIOR_KEEP_MASK: u32 = 31; // keep 1/32 interior
+const TIP_GUARANTEED_SHELL_DROP_MASK: u32 = 3;     // drop 1/4 near shell
 
-// SLEEVE / EXTRA (sparser)
-const TUFT_SPARSE_GATE_MASK: u32 = 3; // keep 1/4 candidates
-const TUFT_SPARSE_INTERIOR_KEEP_MASK: u32 = 63; // keep 1/64 interior
-const TUFT_SPARSE_SHELL_DROP_MASK: u32 = 15; // drop 1/16 near shell
+// SLEEVE: very sparse
+const TUFT_SPARSE_GATE_MASK: u32 = 15;             // keep ~1/16 candidates
+const TUFT_SPARSE_INTERIOR_KEEP_MASK: u32 = 255;   // keep 1/256 interior
+const TUFT_SPARSE_SHELL_DROP_MASK: u32 = 3;        // drop 1/4 near shell
 
 // Trunk wobble (meters)
 const TRUNK_WOBBLE_M_MAX: f32 = 0.25;
+
+// ----------------------------------------
+// Crown at trunk tip (prevents "pruned top")
+// ----------------------------------------
+
+const TOP_CROWN_ENABLE: bool = true;
+const TOP_CROWN_RING_TUFTS: usize = 6;
+const TOP_CROWN_R_SCALE: f32 = 1.65;
+const TOP_CROWN_RING_RAD_SCALE: f32 = 0.85;
+const TOP_CROWN_LIFT_M: f32 = 0.45;
 
 // ================================================================================================
 
@@ -341,7 +352,11 @@ impl WorldGen {
         w: (f32, f32, f32),
     ) -> ((f32, f32, f32), (f32, f32, f32), (f32, f32, f32)) {
         let (wx, wy, wz) = w;
-        let (hx, hy, hz) = if wy.abs() < 0.95 { (0.0, 1.0, 0.0) } else { (1.0, 0.0, 0.0) };
+        let (hx, hy, hz) = if wy.abs() < 0.95 {
+            (0.0, 1.0, 0.0)
+        } else {
+            (1.0, 0.0, 0.0)
+        };
         let (ux, uy, uz) = Self::cross3(hx, hy, hz, wx, wy, wz);
         let (ux, uy, uz) = Self::norm3(ux, uy, uz);
         let (vx, vy, vz) = Self::cross3(wx, wy, wz, ux, uy, uz);
@@ -406,7 +421,7 @@ impl WorldGen {
         }
 
         let trunk_h_m = 5 + (hash_u32(r) % 6) as i32; // 5..10m
-        let crown_r_m = 2 + (hash_u32(r ^ 0xBEEF) % 3) as i32; // 2..4m
+        let crown_r_m = 3 + (hash_u32(r ^ 0xBEEF) % 4) as i32; // 3..6m
         let vpm = config::VOXELS_PER_METER;
 
         Some((r, trunk_h_m * vpm, crown_r_m * vpm))
@@ -425,7 +440,8 @@ impl WorldGen {
         let r1 = 0.18 * vpm + u01(hash_u32(seed ^ 0x2222)) * (0.12 * vpm);
 
         // kept for conservative bounds / variety
-        let canopy_h = ((2.5 * vpm) + u01(hash_u32(seed ^ 0x3333)) * (2.0 * vpm)).round() as i32;
+        let canopy_h =
+            ((2.5 * vpm) + u01(hash_u32(seed ^ 0x3333)) * (2.0 * vpm)).round() as i32;
 
         Some(Tree {
             tx,
@@ -450,8 +466,8 @@ impl WorldGen {
     ) -> TreeCache {
         let vpm = config::VOXELS_PER_METER;
 
-        // crown up to ~4m + slack
-        let pad_m = 6;
+        // Extra slack because canopy tufts can extend beyond crown_r
+        let pad_m = 10;
 
         let xm0 = chunk_ox.div_euclid(vpm) - pad_m;
         let xm1 = (chunk_ox + chunk_size).div_euclid(vpm) + pad_m;
@@ -475,7 +491,7 @@ impl WorldGen {
                 };
 
                 // Conservative XZ AABB reject vs chunk footprint
-                let r = t.crown_r + 2 * vpm;
+                let r = t.crown_r + 5 * vpm; // extra slack for large tufts
                 let x0 = t.tx - r;
                 let x1 = t.tx + r;
                 let z0 = t.tz - r;
@@ -616,7 +632,11 @@ impl WorldGen {
         let y_hi = tree.base_y + (tree.trunk_h * PRIMARY_START_Y_HI_FRAC) / 100;
 
         for i in 0..count.min(32) {
-            let t = if count <= 1 { 0.5 } else { (i as f32) / ((count - 1) as f32) };
+            let t = if count <= 1 {
+                0.5
+            } else {
+                (i as f32) / ((count - 1) as f32)
+            };
             let y_base = (Self::lerp(y_lo as f32, y_hi as f32, t)) as i32;
 
             let r = hash_u32(tree.seed ^ 0xC0DE_0001 ^ (i as u32).wrapping_mul(0x9E37_79B9));
@@ -654,7 +674,6 @@ impl WorldGen {
         for j in 0..child_count {
             let sj = hash_u32(base ^ (j as u32).wrapping_mul(0x9E37_79B9));
 
-            // NEW: depth-based thinning (major branch-count reduction)
             if (sj & Self::spawn_thin_mask(parent.depth)) != 0 {
                 continue;
             }
@@ -682,10 +701,11 @@ impl WorldGen {
             let fan_amp = CHILD_FAN_AMP_BASE + CHILD_FAN_AMP_DEPTH * (depth as f32);
             let fan = Self::s11(sj ^ 0x3333) * fan_amp;
 
-            let up = (CHILD_UP_BASE + CHILD_UP_DEPTH * (depth as f32)) + CHILD_UP_RAND * u01(sj ^ 0x4444);
+            let up = 1.65 * (CHILD_UP_BASE + CHILD_UP_DEPTH * (depth as f32))
+                + 1.25 * (CHILD_UP_RAND * u01(sj ^ 0x4444));
 
             let dirx = (w.0 + sideways.0 * fan).clamp(-2.0, 2.0);
-            let diry = (w.1 + sideways.1 * fan + up).clamp(-0.2, 2.0);
+            let diry = (w.1 + sideways.1 * fan + up).clamp(0.15, 3.0);
             let dirz = (w.2 + sideways.2 * fan).clamp(-2.0, 2.0);
             let (dirx, diry, dirz) = Self::norm3(dirx, diry, dirz);
 
@@ -709,13 +729,17 @@ impl WorldGen {
             let u1 = Self::s11(sj ^ 0x9999);
             let u2 = Self::s11(sj ^ 0xAAAA);
 
-            let c1x = ax + dirx * (CHILD_C1_T * len) + sideways.0 * (bend * CHILD_C1_BEND_SCALE * k1);
-            let c1y = ay + diry * (CHILD_C1_T * len) + (bend * CHILD_C1_Y_BEND_SCALE * u1);
-            let c1z = az + dirz * (CHILD_C1_T * len) + sideways.2 * (bend * CHILD_C1_BEND_SCALE * k1);
+            let c1x = ax + dirx * (CHILD_C1_T * len)
+                + sideways.0 * (bend * CHILD_C1_BEND_SCALE * k1);
+            let c1y = ay + diry * (CHILD_C1_T * len) + (bend * CHILD_C1_Y_BEND_SCALE * u1.abs());
+            let c1z = az + dirz * (CHILD_C1_T * len)
+                + sideways.2 * (bend * CHILD_C1_BEND_SCALE * k1);
 
-            let c2x = ax + dirx * (CHILD_C2_T * len) + sideways.0 * (bend * CHILD_C2_BEND_SCALE * k2);
-            let c2y = ay + diry * (CHILD_C2_T * len) + (bend * CHILD_C2_Y_BEND_SCALE * u2);
-            let c2z = az + dirz * (CHILD_C2_T * len) + sideways.2 * (bend * CHILD_C2_BEND_SCALE * k2);
+            let c2x = ax + dirx * (CHILD_C2_T * len)
+                + sideways.0 * (bend * CHILD_C2_BEND_SCALE * k2);
+            let c2y = ay + diry * (CHILD_C2_T * len) + (bend * CHILD_C2_Y_BEND_SCALE * u2.abs());
+            let c2z = az + dirz * (CHILD_C2_T * len)
+                + sideways.2 * (bend * CHILD_C2_BEND_SCALE * k2);
 
             out.push(Branch {
                 ax,
@@ -776,6 +800,57 @@ impl WorldGen {
             }
         }
 
+        // --- top crown (leaf cluster at trunk tip) ---
+        if TOP_CROWN_ENABLE {
+            let vpm_f = config::VOXELS_PER_METER as f32;
+
+            let tip_y = tree.base_y + tree.trunk_h;
+            let (twx, twz) = self.trunk_wobble(tree, tip_y);
+
+            let cx = tree.tx as f32 + twx;
+            let cy = tip_y as f32 + TOP_CROWN_LIFT_M * vpm_f;
+            let cz = tree.tz as f32 + twz;
+
+            let crown_r =
+                Self::tuft_r_m(0, tree.seed ^ 0xC0A7_0001) * vpm_f * TOP_CROWN_R_SCALE;
+
+            // center tuft (tip profile)
+            self.raster_sphere_leaf_tuft_with_masks(
+                out,
+                cx,
+                cy,
+                cz,
+                crown_r,
+                tree.seed ^ 0xC0A7_CE17,
+                TIP_GUARANTEED_GATE_MASK,
+                TIP_GUARANTEED_INTERIOR_KEEP_MASK,
+                TIP_GUARANTEED_SHELL_DROP_MASK,
+            );
+
+            // ring tufts (sleeve profile) for a crown silhouette
+            let ring_r = crown_r * TOP_CROWN_RING_RAD_SCALE;
+            for i in 0..TOP_CROWN_RING_TUFTS {
+                let rr = hash_u32(tree.seed ^ 0xC0A7_1E99 ^ (i as u32).wrapping_mul(0x9E37_79B9));
+                let ang = u01(rr ^ 0xA1) * std::f32::consts::TAU;
+
+                let ox = ang.cos() * ring_r;
+                let oz = ang.sin() * ring_r;
+                let oy = Self::s11(rr ^ 0xB2) * (0.18 * vpm_f);
+
+                self.raster_sphere_leaf_tuft_with_masks(
+                    out,
+                    cx + ox,
+                    cy + oy,
+                    cz + oz,
+                    crown_r * (0.70 + 0.15 * u01(rr ^ 0xC3)),
+                    tree.seed ^ rr ^ 0xC0A7_7AF7,
+                    TUFT_SPARSE_GATE_MASK,
+                    TUFT_SPARSE_INTERIOR_KEEP_MASK,
+                    TUFT_SPARSE_SHELL_DROP_MASK,
+                );
+            }
+        }
+
         // --- branches ---
         let vpm_f = config::VOXELS_PER_METER as f32;
 
@@ -791,7 +866,8 @@ impl WorldGen {
             let br_seed = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
 
             let ang_j = Self::s11(hash_u32(br_seed ^ 0xABCD_0001)) * PRIMARY_ANG_JITTER;
-            let ang = ang0 + (i as f32) * (std::f32::consts::TAU / (primary_count as f32)) + ang_j;
+            let ang =
+                ang0 + (i as f32) * (std::f32::consts::TAU / (primary_count as f32)) + ang_j;
 
             let dirx = ang.cos();
             let dirz = ang.sin();
@@ -818,8 +894,8 @@ impl WorldGen {
             let by = ay + pitch * len;
             let bz = az + dirz * len;
 
-            let bend =
-                (PRIMARY_BEND_M_MIN * vpm_f) + (PRIMARY_BEND_M_RAND * vpm_f) * u01(hash_u32(br_seed ^ 0x9000));
+            let bend = (PRIMARY_BEND_M_MIN * vpm_f)
+                + (PRIMARY_BEND_M_RAND * vpm_f) * u01(hash_u32(br_seed ^ 0x9000));
             let k1 = Self::s11(hash_u32(br_seed ^ 0x9001));
             let k2 = Self::s11(hash_u32(br_seed ^ 0x9002));
             let u1 = Self::s11(hash_u32(br_seed ^ 0x9003));
@@ -828,12 +904,16 @@ impl WorldGen {
             let perpx = -dirz;
             let perpz = dirx;
 
-            let c1x = ax + dirx * (PRIMARY_C1_T * len) + perpx * (bend * (PRIMARY_C1_BEND_SCALE * k1));
-            let c1z = az + dirz * (PRIMARY_C1_T * len) + perpz * (bend * (PRIMARY_C1_BEND_SCALE * k1));
+            let c1x = ax + dirx * (PRIMARY_C1_T * len)
+                + perpx * (bend * (PRIMARY_C1_BEND_SCALE * k1));
+            let c1z = az + dirz * (PRIMARY_C1_T * len)
+                + perpz * (bend * (PRIMARY_C1_BEND_SCALE * k1));
             let c1y = ay + (pitch * len) * PRIMARY_C1_T + (PRIMARY_C1_Y_BEND_SCALE * bend * u1);
 
-            let c2x = ax + dirx * (PRIMARY_C2_T * len) + perpx * (bend * (PRIMARY_C2_BEND_SCALE * k2));
-            let c2z = az + dirz * (PRIMARY_C2_T * len) + perpz * (bend * (PRIMARY_C2_BEND_SCALE * k2));
+            let c2x = ax + dirx * (PRIMARY_C2_T * len)
+                + perpx * (bend * (PRIMARY_C2_BEND_SCALE * k2));
+            let c2z = az + dirz * (PRIMARY_C2_T * len)
+                + perpz * (bend * (PRIMARY_C2_BEND_SCALE * k2));
             let c2y = ay + (pitch * len) * PRIMARY_C2_T + (PRIMARY_C2_Y_BEND_SCALE * bend * u2);
 
             branches.push(Branch {
@@ -875,14 +955,13 @@ impl WorldGen {
 
         // leaves raster
         for b in &branches {
-            // extremely rare bare branch (mostly disabled)
             if (hash_u32(b.seed ^ 0x1357_2468) & LEAF_RARE_SKIP_MASK) == 0 {
                 continue;
             }
 
             let tuft_r = Self::tuft_r_m(b.depth, b.seed ^ 0x4440) * vpm_f;
 
-            // Always-tip tuft for all branches (denser profile so it shows)
+            // tip tuft
             if LEAF_ALWAYS_TIP_FOR_ALL_BRANCHES {
                 self.raster_sphere_leaf_tuft_with_masks(
                     out,
@@ -897,7 +976,7 @@ impl WorldGen {
                 );
             }
 
-            // Sleeve tufts (sparser) near tip to prevent “bare sticks”
+            // sleeve tufts along branch
             let sleeve_n = Self::sleeve_n(b.depth);
             for si in 0..sleeve_n {
                 let rr = hash_u32(b.seed ^ 0x9000_1000 ^ (si as u32).wrapping_mul(0x9E37_79B9));
@@ -921,7 +1000,7 @@ impl WorldGen {
                 );
             }
 
-            // Extra offset tip tuft (usually), sparse profile
+            // extra offset tip tuft (disabled by LEAF_OFFSET_TIP_MASK=0)
             let h = hash_u32(b.seed ^ 0xABC0_0001);
             if (h & LEAF_OFFSET_TIP_MASK) != 0 {
                 let rr = hash_u32(b.seed ^ 0xABC0_0002);
@@ -1061,7 +1140,6 @@ impl WorldGen {
                 let dx2 = dx * dx;
 
                 for z in minz..=maxz {
-                    // gate
                     if (hash3(seed ^ 0xA11C_E5ED, x, y, z) & gate_mask) != 0 {
                         continue;
                     }

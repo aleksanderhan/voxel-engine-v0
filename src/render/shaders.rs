@@ -6,13 +6,7 @@
 pub const RAY_CS_WGSL: &str = concat!(
     include_str!("../shaders/common.wgsl"),
     "\n",
-    include_str!("../shaders/ray_leaf_wind.wgsl"),
-    "\n",
     include_str!("../shaders/ray_core.wgsl"),
-    "\n",
-    include_str!("../shaders/ray_shadow.wgsl"),
-    "\n",
-    include_str!("../shaders/ray_shade.wgsl"),
     "\n",
     include_str!("../shaders/ray_main.wgsl"),
     "\n",
