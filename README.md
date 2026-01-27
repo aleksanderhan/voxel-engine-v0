@@ -4,7 +4,7 @@ SVO ray tracing engine
 ### Leaves blowing int the wind, animated shaddows
 ![Demo](assets/demo.gif)
 
-### Volumentric fog, godrays
+### Volumetric fog, godrays
 ![Demo](assets/demo2.gif)
 
 ## layout
