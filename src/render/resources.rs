@@ -1,10 +1,7 @@
 // src/render/resources.rs
 
 pub struct OutputTex {
-    pub tex: wgpu::Texture,
     pub view: wgpu::TextureView,
-    pub w: u32,
-    pub h: u32,
 }
 
 pub fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> OutputTex {
@@ -28,5 +25,5 @@ pub fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> OutputTex
 
     let view = tex.create_view(&Default::default());
 
-    OutputTex { tex, view, w, h }
+    OutputTex { view }
 }

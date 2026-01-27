@@ -225,10 +225,6 @@ impl ChunkManager {
         self.slot_to_key.len() as u32
     }
 
-    pub fn chunk_meta(&self) -> &[ChunkMetaGpu] {
-        &self.chunk_meta
-    }
-
     pub fn grid_origin(&self) -> [i32; 3] {
         self.grid_origin_chunk
     }
@@ -243,12 +239,6 @@ impl ChunkManager {
 
     pub fn take_uploads(&mut self) -> Vec<ChunkUpload> {
         std::mem::take(&mut self.uploads)
-    }
-
-    pub fn changed(&mut self) -> bool {
-        let c = self.changed;
-        self.changed = false;
-        c
     }
 
     // -------- update --------

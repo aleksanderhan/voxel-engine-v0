@@ -29,7 +29,6 @@ mod pipelines;
 pub mod textures;
 
 use crate::{
-    config,
     render::gpu_types::{CameraGpu, OverlayGpu},
     streaming::ChunkUpload,
 };

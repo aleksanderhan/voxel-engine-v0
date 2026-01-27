@@ -22,10 +22,6 @@ pub struct Buffers {
     pub node_capacity: u32,
     pub chunk_capacity: u32,
     pub grid_capacity: u32,
-
-    // Dummies kept around (useful for debugging/validation, and occasionally for filler writes)
-    pub dummy_node: NodeGpu,
-    pub dummy_chunk: ChunkMetaGpu,
 }
 
 fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
@@ -51,21 +47,6 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
     let camera = make_uniform_buffer::<crate::render::gpu_types::CameraGpu>(device, "camera_buf");
     let overlay =
         make_uniform_buffer::<crate::render::gpu_types::OverlayGpu>(device, "overlay_buf");
-
-    // Dummy structs (mostly for debugging / optional fallback writes)
-    let dummy_node = NodeGpu {
-        child_base: 0xFFFF_FFFF,
-        child_mask: 0,
-        material: 0,
-        _pad: 0,
-    };
-    let dummy_chunk = ChunkMetaGpu {
-        origin: [0, 0, 0, 0],
-        node_base: 0,
-        node_count: 0,
-        _pad0: 0,
-        _pad1: 0,
-    };
 
     // Node arena capacity derived from budget bytes.
     let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
@@ -102,7 +83,5 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         node_capacity,
         chunk_capacity,
         grid_capacity,
-        dummy_node,
-        dummy_chunk,
     }
 }

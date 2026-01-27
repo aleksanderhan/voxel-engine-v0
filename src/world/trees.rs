@@ -807,50 +807,6 @@ impl WorldGen {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Old per-point query API (kept for compatibility)
-    // -------------------------------------------------------------------------
-
-    pub fn trees_material_from_cache<F: Fn(i32, i32) -> i32>(
-        &self,
-        x: i32,
-        y: i32,
-        z: i32,
-        height_at: &F,
-        cache: &TreeCache,
-    ) -> u32 {
-        if y < height_at(x, z) {
-            return AIR;
-        }
-
-        for tree in &cache.trees {
-            let top_y = tree.base_y + tree.trunk_h;
-
-            let r = tree.crown_r + 2 * config::VOXELS_PER_METER;
-            if x < tree.tx - r || x > tree.tx + r || z < tree.tz - r || z > tree.tz + r {
-                continue;
-            }
-            if y < tree.base_y || y > top_y + tree.canopy_h + config::VOXELS_PER_METER {
-                continue;
-            }
-
-            // trunk
-            if y >= tree.base_y && y <= top_y {
-                let rr = Self::trunk_radius_at(tree, y);
-                let (wx, wz) = self.trunk_wobble(tree, y);
-                let cx = tree.tx as f32 + wx;
-                let cz = tree.tz as f32 + wz;
-                let dx = x as f32 - cx;
-                let dz = z as f32 - cz;
-                if dx * dx + dz * dz <= rr * rr {
-                    return WOOD;
-                }
-            }
-        }
-
-        AIR
-    }
-
     /// Used by the SVO builder to stamp conservative tree-top bounds.
     pub fn tree_instance_at_meter(&self, xm: i32, zm: i32) -> Option<(i32, i32)> {
         let (_seed, trunk_h_vox, crown_r_vox) = self.tree_at_meter_cell(xm, zm)?;

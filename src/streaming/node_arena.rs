@@ -10,20 +10,14 @@ struct Range {
 }
 
 pub struct NodeArena {
-    capacity: u32,
     free: Vec<Range>, // kept sorted by start
 }
 
 impl NodeArena {
     pub fn new(capacity: u32) -> Self {
         Self {
-            capacity,
             free: vec![Range { start: 0, len: capacity }],
         }
-    }
-
-    pub fn capacity(&self) -> u32 {
-        self.capacity
     }
 
     pub fn alloc(&mut self, len: u32) -> Option<u32> {

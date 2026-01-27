@@ -136,23 +136,6 @@ fn prefix_sum_cube(prefix: &[u32], side: usize, x0: usize, y0: usize, z0: usize,
     s as u32
 }
 
-/// Builds a single chunk SVO with sparse (compact) child allocation.
-pub fn build_chunk_svo_sparse(gen: &WorldGen, chunk_origin: [i32; 3], chunk_size: u32) -> Vec<NodeGpu> {
-    static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
-    build_chunk_svo_sparse_cancelable(gen, chunk_origin, chunk_size, &NEVER_CANCEL)
-}
-
-/// Cancelable build (allocates scratch internally).
-pub fn build_chunk_svo_sparse_cancelable(
-    gen: &WorldGen,
-    chunk_origin: [i32; 3],
-    chunk_size: u32,
-    cancel: &AtomicBool,
-) -> Vec<NodeGpu> {
-    let mut scratch = BuildScratch::new();
-    build_chunk_svo_sparse_cancelable_with_scratch(gen, chunk_origin, chunk_size, cancel, &mut scratch)
-}
-
 /// Cancelable build with reusable scratch (fast path).
 pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     gen: &WorldGen,

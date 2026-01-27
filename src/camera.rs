@@ -16,8 +16,6 @@ pub struct Camera {
 }
 
 pub struct CameraFrame {
-    pub view: Mat4,
-    pub proj: Mat4,
     pub view_inv: Mat4,
     pub proj_inv: Mat4,
     pub pos: Vec3,
@@ -101,8 +99,6 @@ impl Camera {
         let proj = Mat4::perspective_rh(self.fovy_rad, aspect, self.z_near, self.z_far);
 
         CameraFrame {
-            view,
-            proj,
             view_inv: view.inverse(),
             proj_inv: proj.inverse(),
             pos: self.pos,

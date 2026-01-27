@@ -6,11 +6,7 @@
 use crate::render::resources::{create_output_texture, OutputTex};
 
 pub struct Tex2D {
-    pub tex: wgpu::Texture,
     pub view: wgpu::TextureView,
-    pub w: u32,
-    pub h: u32,
-    pub format: wgpu::TextureFormat,
 }
 
 /// Bundle of all size-dependent textures used by the renderer.
@@ -62,11 +58,7 @@ fn make_tex2d(
     let view = tex.create_view(&Default::default());
 
     Tex2D {
-        tex,
         view,
-        w,
-        h,
-        format,
     }
 }
 
