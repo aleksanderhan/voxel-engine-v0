@@ -29,8 +29,6 @@ fn should_cancel(cancel: &AtomicBool) -> bool {
 pub struct BuildScratch {
     // 2D (side*side)
     ground: Vec<i32>,
-    carve_bottom: Vec<i32>,
-    carve_top: Vec<i32>,
     tree_top: Vec<i32>,
 
     // 3D (side^3)
@@ -43,28 +41,20 @@ pub struct BuildScratch {
     // mip storage (in-place builders)
     ground_min_levels: Vec<Vec<i32>>,
     ground_max_levels: Vec<Vec<i32>>,
-    carve_min_levels: Vec<Vec<i32>>,
-    carve_max_levels: Vec<Vec<i32>>,
     tree_levels: Vec<Vec<i32>>,
-    carve_top_levels: Vec<Vec<i32>>,
 }
 
 impl BuildScratch {
     pub fn new() -> Self {
         Self {
             ground: Vec::new(),
-            carve_bottom: Vec::new(),
-            carve_top: Vec::new(),
             tree_top: Vec::new(),
             material: Vec::new(),
             solid: Vec::new(),
             prefix: Vec::new(),
             ground_min_levels: Vec::new(),
             ground_max_levels: Vec::new(),
-            carve_min_levels: Vec::new(),
-            carve_max_levels: Vec::new(),
             tree_levels: Vec::new(),
-            carve_top_levels: Vec::new(),
         }
     }
 
@@ -188,7 +178,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     debug_assert!(vpm > 0);
 
     // -------------------------------------------------------------------------
-    // Height cache (local array, no HeightCache dependency)
+    // Height cache (local array)
     // -------------------------------------------------------------------------
     let margin_m: i32 = 6;
     let margin: i32 = margin_m * vpm + (vpm - 1);
@@ -224,7 +214,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     };
 
     // -------------------------------------------------------------------------
-    // Fast tree mask (O(1) lookup) and tunnel cache with mask (O(1) membership)
+    // Tree cache/mask (fast O(1) material lookup)
     // -------------------------------------------------------------------------
     let (_tree_cache_unused, tree_mask) = gen.build_tree_cache_with_mask(
         chunk_ox,
@@ -235,18 +225,10 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         cancel,
     );
 
-    let tunnel_cache =
-        gen.build_tunnel_cache_with_mask(chunk_ox, chunk_oy, chunk_oz, cs_i, &height_at, cancel);
-
     // -------------------------------------------------------------------------
-    // 2D maps (ground + conservative carve)
+    // 2D maps (ground)
     // -------------------------------------------------------------------------
     BuildScratch::ensure_2d(&mut scratch.ground, side, 0);
-    BuildScratch::ensure_2d(&mut scratch.carve_bottom, side, i32::MAX);
-    BuildScratch::ensure_2d(&mut scratch.carve_top, side, i32::MIN);
-
-    let cave_depth = 80 * vpm;
-    let cave_ceiling = 1 * vpm;
 
     for lz in 0..cs_i {
         if (lz & 15) == 0 && should_cancel(cancel) {
@@ -259,21 +241,8 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
             let i = idx2(side, lx as usize, lz as usize);
             scratch.ground[i] = g;
-
-            let b = g - cave_depth;
-            let t = g - cave_ceiling;
-            scratch.carve_bottom[i] = scratch.carve_bottom[i].min(b);
-            scratch.carve_top[i] = scratch.carve_top[i].max(t);
         }
     }
-
-    tunnel_cache.stamp_carve_bounds(
-        chunk_ox,
-        chunk_oz,
-        cs_i,
-        &mut scratch.carve_bottom,
-        &mut scratch.carve_top,
-    );
 
     let ground_mip: MinMaxMipView<'_> = build_minmax_mip_inplace(
         &scratch.ground,
@@ -282,19 +251,8 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         &mut scratch.ground_max_levels,
     );
 
-    let carve_bottom_mip: MinMaxMipView<'_> = build_minmax_mip_inplace(
-        &scratch.carve_bottom,
-        cs_u,
-        &mut scratch.carve_min_levels,
-        &mut scratch.carve_max_levels,
-    );
-
-    let carve_top_mip: MaxMipView<'_> =
-        build_max_mip_inplace(&scratch.carve_top, cs_u, &mut scratch.carve_top_levels);
-
     // -------------------------------------------------------------------------
     // Tree top stamp (2D) for fast “above everything” pruning
-    // (cheap; independent of per-voxel tree material)
     // -------------------------------------------------------------------------
     BuildScratch::ensure_2d(&mut scratch.tree_top, side, -1);
 
@@ -354,10 +312,11 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         }
     }
 
-    let tree_mip: MaxMipView<'_> = build_max_mip_inplace(&scratch.tree_top, cs_u, &mut scratch.tree_levels);
+    let tree_mip: MaxMipView<'_> =
+        build_max_mip_inplace(&scratch.tree_top, cs_u, &mut scratch.tree_levels);
 
     // -------------------------------------------------------------------------
-    // Precompute per-voxel material + occupancy (tree work is O(1) via mask)
+    // Precompute per-voxel material + occupancy (terrain + trees only)
     // -------------------------------------------------------------------------
     BuildScratch::ensure_3d_u32(&mut scratch.material, side, AIR);
     BuildScratch::ensure_3d_u8(&mut scratch.solid, side, 0);
@@ -380,36 +339,15 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
                 let g = scratch.ground[col];
 
                 // base terrain + trees (FAST)
-                let mut m: u32;
-                if wy < g {
-                    m = if wy >= g - dirt_depth { DIRT } else { STONE };
+                let m: u32 = if wy < g {
+                    if wy >= g - dirt_depth { DIRT } else { STONE }
                 } else if wy == g {
                     let tm = tree_mask.material_fast(wx, wy, wz);
-                    m = if tm == WOOD { WOOD } else { GRASS };
+                    if tm == WOOD { WOOD } else { GRASS }
                 } else {
                     let tm = tree_mask.material_fast(wx, wy, wz);
-                    m = if tm != AIR { tm } else { AIR };
-                }
-
-                // carve band below ground
-                if m != AIR {
-                    let carve_y0 = g - 80 * vpm;
-                    let carve_y1 = g - 1 * vpm;
-
-                    if wy >= carve_y0 && wy <= carve_y1 {
-                        let cb = scratch.carve_bottom[col];
-                        let ct = scratch.carve_top[col];
-
-                        // only test expensive stuff if within conservative per-column carve bounds
-                        if wy >= cb && wy <= ct {
-                            if gen.cave_density(wx, wy, wz) < 0.0 {
-                                m = AIR;
-                            } else if tunnel_cache.contains_point_fast(wx, wy, wz) {
-                                m = AIR;
-                            }
-                        }
-                    }
-                }
+                    if tm != AIR { tm } else { AIR }
+                };
 
                 let i3 = idx3(side, lx as usize, ly as usize, lz as usize);
                 scratch.material[i3] = m;
@@ -457,8 +395,6 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         side: usize,
         ground_mip: &MinMaxMipView<'_>,
         tree_mip: &MaxMipView<'_>,
-        carve_bottom_mip: &MinMaxMipView<'_>,
-        carve_top_mip: &MaxMipView<'_>,
         dirt_depth: i32,
         cancel: &AtomicBool,
     ) -> NodeGpu {
@@ -474,19 +410,15 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         let y0 = chunk_oy + oy;
         let y1 = y0 + size - 1;
 
-        // above everything
+        // above everything (ground or tree top)
         let top_solid = gmax.max(tmax);
         if y0 > top_solid {
             return NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 };
         }
 
-        // deep solid & outside carve
+        // deep solid stone (below dirt band everywhere in this node footprint)
         if y1 < gmin - dirt_depth {
-            let (cmin, _) = carve_bottom_mip.query(ox, oz, size_u);
-            let carve_tmax = carve_top_mip.query_max(ox, oz, size_u);
-            if y1 < cmin || y0 > carve_tmax {
-                return NodeGpu { child_base: LEAF, child_mask: 0, material: STONE, _pad: 0 };
-            }
+            return NodeGpu { child_base: LEAF, child_mask: 0, material: STONE, _pad: 0 };
         }
 
         // empty check via prefix
@@ -530,8 +462,6 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
                 side,
                 ground_mip,
                 tree_mip,
-                carve_bottom_mip,
-                carve_top_mip,
                 dirt_depth,
                 cancel,
             );
@@ -569,8 +499,6 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         side,
         &ground_mip,
         &tree_mip,
-        &carve_bottom_mip,
-        &carve_top_mip,
         dirt_depth,
         cancel,
     );

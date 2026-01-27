@@ -6,7 +6,6 @@ use crate::config;
 use super::{
     materials::{AIR, DIRT, GRASS, STONE, WOOD},
     trees::TreeCache,
-    tunnels::TunnelCache,
 };
 
 #[derive(Clone)]
@@ -14,8 +13,6 @@ pub struct WorldGen {
     pub seed: u32,
     height: Fbm<Perlin>,
     detail: Fbm<Perlin>,
-    cave: Fbm<Perlin>,
-    cave_warp: Fbm<Perlin>,
 }
 
 impl WorldGen {
@@ -23,11 +20,7 @@ impl WorldGen {
         let height = Fbm::<Perlin>::new(seed).set_octaves(8).set_frequency(0.025);
         let detail = Fbm::<Perlin>::new(seed ^ 0xA5A5_A5A5).set_octaves(3).set_frequency(0.02);
 
-        // 3D caves: tuned in meters (not voxels)
-        let cave = Fbm::<Perlin>::new(seed ^ 0xC0FF_EE00).set_octaves(3).set_frequency(0.030);
-        let cave_warp = Fbm::<Perlin>::new(seed ^ 0xF00D_BAAD).set_octaves(2).set_frequency(0.010);
-
-        Self { seed, height, detail, cave, cave_warp }
+        Self { seed, height, detail }
     }
 
     pub fn ground_height(&self, x_vox: i32, z_vox: i32) -> i32 {
@@ -45,21 +38,21 @@ impl WorldGen {
         ((base_m + hills_m) * voxels_per_meter).round() as i32
     }
 
-    pub fn material_at_world_cached_with_features<F: Fn(i32, i32) -> i32>(
+    /// Kept as a general "material query" helper (terrain + trees only).
+    /// If you don’t use this anywhere anymore, you can delete it too.
+    pub fn material_at_world_cached<F: Fn(i32, i32) -> i32>(
         &self,
         x: i32,
         y: i32,
         z: i32,
         height_at: &F,
         trees: &TreeCache,
-        tunnels: &TunnelCache,
-        can_carve: bool, // NEW
     ) -> u32 {
         let ground = height_at(x, z);
         let vpm = (1.0 / config::VOXEL_SIZE_M_F64) as i32;
 
-        // ---- base terrain + trees ----
-        let m = if y < ground {
+        // base terrain + trees
+        if y < ground {
             if y >= ground - 3 * vpm { DIRT } else { STONE }
         } else if y == ground {
             let tm = self.trees_material_from_cache(x, y, z, height_at, trees);
@@ -67,40 +60,6 @@ impl WorldGen {
         } else {
             let tm = self.trees_material_from_cache(x, y, z, height_at, trees);
             if tm != AIR { tm } else { AIR }
-        };
-
-        if !can_carve || m == AIR {
-            return m;
         }
-
-        // ---- carve: only in band below ground ----
-        let vpm = config::VOXELS_PER_METER;
-
-        let carve_y0 = ground - 80 * vpm; // bottom: 80m
-        let carve_y1 = ground - 1 * vpm;  // top: 1m below ground
-
-        if y >= carve_y0 && y <= carve_y1 {
-            if self.cave_density(x, y, z) < 0.0 { return AIR; }
-            if tunnels.contains_point(x, y, z) { return AIR; }
-        }
-
-        m
-    }
-
-    #[inline]
-    pub fn cave_density(&self, x_vox: i32, y_vox: i32, z_vox: i32) -> f32 {
-        // world coords in meters
-        let xm = x_vox as f64 * config::VOXEL_SIZE_M_F64;
-        let ym = y_vox as f64 * config::VOXEL_SIZE_M_F64;
-        let zm = z_vox as f64 * config::VOXEL_SIZE_M_F64;
-
-        // domain warp (meters)
-        let w = self.cave_warp.get([xm, ym, zm]) as f32; // ~[-1,1]
-        let wx = xm + (w as f64) * 12.0;
-        let wy = ym + (w as f64) * 8.0;
-        let wz = zm + (w as f64) * 12.0;
-
-        let n = self.cave.get([wx, wy, wz]) as f32; // ~[-1,1]
-        n.abs() - 0.32
     }
 }
