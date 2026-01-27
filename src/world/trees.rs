@@ -15,9 +15,31 @@ struct Tree {
     base_y: i32,   // touches ground
     trunk_h: i32,  // voxels
     crown_r: i32,  // voxels (horizontal extent)
-    canopy_h: i32, // voxels (vertical extent)
+    canopy_h: i32, // voxels (kept for bounds/variety; no canopy-blob raster)
     trunk_r0: f32, // voxels radius at base
     trunk_r1: f32, // voxels radius near top
+    seed: u32,
+}
+
+/// A single curved branch segment (cubic bezier), plus metadata for recursion.
+#[derive(Clone, Copy)]
+struct Branch {
+    ax: f32,
+    ay: f32,
+    az: f32,
+    c1x: f32,
+    c1y: f32,
+    c1z: f32,
+    c2x: f32,
+    c2y: f32,
+    c2z: f32,
+    bx: f32,
+    by: f32,
+    bz: f32,
+    r0: f32,
+    r1: f32,
+    len: f32,
+    depth: u8,
     seed: u32,
 }
 
@@ -107,9 +129,56 @@ impl WorldGen {
 
     #[inline(always)]
     fn bezier3(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
-        // cubic bezier
         let u = 1.0 - t;
         u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+    }
+
+    #[inline(always)]
+    fn bezier3_tangent(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+        let u = 1.0 - t;
+        3.0 * u * u * (b - a) + 6.0 * u * t * (c - b) + 3.0 * t * t * (d - c)
+    }
+
+    #[inline(always)]
+    fn bez_point(b: &Branch, t: f32) -> (f32, f32, f32) {
+        (
+            Self::bezier3(b.ax, b.c1x, b.c2x, b.bx, t),
+            Self::bezier3(b.ay, b.c1y, b.c2y, b.by, t),
+            Self::bezier3(b.az, b.c1z, b.c2z, b.bz, t),
+        )
+    }
+
+    #[inline(always)]
+    fn bez_tangent(b: &Branch, t: f32) -> (f32, f32, f32) {
+        (
+            Self::bezier3_tangent(b.ax, b.c1x, b.c2x, b.bx, t),
+            Self::bezier3_tangent(b.ay, b.c1y, b.c2y, b.by, t),
+            Self::bezier3_tangent(b.az, b.c1z, b.c2z, b.bz, t),
+        )
+    }
+
+    #[inline(always)]
+    fn norm3(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+        let inv = 1.0 / (x * x + y * y + z * z).sqrt().max(1e-6);
+        (x * inv, y * inv, z * inv)
+    }
+
+    #[inline(always)]
+    fn cross3(ax: f32, ay: f32, az: f32, bx: f32, by: f32, bz: f32) -> (f32, f32, f32) {
+        (ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx)
+    }
+
+    /// Orthonormal basis around direction `w` (unit). Returns (u, v, w).
+    /// This removes the “mostly one plane / one side” bias by allowing azimuthal rotation.
+    #[inline(always)]
+    fn basis_from_w(w: (f32, f32, f32)) -> ((f32, f32, f32), (f32, f32, f32), (f32, f32, f32)) {
+        let (wx, wy, wz) = w;
+        // pick a helper not parallel to w
+        let (hx, hy, hz) = if wy.abs() < 0.95 { (0.0, 1.0, 0.0) } else { (1.0, 0.0, 0.0) };
+        let (ux, uy, uz) = Self::cross3(hx, hy, hz, wx, wy, wz);
+        let (ux, uy, uz) = Self::norm3(ux, uy, uz);
+        let (vx, vy, vz) = Self::cross3(wx, wy, wz, ux, uy, uz);
+        ( (ux, uy, uz), (vx, vy, vz), (wx, wy, wz) )
     }
 
     // -------------------------------------------------------------------------
@@ -151,7 +220,7 @@ impl WorldGen {
         let r0 = 0.45 * vpm + u01(hash_u32(seed ^ 0x1111)) * (0.30 * vpm);
         let r1 = 0.18 * vpm + u01(hash_u32(seed ^ 0x2222)) * (0.12 * vpm);
 
-        // canopy height: ~2.5..4.5m
+        // kept for conservative bounds / variety (not used to make a big leaf blob)
         let canopy_h = ((2.5 * vpm) + u01(hash_u32(seed ^ 0x3333)) * (2.0 * vpm)).round() as i32;
 
         Some(Tree {
@@ -225,7 +294,6 @@ impl WorldGen {
     }
 
     /// Build a tree cache + chunk-local voxel mask (fast O(1) tree material queries).
-    /// Use this in the SVO builder to avoid per-voxel geometry tests.
     pub fn build_tree_cache_with_mask<F: Fn(i32, i32) -> i32>(
         &self,
         chunk_ox: i32,
@@ -250,7 +318,6 @@ impl WorldGen {
             stride_y: side_u * side_u,
         };
 
-        // Rasterize each tree into the mask.
         for t in &cache.trees {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
@@ -323,38 +390,33 @@ impl WorldGen {
     #[inline]
     fn branch_count_for_tree(&self, tree: &Tree) -> usize {
         let r = hash_u32(tree.seed ^ 0xBABA_1234);
-        // 2..7
-        let mut n = 2 + (r % 6) as usize;
-        // occasional extremes
-        if (r & 7) == 0 {
-            n = 2;
-        } else if (r & 7) == 1 {
-            n = 7;
+        // 10..26 (more primaries)
+        let mut n = 10 + (r % 17) as usize;
+        if (r & 31) == 0 {
+            n = 10;
+        } else if (r & 63) == 1 {
+            n = 26;
         }
         n
     }
 
-    fn branch_starts_for_tree(&self, tree: &Tree, count: usize) -> [i32; 8] {
-        let mut out = [tree.base_y; 8];
+    fn branch_starts_for_tree(&self, tree: &Tree, count: usize) -> [i32; 32] {
+        let mut out = [tree.base_y; 32];
 
-        let y_lo = tree.base_y + (tree.trunk_h * 45) / 100;
-        let y_hi = tree.base_y + (tree.trunk_h * 85) / 100;
+        let y_lo = tree.base_y + (tree.trunk_h * 32) / 100;
+        let y_hi = tree.base_y + (tree.trunk_h * 93) / 100;
 
-        for i in 0..count.min(8) {
-            let t = if count <= 1 {
-                0.5
-            } else {
-                (i as f32) / ((count - 1) as f32)
-            };
+        for i in 0..count.min(32) {
+            let t = if count <= 1 { 0.5 } else { (i as f32) / ((count - 1) as f32) };
             let y_base = (Self::lerp(y_lo as f32, y_hi as f32, t)) as i32;
 
             let r = hash_u32(tree.seed ^ 0xC0DE_0001 ^ (i as u32).wrapping_mul(0x9E37_79B9));
-            let jitter = (Self::s11(r ^ 0x1111) * 0.06 * (tree.trunk_h as f32)) as i32;
+            let jitter = (Self::s11(r ^ 0x1111) * 0.08 * (tree.trunk_h as f32)) as i32;
             out[i] = (y_base + jitter).clamp(y_lo, y_hi);
         }
 
         // insertion sort ascending
-        for i in 1..count.min(8) {
+        for i in 1..count.min(32) {
             let mut j = i;
             while j > 0 && out[j - 1] > out[j] {
                 out.swap(j - 1, j);
@@ -365,47 +427,141 @@ impl WorldGen {
         out
     }
 
-    fn raster_bezier_wood(
-        &self,
-        out: &mut TreeMaskCache,
-        ax: f32,
-        ay: f32,
-        az: f32,
-        c1x: f32,
-        c1y: f32,
-        c1z: f32,
-        c2x: f32,
-        c2y: f32,
-        c2z: f32,
-        bx: f32,
-        by: f32,
-        bz: f32,
-        r0: f32,
-        r1: f32,
-        steps: i32,
-    ) {
+    fn raster_bezier_wood(&self, out: &mut TreeMaskCache, b: &Branch, steps: i32) {
         let steps = steps.max(2);
         let inv = 1.0 / (steps as f32);
 
-        let mut px = ax;
-        let mut py = ay;
-        let mut pz = az;
+        let mut px = b.ax;
+        let mut py = b.ay;
+        let mut pz = b.az;
 
         for i in 1..=steps {
             let t = (i as f32) * inv;
 
-            let qx = Self::bezier3(ax, c1x, c2x, bx, t);
-            let qy = Self::bezier3(ay, c1y, c2y, by, t);
-            let qz = Self::bezier3(az, c1z, c2z, bz, t);
+            let qx = Self::bezier3(b.ax, b.c1x, b.c2x, b.bx, t);
+            let qy = Self::bezier3(b.ay, b.c1y, b.c2y, b.by, t);
+            let qz = Self::bezier3(b.az, b.c1z, b.c2z, b.bz, t);
 
-            let rr0 = r0 + (r1 - r0) * (((i - 1) as f32) * inv);
-            let rr1 = r0 + (r1 - r0) * t;
+            let rr0 = b.r0 + (b.r1 - b.r0) * (((i - 1) as f32) * inv);
+            let rr1 = b.r0 + (b.r1 - b.r0) * t;
 
-            self.raster_segment_wood(out, px, py, pz, qx, qy, qz, rr0.max(1.0), rr1.max(1.0));
+            self.raster_segment_wood(out, px, py, pz, qx, qy, qz, rr0.max(0.55), rr1.max(0.55));
 
             px = qx;
             py = qy;
             pz = qz;
+        }
+    }
+
+    /// More children, and (critically) azimuthal rotation around parent tangent to avoid planar / one-side bias.
+    fn spawn_child_branches(&self, parent: &Branch, tree_seed: u32, out: &mut Vec<Branch>) {
+        if parent.depth >= 4 {
+            return; // total levels: 0..4
+        }
+
+        let vpm = config::VOXELS_PER_METER as f32;
+
+        let base = hash_u32(parent.seed ^ 0xCC11_0000);
+
+        // higher fan-out mid-depths
+        let child_count = match parent.depth {
+            0 => 4 + (base % 4) as usize, // 4..7
+            1 => 4 + (base % 5) as usize, // 4..8
+            2 => 3 + (base % 5) as usize, // 3..7
+            _ => 2 + (base % 4) as usize, // 2..5
+        };
+
+        for j in 0..child_count {
+            let sj = hash_u32(base ^ (j as u32).wrapping_mul(0x9E37_79B9));
+
+            // spawn along curve (skip very base)
+            let t = (0.20 + 0.70 * u01(sj ^ 0x1111)).clamp(0.0, 1.0);
+
+            let (ax, ay, az) = Self::bez_point(parent, t);
+            let (tx, ty, tz) = Self::bez_tangent(parent, t);
+            let w = Self::norm3(tx, ty, tz);
+            let (u, v, w) = Self::basis_from_w(w);
+
+            // azimuth around tangent (this is the balance fix)
+            let phi = u01(sj ^ 0xFACE_B00C) * std::f32::consts::TAU;
+            let (cs, sn) = (phi.cos(), phi.sin());
+            let sideways = (
+                u.0 * cs + v.0 * sn,
+                u.1 * cs + v.1 * sn,
+                u.2 * cs + v.2 * sn,
+            );
+
+            let depth = parent.depth + 1;
+
+            // length shrinks with depth but keeps many visible twigs
+            let max_from_parent = parent.len * (0.78 - 0.10 * (depth as f32));
+            let mut len = (0.75 * vpm + u01(sj ^ 0x2222) * (2.70 * vpm)).min(max_from_parent);
+            len = len.max(0.60 * vpm);
+
+            // fan amount is symmetric (mean 0), upward bias is symmetric across azimuth
+            let fan_amp = 0.75 + 0.25 * (depth as f32);
+            let fan = Self::s11(sj ^ 0x3333) * fan_amp;
+
+            let up = (0.16 + 0.14 * (depth as f32)) + 0.32 * u01(sj ^ 0x4444);
+
+            // direction = tangent + sideways + up
+            let dirx = (w.0 + sideways.0 * fan).clamp(-2.0, 2.0);
+            let diry = (w.1 + sideways.1 * fan + up).clamp(-0.2, 2.0);
+            let dirz = (w.2 + sideways.2 * fan).clamp(-2.0, 2.0);
+            let (dirx, diry, dirz) = Self::norm3(dirx, diry, dirz);
+
+            // parent radius at spawn point
+            let pr = parent.r0 + (parent.r1 - parent.r0) * t;
+
+            // keep children visible, but taper
+            let shrink = match depth {
+                1 => 0.58,
+                2 => 0.52,
+                3 => 0.46,
+                _ => 0.40,
+            };
+            let r0 = (pr * shrink).max(0.70);
+            let r1 = (r0 * (0.34 + 0.16 * u01(sj ^ 0x5555))).max(0.50);
+
+            let bx = ax + dirx * len;
+            let by = ay + diry * len;
+            let bz = az + dirz * len;
+
+            // curvature: bend in the sideways direction (still randomized by azimuth)
+            let bend = (0.26 + 0.78 * u01(sj ^ 0x6666)) * vpm;
+
+            let k1 = Self::s11(sj ^ 0x7777);
+            let k2 = Self::s11(sj ^ 0x8888);
+            let u1 = Self::s11(sj ^ 0x9999);
+            let u2 = Self::s11(sj ^ 0xAAAA);
+
+            let c1x = ax + dirx * (0.33 * len) + sideways.0 * (bend * 0.85 * k1);
+            let c1y = ay + diry * (0.33 * len) + (0.22 * bend * u1);
+            let c1z = az + dirz * (0.33 * len) + sideways.2 * (bend * 0.85 * k1);
+
+            let c2x = ax + dirx * (0.70 * len) + sideways.0 * (bend * 0.60 * k2);
+            let c2y = ay + diry * (0.70 * len) + (0.18 * bend * u2);
+            let c2z = az + dirz * (0.70 * len) + sideways.2 * (bend * 0.60 * k2);
+
+            out.push(Branch {
+                ax,
+                ay,
+                az,
+                c1x,
+                c1y,
+                c1z,
+                c2x,
+                c2y,
+                c2z,
+                bx,
+                by,
+                bz,
+                r0,
+                r1,
+                len,
+                depth,
+                seed: hash_u32(tree_seed ^ sj ^ 0xBEEF_1234),
+            });
         }
     }
 
@@ -446,72 +602,66 @@ impl WorldGen {
             }
         }
 
-        // --- branches + branch leaves (variable count, truly curved via bezier tessellation) ---
+        // --- branches: lots of recursion, no canopy blob ---
         let vpm_f = config::VOXELS_PER_METER as f32;
 
-        let bcount = self.branch_count_for_tree(tree).min(8);
-        let starts = self.branch_starts_for_tree(tree, bcount);
+        let primary_count = self.branch_count_for_tree(tree).min(32);
+        let starts = self.branch_starts_for_tree(tree, primary_count);
 
         let ang0 = u01(hash_u32(tree.seed ^ 0xA0A0_0001)) * std::f32::consts::TAU;
 
-        for i in 0..bcount {
+        let mut branches: Vec<Branch> = Vec::with_capacity(512);
+
+        for i in 0..primary_count {
             let sy = starts[i];
             let br_seed = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
 
-            // Angle around trunk
-            let ang_j = Self::s11(hash_u32(br_seed ^ 0xABCD_0001)) * 0.55;
-            let ang = ang0 + (i as f32) * (std::f32::consts::TAU / (bcount as f32)) + ang_j;
+            let ang_j = Self::s11(hash_u32(br_seed ^ 0xABCD_0001)) * 0.78;
+            let ang = ang0 + (i as f32) * (std::f32::consts::TAU / (primary_count as f32)) + ang_j;
 
             let dirx = ang.cos();
             let dirz = ang.sin();
-            let perpx = -dirz;
-            let perpz = dirx;
 
-            // Branch length
-            let len = (1.6 * vpm_f) + u01(hash_u32(br_seed ^ 0x1111)) * (2.4 * vpm_f);
+            // Primary length: longer for more children
+            let len = (2.6 * vpm_f) + u01(hash_u32(br_seed ^ 0x1111)) * (3.8 * vpm_f);
 
-            // Height fraction on trunk
             let h = ((sy - tree.base_y) as f32 / (tree.trunk_h as f32)).clamp(0.0, 1.0);
-
-            // Upward pitch (biased upward, more for higher branches)
             let p = u01(hash_u32(br_seed ^ 0x2222));
-            let pitch = (0.22 + 0.30 * h) + (p * p) * (0.40 + 0.30 * h); // ~0.22..0.92
+            let pitch = (0.10 + 0.20 * h) + (p * p) * (0.56 + 0.28 * h);
 
-            // Thickness
-            let br0 = (0.11 * vpm_f) + u01(hash_u32(br_seed ^ 0x3333)) * (0.13 * vpm_f);
-            let br1 = br0 * (0.34 + 0.22 * u01(hash_u32(br_seed ^ 0x3334)));
+            // slightly thicker to keep small branches visible
+            let br0 = (0.13 * vpm_f) + u01(hash_u32(br_seed ^ 0x3333)) * (0.22 * vpm_f);
+            let br1 = br0 * (0.28 + 0.22 * u01(hash_u32(br_seed ^ 0x3334)));
 
-            // Start on trunk (wobble)
             let (twx, twz) = self.trunk_wobble(tree, sy);
             let ax = tree.tx as f32 + twx;
             let ay = sy as f32;
             let az = tree.tz as f32 + twz;
 
-            // End point (ideal)
             let bx = ax + dirx * len;
             let by = ay + pitch * len;
             let bz = az + dirz * len;
 
-            // Curvature strength in voxels (make it big enough to show at your resolution)
-            let bend = (0.85 + 0.85 * u01(hash_u32(br_seed ^ 0x9000))) * vpm_f; // ~0.85..1.70m
+            // curve a bit, but not “spiral”
+            let bend = (0.75 + 1.05 * u01(hash_u32(br_seed ^ 0x9000))) * vpm_f;
             let k1 = Self::s11(hash_u32(br_seed ^ 0x9001));
             let k2 = Self::s11(hash_u32(br_seed ^ 0x9002));
             let u1 = Self::s11(hash_u32(br_seed ^ 0x9003));
             let u2 = Self::s11(hash_u32(br_seed ^ 0x9004));
 
-            // Control points: sideways S-curve + slight vertical kinks
+            // use world-up perpendicular here (primaries), but children are fully azimuthal
+            let perpx = -dirz;
+            let perpz = dirx;
+
             let c1x = ax + dirx * (0.33 * len) + perpx * (bend * (0.95 * k1));
             let c1z = az + dirz * (0.33 * len) + perpz * (bend * (0.95 * k1));
-            let c1y = ay + (pitch * len) * 0.33 + (0.35 * bend * u1);
+            let c1y = ay + (pitch * len) * 0.33 + (0.32 * bend * u1);
 
             let c2x = ax + dirx * (0.70 * len) + perpx * (bend * (0.70 * k2));
             let c2z = az + dirz * (0.70 * len) + perpz * (bend * (0.70 * k2));
-            let c2y = ay + (pitch * len) * 0.70 + (0.25 * bend * u2);
+            let c2y = ay + (pitch * len) * 0.70 + (0.24 * bend * u2);
 
-            // Tessellate enough so it stops reading as "straight"
-            let steps = 22 + (hash_u32(br_seed ^ 0xDEAD) % 12) as i32; // 22..33
-            self.raster_bezier_wood(
-                out,
+            branches.push(Branch {
                 ax,
                 ay,
                 az,
@@ -524,59 +674,97 @@ impl WorldGen {
                 bx,
                 by,
                 bz,
-                br0.max(1.0),
-                br1.max(1.0),
-                steps,
-            );
+                r0: br0.max(1.0),
+                r1: br1.max(0.80),
+                len,
+                depth: 0,
+                seed: hash_u32(tree.seed ^ br_seed ^ 0x1A2B_3C4D),
+            });
+        }
 
-            // Choose two points along the curve for leaf placement (mid + tip)
-            let tmid = 0.70;
-            let midx = Self::bezier3(ax, c1x, c2x, bx, tmid);
-            let midy = Self::bezier3(ay, c1y, c2y, by, tmid);
-            let midz = Self::bezier3(az, c1z, c2z, bz, tmid);
+        // BFS recursion to generate many endpoints.
+        let mut k = 0usize;
+        let cap = 520usize; // more branches
+        while k < branches.len() && branches.len() < cap {
+            let b = branches[k];
+            self.spawn_child_branches(&b, tree.seed, &mut branches);
+            k += 1;
+        }
 
-            let tipx = bx;
-            let tipy = by;
-            let tipz = bz;
+        // Raster all branches as wood
+        for b in &branches {
+            let steps = (10.0 + (b.len / (0.30 * vpm_f))).round() as i32;
+            let steps = steps.clamp(8, 30);
+            self.raster_bezier_wood(out, b, steps);
+        }
 
-            // Some branches are bare
-            if (hash_u32(br_seed ^ 0x55AA_1234) & 31) == 0 {
+        // Leaves:
+        // - Put leaves on (almost) every branch that is depth>=2.
+        // - Also add 1–3 extra tufts along the last part of the branch so you don't get “bare sticks”.
+        for b in &branches {
+            if b.depth < 2 {
                 continue;
             }
 
-            // Sleeve near tip
-            let sleeve_r = (0.18 * vpm_f).max(1.0);
-            self.raster_sphere_leaf_canopy_style(
-                out,
-                tipx,
-                tipy,
-                tipz,
-                sleeve_r,
-                tree.seed ^ br_seed ^ 0x600D_600D,
-            );
+            // very rare bare branch for variety (was too common before)
+            if (hash_u32(b.seed ^ 0x1357_2468) & 255) == 0 {
+                continue;
+            }
 
-            // Tufts
-            let tuft_r = (0.55 * vpm_f) + u01(hash_u32(br_seed ^ 0x4444)) * (0.40 * vpm_f);
-            self.raster_sphere_leaf_canopy_style(
-                out,
-                tipx,
-                tipy,
-                tipz,
-                tuft_r,
-                tree.seed ^ br_seed ^ 0x1EE7_1EAF,
-            );
-            self.raster_sphere_leaf_canopy_style(
-                out,
-                midx,
-                midy,
-                midz,
-                tuft_r * 0.80,
-                tree.seed ^ br_seed ^ 0x2AA2_2AA2,
-            );
+            let tuft_r = match b.depth {
+                4 => (0.26 * vpm_f) + u01(hash_u32(b.seed ^ 0x4444)) * (0.50 * vpm_f),
+                3 => (0.25 * vpm_f) + u01(hash_u32(b.seed ^ 0x4445)) * (0.46 * vpm_f),
+                _ => (0.24 * vpm_f) + u01(hash_u32(b.seed ^ 0x4446)) * (0.42 * vpm_f),
+            };
+
+            // Always a tip tuft
+            self.raster_sphere_leaf_tuft_dense(out, b.bx, b.by, b.bz, tuft_r, b.seed ^ 0x1EE7_1EAF);
+
+            // Sleeve tufts along last ~35% of branch (prevents bare branches)
+            let sleeve_n = match b.depth {
+                4 => 3,
+                3 => 2,
+                _ => 1,
+            };
+
+            for si in 0..sleeve_n {
+                let rr = hash_u32(b.seed ^ 0x9000_1000 ^ (si as u32).wrapping_mul(0x9E37_79B9));
+                let t = 0.62 + 0.30 * u01(rr ^ 0x0101); // 0.62..0.92
+                let (mx, my, mz) = Self::bez_point(b, t);
+
+                // small random offset around the branch (keeps it from looking like a ball-chain)
+                let ox = Self::s11(rr ^ 0x0202) * (0.22 * vpm_f);
+                let oy = u01(rr ^ 0x0303) * (0.18 * vpm_f);
+                let oz = Self::s11(rr ^ 0x0404) * (0.22 * vpm_f);
+
+                self.raster_sphere_leaf_tuft_dense(
+                    out,
+                    mx + ox,
+                    my + oy,
+                    mz + oz,
+                    tuft_r * (0.60 + 0.12 * (si as f32)),
+                    b.seed ^ rr ^ 0x2AA2_2AA2,
+                );
+            }
+
+            // Extra offset tip tuft quite often to break symmetry
+            if (hash_u32(b.seed ^ 0xABC0_0001) & 3) != 0 {
+                let rr = hash_u32(b.seed ^ 0xABC0_0002);
+                let ox = Self::s11(rr ^ 0xABC1) * (0.30 * vpm_f);
+                let oy = u01(rr ^ 0xABC2) * (0.22 * vpm_f);
+                let oz = Self::s11(rr ^ 0xABC3) * (0.30 * vpm_f);
+                self.raster_sphere_leaf_tuft_dense(
+                    out,
+                    b.bx + ox,
+                    b.by + oy,
+                    b.bz + oz,
+                    tuft_r * 0.80,
+                    b.seed ^ 0x600D_600D,
+                );
+            }
         }
 
-        // --- canopy leaves (4 lumpy spheres) ---
-        self.raster_canopy(out, tree);
+        // NOTE: no canopy raster pass at all.
     }
 
     fn raster_segment_wood(
@@ -617,7 +805,8 @@ impl WorldGen {
         }
     }
 
-    fn raster_sphere_leaf_canopy_style(
+    // Denser leaf tufts (still irregular). Designed to be used many times on branch tips/sleeves.
+    fn raster_sphere_leaf_tuft_dense(
         &self,
         out: &mut TreeMaskCache,
         cx: f32,
@@ -640,7 +829,7 @@ impl WorldGen {
 
         for y in miny..=maxy {
             let py = y as f32;
-            let dy = (py - cy) * 1.25;
+            let dy = (py - cy) * 1.16;
             let dy2 = dy * dy;
 
             for x in minx..=maxx {
@@ -649,8 +838,8 @@ impl WorldGen {
                 let dx2 = dx * dx;
 
                 for z in minz..=maxz {
-                    // cheap gate (same as canopy): keep ~1/4
-                    let gate = hash3(seed ^ 0xA11C_E5ED, x, y, z) & 3;
+                    // keep ~1/2 (denser than earlier)
+                    let gate = hash3(seed ^ 0xA11C_E5ED, x, y, z) & 1;
                     if gate != 0 {
                         continue;
                     }
@@ -662,142 +851,17 @@ impl WorldGen {
                         continue;
                     }
 
+                    // denser interior; still a bit hollow-ish
                     let nd = (d2.sqrt() / rr).clamp(0.0, 1.0);
-
                     if nd < 0.80 {
                         let n = hash3(seed ^ 0xCAFE_BABE, x, y, z);
-                        if (n & 63) != 0 {
-                            continue; // keep 1/64 in interior
+                        if (n & 31) != 0 {
+                            continue; // keep 1/32 interior
                         }
                     } else {
                         let n = hash3(seed ^ 0xD00D_F00D, x, y, z);
-                        if (n & 7) == 0 {
-                            continue; // drop 1/8 near shell
-                        }
-                    }
-
-                    out.write_leaf(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
-                }
-            }
-        }
-    }
-
-    fn raster_canopy(&self, out: &mut TreeMaskCache, tree: &Tree) {
-        let vpm = config::VOXELS_PER_METER;
-        let top_y = tree.base_y + tree.trunk_h;
-
-        let canopy_y0 = top_y - (vpm / 3);
-        let canopy_y1 = top_y + (tree.canopy_h * 3) / 4;
-
-        let y0 = canopy_y0.max(out.origin[1]);
-        let y1 = canopy_y1.min(out.origin[1] + out.size - 1);
-        if y0 > y1 {
-            return;
-        }
-
-        let (wx, wz) = self.trunk_wobble(tree, top_y);
-        let cx0 = tree.tx as f32 + wx;
-        let cz0 = tree.tz as f32 + wz;
-        let cy0 = top_y as f32 + 0.30 * (tree.canopy_h as f32);
-
-        let base_r = (tree.crown_r as f32) * 0.90;
-
-        // Conservative AABB in XZ
-        let max_r = base_r * 1.20;
-        let minx = (cx0 - max_r).floor() as i32;
-        let maxx = (cx0 + max_r).ceil() as i32;
-        let minz = (cz0 - max_r).floor() as i32;
-        let maxz = (cz0 + max_r).ceil() as i32;
-
-        let x0 = minx.max(out.origin[0]);
-        let x1 = maxx.min(out.origin[0] + out.size - 1);
-        let z0 = minz.max(out.origin[2]);
-        let z1 = maxz.min(out.origin[2] + out.size - 1);
-        if x0 > x1 || z0 > z1 {
-            return;
-        }
-
-        // 4 lumpy spheres
-        let mut spheres = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); 4];
-        for i in 0..4u32 {
-            let rr = hash_u32(tree.seed ^ 0xC100 ^ i.wrapping_mul(0x9E37_79B9));
-            let ang = u01(rr) * std::f32::consts::TAU;
-
-            let rad = u01(hash_u32(rr ^ 0x10)) * (0.60 * base_r);
-            let cx = cx0 + ang.cos() * rad;
-            let cz = cz0 + ang.sin() * rad;
-            let cy = cy0 + (u01(hash_u32(rr ^ 0x20)) - 0.5) * (0.50 * tree.canopy_h as f32);
-
-            let cr = (0.48 + 0.28 * u01(hash_u32(rr ^ 0x30))) * base_r;
-            spheres[i as usize] = (cx, cy, cz, cr);
-        }
-
-        let max_r2 = max_r * max_r;
-        let trunk_clear = 0.45 * (vpm as f32);
-        let trunk_clear2 = trunk_clear * trunk_clear;
-
-        for y in y0..=y1 {
-            let py = y as f32;
-
-            for x in x0..=x1 {
-                let px = x as f32;
-                let dx0 = px - cx0;
-                let dx02 = dx0 * dx0;
-
-                for z in z0..=z1 {
-                    // cheap “gate” (cuts fill-rate)
-                    let gate = hash3(self.seed ^ 0xA11C_E5ED, x, y, z) & 3;
-                    if gate != 0 {
-                        continue;
-                    }
-
-                    let pz = z as f32;
-                    let dz0 = pz - cz0;
-                    let d0 = dx02 + dz0 * dz0;
-
-                    if d0 > max_r2 {
-                        continue;
-                    }
-
-                    let mut best_nd: f32 = 2.0;
-                    let mut hit = false;
-
-                    for (cx, cy, cz, cr) in spheres {
-                        let dx = px - cx;
-                        let dy = (py - cy) * 1.45;
-                        let dz = pz - cz;
-
-                        let d2 = dx * dx + dy * dy + dz * dz;
-                        if d2 <= cr * cr {
-                            hit = true;
-                            let nd = d2.sqrt() / cr;
-                            if nd < best_nd {
-                                best_nd = nd;
-                            }
-                        }
-                    }
-
-                    if !hit {
-                        continue;
-                    }
-
-                    if best_nd < 0.80 {
-                        let n = hash3(self.seed ^ 0xCAFE_BABE, x, y, z);
-                        if (n & 63) != 0 {
-                            continue;
-                        }
-                    } else {
-                        let n = hash3(self.seed ^ 0xD00D_F00D, x, y, z);
-                        if (n & 7) == 0 {
-                            continue;
-                        }
-                    }
-
-                    // trunk clear-ish
-                    if d0 < trunk_clear2 {
-                        let n2 = hash3(self.seed ^ 0x5151_5151, x, y, z);
-                        if (n2 & 15) != 0 {
-                            continue;
+                        if (n & 15) == 0 {
+                            continue; // drop 1/16 near shell
                         }
                     }
 

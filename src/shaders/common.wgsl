@@ -30,7 +30,7 @@ const EPS_INV  : f32 = 1e-8;        // Epsilon for safe inverses / parallel test
 // --- Sun / sky ---
 const SUN_DIR : vec3<f32> = vec3<f32>(0.61237244, 0.5, 0.61237244); // fixed directional light
 const SUN_COLOR     : vec3<f32> = vec3<f32>(1.0, 0.98, 0.90);
-const SUN_INTENSITY : f32 = 2.5;
+const SUN_INTENSITY : f32 = 3.5;
 
 // Sun disc tuning (angular radius ~0.5° in radians, with softness)
 const SUN_DISC_ANGULAR_RADIUS : f32 = 0.009;
@@ -44,7 +44,7 @@ const SHADOW_BIAS : f32 = 2e-4; // also see ray_shadow.wgsl for per-ray biasing
 
 // --- Fog / volumetrics ---
 // Fog density comes from cam.voxel_params.w; these shape its behavior.
-const FOG_HEIGHT_FALLOFF : f32 = 0.10;  // larger = fog decays faster with height
+const FOG_HEIGHT_FALLOFF : f32 = 0.07;  // larger = fog decays faster with height
 const FOG_MAX_DIST       : f32 = 100.0; // meters: cap fog integration distance
 
 // Godray tuning (used by ray_main.wgsl, but kept here for shared helpers)

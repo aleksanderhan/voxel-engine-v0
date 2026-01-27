@@ -1,11 +1,15 @@
 // src/streaming/manager.rs
 //
-// Chunk streaming + background SVO building.
+// Chunk streaming + background SVO (Sparse Voxel Octree) building.
 //
 // Key perf change (for the renderer optimization pass):
 // - update(...) now returns `bool grid_changed` so the app can skip uploading `chunk_grid`
-//   every frame. We track a `grid_dirty` flag and only rebuild the GPU lookup grid when
-//   something that affects it actually changed (origin shift or resident set / slot moves).
+//   every frame. We track a `grid_dirty` flag and only rebuild the GPU (Graphics Processing Unit)
+//   lookup grid when something that affects it actually changed (origin shift or resident set / slot moves).
+//
+// Important correctness fix:
+// - Always send a BuildDone for every BuildJob that is received by a worker, even if it was canceled.
+//   Otherwise `in_flight` can get "stuck" at MAX_IN_FLIGHT and chunk streaming will halt.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -61,6 +65,7 @@ struct BuildJob {
 struct BuildDone {
     key: ChunkKey,
     cancel: Arc<AtomicBool>,
+    canceled: bool,
     nodes: Vec<NodeGpu>,
 }
 
@@ -83,11 +88,25 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
             let mut scratch = BuildScratch::new();
 
             while let Ok(job) = rx_job.recv() {
+                let k = job.key;
+
+                // If we were already cancelled before starting, still notify the main thread
+                // so it can decrement `in_flight`.
                 if job.cancel.load(Ordering::Relaxed) {
+                    if tx_done
+                        .send(BuildDone {
+                            key: k,
+                            cancel: job.cancel,
+                            canceled: true,
+                            nodes: Vec::new(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                     continue;
                 }
 
-                let k = job.key;
                 let origin = [
                     k.x * config::CHUNK_SIZE as i32,
                     k.y * config::CHUNK_SIZE as i32,
@@ -102,15 +121,16 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                     &mut scratch,
                 );
 
-                // If we got cancelled mid-build, drop it (don’t send; saves main-thread work).
-                if job.cancel.load(Ordering::Relaxed) {
-                    continue;
-                }
+                // If we got cancelled mid-build, still notify the main thread,
+                // but drop nodes to save main-thread work + upload pressure.
+                let canceled = job.cancel.load(Ordering::Relaxed);
+                let nodes = if canceled { Vec::new() } else { nodes };
 
                 if tx_done
                     .send(BuildDone {
                         key: k,
                         cancel: job.cancel,
+                        canceled,
                         nodes,
                     })
                     .is_err()
@@ -140,24 +160,14 @@ fn sort_queue_near_first(queue: &mut VecDeque<ChunkKey>, center: ChunkKey, cam_f
     queue.extend(v);
 }
 
-fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
+fn chunk_priority_score(k: ChunkKey, c: ChunkKey, _fwd_xz: Vec2) -> f32 {
     let dx = (k.x - c.x) as f32;
     let dz = (k.z - c.z) as f32;
     let dy = (k.y - c.y) as f32;
 
-    // Base distance (prefer close). Penalize vertical moves more.
-    let dist = dx.abs() + dz.abs() + 2.0 * dy.abs();
-
-    // Prefer chunks in front (ahead in XZ).
-    let dir = Vec2::new(dx, dz);
-    let ahead = if dir.length_squared() > 1e-6 {
-        dir.normalize().dot(fwd_xz) // [-1..1]
-    } else {
-        1.0
-    };
-
     // Lower score = higher priority.
-    dist - 1.75 * ahead
+    // Base distance (prefer close). Penalize vertical moves more.
+    dx.abs() + dz.abs() + 2.0 * dy.abs()
 }
 
 pub struct ChunkManager {
@@ -355,8 +365,8 @@ impl ChunkManager {
                 self.in_flight -= 1;
             }
 
-            // If cancelled after completion, drop.
-            if done.cancel.load(Ordering::Relaxed) {
+            // If canceled (either before start or mid-build), ignore the result.
+            if done.canceled || done.cancel.load(Ordering::Relaxed) {
                 continue;
             }
 
