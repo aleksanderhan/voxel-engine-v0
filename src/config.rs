@@ -13,4 +13,4 @@ pub const VOXELS_PER_METER: i32 = 10; // 1.0 / 0.10
 pub const WORKER_THREADS: usize = 4;
 pub const MAX_IN_FLIGHT: usize = 8;
 
-pub const NODE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+pub const NODE_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;

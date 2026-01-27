@@ -10,6 +10,10 @@
 // Important correctness fix:
 // - Always send a BuildDone for every BuildJob that is received by a worker, even if it was canceled.
 //   Otherwise `in_flight` can get "stuck" at MAX_IN_FLIGHT and chunk streaming will halt.
+//
+// Additional perf fix (requested):
+// - Deduplicate and purge stale entries in build_queue.
+// - Only (purge + sort) the queue when the center chunk changes.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -176,6 +180,12 @@ pub struct ChunkManager {
     chunks: HashMap<ChunkKey, ChunkState>,
     build_queue: VecDeque<ChunkKey>,
 
+    // Deduplicate queued keys (prevents unbounded queue growth).
+    queued_set: HashSet<ChunkKey>,
+
+    // Only sort/purge when center chunk changes.
+    last_center: Option<ChunkKey>,
+
     // Per-chunk cancel tokens
     cancels: HashMap<ChunkKey, Arc<AtomicBool>>,
 
@@ -224,6 +234,9 @@ impl ChunkManager {
             gen,
             chunks: HashMap::new(),
             build_queue: VecDeque::new(),
+            queued_set: HashSet::new(),
+            last_center: None,
+
             cancels: HashMap::new(),
             tx_job,
             rx_done,
@@ -233,8 +246,8 @@ impl ChunkManager {
             chunk_meta: Vec::new(),
             uploads: Vec::new(),
             changed: false,
-            grid_dirty: true, // first update should build + upload the grid
 
+            grid_dirty: true, // first update should build + upload the grid
             arena: NodeArena::new(node_capacity),
 
             grid_origin_chunk: [0, 0, 0],
@@ -307,7 +320,11 @@ impl ChunkManager {
                     c.store(false, Ordering::Relaxed);
 
                     self.chunks.insert(*k, ChunkState::Queued);
-                    self.build_queue.push_back(*k);
+
+                    // Dedupe queue entries.
+                    if self.queued_set.insert(*k) {
+                        self.build_queue.push_back(*k);
+                    }
                 }
                 _ => {}
             }
@@ -323,11 +340,30 @@ impl ChunkManager {
             }
         }
 
-        // Dispatch builds (forward-cone priority).
-        sort_queue_near_first(&mut self.build_queue, center, cam_fwd);
+        // Only purge + sort when the center chunk changes.
+        let center_changed = self.last_center.map_or(true, |c| c != center);
+        if center_changed {
+            self.last_center = Some(center);
 
+            // Purge stale keys aggressively: keep only keys that are still queued and still in KEEP.
+            self.build_queue.retain(|k| {
+                keep_set.contains(k) && matches!(self.chunks.get(k), Some(ChunkState::Queued))
+            });
+
+            // Rebuild queued_set from the queue so it matches reality.
+            self.queued_set.clear();
+            self.queued_set.extend(self.build_queue.iter().copied());
+
+            // Sort once per center change.
+            sort_queue_near_first(&mut self.build_queue, center, cam_fwd);
+        }
+
+        // Dispatch builds.
         while self.in_flight < config::MAX_IN_FLIGHT {
             let Some(k) = self.build_queue.pop_front() else { break; };
+
+            // Popped => no longer queued.
+            self.queued_set.remove(&k);
 
             if !keep_set.contains(&k) {
                 // Cancel if it was pending.
@@ -354,6 +390,11 @@ impl ChunkManager {
                 } else {
                     // Channel closed; keep it queued.
                     self.chunks.insert(k, ChunkState::Queued);
+
+                    // Put it back (dedup-safe).
+                    if self.queued_set.insert(k) {
+                        self.build_queue.push_back(k);
+                    }
                     break;
                 }
             }
@@ -365,13 +406,22 @@ impl ChunkManager {
                 self.in_flight -= 1;
             }
 
-            // If canceled (either before start or mid-build), ignore the result.
+            // If the job was canceled (either before start or mid-build),
+            // the chunk MUST NOT stay in Building forever.
             if done.canceled || done.cancel.load(Ordering::Relaxed) {
+                // If it still exists and is Building, clear it.
+                // (Missing is fine; desired() will re-queue if needed.)
+                if matches!(self.chunks.get(&done.key), Some(ChunkState::Building)) {
+                    self.chunks.insert(done.key, ChunkState::Missing);
+                } else if self.chunks.get(&done.key).is_some() {
+                    // Conservative: ensure we don't leave it in a non-retryable state.
+                    self.chunks.insert(done.key, ChunkState::Missing);
+                }
                 continue;
             }
 
+            // If it finished but is no longer in KEEP, drop it and mark Missing.
             if !keep_set.contains(&done.key) {
-                // Drop build result, also mark cancelled to avoid late reuse.
                 self.cancel_token(done.key).store(true, Ordering::Relaxed);
                 self.chunks.insert(done.key, ChunkState::Missing);
                 continue;
@@ -380,6 +430,7 @@ impl ChunkManager {
             // Still relevant.
             self.on_build_done(done.key, done.nodes);
         }
+
 
         // If the keep-grid origin would shift, the lookup mapping changes.
         if self.keep_origin_for(center) != self.grid_origin_chunk {
@@ -439,7 +490,11 @@ impl ChunkManager {
             self.cancel_token(key).store(false, Ordering::Relaxed);
 
             self.chunks.insert(key, ChunkState::Queued);
-            self.build_queue.push_back(key);
+
+            // Dedup-safe requeue.
+            if self.queued_set.insert(key) {
+                self.build_queue.push_back(key);
+            }
             return;
         };
 
@@ -536,10 +591,12 @@ impl ChunkManager {
                 // Cancel work in-flight.
                 self.cancel_token(key).store(true, Ordering::Relaxed);
 
+                // If it was queued, prevent duplicate re-adds.
+                self.queued_set.remove(&key);
+
                 self.chunks.insert(key, ChunkState::Missing);
 
-                // Even though it wasn't resident, this often correlates with resident churn;
-                // mark dirty conservatively (cheap).
+                // Conservative dirty.
                 self.grid_dirty = true;
                 self.changed = true;
             }
@@ -567,7 +624,6 @@ impl ChunkManager {
         let ny = GRID_Y_COUNT;
 
         self.grid_dims = [nx, ny, nz];
-
         self.grid_origin_chunk = self.keep_origin_for(center);
 
         let needed = (nx * ny * nz) as usize;
