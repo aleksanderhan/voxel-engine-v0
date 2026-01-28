@@ -3,15 +3,7 @@
 // src/app/mod.rs
 // --------------
 //
-// High-level application glue:
-// - Owns the window + wgpu surface configuration (swapchain-ish state).
-// - Owns input + camera state.
-// - Owns world/chunk streaming state.
-// - Owns clipmap state (CPU-updated 2D heightmap rings).
-// - Delegates all GPU resource ownership and rendering work to `Renderer`.
-//
-// The core loop is driven by winit events. We run with `ControlFlow::Wait`
-// and request redraws from AboutToWait.
+// Only change here is that ClipmapUpload now has x/y/w/h, so this compiles.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,9 +24,6 @@ use crate::{
     world::WorldGen,
 };
 
-/// Entrypoint called by main:
-/// - Builds the `App` (async, because wgpu adapter/device acquisition is async).
-/// - Starts the winit event loop and forwards events into the app.
 pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
     let mut app = App::new(window).await;
 
@@ -60,12 +49,10 @@ pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
         .unwrap();
 }
 
-/// Application state that lives for the duration of the event loop.
 pub struct App {
     window: Arc<Window>,
     start_time: Instant,
 
-    // --- WGPU presentation state ---
     _instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     _adapter: wgpu::Adapter,
@@ -74,18 +61,14 @@ pub struct App {
 
     renderer: Renderer,
 
-    // --- World + streaming state ---
     world: Arc<WorldGen>,
     chunks: ChunkManager,
 
-    // --- Clipmap fallback terrain ---
     clipmap: Clipmap,
 
-    // --- Interaction state ---
     input: InputState,
     camera: Camera,
 
-    // --- FPS overlay bookkeeping ---
     fps_value: u32,
     fps_frames: u32,
     fps_last: Instant,
@@ -210,7 +193,8 @@ impl App {
         self.renderer.write_clipmap(&clip_gpu);
 
         for up in clip_uploads {
-            self.renderer.write_clipmap_level(up.level, &up.data_f16);
+            self.renderer
+                .write_clipmap_patch(up.level, up.x, up.y, up.w, up.h, &up.data_f16);
         }
 
         // 4) camera matrices -> CameraGpu
@@ -426,12 +410,25 @@ impl Camera {
 // - This halves upload bandwidth and reduces VRAM traffic.
 // - WGSL textureLoad still returns f32 when sampling R16Float.
 //
-// Strategy:
-// - Each level is a full CLIPMAP_RES x CLIPMAP_RES height map (meters).
+// Strategy (ring clipmap / strip updates):
+// - Each level is a CLIPMAP_RES x CLIPMAP_RES height map (meters) stored as a TORUS.
 // - Level i has cell size = CLIPMAP_BASE_CELL_M * 2^i.
-// - We "snap" the level origin to cell boundaries so updates are stable.
-// - When the camera moves enough that a level origin changes, we refresh that entire level.
-//   (Not incremental ring updates; simple + robust.)
+// - We "snap" the *logical* origin (world cell coords) to cell boundaries for stability.
+// - When the origin changes by a small delta (dx,dz in cells), we DO NOT full refresh.
+//   Instead we:
+//     1) advance a per-level torus offset (texel origin) by (dx,dz)
+//     2) upload only the newly exposed rows/columns as strip patches
+// - Shader maps world->logical texel (0..res-1) then applies torus offset modulo res.
+//
+// Uniform packing (per level):
+// - We keep the clipmap uniform array as vec4<f32> per level.
+// - We store:
+//     x = origin_x_m
+//     y = origin_z_m
+//     z = cell_size_m
+//     w = packed offsets (u16 off_x | (u16 off_z << 16)) bitcast via f32 bits
+// - We KEEP inv_cell_size_m on CPU side for any legacy uses, but shader can compute 1/cell.
+//
 
 use glam::Vec3;
 
@@ -443,9 +440,11 @@ pub struct ClipLevelParams {
     pub origin_z_m: f32,
     pub cell_size_m: f32,
     pub inv_cell_size_m: f32,
+    /// Packed torus offsets: off_x in low 16 bits, off_z in high 16 bits.
+    pub packed_offsets: u32,
 }
 
-/// GPU payload for clipmap params (mirrors `ClipmapGpu` in `render/gpu_types.rs`).
+/// CPU-side clipmap params (fed into GPU packing in `render/gpu_types.rs`).
 #[derive(Clone, Copy, Debug)]
 pub struct ClipmapParamsCpu {
     pub levels: u32,
@@ -455,14 +454,25 @@ pub struct ClipmapParamsCpu {
     pub level: [ClipLevelParams; config::CLIPMAP_LEVELS_USIZE],
 }
 
+/// A sub-rectangle upload into a clipmap level texture layer.
+///
+/// IMPORTANT: this struct used to be `{ level, data_f16 }` in your tree, which is
+/// why you were seeing the E0609 errors. Ring/strip updates require the rect.
 pub struct ClipmapUpload {
     pub level: u32,
-    /// CLIPMAP_RES * CLIPMAP_RES heights, FP16 bits (IEEE-754 half), row-major.
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    /// w*h heights, FP16 bits (IEEE-754 half), row-major for the patch.
     pub data_f16: Vec<u16>,
 }
 
 pub struct Clipmap {
     last_origin_cell: [(i32, i32); config::CLIPMAP_LEVELS_USIZE],
+    /// Toroidal storage offset per level (in texels).
+    /// Mapping: storage = (logical + offset) mod res
+    tex_offset: [(u16, u16); config::CLIPMAP_LEVELS_USIZE],
     last_update_time_s: [f32; config::CLIPMAP_LEVELS_USIZE],
 }
 
@@ -470,6 +480,7 @@ impl Clipmap {
     pub fn new() -> Self {
         Self {
             last_origin_cell: [(i32::MIN, i32::MIN); config::CLIPMAP_LEVELS_USIZE],
+            tex_offset: [(0, 0); config::CLIPMAP_LEVELS_USIZE],
             last_update_time_s: [f32::NEG_INFINITY; config::CLIPMAP_LEVELS_USIZE],
         }
     }
@@ -499,16 +510,23 @@ impl Clipmap {
         (cell_x as f32 * cell_m, cell_z as f32 * cell_m)
     }
 
+    #[inline]
+    fn pack_offsets(off_x: u16, off_z: u16) -> u32 {
+        (off_x as u32) | ((off_z as u32) << 16)
+    }
+
+    #[inline]
+    fn wrap_i32_mod_u16(v: i32, m: i32) -> u16 {
+        let mut r = v % m;
+        if r < 0 {
+            r += m;
+        }
+        r as u16
+    }
+
     // -------------------------------------------------------------------------
     // f32 -> f16 (bits) conversion, IEEE-754 half precision
     // -------------------------------------------------------------------------
-    //
-    // Fast, dependency-free conversion.
-    // - Rounds to nearest-even.
-    // - Preserves NaN/Inf.
-    // - Handles subnormals.
-    //
-    // This is "good enough" for terrain heights.
     #[inline]
     fn f32_to_f16_bits(v: f32) -> u16 {
         let x = v.to_bits();
@@ -522,7 +540,6 @@ impl Clipmap {
             if mant == 0 {
                 return sign | 0x7C00; // Inf
             } else {
-                // quiet NaN, keep some payload
                 let payload = (mant >> 13) as u16;
                 return sign | 0x7C00 | (payload.max(1));
             }
@@ -539,20 +556,16 @@ impl Clipmap {
 
         // Too small => subnormal or zero
         if e16 <= 0 {
-            // If it's way too small, flush to zero
             if e16 < -10 {
                 return sign;
             }
 
-            // Subnormal: implicit leading 1 for mantissa in f32 normal range
-            // Build a 24-bit mantissa with leading 1
             let m = mant | 0x0080_0000;
 
-            // Shift to get f16 subnormal mantissa (10 bits)
-            let shift = 14 - e16; // 1..24
+            let shift = 14 - e16;
             let mut mant16 = (m >> shift) as u16;
 
-            // Round to nearest-even using the remainder
+            // Round to nearest-even
             let rem_mask = (1u32 << shift) - 1;
             let rem = m & rem_mask;
             let half = 1u32 << (shift - 1);
@@ -564,13 +577,13 @@ impl Clipmap {
             return sign | mant16;
         }
 
-        // Normal f16 number
+        // Normal f16
         let mut mant16 = (mant >> 13) as u16;
 
-        // Round to nearest-even based on lower bits
         let round_bits = mant & 0x0000_1FFF;
         if round_bits > 0x1000 || (round_bits == 0x1000 && (mant16 & 1) != 0) {
             mant16 = mant16.wrapping_add(1);
+
             // Mantissa overflow => bump exponent
             if mant16 & 0x0400 != 0 {
                 mant16 = 0;
@@ -585,15 +598,99 @@ impl Clipmap {
         sign | ((e16 as u16) << 10) | (mant16 & 0x03FF)
     }
 
+    #[inline]
+    fn sample_height_f16(world: &WorldGen, wx_m: f32, wz_m: f32) -> u16 {
+        let vs = config::VOXEL_SIZE_M_F32;
+
+        let wx_vx = (wx_m / vs).floor() as i32;
+        let wz_vx = (wz_m / vs).floor() as i32;
+
+        let h_vx = world.ground_height(wx_vx, wz_vx);
+        let h_m = (h_vx as f32) * vs;
+
+        Self::f32_to_f16_bits(h_m)
+    }
+
+    fn build_full_level(world: &WorldGen, ox_m: f32, oz_m: f32, cell_m: f32) -> Vec<u16> {
+        let res = config::CLIPMAP_RES as usize;
+        let mut data = vec![0u16; res * res];
+
+        for tz in 0..res {
+            let wz_m = oz_m + (tz as f32 + 0.5) * cell_m;
+            let row = tz * res;
+
+            for tx in 0..res {
+                let wx_m = ox_m + (tx as f32 + 0.5) * cell_m;
+                data[row + tx] = Self::sample_height_f16(world, wx_m, wz_m);
+            }
+        }
+
+        data
+    }
+
+    fn build_row_patch(
+        world: &WorldGen,
+        ox_m: f32,
+        oz_m: f32,
+        cell_m: f32,
+        logical_z0: u32,
+        rows: u32,
+    ) -> Vec<u16> {
+        let res = config::CLIPMAP_RES as usize;
+        let w = res as u32;
+
+        let h = rows as usize;
+        let mut data = vec![0u16; (w as usize) * h];
+
+        for rz in 0..rows {
+            let lz = logical_z0 + rz;
+            let wz_m = oz_m + (lz as f32 + 0.5) * cell_m;
+
+            let row = (rz as usize) * res;
+            for tx in 0..res {
+                let wx_m = ox_m + (tx as f32 + 0.5) * cell_m;
+                data[row + tx] = Self::sample_height_f16(world, wx_m, wz_m);
+            }
+        }
+
+        data
+    }
+
+    fn build_col_patch(
+        world: &WorldGen,
+        ox_m: f32,
+        oz_m: f32,
+        cell_m: f32,
+        logical_x0: u32,
+        cols: u32,
+    ) -> Vec<u16> {
+        let res = config::CLIPMAP_RES as usize;
+        let w = cols as usize;
+        let h = res;
+
+        let mut data = vec![0u16; w * h];
+
+        for tz in 0..res {
+            let wz_m = oz_m + (tz as f32 + 0.5) * cell_m;
+            let row = tz * w;
+
+            for cx in 0..cols {
+                let lx = logical_x0 + cx;
+                let wx_m = ox_m + (lx as f32 + 0.5) * cell_m;
+                data[row + (cx as usize)] = Self::sample_height_f16(world, wx_m, wz_m);
+            }
+        }
+
+        data
+    }
+
     /// Update clipmap data around camera.
     ///
-    /// Inputs:
-    /// - `cam_pos_m`: camera position in meters.
-    /// - `time_s`: monotonically increasing time (seconds).
-    ///
-    /// Outputs:
-    /// - params for GPU
-    /// - uploads for any levels that changed origin (full level refresh)
+    /// Returns:
+    /// - CPU params for GPU packing
+    /// - uploads:
+    ///     - full refresh on first touch or huge jump
+    ///     - otherwise strip patches (rows/cols)
     pub fn update(
         &mut self,
         world: &WorldGen,
@@ -610,63 +707,301 @@ impl Clipmap {
                 origin_z_m: 0.0,
                 cell_size_m: 1.0,
                 inv_cell_size_m: 1.0,
+                packed_offsets: 0,
             }; config::CLIPMAP_LEVELS_USIZE],
         };
 
         let mut uploads = Vec::new();
 
+        let res_u = config::CLIPMAP_RES;
+        let res_i = res_u as i32;
+
         for i in 0..config::CLIPMAP_LEVELS {
             let li = i as usize;
             let cell_m = Self::level_cell_size(i);
-            let inv = 1.0 / cell_m;
+            let inv_cell_m = 1.0 / cell_m.max(1e-6);
 
-            let (ox_c, oz_c) = Self::snapped_origin_cell(cam_pos_m.x, cam_pos_m.z, cell_m);
-            let (ox_m, oz_m) = Self::cell_to_origin_m(ox_c, oz_c, cell_m);
+            let (new_ox_c, new_oz_c) = Self::snapped_origin_cell(cam_pos_m.x, cam_pos_m.z, cell_m);
+            let (new_ox_m, new_oz_m) = Self::cell_to_origin_m(new_ox_c, new_oz_c, cell_m);
 
-            params.level[li] = ClipLevelParams {
-                origin_x_m: ox_m,
-                origin_z_m: oz_m,
-                cell_size_m: cell_m,
-                inv_cell_size_m: inv,
-            };
+            // Current torus offsets
+            let (mut off_x, mut off_z) = self.tex_offset[li];
 
-            let changed = self.last_origin_cell[li] != (ox_c, oz_c);
+            let (old_ox_c, old_oz_c) = self.last_origin_cell[li];
+            let first = old_ox_c == i32::MIN;
+
+            let dx = if first { 0 } else { new_ox_c - old_ox_c };
+            let dz = if first { 0 } else { new_oz_c - old_oz_c };
+
+            let mut want_update = first || dx != 0 || dz != 0;
+
             let allow_by_time =
                 (time_s - self.last_update_time_s[li]) >= config::CLIPMAP_MIN_UPDATE_INTERVAL_S;
 
-            if changed && allow_by_time {
-                self.last_origin_cell[li] = (ox_c, oz_c);
+            if !allow_by_time {
+                want_update = false;
+            }
+
+            if want_update {
                 self.last_update_time_s[li] = time_s;
 
-                // Full refresh of this level.
-                let res = config::CLIPMAP_RES as usize;
-                let mut data = vec![0u16; res * res];
+                if first {
+                    // Full refresh first time
+                    self.last_origin_cell[li] = (new_ox_c, new_oz_c);
+                    off_x = 0;
+                    off_z = 0;
+                    self.tex_offset[li] = (off_x, off_z);
 
-                // We sample the procedural ground height at world (x,z) mapped from cells.
-                // WorldGen::ground_height returns voxels, so convert to meters.
-                let vs = config::VOXEL_SIZE_M_F32;
+                    let full = Self::build_full_level(world, new_ox_m, new_oz_m, cell_m);
+                    uploads.push(ClipmapUpload {
+                        level: i,
+                        x: 0,
+                        y: 0,
+                        w: res_u,
+                        h: res_u,
+                        data_f16: full,
+                    });
+                } else {
+                    let adx = dx.unsigned_abs() as u32;
+                    let adz = dz.unsigned_abs() as u32;
+                    let big_jump = adx >= res_u || adz >= res_u;
 
-                for tz in 0..res {
-                    let wz_m = oz_m + (tz as f32 + 0.5) * cell_m;
-                    let wz_vx = (wz_m / vs).floor() as i32;
+                    if big_jump {
+                        // Teleport-scale jump: full refresh
+                        self.last_origin_cell[li] = (new_ox_c, new_oz_c);
+                        off_x = 0;
+                        off_z = 0;
+                        self.tex_offset[li] = (off_x, off_z);
 
-                    let row = tz * res;
-                    for tx in 0..res {
-                        let wx_m = ox_m + (tx as f32 + 0.5) * cell_m;
-                        let wx_vx = (wx_m / vs).floor() as i32;
+                        let full = Self::build_full_level(world, new_ox_m, new_oz_m, cell_m);
+                        uploads.push(ClipmapUpload {
+                            level: i,
+                            x: 0,
+                            y: 0,
+                            w: res_u,
+                            h: res_u,
+                            data_f16: full,
+                        });
+                    } else {
+                        // Scroll torus offsets
+                        off_x = Self::wrap_i32_mod_u16((off_x as i32) + dx, res_i);
+                        off_z = Self::wrap_i32_mod_u16((off_z as i32) + dz, res_i);
+                        self.tex_offset[li] = (off_x, off_z);
+                        self.last_origin_cell[li] = (new_ox_c, new_oz_c);
 
-                        let h_vx = world.ground_height(wx_vx, wz_vx);
-                        let h_m = (h_vx as f32) * vs;
+                        // logical -> storage
+                        let map_x = |lx: u32| -> u32 { (lx + (off_x as u32)) % res_u };
+                        let map_z = |lz: u32| -> u32 { (lz + (off_z as u32)) % res_u };
 
-                        data[row + tx] = Self::f32_to_f16_bits(h_m);
+                        // New columns
+                        if dx != 0 {
+                            let cols = dx.unsigned_abs() as u32;
+
+                            if dx > 0 {
+                                // logical [res-cols .. res-1]
+                                let logical_x0 = res_u - cols;
+                                let sx0 = map_x(logical_x0);
+                                let end = sx0 + cols;
+
+                                if end <= res_u {
+                                    let data = Self::build_col_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_x0, cols,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: sx0,
+                                        y: 0,
+                                        w: cols,
+                                        h: res_u,
+                                        data_f16: data,
+                                    });
+                                } else {
+                                    let a = res_u - sx0;
+                                    let b = end - res_u;
+
+                                    let data_a = Self::build_col_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_x0, a,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: sx0,
+                                        y: 0,
+                                        w: a,
+                                        h: res_u,
+                                        data_f16: data_a,
+                                    });
+
+                                    let data_b = Self::build_col_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_x0 + a, b,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: 0,
+                                        y: 0,
+                                        w: b,
+                                        h: res_u,
+                                        data_f16: data_b,
+                                    });
+                                }
+                            } else {
+                                // dx < 0: logical [0 .. cols-1]
+                                let logical_x0 = 0;
+                                let sx0 = map_x(logical_x0);
+                                let end = sx0 + cols;
+
+                                if end <= res_u {
+                                    let data = Self::build_col_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_x0, cols,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: sx0,
+                                        y: 0,
+                                        w: cols,
+                                        h: res_u,
+                                        data_f16: data,
+                                    });
+                                } else {
+                                    let a = res_u - sx0;
+                                    let b = end - res_u;
+
+                                    let data_a = Self::build_col_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_x0, a,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: sx0,
+                                        y: 0,
+                                        w: a,
+                                        h: res_u,
+                                        data_f16: data_a,
+                                    });
+
+                                    let data_b = Self::build_col_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_x0 + a, b,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: 0,
+                                        y: 0,
+                                        w: b,
+                                        h: res_u,
+                                        data_f16: data_b,
+                                    });
+                                }
+                            }
+                        }
+
+                        // New rows
+                        if dz != 0 {
+                            let rows = dz.unsigned_abs() as u32;
+
+                            if dz > 0 {
+                                // logical [res-rows .. res-1]
+                                let logical_z0 = res_u - rows;
+                                let sy0 = map_z(logical_z0);
+                                let end = sy0 + rows;
+
+                                if end <= res_u {
+                                    let data = Self::build_row_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_z0, rows,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: 0,
+                                        y: sy0,
+                                        w: res_u,
+                                        h: rows,
+                                        data_f16: data,
+                                    });
+                                } else {
+                                    let a = res_u - sy0;
+                                    let b = end - res_u;
+
+                                    let data_a = Self::build_row_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_z0, a,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: 0,
+                                        y: sy0,
+                                        w: res_u,
+                                        h: a,
+                                        data_f16: data_a,
+                                    });
+
+                                    let data_b = Self::build_row_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_z0 + a, b,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: 0,
+                                        y: 0,
+                                        w: res_u,
+                                        h: b,
+                                        data_f16: data_b,
+                                    });
+                                }
+                            } else {
+                                // dz < 0: logical [0 .. rows-1]
+                                let logical_z0 = 0;
+                                let sy0 = map_z(logical_z0);
+                                let end = sy0 + rows;
+
+                                if end <= res_u {
+                                    let data = Self::build_row_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_z0, rows,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: 0,
+                                        y: sy0,
+                                        w: res_u,
+                                        h: rows,
+                                        data_f16: data,
+                                    });
+                                } else {
+                                    let a = res_u - sy0;
+                                    let b = end - res_u;
+
+                                    let data_a = Self::build_row_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_z0, a,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: 0,
+                                        y: sy0,
+                                        w: res_u,
+                                        h: a,
+                                        data_f16: data_a,
+                                    });
+
+                                    let data_b = Self::build_row_patch(
+                                        world, new_ox_m, new_oz_m, cell_m, logical_z0 + a, b,
+                                    );
+                                    uploads.push(ClipmapUpload {
+                                        level: i,
+                                        x: 0,
+                                        y: 0,
+                                        w: res_u,
+                                        h: b,
+                                        data_f16: data_b,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
-
-                uploads.push(ClipmapUpload {
-                    level: i,
-                    data_f16: data,
-                });
             }
+
+            let packed = Self::pack_offsets(off_x, off_z);
+            params.level[li] = ClipLevelParams {
+                origin_x_m: new_ox_m,
+                origin_z_m: new_oz_m,
+                cell_size_m: cell_m,
+                inv_cell_size_m: inv_cell_m,
+                packed_offsets: packed,
+            };
         }
 
         (params, uploads)
@@ -698,7 +1033,7 @@ pub const NODE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
 
 // CPU chunk cache budget (SVO nodes stored on CPU so we don't rebuild chunks).
 // This is the *total* bytes of cached NodeGpu arrays across all cached chunks.
-pub const CHUNK_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024; // 512 MB
+pub const CHUNK_CACHE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1024 MB
 
 // -----------------------------------------------------------------------------
 // Clipmap (far terrain fallback)
@@ -865,8 +1200,11 @@ fn main() {
 // src/render/gpu_types.rs
 // -----------------------
 // src/render/gpu_types.rs
+// -----------------------
 //
-// GPU-facing data layouts shared between Rust and WGSL.
+// Fix: ClipLevelParams now has `packed_offsets`, but we keep its existing
+// `inv_cell_size_m` field on CPU side.
+// GPU uniform uses vec4 per level with packed offsets in .w.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -907,9 +1245,15 @@ pub struct CameraGpu {
     pub grid_dims: [u32; 4],
 }
 
-/// Clipmap uniform payload (bound only for the primary compute pass).
+/// Clipmap uniform payload.
 ///
 /// Matches `shaders/clipmap.wgsl`.
+///
+/// Per level vec4:
+///   x = origin_x_m
+///   y = origin_z_m
+///   z = cell_size_m
+///   w = packed offsets bits (off_x u16 | (off_z u16 << 16)) stored via f32::from_bits
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct ClipmapGpu {
@@ -918,20 +1262,21 @@ pub struct ClipmapGpu {
     pub base_cell_m: f32,
     pub _pad0: f32,
 
-    /// For each level i:
-    /// x = origin_x_m
-    /// y = origin_z_m
-    /// z = cell_size_m
-    /// w = inv_cell_size_m
     pub level: [[f32; 4]; crate::config::CLIPMAP_LEVELS_USIZE],
 }
 
 impl ClipmapGpu {
     pub fn from_cpu(cpu: &crate::clipmap::ClipmapParamsCpu) -> Self {
         let mut level = [[0.0f32; 4]; crate::config::CLIPMAP_LEVELS_USIZE];
+
         for i in 0..crate::config::CLIPMAP_LEVELS_USIZE {
             let p = cpu.level[i];
-            level[i] = [p.origin_x_m, p.origin_z_m, p.cell_size_m, p.inv_cell_size_m];
+            level[i] = [
+                p.origin_x_m,
+                p.origin_z_m,
+                p.cell_size_m,
+                f32::from_bits(p.packed_offsets),
+            ];
         }
 
         Self {
@@ -1745,35 +2090,92 @@ impl Renderer {
             .write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
     }
 
-    // FP16 clipmap upload: data is u16 bits (IEEE half), texture format is R16Float.
+    /// FP16 clipmap patch upload into a sub-rectangle of a level.
+    ///
+    /// `data_f16` is w*h u16 values (IEEE half bits), row-major for the patch.
+    ///
+    /// IMPORTANT: WebGPU requires `bytes_per_row` to be a multiple of 256 bytes.
+    /// For narrow strips (especially columns), we pad each row on the CPU when needed.
+    pub fn write_clipmap_patch(&self, level: u32, x: u32, y: u32, w: u32, h: u32, data_f16: &[u16]) {
+        let res = config::CLIPMAP_RES;
+        if level >= config::CLIPMAP_LEVELS {
+            return;
+        }
+        if w == 0 || h == 0 {
+            return;
+        }
+        if x + w > res || y + h > res {
+            return;
+        }
+
+        let expected = (w as usize) * (h as usize);
+        if data_f16.len() != expected {
+            return;
+        }
+
+        // Source row pitch (tightly packed)
+        let row_bytes = (w * 2) as usize; // R16Float => 2 bytes per texel
+
+        // WebGPU alignment requirement
+        let align = 256usize;
+        let padded_row_bytes = ((row_bytes + align - 1) / align) * align;
+
+        let bytes: Vec<u8>;
+        let bytes_ref: &[u8];
+
+        if padded_row_bytes == row_bytes {
+            bytes_ref = bytemuck::cast_slice(data_f16);
+        } else {
+            // Pad each row up to padded_row_bytes
+            bytes = {
+                let mut out = vec![0u8; padded_row_bytes * (h as usize)];
+                let src: &[u8] = bytemuck::cast_slice(data_f16);
+
+                for row in 0..(h as usize) {
+                    let src_off = row * row_bytes;
+                    let dst_off = row * padded_row_bytes;
+                    out[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
+                }
+                out
+            };
+            bytes_ref = &bytes;
+        }
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.textures.clip_height.tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: level },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes_ref,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_row_bytes as u32),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Convenience full-level upload (kept for compatibility / debugging).
     pub fn write_clipmap_level(&self, level: u32, data_f16: &[u16]) {
         let res = config::CLIPMAP_RES as usize;
         let expected = res * res;
         if data_f16.len() != expected {
             return;
         }
-
-        let bytes: &[u8] = bytemuck::cast_slice(data_f16);
-
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.textures.clip_height.tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: level },
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytes,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                // 2 bytes per texel (R16Float)
-                bytes_per_row: Some((config::CLIPMAP_RES * 2) as u32),
-                rows_per_image: Some(config::CLIPMAP_RES),
-            },
-            wgpu::Extent3d {
-                width: config::CLIPMAP_RES,
-                height: config::CLIPMAP_RES,
-                depth_or_array_layers: 1,
-            },
+        self.write_clipmap_patch(
+            level,
+            0,
+            0,
+            config::CLIPMAP_RES,
+            config::CLIPMAP_RES,
+            data_f16,
         );
     }
 
@@ -2448,28 +2850,14 @@ fn fs_main(@builtin(position) frag_pos: vec4<f32>, @location(0) uv: vec2<f32>) -
 // ------------------------
 // src/shaders/clipmap.wgsl
 // ------------------------
-// src/shaders/clipmap.wgsl
 //
-// Clipmap heightfield sampling + ray intersection fallback.
-//
-// This file is concatenated AFTER ray_core.wgsl, so it can reuse:
-// - MAT_* constants
-// - SUN_DIR / SUN_COLOR / SUN_INTENSITY
-// - sky_color(), cloud_sun_transmittance()
-// - fog helpers
-// - etc.
-//
-// It is also concatenated BEFORE ray_main.wgsl, so ray_main can call functions here.
-//
-// Bindings are only present in the PRIMARY compute pass bind group (group(0)):
-// - @binding(6) clipmap uniform
-// - @binding(7) clipmap height texture array
+// UPDATED for toroidal (ring) clipmap storage.
+// level[i].w stores packed offsets (u16 off_x | (u16 off_z << 16)) via f32 bits.
+// We compute inv_cell = 1.0 / cell in shader (since CPU still keeps inv too).
 
-// NOTE: levels/res are provided by the uniform, but we keep a compile-time max here
-// to match the fixed-size uniform array.
 const CLIP_LEVELS_MAX : u32 = 5u;
 
-// March tuning (performance critical)
+// March tuning
 const HF_MAX_STEPS : u32 = 80u;
 const HF_BISECT    : u32 = 6u;
 
@@ -2482,27 +2870,33 @@ struct ClipmapParams {
   res         : u32,
   base_cell_m : f32,
   _pad0       : f32,
-  // x=origin_x_m, y=origin_z_m, z=cell_size_m, w=inv_cell_size_m
+  // x=origin_x_m, y=origin_z_m, z=cell_size_m, w=packed offsets bits (off_x/off_z)
   level       : array<vec4<f32>, 5>,
 };
 
 @group(0) @binding(6) var<uniform> clip : ClipmapParams;
 @group(0) @binding(7) var clip_height : texture_2d_array<f32>;
 
-// --------------------------
-// Level selection
-// --------------------------
+fn imod(a: i32, m: i32) -> i32 {
+  var r = a % m;
+  if (r < 0) { r = r + m; }
+  return r;
+}
+
+fn clip_unpack_offsets(level: u32) -> vec2<i32> {
+  let bits: u32 = bitcast<u32>(clip.level[level].w);
+  let off_x: i32 = i32(bits & 0xFFFFu);
+  let off_z: i32 = i32((bits >> 16u) & 0xFFFFu);
+  return vec2<i32>(off_x, off_z);
+}
 
 fn clip_choose_level(xz: vec2<f32>) -> u32 {
-  // Choose the finest level that still comfortably contains the query point.
-  // Conservative inner coverage avoids sampling near edges.
   let cam_xz = vec2<f32>(cam.cam_pos.x, cam.cam_pos.z);
   let d = max(abs(xz.x - cam_xz.x), abs(xz.y - cam_xz.y));
 
   let res_i = max(i32(clip.res), 1);
   let res_f = f32(res_i);
 
-  // Default to coarsest.
   var best: u32 = max(clip.levels, 1u) - 1u;
 
   let n = min(clip.levels, CLIP_LEVELS_MAX);
@@ -2516,20 +2910,15 @@ fn clip_choose_level(xz: vec2<f32>) -> u32 {
   return best;
 }
 
-// --------------------------
-// Height sampling (fast path)
-// --------------------------
-
 fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
   let res_i = max(i32(clip.res), 1);
 
   let p = clip.level[level];
   let origin = vec2<f32>(p.x, p.y);
-  let inv_cell = p.w;
+  let cell   = max(p.z, 1e-6);
+  let inv_cell = 1.0 / cell;
 
-  // Map world -> texel
-  // CPU wrote heights for texel centers at (tx+0.5)*cell, but sampling by floor() here
-  // is consistent for heightfield marching and stable across movement due to snapping.
+  // world -> logical texel
   let uv = (world_xz - origin) * inv_cell;
 
   var ix = i32(floor(uv.x));
@@ -2538,7 +2927,11 @@ fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
   ix = clamp(ix, 0, res_i - 1);
   iz = clamp(iz, 0, res_i - 1);
 
-  return textureLoad(clip_height, vec2<i32>(ix, iz), i32(level), 0).x;
+  let off = clip_unpack_offsets(level);
+  let sx = imod(ix + off.x, res_i);
+  let sz = imod(iz + off.y, res_i);
+
+  return textureLoad(clip_height, vec2<i32>(sx, sz), i32(level), 0).x;
 }
 
 fn clip_height_at(xz: vec2<f32>) -> f32 {
@@ -2546,14 +2939,9 @@ fn clip_height_at(xz: vec2<f32>) -> f32 {
   return clip_height_at_level(xz, lvl);
 }
 
-// --------------------------
-// Normal (2-tap)
-// --------------------------
-
 fn clip_normal_at_level_2tap(world_xz: vec2<f32>, level: u32) -> vec3<f32> {
   let cell = clip.level[level].z;
 
-  // 2-tap forward differences (2 texture loads + 1 reuse)
   let h  = clip_height_at_level(world_xz, level);
   let hx = clip_height_at_level(world_xz + vec2<f32>(cell, 0.0), level);
   let hz = clip_height_at_level(world_xz + vec2<f32>(0.0, cell), level);
@@ -2569,10 +2957,6 @@ fn clip_normal_at(xz: vec2<f32>) -> vec3<f32> {
   return clip_normal_at_level_2tap(xz, lvl);
 }
 
-// --------------------------
-// Trace
-// --------------------------
-
 struct ClipHit {
   hit : bool,
   t   : f32,
@@ -2581,17 +2965,13 @@ struct ClipHit {
 };
 
 fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> ClipHit {
-  // If we're not pointing downward, don't bother.
   if (rd.y >= -1e-4) {
     return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
   }
 
-  // Start
   var t = max(t_min, 0.0);
-
   var p = ro + rd * t;
 
-  // Cache the chosen clip level (avoid repeated clip_choose_level inside helpers)
   var lvl: u32 = clip_choose_level(p.xz);
 
   var h = clip_height_at_level(p.xz, lvl);
@@ -2603,13 +2983,11 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
 
     p = ro + rd * t;
 
-    // Update cached level once per step (not per sample)
     lvl = clip_choose_level(p.xz);
 
     h = clip_height_at_level(p.xz, lvl);
     let s = p.y - h;
 
-    // Bracketed hit -> bisection refine
     if (s <= 0.0 && s_prev > 0.0) {
       var a = t_prev;
       var b = t;
@@ -2637,7 +3015,6 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
     s_prev = s;
     t_prev = t;
 
-    // Adaptive dt from vertical gap (more aggressive than before).
     let vy = max(-rd.y, 0.12);
     var dt = abs(s) / vy;
     dt = clamp(dt, HF_DT_MIN, HF_DT_MAX);
@@ -2648,11 +3025,6 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
   return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
 }
 
-// --------------------------
-// Shading
-// --------------------------
-
-// Far-terrain shading (no voxel occluder shadows).
 fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit) -> vec3<f32> {
   let hp = ro + ch.t * rd;
 

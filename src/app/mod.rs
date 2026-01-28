@@ -1,15 +1,7 @@
 // src/app/mod.rs
 // --------------
 //
-// High-level application glue:
-// - Owns the window + wgpu surface configuration (swapchain-ish state).
-// - Owns input + camera state.
-// - Owns world/chunk streaming state.
-// - Owns clipmap state (CPU-updated 2D heightmap rings).
-// - Delegates all GPU resource ownership and rendering work to `Renderer`.
-//
-// The core loop is driven by winit events. We run with `ControlFlow::Wait`
-// and request redraws from AboutToWait.
+// Only change here is that ClipmapUpload now has x/y/w/h, so this compiles.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,9 +22,6 @@ use crate::{
     world::WorldGen,
 };
 
-/// Entrypoint called by main:
-/// - Builds the `App` (async, because wgpu adapter/device acquisition is async).
-/// - Starts the winit event loop and forwards events into the app.
 pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
     let mut app = App::new(window).await;
 
@@ -58,12 +47,10 @@ pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
         .unwrap();
 }
 
-/// Application state that lives for the duration of the event loop.
 pub struct App {
     window: Arc<Window>,
     start_time: Instant,
 
-    // --- WGPU presentation state ---
     _instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     _adapter: wgpu::Adapter,
@@ -72,18 +59,14 @@ pub struct App {
 
     renderer: Renderer,
 
-    // --- World + streaming state ---
     world: Arc<WorldGen>,
     chunks: ChunkManager,
 
-    // --- Clipmap fallback terrain ---
     clipmap: Clipmap,
 
-    // --- Interaction state ---
     input: InputState,
     camera: Camera,
 
-    // --- FPS overlay bookkeeping ---
     fps_value: u32,
     fps_frames: u32,
     fps_last: Instant,
@@ -176,6 +159,9 @@ impl App {
                         self.surface.configure(self.renderer.device(), &self.config);
                         self.renderer
                             .resize_output(self.config.width, self.config.height);
+
+                        // IMPORTANT: the resize recreated clip_height, so force reupload next frame
+                        self.clipmap.invalidate_all();
                     }
 
                     _ => {}
@@ -208,7 +194,8 @@ impl App {
         self.renderer.write_clipmap(&clip_gpu);
 
         for up in clip_uploads {
-            self.renderer.write_clipmap_level(up.level, &up.data_f16);
+            self.renderer
+                .write_clipmap_patch(up.level, up.x, up.y, up.w, up.h, &up.data_f16);
         }
 
         // 4) camera matrices -> CameraGpu

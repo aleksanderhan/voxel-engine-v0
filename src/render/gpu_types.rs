@@ -1,6 +1,9 @@
 // src/render/gpu_types.rs
+// -----------------------
 //
-// GPU-facing data layouts shared between Rust and WGSL.
+// Fix: ClipLevelParams now has `packed_offsets`, but we keep its existing
+// `inv_cell_size_m` field on CPU side.
+// GPU uniform uses vec4 per level with packed offsets in .w.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -41,9 +44,15 @@ pub struct CameraGpu {
     pub grid_dims: [u32; 4],
 }
 
-/// Clipmap uniform payload (bound only for the primary compute pass).
+/// Clipmap uniform payload.
 ///
 /// Matches `shaders/clipmap.wgsl`.
+///
+/// Per level vec4:
+///   x = origin_x_m
+///   y = origin_z_m
+///   z = cell_size_m
+///   w = packed offsets bits (off_x u16 | (off_z u16 << 16)) stored via f32::from_bits
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct ClipmapGpu {
@@ -52,20 +61,21 @@ pub struct ClipmapGpu {
     pub base_cell_m: f32,
     pub _pad0: f32,
 
-    /// For each level i:
-    /// x = origin_x_m
-    /// y = origin_z_m
-    /// z = cell_size_m
-    /// w = inv_cell_size_m
     pub level: [[f32; 4]; crate::config::CLIPMAP_LEVELS_USIZE],
 }
 
 impl ClipmapGpu {
     pub fn from_cpu(cpu: &crate::clipmap::ClipmapParamsCpu) -> Self {
         let mut level = [[0.0f32; 4]; crate::config::CLIPMAP_LEVELS_USIZE];
+
         for i in 0..crate::config::CLIPMAP_LEVELS_USIZE {
             let p = cpu.level[i];
-            level[i] = [p.origin_x_m, p.origin_z_m, p.cell_size_m, p.inv_cell_size_m];
+            level[i] = [
+                p.origin_x_m,
+                p.origin_z_m,
+                p.cell_size_m,
+                f32::from_bits(p.packed_offsets),
+            ];
         }
 
         Self {

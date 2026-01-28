@@ -21,7 +21,7 @@ pub const NODE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
 
 // CPU chunk cache budget (SVO nodes stored on CPU so we don't rebuild chunks).
 // This is the *total* bytes of cached NodeGpu arrays across all cached chunks.
-pub const CHUNK_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024; // 512 MB
+pub const CHUNK_CACHE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1024 MB
 
 // -----------------------------------------------------------------------------
 // Clipmap (far terrain fallback)
@@ -35,14 +35,14 @@ pub const CHUNK_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024; // 512 MB
 //
 // NOTE: These constants MUST match shader-side constants in `shaders/clipmap.wgsl`.
 
-pub const CLIPMAP_LEVELS: u32 = 5;
+pub const CLIPMAP_LEVELS: u32 = 8;
 pub const CLIPMAP_LEVELS_USIZE: usize = CLIPMAP_LEVELS as usize;
 
 // Texture resolution per level (square).
 pub const CLIPMAP_RES: u32 = 512;
 
 // Base cell size (meters) for level 0. Level i cell size = BASE * 2^i.
-pub const CLIPMAP_BASE_CELL_M: f32 = 0.50;
+pub const CLIPMAP_BASE_CELL_M: f32 = 0.25;
 
 // How often we allow a full refresh per level at most (seconds).
 // (Prevents thrashing if you ever tie updates to very tiny camera jitter.)

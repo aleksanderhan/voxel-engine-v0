@@ -1,27 +1,13 @@
 // src/shaders/clipmap.wgsl
 // ------------------------
-// src/shaders/clipmap.wgsl
 //
-// Clipmap heightfield sampling + ray intersection fallback.
-//
-// This file is concatenated AFTER ray_core.wgsl, so it can reuse:
-// - MAT_* constants
-// - SUN_DIR / SUN_COLOR / SUN_INTENSITY
-// - sky_color(), cloud_sun_transmittance()
-// - fog helpers
-// - etc.
-//
-// It is also concatenated BEFORE ray_main.wgsl, so ray_main can call functions here.
-//
-// Bindings are only present in the PRIMARY compute pass bind group (group(0)):
-// - @binding(6) clipmap uniform
-// - @binding(7) clipmap height texture array
+// UPDATED for toroidal (ring) clipmap storage.
+// level[i].w stores packed offsets (u16 off_x | (u16 off_z << 16)) via f32 bits.
+// We compute inv_cell = 1.0 / cell in shader (since CPU still keeps inv too).
 
-// NOTE: levels/res are provided by the uniform, but we keep a compile-time max here
-// to match the fixed-size uniform array.
-const CLIP_LEVELS_MAX : u32 = 5u;
+const CLIP_LEVELS_MAX : u32 = 8u;
 
-// March tuning (performance critical)
+// March tuning
 const HF_MAX_STEPS : u32 = 80u;
 const HF_BISECT    : u32 = 6u;
 
@@ -34,27 +20,33 @@ struct ClipmapParams {
   res         : u32,
   base_cell_m : f32,
   _pad0       : f32,
-  // x=origin_x_m, y=origin_z_m, z=cell_size_m, w=inv_cell_size_m
+  // x=origin_x_m, y=origin_z_m, z=cell_size_m, w=packed offsets bits (off_x/off_z)
   level       : array<vec4<f32>, 5>,
 };
 
 @group(0) @binding(6) var<uniform> clip : ClipmapParams;
 @group(0) @binding(7) var clip_height : texture_2d_array<f32>;
 
-// --------------------------
-// Level selection
-// --------------------------
+fn imod(a: i32, m: i32) -> i32 {
+  var r = a % m;
+  if (r < 0) { r = r + m; }
+  return r;
+}
+
+fn clip_unpack_offsets(level: u32) -> vec2<i32> {
+  let bits: u32 = bitcast<u32>(clip.level[level].w);
+  let off_x: i32 = i32(bits & 0xFFFFu);
+  let off_z: i32 = i32((bits >> 16u) & 0xFFFFu);
+  return vec2<i32>(off_x, off_z);
+}
 
 fn clip_choose_level(xz: vec2<f32>) -> u32 {
-  // Choose the finest level that still comfortably contains the query point.
-  // Conservative inner coverage avoids sampling near edges.
   let cam_xz = vec2<f32>(cam.cam_pos.x, cam.cam_pos.z);
   let d = max(abs(xz.x - cam_xz.x), abs(xz.y - cam_xz.y));
 
   let res_i = max(i32(clip.res), 1);
   let res_f = f32(res_i);
 
-  // Default to coarsest.
   var best: u32 = max(clip.levels, 1u) - 1u;
 
   let n = min(clip.levels, CLIP_LEVELS_MAX);
@@ -68,20 +60,15 @@ fn clip_choose_level(xz: vec2<f32>) -> u32 {
   return best;
 }
 
-// --------------------------
-// Height sampling (fast path)
-// --------------------------
-
 fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
   let res_i = max(i32(clip.res), 1);
 
   let p = clip.level[level];
   let origin = vec2<f32>(p.x, p.y);
-  let inv_cell = p.w;
+  let cell   = max(p.z, 1e-6);
+  let inv_cell = 1.0 / cell;
 
-  // Map world -> texel
-  // CPU wrote heights for texel centers at (tx+0.5)*cell, but sampling by floor() here
-  // is consistent for heightfield marching and stable across movement due to snapping.
+  // world -> logical texel
   let uv = (world_xz - origin) * inv_cell;
 
   var ix = i32(floor(uv.x));
@@ -90,7 +77,11 @@ fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
   ix = clamp(ix, 0, res_i - 1);
   iz = clamp(iz, 0, res_i - 1);
 
-  return textureLoad(clip_height, vec2<i32>(ix, iz), i32(level), 0).x;
+  let off = clip_unpack_offsets(level);
+  let sx = imod(ix + off.x, res_i);
+  let sz = imod(iz + off.y, res_i);
+
+  return textureLoad(clip_height, vec2<i32>(sx, sz), i32(level), 0).x;
 }
 
 fn clip_height_at(xz: vec2<f32>) -> f32 {
@@ -98,14 +89,9 @@ fn clip_height_at(xz: vec2<f32>) -> f32 {
   return clip_height_at_level(xz, lvl);
 }
 
-// --------------------------
-// Normal (2-tap)
-// --------------------------
-
 fn clip_normal_at_level_2tap(world_xz: vec2<f32>, level: u32) -> vec3<f32> {
   let cell = clip.level[level].z;
 
-  // 2-tap forward differences (2 texture loads + 1 reuse)
   let h  = clip_height_at_level(world_xz, level);
   let hx = clip_height_at_level(world_xz + vec2<f32>(cell, 0.0), level);
   let hz = clip_height_at_level(world_xz + vec2<f32>(0.0, cell), level);
@@ -121,10 +107,6 @@ fn clip_normal_at(xz: vec2<f32>) -> vec3<f32> {
   return clip_normal_at_level_2tap(xz, lvl);
 }
 
-// --------------------------
-// Trace
-// --------------------------
-
 struct ClipHit {
   hit : bool,
   t   : f32,
@@ -133,17 +115,13 @@ struct ClipHit {
 };
 
 fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> ClipHit {
-  // If we're not pointing downward, don't bother.
   if (rd.y >= -1e-4) {
     return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
   }
 
-  // Start
   var t = max(t_min, 0.0);
-
   var p = ro + rd * t;
 
-  // Cache the chosen clip level (avoid repeated clip_choose_level inside helpers)
   var lvl: u32 = clip_choose_level(p.xz);
 
   var h = clip_height_at_level(p.xz, lvl);
@@ -155,13 +133,11 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
 
     p = ro + rd * t;
 
-    // Update cached level once per step (not per sample)
     lvl = clip_choose_level(p.xz);
 
     h = clip_height_at_level(p.xz, lvl);
     let s = p.y - h;
 
-    // Bracketed hit -> bisection refine
     if (s <= 0.0 && s_prev > 0.0) {
       var a = t_prev;
       var b = t;
@@ -189,7 +165,6 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
     s_prev = s;
     t_prev = t;
 
-    // Adaptive dt from vertical gap (more aggressive than before).
     let vy = max(-rd.y, 0.12);
     var dt = abs(s) / vy;
     dt = clamp(dt, HF_DT_MIN, HF_DT_MAX);
@@ -200,11 +175,6 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
   return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
 }
 
-// --------------------------
-// Shading
-// --------------------------
-
-// Far-terrain shading (no voxel occluder shadows).
 fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit) -> vec3<f32> {
   let hp = ro + ch.t * rd;
 

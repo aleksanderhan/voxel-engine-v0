@@ -144,35 +144,92 @@ impl Renderer {
             .write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
     }
 
-    // FP16 clipmap upload: data is u16 bits (IEEE half), texture format is R16Float.
+    /// FP16 clipmap patch upload into a sub-rectangle of a level.
+    ///
+    /// `data_f16` is w*h u16 values (IEEE half bits), row-major for the patch.
+    ///
+    /// IMPORTANT: WebGPU requires `bytes_per_row` to be a multiple of 256 bytes.
+    /// For narrow strips (especially columns), we pad each row on the CPU when needed.
+    pub fn write_clipmap_patch(&self, level: u32, x: u32, y: u32, w: u32, h: u32, data_f16: &[u16]) {
+        let res = config::CLIPMAP_RES;
+        if level >= config::CLIPMAP_LEVELS {
+            return;
+        }
+        if w == 0 || h == 0 {
+            return;
+        }
+        if x + w > res || y + h > res {
+            return;
+        }
+
+        let expected = (w as usize) * (h as usize);
+        if data_f16.len() != expected {
+            return;
+        }
+
+        // Source row pitch (tightly packed)
+        let row_bytes = (w * 2) as usize; // R16Float => 2 bytes per texel
+
+        // WebGPU alignment requirement
+        let align = 256usize;
+        let padded_row_bytes = ((row_bytes + align - 1) / align) * align;
+
+        let bytes: Vec<u8>;
+        let bytes_ref: &[u8];
+
+        if padded_row_bytes == row_bytes {
+            bytes_ref = bytemuck::cast_slice(data_f16);
+        } else {
+            // Pad each row up to padded_row_bytes
+            bytes = {
+                let mut out = vec![0u8; padded_row_bytes * (h as usize)];
+                let src: &[u8] = bytemuck::cast_slice(data_f16);
+
+                for row in 0..(h as usize) {
+                    let src_off = row * row_bytes;
+                    let dst_off = row * padded_row_bytes;
+                    out[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
+                }
+                out
+            };
+            bytes_ref = &bytes;
+        }
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.textures.clip_height.tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: level },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes_ref,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_row_bytes as u32),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Convenience full-level upload (kept for compatibility / debugging).
     pub fn write_clipmap_level(&self, level: u32, data_f16: &[u16]) {
         let res = config::CLIPMAP_RES as usize;
         let expected = res * res;
         if data_f16.len() != expected {
             return;
         }
-
-        let bytes: &[u8] = bytemuck::cast_slice(data_f16);
-
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.textures.clip_height.tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: level },
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytes,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                // 2 bytes per texel (R16Float)
-                bytes_per_row: Some((config::CLIPMAP_RES * 2) as u32),
-                rows_per_image: Some(config::CLIPMAP_RES),
-            },
-            wgpu::Extent3d {
-                width: config::CLIPMAP_RES,
-                height: config::CLIPMAP_RES,
-                depth_or_array_layers: 1,
-            },
+        self.write_clipmap_patch(
+            level,
+            0,
+            0,
+            config::CLIPMAP_RES,
+            config::CLIPMAP_RES,
+            data_f16,
         );
     }
 
