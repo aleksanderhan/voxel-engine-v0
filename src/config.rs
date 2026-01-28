@@ -19,9 +19,6 @@ pub const CHUNK_SIZE_M_F32: f32 = VOXEL_SIZE_M_F32 * CHUNK_VOXELS as f32;
 // Render scale (internal resolution)
 // -----------------------------------------------------------------------------
 
-// Internal compute resolution fraction of window resolution.
-// 1.0 = native, 0.5 = 1/4 pixels, 0.35 ≈ 1/8 pixels.
-// If you're seeing <10 FPS, drop this further (0.25 is aggressive).
 pub const RENDER_SCALE: f32 = 0.35;
 
 pub fn render_dims(window_w: u32, window_h: u32) -> (u32, u32) {
@@ -34,15 +31,16 @@ pub fn render_dims(window_w: u32, window_h: u32) -> (u32, u32) {
 // Streaming policy (dense neighborhood grid)
 // -----------------------------------------------------------------------------
 
-pub const CHUNK_RADIUS_X: i32 = 4;
+pub const CHUNK_RADIUS_X: i32 = 8;
 pub const CHUNK_RADIUS_Y: i32 = 2;
-pub const CHUNK_RADIUS_Z: i32 = 4;
+pub const CHUNK_RADIUS_Z: i32 = 8;
 
-pub const GRID_X: u32 = (CHUNK_RADIUS_X as u32) * 2 + 1; // 9
+// With radius 8 => 2*8+1 = 17, radius 2 => 5
+pub const GRID_X: u32 = (CHUNK_RADIUS_X as u32) * 2 + 1; // 17
 pub const GRID_Y: u32 = (CHUNK_RADIUS_Y as u32) * 2 + 1; // 5
-pub const GRID_Z: u32 = (CHUNK_RADIUS_Z as u32) * 2 + 1; // 9
+pub const GRID_Z: u32 = (CHUNK_RADIUS_Z as u32) * 2 + 1; // 17
 
-pub const MAX_CHUNKS: u32 = GRID_X * GRID_Y * GRID_Z; // 405
+pub const MAX_CHUNKS: u32 = GRID_X * GRID_Y * GRID_Z; // 17*5*17 = 1445
 
 // -----------------------------------------------------------------------------
 // Octree sizes

@@ -34,4 +34,10 @@ pub struct StreamGpu {
     pub oy: u32,
     pub oz: u32,
     pub dirty_count: u32,
+
+    // NEW: batching controls
+    pub dirty_offset: u32, // start index into dirty_slots[]
+    pub build_count: u32,  // how many dirty slots to process this frame
+    pub _pad1: u32,
+    pub _pad2: u32,
 }

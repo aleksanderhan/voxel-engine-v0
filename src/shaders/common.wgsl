@@ -16,13 +16,13 @@ const SUN_DISC_COS_SOFT : f32 = 0.9998720;
 
 // Fog
 const FOG_HEIGHT_FALLOFF : f32 = 0.12;
-const FOG_MAX_DIST       : f32 = 90.0;
-const FOG_PRIMARY_VIS    : f32 = 0.10;
+const FOG_MAX_DIST       : f32 = 240.0;
+const FOG_PRIMARY_VIS    : f32 = 0.0;
 
 // Godrays
 const GODRAY_MAX_DIST    : f32 = 70.0;
 const GODRAY_STEPS       : u32 = 12u;
-const GODRAY_STRENGTH    : f32 = 2.6;
+const GODRAY_STRENGTH    : f32 = 0.0;
 const GODRAY_FRAME_FPS   : f32 = 60.0;
 
 // Post / composite
@@ -46,7 +46,13 @@ struct Stream {
   oy : u32,
   oz : u32,
   dirty_count : u32,
+
+  dirty_offset : u32,
+  build_count  : u32,
+  _pad1        : u32,
+  _pad2        : u32,
 };
+
 
 @group(0) @binding(3) var<uniform> stream : Stream;
 @group(0) @binding(0) var<uniform> cam : Camera;

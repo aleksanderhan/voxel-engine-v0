@@ -8,7 +8,8 @@ use crate::render::gpu_types::StreamGpu;
 use crate::world::ChunkCoord;
 
 pub const FLAG_ACTIVE: u32 = 1;
-pub const FLAG_DIRTY:  u32 = 2;
+pub const FLAG_DIRTY: u32 = 2;
+pub const FLAG_READY: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -21,7 +22,12 @@ pub struct ChunkMetaGpu {
 
 impl ChunkMetaGpu {
     pub fn inactive() -> Self {
-        Self { x: 0, y: 0, z: 0, flags: 0 }
+        Self {
+            x: 0,
+            y: 0,
+            z: 0,
+            flags: 0,
+        }
     }
 }
 
@@ -48,8 +54,12 @@ impl StreamingState {
         }
     }
 
-    pub fn meta(&self) -> &[ChunkMetaGpu] { &self.meta }
-    pub fn dirty_slots(&self) -> &[u32] { &self.dirty_slots }
+    pub fn meta(&self) -> &[ChunkMetaGpu] {
+        &self.meta
+    }
+    pub fn dirty_slots(&self) -> &[u32] {
+        &self.dirty_slots
+    }
 
     pub fn stream_gpu(&self) -> StreamGpu {
         StreamGpu {
@@ -57,19 +67,32 @@ impl StreamingState {
             origin_y: self.origin.y,
             origin_z: self.origin.z,
             _pad0: 0,
+
             ox: self.ox,
             oy: self.oy,
             oz: self.oz,
             dirty_count: self.dirty_slots.len() as u32,
+
+            // batching (renderer fills these per-frame)
+            dirty_offset: 0,
+            build_count: 0,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 
-    fn dx() -> i32 { config::GRID_X as i32 }
-    fn dy() -> i32 { config::GRID_Y as i32 }
-    fn dz() -> i32 { config::GRID_Z as i32 }
+    fn dx() -> i32 {
+        config::GRID_X as i32
+    }
+    fn dy() -> i32 {
+        config::GRID_Y as i32
+    }
+    fn dz() -> i32 {
+        config::GRID_Z as i32
+    }
 
     fn slot_from_phys(px: i32, py: i32, pz: i32) -> usize {
-        ((pz as usize * config::GRID_X as usize + px as usize) * config::GRID_Y as usize + py as usize)
+        (pz as usize * config::GRID_X as usize + px as usize) * config::GRID_Y as usize + py as usize
     }
 
     fn wrap_i32(v: i32, m: i32) -> i32 {
@@ -84,7 +107,12 @@ impl StreamingState {
     }
 
     fn set_slot(&mut self, slot: usize, cc: ChunkCoord, flags: u32) {
-        self.meta[slot] = ChunkMetaGpu { x: cc.x, y: cc.y, z: cc.z, flags };
+        self.meta[slot] = ChunkMetaGpu {
+            x: cc.x,
+            y: cc.y,
+            z: cc.z,
+            flags,
+        };
     }
 
     fn clear_and_rebuild_all(&mut self, center: ChunkCoord) {
@@ -115,12 +143,15 @@ impl StreamingState {
                     };
                     let (px, py, pz) = self.phys_from_rel(ix, iy, iz);
                     let slot = Self::slot_from_phys(px, py, pz);
+
+                    // NOTE: do NOT set READY here (fresh coords need a build first)
                     self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 }
             }
         }
 
-        self.dirty_slots.extend((0..config::MAX_CHUNKS).map(|s| s as u32));
+        self.dirty_slots
+            .extend((0..config::MAX_CHUNKS).map(|s| s as u32));
     }
 
     fn shift_x_pos(&mut self) {
@@ -137,6 +168,8 @@ impl StreamingState {
                 };
                 let (px, py, pz) = self.phys_from_rel(ix_enter, iy, iz);
                 let slot = Self::slot_from_phys(px, py, pz);
+
+                // entering strip: new coord => not READY yet
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -157,6 +190,7 @@ impl StreamingState {
                 };
                 let (px, py, pz) = self.phys_from_rel(ix_enter, iy, iz);
                 let slot = Self::slot_from_phys(px, py, pz);
+
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -177,6 +211,7 @@ impl StreamingState {
                 };
                 let (px, py, pz) = self.phys_from_rel(ix, iy_enter, iz);
                 let slot = Self::slot_from_phys(px, py, pz);
+
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -197,6 +232,7 @@ impl StreamingState {
                 };
                 let (px, py, pz) = self.phys_from_rel(ix, iy_enter, iz);
                 let slot = Self::slot_from_phys(px, py, pz);
+
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -217,6 +253,7 @@ impl StreamingState {
                 };
                 let (px, py, pz) = self.phys_from_rel(ix, iy, iz_enter);
                 let slot = Self::slot_from_phys(px, py, pz);
+
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -237,6 +274,7 @@ impl StreamingState {
                 };
                 let (px, py, pz) = self.phys_from_rel(ix, iy, iz_enter);
                 let slot = Self::slot_from_phys(px, py, pz);
+
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -268,12 +306,27 @@ impl StreamingState {
 
         self.dirty_slots.clear();
 
-        if dx == 1 { self.shift_x_pos(); }
-        if dx == -1 { self.shift_x_neg(); }
-        if dy == 1 { self.shift_y_pos(); }
-        if dy == -1 { self.shift_y_neg(); }
-        if dz == 1 { self.shift_z_pos(); }
-        if dz == -1 { self.shift_z_neg(); }
+        if dx == 1 {
+            self.shift_x_pos();
+        }
+        if dx == -1 {
+            self.shift_x_neg();
+        }
+        if dy == 1 {
+            self.shift_y_pos();
+        }
+        if dy == -1 {
+            self.shift_y_neg();
+        }
+        if dz == 1 {
+            self.shift_z_pos();
+        }
+        if dz == -1 {
+            self.shift_z_neg();
+        }
+
+        self.dirty_slots.sort_unstable();
+        self.dirty_slots.dedup();
 
         !self.dirty_slots.is_empty()
     }
@@ -282,6 +335,7 @@ impl StreamingState {
         self.dirty_slots.clear();
         for i in 0..config::MAX_CHUNKS as usize {
             if (self.meta[i].flags & FLAG_ACTIVE) != 0 {
+                // NOTE: keep READY as-is so old data can still be rendered while rebuilding
                 self.meta[i].flags |= FLAG_DIRTY;
                 self.dirty_slots.push(i as u32);
             }

@@ -152,7 +152,8 @@ impl App {
 
         self.camera.integrate_input(&mut self.input, dt);
 
-        let now_chunk = world::ChunkCoord::from_world_pos_m(self.camera.position());
+        let mut now_chunk = world::ChunkCoord::from_world_pos_m(self.camera.position());
+        now_chunk.y = 0;
         if now_chunk != self.last_chunk {
             self.last_chunk = now_chunk;
             self.renderer.update_center_chunk(now_chunk);

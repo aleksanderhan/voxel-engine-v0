@@ -1,5 +1,6 @@
 // src/render/state/mod.rs
 // -----------------------
+use bytemuck::Zeroable;
 
 mod bindgroups;
 mod buffers;
@@ -9,7 +10,7 @@ mod streaming;
 pub mod textures;
 
 use crate::config;
-use crate::render::gpu_types::{CameraGpu, OverlayGpu};
+use crate::render::gpu_types::{CameraGpu, OverlayGpu, StreamGpu};
 use crate::world;
 
 use bindgroups::{create_bind_groups, BindGroups};
@@ -34,8 +35,15 @@ pub struct Renderer {
 
     ping: usize,
 
+    // World build state
     world_built: bool,
     streaming: StreamingState,
+
+    // Batching state
+    stream_base: StreamGpu, // origin/ox/oy/oz + dirty_count
+    dirty_total: u32,       // total dirty slots in current rebuild
+    dirty_offset: u32,      // how many we've processed so far
+    build_batch: u32,       // chunks per frame
 
     // internal render size (scaled)
     render_w: u32,
@@ -78,7 +86,6 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(crate::render::shaders::blit_wgsl().into()),
         });
 
-        // Upscale looks much better with linear filtering; cost is tiny vs raymarching.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("blit_sampler_linear"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -104,8 +111,15 @@ impl Renderer {
             textures,
             bind_groups,
             ping: 0,
+
             world_built: false,
             streaming: StreamingState::new(),
+
+            stream_base: StreamGpu::zeroed(),
+            dirty_total: 0,
+            dirty_offset: 0,
+            build_batch: 32, // <-- tune: 16/32/64 depending on GPU
+
             render_w: render_w.max(1),
             render_h: render_h.max(1),
         }
@@ -115,12 +129,28 @@ impl Renderer {
     // Streaming
     // -------------------------------------------------------------------------
 
+    fn reset_batching_from_streaming(&mut self) {
+        self.stream_base = self.streaming.stream_gpu();
+        self.dirty_total = self.stream_base.dirty_count;
+        self.dirty_offset = 0;
+        self.world_built = false;
+    }
+
+    fn write_stream_batch(&self, offset: u32, count: u32) {
+        let mut s = self.stream_base;
+        s.dirty_offset = offset;
+        s.build_count = count;
+        self.queue
+            .write_buffer(&self.buffers.stream, 0, bytemuck::bytes_of(&s));
+    }
+
     pub fn update_center_chunk(&mut self, center: world::ChunkCoord) {
         let changed = self.streaming.update_center(center);
         if !changed {
             return;
         }
 
+        // Upload meta + dirty list
         self.queue.write_buffer(
             &self.buffers.chunk_meta,
             0,
@@ -133,10 +163,16 @@ impl Renderer {
             bytemuck::cast_slice(self.streaming.dirty_slots()),
         );
 
-        let s = self.streaming.stream_gpu();
-        self.queue.write_buffer(&self.buffers.stream, 0, bytemuck::bytes_of(&s));
-
+        // Restart batching for this new dirty list
+        self.stream_base = self.streaming.stream_gpu();
+        self.dirty_total = self.stream_base.dirty_count;
+        self.dirty_offset = 0;
         self.world_built = false;
+
+        // Initialize first batch window
+        let remaining = self.dirty_total.saturating_sub(self.dirty_offset);
+        let count = remaining.min(self.build_batch);
+        self.write_stream_batch(self.dirty_offset, count);
     }
 
     pub fn request_world_rebuild(&mut self) {
@@ -147,24 +183,30 @@ impl Renderer {
             0,
             bytemuck::cast_slice(self.streaming.meta()),
         );
+
         self.queue.write_buffer(
             &self.buffers.dirty_slots,
             0,
             bytemuck::cast_slice(self.streaming.dirty_slots()),
         );
 
-        let s = self.streaming.stream_gpu();
-        self.queue.write_buffer(&self.buffers.stream, 0, bytemuck::bytes_of(&s));
+        self.reset_batching_from_streaming();
 
-        self.world_built = false;
+        let remaining = self.dirty_total.saturating_sub(self.dirty_offset);
+        let count = remaining.min(self.build_batch);
+        self.write_stream_batch(self.dirty_offset, count);
     }
 
     // -------------------------------------------------------------------------
     // Accessors
     // -------------------------------------------------------------------------
 
-    pub fn device(&self) -> &wgpu::Device { &self.device }
-    pub fn queue(&self) -> &wgpu::Queue { &self.queue }
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
 
     pub fn render_size(&self) -> (u32, u32) {
         (self.render_w, self.render_h)
@@ -195,22 +237,30 @@ impl Renderer {
     // -------------------------------------------------------------------------
 
     pub fn write_camera(&self, cam: &CameraGpu) {
-        self.queue.write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
+        self.queue
+            .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
     }
 
     pub fn write_overlay(&self, ov: &OverlayGpu) {
-        self.queue.write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
+        self.queue
+            .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
     }
 
     // -------------------------------------------------------------------------
     // Encode
     // -------------------------------------------------------------------------
 
-    fn encode_world_build(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        let dirty_count = self.streaming.stream_gpu().dirty_count;
-        if dirty_count == 0 {
-            return;
+    fn encode_world_build_batch(&mut self, encoder: &mut wgpu::CommandEncoder) -> bool {
+        // returns true when fully done building all dirty chunks
+        let remaining = self.dirty_total.saturating_sub(self.dirty_offset);
+        if remaining == 0 {
+            // make sure stream says "no work"
+            self.write_stream_batch(self.dirty_offset, 0);
+            return true;
         }
+
+        let build_count = remaining.min(self.build_batch);
+        self.write_stream_batch(self.dirty_offset, build_count);
 
         // build_leaves
         {
@@ -223,7 +273,7 @@ impl Renderer {
 
             let gx = (32 + 7) / 8;
             let gy = (32 + 7) / 8;
-            let gz = 32 * dirty_count;
+            let gz = 32 * build_count;
             cpass.dispatch_workgroups(gx, gy, gz);
         }
 
@@ -238,7 +288,7 @@ impl Renderer {
 
             let gx = (16 + 7) / 8;
             let gy = (16 + 7) / 8;
-            let gz = 16 * dirty_count;
+            let gz = 16 * build_count;
             cpass.dispatch_workgroups(gx, gy, gz);
         }
 
@@ -250,7 +300,7 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.build_l3);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-            cpass.dispatch_workgroups(1, 1, 8 * dirty_count);
+            cpass.dispatch_workgroups(1, 1, 8 * build_count);
         }
 
         // build_L2
@@ -261,7 +311,7 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.build_l2);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-            cpass.dispatch_workgroups(1, 1, 4 * dirty_count);
+            cpass.dispatch_workgroups(1, 1, 4 * build_count);
         }
 
         // build_L1
@@ -272,7 +322,7 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.build_l1);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-            cpass.dispatch_workgroups(1, 1, 2 * dirty_count);
+            cpass.dispatch_workgroups(1, 1, 2 * build_count);
         }
 
         // build_L0
@@ -283,10 +333,10 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.build_l0);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-            cpass.dispatch_workgroups(dirty_count, 1, 1);
+            cpass.dispatch_workgroups(build_count, 1, 1);
         }
 
-        // clear_dirty
+        // clear_dirty (only this batch)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("clear_dirty_pass"),
@@ -295,15 +345,18 @@ impl Renderer {
             cpass.set_pipeline(&self.pipelines.clear_dirty);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
 
-            let gx = (dirty_count + 63) / 64;
+            let gx = (build_count + 63) / 64;
             cpass.dispatch_workgroups(gx, 1, 1);
         }
+
+        self.dirty_offset += build_count;
+        self.dirty_offset >= self.dirty_total
     }
 
     pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder) {
         if !self.world_built {
-            self.encode_world_build(encoder);
-            self.world_built = true;
+            let done = self.encode_world_build_batch(encoder);
+            self.world_built = done;
         }
 
         let width = self.render_w;
