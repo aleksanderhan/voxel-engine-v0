@@ -36,7 +36,7 @@ pub struct CameraGpu {
     pub chunk_size: u32,
     pub chunk_count: u32,
     pub max_steps: u32,
-    pub _pad0: u32,
+    pub frame_index: u32,
 
     pub voxel_params: [f32; 4],
 

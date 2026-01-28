@@ -70,6 +70,9 @@ pub struct App {
     fps_value: u32,
     fps_frames: u32,
     fps_last: Instant,
+
+    frame_index: u32,
+
 }
 
 impl App {
@@ -133,6 +136,7 @@ impl App {
             fps_value: 0,
             fps_frames: 0,
             fps_last: Instant::now(),
+            frame_index: 0,
         }
     }
 
@@ -177,6 +181,7 @@ impl App {
     fn frame(&mut self, elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
         // 1) camera integrate
         self.camera.integrate_input(&mut self.input);
+        self.frame_index = self.frame_index.wrapping_add(1);
 
         // 2) streaming update
         let cam_pos = self.camera.position();
@@ -212,7 +217,7 @@ impl App {
             chunk_size: config::CHUNK_SIZE,
             chunk_count: self.chunks.chunk_count(),
             max_steps,
-            _pad0: 0,
+            frame_index: self.frame_index,
 
             voxel_params: [config::VOXEL_SIZE_M_F32, t, 2.0, 0.003],
 

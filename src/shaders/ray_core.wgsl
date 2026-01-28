@@ -564,7 +564,7 @@ fn trace_chunk_shadow_trans_interval(
 
     if (q.mat != MAT_AIR) {
       if (q.mat == MAT_LEAF) {
-        if (SHADOW_DISPLACED_LEAVES) {
+        if (VOLUME_DISPLACED_LEAVES) {
           let time_s   = cam.voxel_params.y;
           let strength = cam.voxel_params.z;
 
@@ -590,7 +590,6 @@ fn trace_chunk_shadow_trans_interval(
           continue;
         }
       }
-
       return 0.0;
     }
 

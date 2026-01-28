@@ -43,14 +43,41 @@ const SKY_EXPOSURE : f32 = 0.40;
 const SHADOW_BIAS : f32 = 2e-4;
 const SHADOW_STEPS : u32 = 32u;
 
-// If false: leaves cast shadows using their undisplaced cube (faster).
-// If true : shadows match displaced leaf cubes (slower but consistent).
+// Existing:
 const SHADOW_DISPLACED_LEAVES : bool = false;
+const VOLUME_DISPLACED_LEAVES : bool = true;
 
 // Volumetric “sun transmittance” tuning (leafy canopy)
 const VSM_STEPS : u32 = 24u;
 const LEAF_LIGHT_TRANSMIT : f32 = 0.50;
 const MIN_TRANS : f32 = 0.03;
+
+
+// ------------------------------------------------------------
+// Godray tuning knobs (pulled out for easy tweaking)
+// ------------------------------------------------------------
+
+// Boost applied to integrated godray energy before any compression.
+// Typical: 4..12
+const GODRAY_ENERGY_BOOST : f32 = 8.0;
+
+// Soft-knee for godray compression (higher = safer/less intense).
+// Typical: 0.18..0.60  (smaller -> stronger)
+const GODRAY_KNEE_INTEGRATE : f32 = 0.35;
+
+// Composite-time scale for added godray light.
+// Typical: 1.5..6.0
+const GODRAY_COMPOSITE_SCALE : f32 = 6.5;
+
+// Distance fade for godrays in composite (meters).
+// Start fading at NEAR, mostly faded by FAR.
+const GODRAY_FADE_NEAR : f32 = 60.0;
+const GODRAY_FADE_FAR  : f32 = 160.0;
+
+// Composite knee (optional second clamp after upsample/sharpen).
+// Typical: 0.15..0.50
+const GODRAY_KNEE_COMPOSITE : f32 = 0.25;
+
 
 // ------------------------------------------------------------
 // Fog / volumetrics
@@ -60,15 +87,12 @@ const FOG_HEIGHT_FALLOFF : f32 = 0.18;
 const FOG_MAX_DIST       : f32 = 100.0;
 
 const FOG_PRIMARY_SCALE : f32 = 0.02;
-const FOG_GODRAY_SCALE  : f32 = 2.0;
+const FOG_GODRAY_SCALE  : f32 = 1.0;
 
-const FOG_PRIMARY_VIS   : f32 = 0.08;
-
-const FOG_COLOR_GROUND     : vec3<f32> = vec3<f32>(0.62, 0.64, 0.66);
-const FOG_COLOR_SKY_BLEND  : f32 = 0.20;
+const FOG_COLOR_GROUND     : vec3<f32> = vec3<f32>(0.40, 0.42, 0.45); // darker
+const FOG_COLOR_SKY_BLEND  : f32 = 0.10;
 
 const GODRAY_MAX_DIST    : f32 = 80.0;
-const GODRAY_STRENGTH    : f32 = 24.0;
 
 const GODRAY_OFFAXIS_POW : f32 = 2.0;
 const GODRAY_OFFAXIS_W   : f32 = 0.18;
@@ -77,7 +101,7 @@ const GODRAY_SCATTER_HEIGHT_FALLOFF : f32 = 0.04;
 const GODRAY_SCATTER_MIN_FRAC       : f32 = 0.35;
 
 const GODRAY_SIDE_BOOST : f32 = 0.65;
-const GODRAY_BLACK_LEVEL : f32 = 0.010;
+const GODRAY_BLACK_LEVEL : f32 = 0.004;
 
 const GODRAY_TS_LP_ALPHA   : f32 = 0.40;
 const GODRAY_EDGE0         : f32 = 0.004;
@@ -167,15 +191,15 @@ const J2_F : vec2<f32> = vec2<f32>(0.37, 0.41);
 const J3_F : vec2<f32> = vec2<f32>(0.53, 0.59);
 
 const GODRAY_TV_CUTOFF : f32 = 0.02;
-const GODRAY_STEPS_FAST : u32 = 8u;
+const GODRAY_STEPS_FAST : u32 = 16u;
 
 // Composite
-const COMPOSITE_SHARPEN : f32 = 0.55;
-const COMPOSITE_GOD_SCALE : f32 = 18.00;
+const COMPOSITE_SHARPEN : f32 = 0.15;
+const COMPOSITE_GOD_SCALE : f32 = 4.00;
 const COMPOSITE_BEAM_COMPRESS : bool = true;
 
 // Post
-const POST_EXPOSURE : f32 = 0.15;
+const POST_EXPOSURE : f32 = 0.11;
 
 // ------------------------------------------------------------
 // GPU structs (must match Rust layouts)
@@ -196,7 +220,7 @@ struct Camera {
   chunk_size  : u32,
   chunk_count : u32,
   max_steps   : u32,
-  _pad0       : u32,
+  frame_index : u32,
 
   // x = voxel_size_m, y = time_seconds, z = wind_strength, w = fog_density
   voxel_params : vec4<f32>,
@@ -481,8 +505,12 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
 // Fog color used by primary composition
 fn fog_color(rd: vec3<f32>) -> vec3<f32> {
   let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+
+  // Use sky, but prevent sun/halo from whitening the fog
   let sky = sky_color(rd);
-  return mix(FOG_COLOR_GROUND, sky, FOG_COLOR_SKY_BLEND * up);
+  let sky_clamped = min(sky, vec3<f32>(0.45)); // key: stops “bright overlay”
+
+  return mix(FOG_COLOR_GROUND, sky_clamped, FOG_COLOR_SKY_BLEND * up);
 }
 
 // (3) Sun-tinted in-scatter lobe for fog readability
