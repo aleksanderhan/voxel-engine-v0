@@ -60,9 +60,8 @@ fn find_slot_for_chunk(cc: vec3<i32>) -> u32 {
 
   if ((cm.flags & FLAG_ACTIVE) == 0u) { return 0xffffffffu; }
 
-  // KEY CHANGE:
-  // Render is allowed while DIRTY (stale data) as long as READY is set.
-  // New / repurposed slots start NOT READY, so they won't render wrong data.
+  // Render allowed while DIRTY (stale data), as long as READY is set.
+  // New/repurposed slots start not READY so they won't show wrong old data.
   if ((cm.flags & FLAG_READY) == 0u) { return 0xffffffffu; }
 
   if (cm.x != cc.x || cm.y != cc.y || cm.z != cc.z) { return 0xffffffffu; }
@@ -349,14 +348,10 @@ fn clear_dirty(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (slot >= MAX_CHUNKS) { return; }
 
   var cm = chunk_meta[slot];
-
-  // Build completed for this slot:
-  // - clear DIRTY
-  // - set READY so it can render (even if it later becomes DIRTY again)
   cm.flags = (cm.flags & (~FLAG_DIRTY)) | FLAG_READY;
-
   chunk_meta[slot] = cm;
 }
+
 
 // -----------------------------------------------------------------------------
 // Ray tracing

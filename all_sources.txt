@@ -1057,6 +1057,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
 // -----------------------
 // src/render/state/mod.rs
 // -----------------------
+
 use bytemuck::Zeroable;
 
 mod bindgroups;
@@ -1092,17 +1093,14 @@ pub struct Renderer {
 
     ping: usize,
 
-    // World build state
     world_built: bool,
     streaming: StreamingState,
 
-    // Batching state
-    stream_base: StreamGpu,     // origin/ox/oy/oz + dirty_count
-    dirty_total: u32,           // total dirty slots in current rebuild
-    dirty_offset: u32,          // how many we've processed so far
-    build_batch: u32,           // chunks per frame
+    stream_base: StreamGpu,
+    dirty_total: u32,
+    dirty_offset: u32,
+    build_batch: u32,
 
-    // internal render size (scaled)
     render_w: u32,
     render_h: u32,
 }
@@ -1175,16 +1173,12 @@ impl Renderer {
             stream_base: StreamGpu::zeroed(),
             dirty_total: 0,
             dirty_offset: 0,
-            build_batch: 32, // <-- tune: 16/32/64 depending on GPU
+            build_batch: 32,
 
             render_w: render_w.max(1),
             render_h: render_h.max(1),
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Streaming
-    // -------------------------------------------------------------------------
 
     fn reset_batching_from_streaming(&mut self) {
         self.stream_base = self.streaming.stream_gpu();
@@ -1207,14 +1201,7 @@ impl Renderer {
             return;
         }
 
-        // If we are mid-build and the center changes, do a full rebuild to avoid
-        // mixing partially-built old chunks with new coords.
-        let build_in_progress = self.dirty_total > 0 && self.dirty_offset < self.dirty_total;
-        if build_in_progress {
-            self.streaming.mark_all_dirty();
-        }
-
-        // Upload meta + dirty list
+        // Upload meta + dirty list (CPU meta now preserves READY thanks to mark_built_range)
         self.queue.write_buffer(
             &self.buffers.chunk_meta,
             0,
@@ -1227,18 +1214,16 @@ impl Renderer {
             bytemuck::cast_slice(self.streaming.dirty_slots()),
         );
 
-        // Restart batching for this new dirty list
+        // Restart batching for *this* dirty list
         self.stream_base = self.streaming.stream_gpu();
         self.dirty_total = self.stream_base.dirty_count;
         self.dirty_offset = 0;
         self.world_built = false;
 
-        // Initialize first batch window
         let remaining = self.dirty_total.saturating_sub(self.dirty_offset);
         let count = remaining.min(self.build_batch);
         self.write_stream_batch(self.dirty_offset, count);
     }
-
 
     pub fn request_world_rebuild(&mut self) {
         self.streaming.mark_all_dirty();
@@ -1262,24 +1247,10 @@ impl Renderer {
         self.write_stream_batch(self.dirty_offset, count);
     }
 
-    // -------------------------------------------------------------------------
-    // Accessors
-    // -------------------------------------------------------------------------
+    pub fn device(&self) -> &wgpu::Device { &self.device }
+    pub fn queue(&self) -> &wgpu::Queue { &self.queue }
 
-    pub fn device(&self) -> &wgpu::Device {
-        &self.device
-    }
-    pub fn queue(&self) -> &wgpu::Queue {
-        &self.queue
-    }
-
-    pub fn render_size(&self) -> (u32, u32) {
-        (self.render_w, self.render_h)
-    }
-
-    // -------------------------------------------------------------------------
-    // Resizing
-    // -------------------------------------------------------------------------
+    pub fn render_size(&self) -> (u32, u32) { (self.render_w, self.render_h) }
 
     pub fn resize_output(&mut self, window_w: u32, window_h: u32) {
         let (rw, rh) = config::render_dims(window_w, window_h);
@@ -1297,10 +1268,6 @@ impl Renderer {
         self.ping = 0;
     }
 
-    // -------------------------------------------------------------------------
-    // Uniform writes
-    // -------------------------------------------------------------------------
-
     pub fn write_camera(&self, cam: &CameraGpu) {
         self.queue
             .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
@@ -1311,15 +1278,9 @@ impl Renderer {
             .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
     }
 
-    // -------------------------------------------------------------------------
-    // Encode
-    // -------------------------------------------------------------------------
-
     fn encode_world_build_batch(&mut self, encoder: &mut wgpu::CommandEncoder) -> bool {
-        // returns true when fully done building all dirty chunks
         let remaining = self.dirty_total.saturating_sub(self.dirty_offset);
         if remaining == 0 {
-            // make sure stream says "no work"
             self.write_stream_batch(self.dirty_offset, 0);
             return true;
         }
@@ -1335,7 +1296,6 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.build_leaves);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-
             let gx = (32 + 7) / 8;
             let gy = (32 + 7) / 8;
             let gz = 32 * build_count;
@@ -1350,7 +1310,6 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.build_l4);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-
             let gx = (16 + 7) / 8;
             let gy = (16 + 7) / 8;
             let gz = 16 * build_count;
@@ -1401,7 +1360,7 @@ impl Renderer {
             cpass.dispatch_workgroups(build_count, 1, 1);
         }
 
-        // clear_dirty (only this batch)
+        // clear_dirty (GPU flags update)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("clear_dirty_pass"),
@@ -1409,10 +1368,13 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.clear_dirty);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-
             let gx = (build_count + 63) / 64;
             cpass.dispatch_workgroups(gx, 1, 1);
         }
+
+        // CRITICAL: mirror the same flag transition into CPU meta,
+        // so the next chunk_meta upload doesn't wipe READY.
+        self.streaming.mark_built_range(self.dirty_offset, build_count);
 
         self.dirty_offset += build_count;
         self.dirty_offset >= self.dirty_total
@@ -1655,7 +1617,8 @@ use crate::render::gpu_types::StreamGpu;
 use crate::world::ChunkCoord;
 
 pub const FLAG_ACTIVE: u32 = 1;
-pub const FLAG_DIRTY:  u32 = 2;
+pub const FLAG_DIRTY: u32 = 2;
+pub const FLAG_READY: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1718,13 +1681,28 @@ impl StreamingState {
         }
     }
 
+    /// Called by Renderer after it has *built* dirty_slots[start..start+count] this frame.
+    /// Keeps CPU meta.flags consistent with what the GPU does in clear_dirty (DIRTY cleared, READY set).
+    pub fn mark_built_range(&mut self, start: u32, count: u32) {
+        if count == 0 { return; }
+        let end = start.saturating_add(count).min(self.dirty_slots.len() as u32);
+
+        for i in start..end {
+            let slot = self.dirty_slots[i as usize] as usize;
+            if slot >= self.meta.len() { continue; }
+
+            // clear DIRTY, set READY (keep ACTIVE as-is)
+            let f = self.meta[slot].flags;
+            self.meta[slot].flags = (f & !FLAG_DIRTY) | FLAG_READY;
+        }
+    }
+
     fn dx() -> i32 { config::GRID_X as i32 }
     fn dy() -> i32 { config::GRID_Y as i32 }
     fn dz() -> i32 { config::GRID_Z as i32 }
 
     fn slot_from_phys(px: i32, py: i32, pz: i32) -> usize {
-        (pz as usize * config::GRID_X as usize + px as usize) * config::GRID_Y as usize
-            + py as usize
+        (pz as usize * config::GRID_X as usize + px as usize) * config::GRID_Y as usize + py as usize
     }
 
     fn wrap_i32(v: i32, m: i32) -> i32 { v.rem_euclid(m) }
@@ -1768,6 +1746,8 @@ impl StreamingState {
                     };
                     let (px, py, pz) = self.phys_from_rel(ix, iy, iz);
                     let slot = Self::slot_from_phys(px, py, pz);
+
+                    // fresh coords: NOT READY yet, must build
                     self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 }
             }
@@ -1786,6 +1766,8 @@ impl StreamingState {
                 let cc = ChunkCoord { x: self.origin.x + ix_enter, y: self.origin.y + iy, z: self.origin.z + iz };
                 let (px, py, pz) = self.phys_from_rel(ix_enter, iy, iz);
                 let slot = Self::slot_from_phys(px, py, pz);
+
+                // entering strip: new coord => clear READY
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -1802,6 +1784,7 @@ impl StreamingState {
                 let cc = ChunkCoord { x: self.origin.x + ix_enter, y: self.origin.y + iy, z: self.origin.z + iz };
                 let (px, py, pz) = self.phys_from_rel(ix_enter, iy, iz);
                 let slot = Self::slot_from_phys(px, py, pz);
+
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -1818,6 +1801,7 @@ impl StreamingState {
                 let cc = ChunkCoord { x: self.origin.x + ix, y: self.origin.y + iy_enter, z: self.origin.z + iz };
                 let (px, py, pz) = self.phys_from_rel(ix, iy_enter, iz);
                 let slot = Self::slot_from_phys(px, py, pz);
+
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -1834,6 +1818,7 @@ impl StreamingState {
                 let cc = ChunkCoord { x: self.origin.x + ix, y: self.origin.y + iy_enter, z: self.origin.z + iz };
                 let (px, py, pz) = self.phys_from_rel(ix, iy_enter, iz);
                 let slot = Self::slot_from_phys(px, py, pz);
+
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -1850,6 +1835,7 @@ impl StreamingState {
                 let cc = ChunkCoord { x: self.origin.x + ix, y: self.origin.y + iy, z: self.origin.z + iz_enter };
                 let (px, py, pz) = self.phys_from_rel(ix, iy, iz_enter);
                 let slot = Self::slot_from_phys(px, py, pz);
+
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -1866,6 +1852,7 @@ impl StreamingState {
                 let cc = ChunkCoord { x: self.origin.x + ix, y: self.origin.y + iy, z: self.origin.z + iz_enter };
                 let (px, py, pz) = self.phys_from_rel(ix, iy, iz_enter);
                 let slot = Self::slot_from_phys(px, py, pz);
+
                 self.set_slot(slot, cc, FLAG_ACTIVE | FLAG_DIRTY);
                 self.dirty_slots.push(slot as u32);
             }
@@ -1914,6 +1901,7 @@ impl StreamingState {
         self.dirty_slots.clear();
         for i in 0..config::MAX_CHUNKS as usize {
             if (self.meta[i].flags & FLAG_ACTIVE) != 0 {
+                // keep READY so old data can render while rebuilding
                 self.meta[i].flags |= FLAG_DIRTY;
                 self.dirty_slots.push(i as u32);
             }
@@ -2523,6 +2511,7 @@ const MAX_CHUNKS   : u32 = GRID_X * GRID_Y * GRID_Z;
 
 const FLAG_ACTIVE : u32 = 1u;
 const FLAG_DIRTY  : u32 = 2u;
+const FLAG_READY  : u32 = 4u;
 
 const NODES_PER_CHUNK : u32 = 37449u;
 
@@ -2566,14 +2555,14 @@ fn find_slot_for_chunk(cc: vec3<i32>) -> u32 {
 
   if ((cm.flags & FLAG_ACTIVE) == 0u) { return 0xffffffffu; }
 
-  // ✅ critical: don't use stale node data
-  if ((cm.flags & FLAG_DIRTY) != 0u) { return 0xffffffffu; }
+  // Render allowed while DIRTY (stale data), as long as READY is set.
+  // New/repurposed slots start not READY so they won't show wrong old data.
+  if ((cm.flags & FLAG_READY) == 0u) { return 0xffffffffu; }
 
   if (cm.x != cc.x || cm.y != cc.y || cm.z != cc.z) { return 0xffffffffu; }
 
   return slot;
 }
-
 
 fn chunk_size_m() -> f32 {
   return cam.params.z * f32(CHUNK_VOXELS);
@@ -2854,9 +2843,10 @@ fn clear_dirty(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (slot >= MAX_CHUNKS) { return; }
 
   var cm = chunk_meta[slot];
-  cm.flags = cm.flags & (~FLAG_DIRTY);
+  cm.flags = (cm.flags & (~FLAG_DIRTY)) | FLAG_READY;
   chunk_meta[slot] = cm;
 }
+
 
 // -----------------------------------------------------------------------------
 // Ray tracing

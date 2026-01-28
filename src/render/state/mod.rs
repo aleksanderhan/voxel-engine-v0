@@ -1,5 +1,6 @@
 // src/render/state/mod.rs
 // -----------------------
+
 use bytemuck::Zeroable;
 
 mod bindgroups;
@@ -35,17 +36,14 @@ pub struct Renderer {
 
     ping: usize,
 
-    // World build state
     world_built: bool,
     streaming: StreamingState,
 
-    // Batching state
-    stream_base: StreamGpu, // origin/ox/oy/oz + dirty_count
-    dirty_total: u32,       // total dirty slots in current rebuild
-    dirty_offset: u32,      // how many we've processed so far
-    build_batch: u32,       // chunks per frame
+    stream_base: StreamGpu,
+    dirty_total: u32,
+    dirty_offset: u32,
+    build_batch: u32,
 
-    // internal render size (scaled)
     render_w: u32,
     render_h: u32,
 }
@@ -118,16 +116,12 @@ impl Renderer {
             stream_base: StreamGpu::zeroed(),
             dirty_total: 0,
             dirty_offset: 0,
-            build_batch: 32, // <-- tune: 16/32/64 depending on GPU
+            build_batch: 32,
 
             render_w: render_w.max(1),
             render_h: render_h.max(1),
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Streaming
-    // -------------------------------------------------------------------------
 
     fn reset_batching_from_streaming(&mut self) {
         self.stream_base = self.streaming.stream_gpu();
@@ -150,7 +144,7 @@ impl Renderer {
             return;
         }
 
-        // Upload meta + dirty list
+        // Upload meta + dirty list (CPU meta now preserves READY thanks to mark_built_range)
         self.queue.write_buffer(
             &self.buffers.chunk_meta,
             0,
@@ -163,13 +157,12 @@ impl Renderer {
             bytemuck::cast_slice(self.streaming.dirty_slots()),
         );
 
-        // Restart batching for this new dirty list
+        // Restart batching for *this* dirty list
         self.stream_base = self.streaming.stream_gpu();
         self.dirty_total = self.stream_base.dirty_count;
         self.dirty_offset = 0;
         self.world_built = false;
 
-        // Initialize first batch window
         let remaining = self.dirty_total.saturating_sub(self.dirty_offset);
         let count = remaining.min(self.build_batch);
         self.write_stream_batch(self.dirty_offset, count);
@@ -197,24 +190,10 @@ impl Renderer {
         self.write_stream_batch(self.dirty_offset, count);
     }
 
-    // -------------------------------------------------------------------------
-    // Accessors
-    // -------------------------------------------------------------------------
+    pub fn device(&self) -> &wgpu::Device { &self.device }
+    pub fn queue(&self) -> &wgpu::Queue { &self.queue }
 
-    pub fn device(&self) -> &wgpu::Device {
-        &self.device
-    }
-    pub fn queue(&self) -> &wgpu::Queue {
-        &self.queue
-    }
-
-    pub fn render_size(&self) -> (u32, u32) {
-        (self.render_w, self.render_h)
-    }
-
-    // -------------------------------------------------------------------------
-    // Resizing
-    // -------------------------------------------------------------------------
+    pub fn render_size(&self) -> (u32, u32) { (self.render_w, self.render_h) }
 
     pub fn resize_output(&mut self, window_w: u32, window_h: u32) {
         let (rw, rh) = config::render_dims(window_w, window_h);
@@ -232,10 +211,6 @@ impl Renderer {
         self.ping = 0;
     }
 
-    // -------------------------------------------------------------------------
-    // Uniform writes
-    // -------------------------------------------------------------------------
-
     pub fn write_camera(&self, cam: &CameraGpu) {
         self.queue
             .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
@@ -246,15 +221,9 @@ impl Renderer {
             .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
     }
 
-    // -------------------------------------------------------------------------
-    // Encode
-    // -------------------------------------------------------------------------
-
     fn encode_world_build_batch(&mut self, encoder: &mut wgpu::CommandEncoder) -> bool {
-        // returns true when fully done building all dirty chunks
         let remaining = self.dirty_total.saturating_sub(self.dirty_offset);
         if remaining == 0 {
-            // make sure stream says "no work"
             self.write_stream_batch(self.dirty_offset, 0);
             return true;
         }
@@ -270,7 +239,6 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.build_leaves);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-
             let gx = (32 + 7) / 8;
             let gy = (32 + 7) / 8;
             let gz = 32 * build_count;
@@ -285,7 +253,6 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.build_l4);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-
             let gx = (16 + 7) / 8;
             let gy = (16 + 7) / 8;
             let gz = 16 * build_count;
@@ -336,7 +303,7 @@ impl Renderer {
             cpass.dispatch_workgroups(build_count, 1, 1);
         }
 
-        // clear_dirty (only this batch)
+        // clear_dirty (GPU flags update)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("clear_dirty_pass"),
@@ -344,10 +311,13 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.clear_dirty);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-
             let gx = (build_count + 63) / 64;
             cpass.dispatch_workgroups(gx, 1, 1);
         }
+
+        // CRITICAL: mirror the same flag transition into CPU meta,
+        // so the next chunk_meta upload doesn't wipe READY.
+        self.streaming.mark_built_range(self.dirty_offset, build_count);
 
         self.dirty_offset += build_count;
         self.dirty_offset >= self.dirty_total
