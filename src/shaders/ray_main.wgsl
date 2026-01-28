@@ -82,25 +82,34 @@ fn godray_integrate(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, j: f32) -> vec3<f3
     let Tv = fog_transmittance_godray(ro, rd, ti);
     if (Tv < GODRAY_TV_CUTOFF) { break; }
 
-    let Ts0 = sun_transmittance(p, SUN_DIR);
-    let Ts_soft = pow(clamp(Ts0, 0.0, 1.0), 0.75);
+    let Ts_geom = sun_transmittance_geom_only(p, SUN_DIR);
+    let Tc      = cloud_sun_transmittance(p, SUN_DIR);
+
+    // clouds only dim the light (and softly)
+    let Tc_vol  = mix(1.0, Tc, CLOUD_GODRAY_W);
+    let Ts_soft = pow(clamp(Ts_geom, 0.0, 1.0), 0.75);
 
     let ts_prev = ts_lp;
     ts_lp = mix(ts_lp, Ts_soft, a_ts);
 
-    let dTs = abs(Ts_soft - ts_prev);
+    let dTs = max(0.0, ts_prev - Ts_soft);
 
     var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
-    shaft = sqrt(shaft);
+    shaft *= (1.0 - Ts_soft);
+
+    // contrast curve (bigger pop)
+    shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
+
+
     shaft_lp = mix(shaft_lp, shaft, a_shaft);
     shaft = shaft_lp;
 
     let haze_ramp = 1.0 - exp(-ti / GODRAY_HAZE_NEAR_FADE);
-    let haze = GODRAY_BASE_HAZE * haze_ramp;
+    let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts_lp, 2.0);
 
-    let shaft_sun_gate = smoothstep(0.10, 0.55, ts_lp);
-
-    let w = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
+    let shaft_sun_gate = smoothstep(0.35, 0.80, ts_lp); // shift up: only strong beams when sun mostly visible
+    let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
+    let w = clamp(w_raw, 0.0, 1.0);
 
     let hfall = GODRAY_SCATTER_HEIGHT_FALLOFF;
     let hmin  = GODRAY_SCATTER_MIN_FRAC;
@@ -110,7 +119,10 @@ fn godray_integrate(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, j: f32) -> vec3<f3
 
     let strength_scale = 0.70;
 
-    sum += (SUN_COLOR * SUN_INTENSITY) * (dens * dt) * Tv * ts_lp * phase * w * strength_scale;
+    sum += (SUN_COLOR * SUN_INTENSITY)
+     * (dens * dt) * Tv * ts_lp * phase * w
+     * Tc_vol;
+
   }
 
   return sum * GODRAY_STRENGTH;

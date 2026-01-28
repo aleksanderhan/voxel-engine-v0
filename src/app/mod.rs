@@ -202,7 +202,7 @@ impl App {
         let aspect = self.config.width as f32 / self.config.height as f32;
         let cf = self.camera.frame_matrices(aspect);
 
-        let max_steps = (config::CHUNK_SIZE * 2).clamp(48, 96);
+        let max_steps = (config::CHUNK_SIZE * 2).clamp(64, 256);
 
         let cam_gpu = CameraGpu {
             view_inv: cf.view_inv.to_cols_array_2d(),

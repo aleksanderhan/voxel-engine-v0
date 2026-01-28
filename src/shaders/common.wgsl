@@ -69,8 +69,8 @@ const FOG_PRIMARY_VIS   : f32 = 0.08;
 const FOG_COLOR_GROUND     : vec3<f32> = vec3<f32>(0.62, 0.64, 0.66);
 const FOG_COLOR_SKY_BLEND  : f32 = 0.20;
 
-const GODRAY_MAX_DIST    : f32 = 120.0;
-const GODRAY_STRENGTH    : f32 = 4.0;
+const GODRAY_MAX_DIST    : f32 = 80.0;
+const GODRAY_STRENGTH    : f32 = 14.0;
 
 const GODRAY_OFFAXIS_POW : f32 = 3.0;
 const GODRAY_OFFAXIS_W   : f32 = 0.18;
@@ -79,20 +79,21 @@ const GODRAY_OFFAXIS_W   : f32 = 0.18;
 const GODRAY_SCATTER_HEIGHT_FALLOFF : f32 = 0.04; // << smaller than FOG_HEIGHT_FALLOFF (0.18)
 const GODRAY_SCATTER_MIN_FRAC       : f32 = 0.35; // floor as fraction of sea-level scatter
 
-const GODRAY_SIDE_BOOST : f32 = 0.65; // 0..1
-const GODRAY_BLACK_LEVEL : f32 = 0.018; // try 0.010..0.030
+const GODRAY_SIDE_BOOST : f32 = 0.75; // 0..1
+const GODRAY_BLACK_LEVEL : f32 = 0.010; // try 0.010..0.030
 
-const GODRAY_TS_LP_ALPHA   : f32 = 0.50; // 0.2..0.5 (higher = smoother, less noisy)
-const GODRAY_EDGE0         : f32 = 0.015;
-const GODRAY_EDGE1         : f32 = 0.10;
+const GODRAY_TS_LP_ALPHA   : f32 = 0.30; // 0.2..0.5 (higher = smoother, less noisy)
+const GODRAY_EDGE0         : f32 = 0.004;
+const GODRAY_EDGE1         : f32 = 0.035;
 
-const GODRAY_BASE_HAZE     : f32 = 0.08; // 0.02..0.10 (tiny DC term)
+const GODRAY_BASE_HAZE     : f32 = 0.02; // 0.02..0.10 (tiny DC term)
 const GODRAY_HAZE_NEAR_FADE: f32 = 18.0; // meters: haze ramps in with distance
 
+const CLOUD_GODRAY_W : f32 = 0.25; // 0..1 (how much clouds affect godrays brightness)
 
 const INV_4PI      : f32 = 0.0795774715;
-const PHASE_G      : f32 = 0.55;
-const PHASE_MIE_W  : f32 = 0.60;
+const PHASE_G      : f32 = 0.25;
+const PHASE_MIE_W  : f32 = 0.30;
 
 // ------------------------------------------------------------
 // Fractal clouds
@@ -141,8 +142,8 @@ const WIND_FLUTTER_WEIGHT : f32 = 0.25;
 const WIND_VERTICAL_SCALE : f32 = 0.25;
 const LEAF_VERTICAL_REDUCE : f32 = 0.15;
 
-const LEAF_OFFSET_AMP : f32 = 0.45;
-const LEAF_OFFSET_MAX_FRAC : f32 = 0.45;
+const LEAF_OFFSET_AMP : f32 = 0.75;
+const LEAF_OFFSET_MAX_FRAC : f32 = 0.75;
 
 const WIND_PHASE_OFF_1 : vec3<f32> = vec3<f32>(19.0, 7.0, 11.0);
 const TAU : f32 = 6.28318530718;
@@ -172,8 +173,8 @@ const GODRAY_TV_CUTOFF : f32 = 0.02;
 const GODRAY_STEPS_FAST : u32 = 8u;
 
 // Composite
-const COMPOSITE_SHARPEN : f32 = 0.35;
-const COMPOSITE_GOD_SCALE : f32 = 3.0;
+const COMPOSITE_SHARPEN : f32 = 0.15;
+const COMPOSITE_GOD_SCALE : f32 = 8.00;
 const COMPOSITE_BEAM_COMPRESS : bool = true;
 
 // Post
@@ -407,13 +408,15 @@ fn phase_mie(costh: f32) -> f32 {
   let g = PHASE_G;
   let gg = g * g;
   let denom = pow(1.0 + gg - 2.0 * g * costh, 1.5);
-  return (1.0 - gg) / max(denom, 1e-3);
+  // HG normalized by 1/(4π)
+  return INV_4PI * (1.0 - gg) / max(denom, 1e-3);
 }
 
 fn phase_blended(costh: f32) -> f32 {
-  let mie = phase_mie(costh);
-  return mix(INV_4PI, mie, PHASE_MIE_W);
+  let mie = phase_mie(costh);              // now already normalized
+  return mix(INV_4PI, mie, PHASE_MIE_W);   // isotropic ↔ mie
 }
+
 
 // ------------------------------------------------------------
 // Sky

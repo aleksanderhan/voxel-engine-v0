@@ -175,16 +175,49 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
   return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
 }
 
+fn material_variation_clip(world_p: vec3<f32>, cell_size_m: f32, strength: f32) -> f32 {
+  let cell = floor(world_p / cell_size_m);
+  return (hash31(cell) - 0.5) * strength;
+}
+
+// a slightly more “can't miss it” grass tint
+fn apply_material_variation_clip(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f32> {
+  var c = base;
+  if (mat == MAT_GRASS) {
+    let v0 = material_variation_clip(hp, 3.0, 1.0);   // big patches
+    let v1 = material_variation_clip(hp, 0.75, 0.35); // small breakup
+    let v  = v0 + v1;
+
+    // additive tint is much more visible than tiny multiplicative tweaks
+    c += vec3<f32>(0.10 * v, 0.18 * v, 0.06 * v);
+
+    // keep sane
+    c = clamp(c, vec3<f32>(0.0), vec3<f32>(2.0));
+  }
+  return c;
+}
+
 fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit) -> vec3<f32> {
   let hp = ro + ch.t * rd;
 
-  let base = color_for_material(ch.mat);
+  // base + variation
+  var base = color_for_material(ch.mat);
+  base = apply_material_variation_clip(base, ch.mat, hp);
 
-  let cloud = cloud_sun_transmittance(hp, SUN_DIR);
+  // lighting model consistent with voxels
+  let voxel_size = cam.voxel_params.x;
+  let hp_shadow  = hp + ch.n * (0.75 * voxel_size);
+
+  let vis  = sun_transmittance(hp_shadow, SUN_DIR);
   let diff = max(dot(ch.n, SUN_DIR), 0.0);
 
-  let ambient = 0.22;
-  let direct = SUN_COLOR * SUN_INTENSITY * diff * cloud;
+  let amb_col = hemi_ambient(ch.n);
+  let amb_strength = 0.10; // terrain can be slightly lower than voxels
+  let ambient = amb_col * amb_strength;
 
-  return base * (ambient + (1.0 - ambient) * direct);
+  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis;
+
+  return base * (ambient + direct);
 }
+
+

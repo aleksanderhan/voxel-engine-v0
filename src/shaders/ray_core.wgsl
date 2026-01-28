@@ -540,6 +540,114 @@ fn trace_chunk_shadow_trans_interval(
   return trans;
 }
 
+fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+  let voxel_size   = cam.voxel_params.x;
+  let nudge_s      = 0.18 * voxel_size;
+  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
+
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+
+  let grid_bmin = vec3<f32>(
+    f32(go.x) * chunk_size_m,
+    f32(go.y) * chunk_size_m,
+    f32(go.z) * chunk_size_m
+  );
+
+  let grid_bmax = grid_bmin + vec3<f32>(
+    f32(gd.x) * chunk_size_m,
+    f32(gd.y) * chunk_size_m,
+    f32(gd.z) * chunk_size_m
+  );
+
+  let bias = max(SHADOW_BIAS, 0.50 * voxel_size);
+  let ro   = p + sun_dir * bias;
+  let rd   = sun_dir;
+
+  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  let t_enter = max(rtg.x, 0.0);
+  let t_exit  = rtg.y;
+  if (t_exit < t_enter) { return 1.0; }
+
+  let start_t = t_enter + nudge_s;
+  let p0 = ro + start_t * rd;
+
+  var t_local: f32 = 0.0;
+  let t_exit_local = max(t_exit - start_t, 0.0);
+
+  var c = chunk_coord_from_pos(p0, chunk_size_m);
+  var cx: i32 = c.x;
+  var cy: i32 = c.y;
+  var cz: i32 = c.z;
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  let step_x: i32 = select(-1, 1, rd.x > 0.0);
+  let step_y: i32 = select(-1, 1, rd.y > 0.0);
+  let step_z: i32 = select(-1, 1, rd.z > 0.0);
+
+  let bx = select(f32(cx) * chunk_size_m, f32(cx + 1) * chunk_size_m, rd.x > 0.0);
+  let by = select(f32(cy) * chunk_size_m, f32(cy + 1) * chunk_size_m, rd.y > 0.0);
+  let bz = select(f32(cz) * chunk_size_m, f32(cz + 1) * chunk_size_m, rd.z > 0.0);
+
+  var tMaxX: f32 = (bx - p0.x) * inv.x;
+  var tMaxY: f32 = (by - p0.y) * inv.y;
+  var tMaxZ: f32 = (bz - p0.z) * inv.z;
+
+  let tDeltaX: f32 = abs(chunk_size_m * inv.x);
+  let tDeltaY: f32 = abs(chunk_size_m * inv.y);
+  let tDeltaZ: f32 = abs(chunk_size_m * inv.z);
+
+  if (abs(rd.x) < EPS_INV) { tMaxX = BIG_F32; }
+  if (abs(rd.y) < EPS_INV) { tMaxY = BIG_F32; }
+  if (abs(rd.z) < EPS_INV) { tMaxZ = BIG_F32; }
+
+  var trans = 1.0;
+
+  let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 512u);
+
+  for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
+    if (t_local > t_exit_local) { break; }
+    if (trans < MIN_TRANS) { break; }
+
+    let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
+    let slot = grid_lookup_slot(cx, cy, cz);
+
+    if (slot != INVALID_U32 && slot < cam.chunk_count) {
+      let ch = chunks[slot];
+
+      let cell_enter = start_t + t_local;
+      let cell_exit  = start_t + min(tNextLocal, t_exit_local);
+
+      trans *= trace_chunk_shadow_trans_interval(ro, rd, ch, cell_enter, cell_exit);
+      if (trans < MIN_TRANS) { break; }
+    }
+
+    if (tMaxX < tMaxY) {
+      if (tMaxX < tMaxZ) { cx += step_x; t_local = tMaxX; tMaxX += tDeltaX; }
+      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
+    } else {
+      if (tMaxY < tMaxZ) { cy += step_y; t_local = tMaxY; tMaxY += tDeltaY; }
+      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
+    }
+
+    let ox = cam.grid_origin_chunk.x;
+    let oy = cam.grid_origin_chunk.y;
+    let oz = cam.grid_origin_chunk.z;
+
+    let nx = i32(cam.grid_dims.x);
+    let ny = i32(cam.grid_dims.y);
+    let nz = i32(cam.grid_dims.z);
+
+    if (cx < ox || cy < oy || cz < oz || cx >= ox + nx || cy >= oy + ny || cz >= oz + nz) {
+      break;
+    }
+  }
+
+  return trans;
+}
+
+
 fn sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let Tc = cloud_sun_transmittance(p, sun_dir);
 
