@@ -305,8 +305,13 @@ impl Renderer {
 
             cpass.set_pipeline(&self.pipelines.composite);
 
-            cpass.set_bind_group(0, &self.bind_groups.empty, &[]);
+            // group(0) must match layouts.scene now
+            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
+
+            // group(1) is still empty (or you can omit setting it)
             cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
+
+            // group(2) is your composite textures
             cpass.set_bind_group(2, &self.bind_groups.composite[pong], &[]);
 
             let gx = (width + 7) / 8;

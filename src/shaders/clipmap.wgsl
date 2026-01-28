@@ -183,17 +183,31 @@ fn material_variation_clip(world_p: vec3<f32>, cell_size_m: f32, strength: f32) 
 // a slightly more “can't miss it” grass tint
 fn apply_material_variation_clip(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f32> {
   var c = base;
+
+  // Stable patch noise (no shimmer)
   if (mat == MAT_GRASS) {
-    let v0 = material_variation_clip(hp, 3.0, 1.0);   // big patches
-    let v1 = material_variation_clip(hp, 0.75, 0.35); // small breakup
+    let v0 = material_variation_clip(hp, 3.0, 1.0);    // big patches
+    let v1 = material_variation_clip(hp, 0.75, 0.35);  // small breakup
     let v  = v0 + v1;
 
-    // additive tint is much more visible than tiny multiplicative tweaks
+    // additive tint (visible)
     c += vec3<f32>(0.10 * v, 0.18 * v, 0.06 * v);
 
-    // keep sane
+    // subtle brightness
+    c *= (1.0 + 0.06 * v);
+
+    c = clamp(c, vec3<f32>(0.0), vec3<f32>(2.0));
+  } else if (mat == MAT_DIRT) {
+    let v = material_variation_clip(hp, 1.5, 0.8);
+    c += vec3<f32>(0.05 * v, 0.03 * v, 0.01 * v);
+    c *= (1.0 + 0.08 * v);
+    c = clamp(c, vec3<f32>(0.0), vec3<f32>(2.0));
+  } else if (mat == MAT_STONE) {
+    let v = material_variation_clip(hp, 2.0, 0.9);
+    c *= (1.0 + 0.10 * v);
     c = clamp(c, vec3<f32>(0.0), vec3<f32>(2.0));
   }
+
   return c;
 }
 
@@ -211,13 +225,53 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit) -> vec3<f32> {
   let vis  = sun_transmittance(hp_shadow, SUN_DIR);
   let diff = max(dot(ch.n, SUN_DIR), 0.0);
 
+  // AO-lite for terrain: reuse voxel AO idea with cheap taps against heightfield itself
+  // We approximate occlusion using height samples around the hitpoint.
+  let lvl = clip_choose_level(hp.xz);
+  let cell = clip.level[lvl].z;
+
+  let h0  = clip_height_at_level(hp.xz, lvl);
+  let hx1 = clip_height_at_level(hp.xz + vec2<f32>( cell, 0.0), lvl);
+  let hx0 = clip_height_at_level(hp.xz + vec2<f32>(-cell, 0.0), lvl);
+  let hz1 = clip_height_at_level(hp.xz + vec2<f32>(0.0,  cell), lvl);
+  let hz0 = clip_height_at_level(hp.xz + vec2<f32>(0.0, -cell), lvl);
+
+  // If neighbors are higher than current point, it feels “more occluded”.
+  let occ =
+    max(0.0, hx1 - h0) +
+    max(0.0, hx0 - h0) +
+    max(0.0, hz1 - h0) +
+    max(0.0, hz0 - h0);
+
+  let ao = clamp(1.0 - 0.65 * occ / max(cell, 1e-3), 0.45, 1.0);
+
   let amb_col = hemi_ambient(ch.n);
-  let amb_strength = 0.10; // terrain can be slightly lower than voxels
-  let ambient = amb_col * amb_strength;
+  let amb_strength = 0.10;
+  let ambient = amb_col * amb_strength * ao;
 
   let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis;
 
-  return base * (ambient + direct);
+  // Spec + fresnel like voxel path (simple)
+  let vdir = normalize(-rd);
+  let hdir = normalize(vdir + SUN_DIR);
+  let ndv  = max(dot(ch.n, vdir), 0.0);
+  let ndh  = max(dot(ch.n, hdir), 0.0);
+
+  // terrain roughness
+  var rough = 0.85;
+  if (ch.mat == MAT_STONE) { rough = 0.50; }
+  if (ch.mat == MAT_DIRT)  { rough = 0.90; }
+  if (ch.mat == MAT_GRASS) { rough = 0.88; }
+
+  let shininess = mix(8.0, 96.0, 1.0 - rough);
+  let spec = pow(ndh, shininess);
+
+  // fresnel (scalar)
+  var f0 = 0.03;
+  if (ch.mat == MAT_STONE) { f0 = 0.04; }
+  let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(ndv, 0.0, 1.0), 5.0);
+
+  let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis;
+
+  return base * (ambient + direct) + 0.18 * spec_col;
 }
-
-

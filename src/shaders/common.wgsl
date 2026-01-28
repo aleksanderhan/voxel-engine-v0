@@ -1,7 +1,7 @@
-// common.wgsl
+// src/shaders/common.wgsl
 //
 // Shared WGSL across compute passes.
-// - Constants / tuning knobs (ALL constants live here)
+// - Constants / tuning knobs
 // - GPU-side struct defs + scene bindings
 // - Shared math + grid helpers + sky/cloud/fog utilities
 
@@ -9,13 +9,13 @@
 // IDs / numeric
 // ------------------------------------------------------------
 
-const LEAF_U32 : u32 = 0xFFFFFFFFu; // Sentinel for "leaf node" in child_base.
-const INVALID_U32 : u32 = 0xFFFFFFFFu; // Sentinel for invalid grid slot (chunk_grid entry).
+const LEAF_U32 : u32 = 0xFFFFFFFFu;
+const INVALID_U32 : u32 = 0xFFFFFFFFu;
 
 const BIG_F32  : f32 = 1e30;
 const EPS_INV  : f32 = 1e-8;
 
-// Materials (keeps magic numbers out of core code)
+// Materials
 const MAT_AIR   : u32 = 0u;
 const MAT_GRASS : u32 = 1u;
 const MAT_DIRT  : u32 = 2u;
@@ -41,8 +41,6 @@ const SKY_EXPOSURE : f32 = 0.40;
 // ------------------------------------------------------------
 
 const SHADOW_BIAS : f32 = 2e-4;
-
-// Shadow traversal tuning
 const SHADOW_STEPS : u32 = 32u;
 
 // If false: leaves cast shadows using their undisplaced cube (faster).
@@ -75,21 +73,20 @@ const GODRAY_STRENGTH    : f32 = 24.0;
 const GODRAY_OFFAXIS_POW : f32 = 2.0;
 const GODRAY_OFFAXIS_W   : f32 = 0.18;
 
-// Godray scattering height behavior (ONLY affects added beam light, not fog density)
-const GODRAY_SCATTER_HEIGHT_FALLOFF : f32 = 0.04; // << smaller than FOG_HEIGHT_FALLOFF (0.18)
-const GODRAY_SCATTER_MIN_FRAC       : f32 = 0.35; // floor as fraction of sea-level scatter
+const GODRAY_SCATTER_HEIGHT_FALLOFF : f32 = 0.04;
+const GODRAY_SCATTER_MIN_FRAC       : f32 = 0.35;
 
-const GODRAY_SIDE_BOOST : f32 = 0.65; // 0..1
-const GODRAY_BLACK_LEVEL : f32 = 0.010; // try 0.010..0.030
+const GODRAY_SIDE_BOOST : f32 = 0.65;
+const GODRAY_BLACK_LEVEL : f32 = 0.010;
 
-const GODRAY_TS_LP_ALPHA   : f32 = 0.40; // 0.2..0.5 (higher = smoother, less noisy)
+const GODRAY_TS_LP_ALPHA   : f32 = 0.40;
 const GODRAY_EDGE0         : f32 = 0.004;
 const GODRAY_EDGE1         : f32 = 0.035;
 
-const GODRAY_BASE_HAZE     : f32 = 0.04; // 0.02..0.10 (tiny DC term)
-const GODRAY_HAZE_NEAR_FADE: f32 = 18.0; // meters: haze ramps in with distance
+const GODRAY_BASE_HAZE     : f32 = 0.04;
+const GODRAY_HAZE_NEAR_FADE: f32 = 18.0;
 
-const CLOUD_GODRAY_W : f32 = 0.25; // 0..1 (how much clouds affect godrays brightness)
+const CLOUD_GODRAY_W : f32 = 0.25;
 
 const INV_4PI      : f32 = 0.0795774715;
 const PHASE_G      : f32 = 0.25;
@@ -149,7 +146,7 @@ const WIND_PHASE_OFF_1 : vec3<f32> = vec3<f32>(19.0, 7.0, 11.0);
 const TAU : f32 = 6.28318530718;
 
 // ------------------------------------------------------------
-// Ray/main pass knobs (moved from ray_main)
+// Ray/main pass knobs
 // ------------------------------------------------------------
 
 const PRIMARY_NUDGE_VOXEL_FRAC : f32 = 1e-4;
@@ -297,7 +294,7 @@ fn child_rank(mask: u32, ci: u32) -> u32 {
 }
 
 // ------------------------------------------------------------
-// Chunk-grid helpers (moved from ray_main; used by shadows too)
+// Chunk-grid helpers
 // ------------------------------------------------------------
 
 fn grid_lookup_slot(cx: i32, cy: i32, cz: i32) -> u32 {
@@ -408,18 +405,16 @@ fn phase_mie(costh: f32) -> f32 {
   let g = PHASE_G;
   let gg = g * g;
   let denom = pow(1.0 + gg - 2.0 * g * costh, 1.5);
-  // HG normalized by 1/(4π)
   return INV_4PI * (1.0 - gg) / max(denom, 1e-3);
 }
 
 fn phase_blended(costh: f32) -> f32 {
-  let mie = phase_mie(costh);              // now already normalized
-  return mix(INV_4PI, mie, PHASE_MIE_W);   // isotropic ↔ mie
+  let mie = phase_mie(costh);
+  return mix(INV_4PI, mie, PHASE_MIE_W);
 }
 
-
 // ------------------------------------------------------------
-// Sky
+// Sky (UPDATED: horizon band + cooler zenith)
 // ------------------------------------------------------------
 
 fn sky_color(rd: vec3<f32>) -> vec3<f32> {
@@ -429,6 +424,13 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
     vec3<f32>(0.55, 0.75, 0.95),
     tsky
   );
+
+  // Atmospheric shaping: horizon bright band + cooler zenith tint
+  let y = clamp(rd.y, -0.2, 1.0);
+  let horizon = exp(-abs(y) * 8.0);
+  let zenith  = smoothstep(0.0, 1.0, y);
+  col += 0.12 * horizon * vec3<f32>(0.80, 0.75, 0.70);
+  col += 0.05 * zenith  * vec3<f32>(0.20, 0.35, 0.60);
 
   col *= SKY_EXPOSURE;
 
@@ -453,8 +455,8 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
 
       cloud = cloud_coverage_at_xz(hit.xz, time_s);
 
-      let horizon = clamp((rd.y - CLOUD_HORIZON_Y0) / CLOUD_HORIZON_Y1, 0.0, 1.0);
-      cloud *= horizon;
+      let horizon2 = clamp((rd.y - CLOUD_HORIZON_Y0) / CLOUD_HORIZON_Y1, 0.0, 1.0);
+      cloud *= horizon2;
 
       col *= mix(1.0, CLOUD_SKY_DARKEN, cloud);
 
@@ -481,6 +483,13 @@ fn fog_color(rd: vec3<f32>) -> vec3<f32> {
   let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
   let sky = sky_color(rd);
   return mix(FOG_COLOR_GROUND, sky, FOG_COLOR_SKY_BLEND * up);
+}
+
+// (3) Sun-tinted in-scatter lobe for fog readability
+fn fog_inscatter(rd: vec3<f32>, fogc: vec3<f32>) -> vec3<f32> {
+  let mu = clamp(dot(rd, SUN_DIR), 0.0, 1.0);
+  let sun_scatter = pow(mu, 8.0);
+  return fogc + 0.35 * sun_scatter * SUN_COLOR;
 }
 
 // ------------------------------------------------------------

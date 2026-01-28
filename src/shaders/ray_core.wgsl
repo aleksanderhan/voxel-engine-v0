@@ -1,12 +1,10 @@
-// ray_core.wgsl
+// src/shaders/ray_core.wgsl
 //
 // Consolidated core:
 // - SVO queries + hybrid traversal
 // - Leaf wind + displaced hit
 // - Shadows + sun transmittance
-// - Material palette + shading
-
-// Depends on: common.wgsl (constants, structs, bindings, helpers)
+// - Material palette + shading (UPDATED: spec+fresnel + AO)
 
 fn safe_inv(x: f32) -> f32 {
   return select(1.0 / x, BIG_F32, abs(x) < EPS_INV);
@@ -250,11 +248,35 @@ fn leaf_displaced_cube_hit(
 // ------------------------------------------------------------
 
 struct HitGeom {
-  hit : bool,
-  t   : f32,
-  mat : u32,
-  n   : vec3<f32>,
+  hit      : u32,       // 0/1
+  mat      : u32,
+  _pad0    : u32,
+  _pad1    : u32,
+
+  t        : f32,
+  _pad2    : vec3<f32>,
+
+  n        : vec3<f32>,
+  _pad3    : f32,
+
+  // AO sampling in same chunk
+  root_bmin : vec3<f32>,
+  root_size : f32,
+  node_base : u32,
+  _pad4     : vec3<u32>,
 };
+
+fn miss_hitgeom() -> HitGeom {
+  var h : HitGeom;
+  h.hit = 0u;
+  h.mat = MAT_AIR;
+  h.t   = BIG_F32;
+  h.n   = vec3<f32>(0.0);
+  h.root_bmin = vec3<f32>(0.0);
+  h.root_size = 0.0;
+  h.node_base = 0u;
+  return h;
+}
 
 fn trace_chunk_hybrid_interval(
   ro: vec3<f32>,
@@ -297,7 +319,15 @@ fn trace_chunk_hybrid_interval(
         );
 
         if (h2.hit) {
-          return HitGeom(true, h2.t, MAT_LEAF, h2.n);
+          var out = miss_hitgeom();
+          out.hit = 1u;
+          out.t   = h2.t;
+          out.mat = MAT_LEAF;
+          out.n   = h2.n;
+          out.root_bmin = root_bmin;
+          out.root_size = root_size;
+          out.node_base = ch.node_base;
+          return out;
         }
 
         let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
@@ -313,7 +343,15 @@ fn trace_chunk_hybrid_interval(
       );
 
       if (bh.hit) {
-        return HitGeom(true, bh.t, q.mat, bh.n);
+        var out = miss_hitgeom();
+        out.hit = 1u;
+        out.t   = bh.t;
+        out.mat = q.mat;
+        out.n   = bh.n;
+        out.root_bmin = root_bmin;
+        out.root_size = root_size;
+        out.node_base = ch.node_base;
+        return out;
       }
 
       let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
@@ -325,7 +363,7 @@ fn trace_chunk_hybrid_interval(
     tcur = max(t_leave, tcur) + eps_step;
   }
 
-  return HitGeom(false, BIG_F32, MAT_AIR, vec3<f32>(0.0));
+  return miss_hitgeom();
 }
 
 // ------------------------------------------------------------
@@ -389,6 +427,112 @@ fn trace_chunk_shadow_interval(
   return false;
 }
 
+fn in_shadow(p: vec3<f32>, sun_dir: vec3<f32>) -> bool {
+  let voxel_size   = cam.voxel_params.x;
+  let nudge_s      = 0.18 * voxel_size;
+  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
+
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+
+  let grid_bmin = vec3<f32>(
+    f32(go.x) * chunk_size_m,
+    f32(go.y) * chunk_size_m,
+    f32(go.z) * chunk_size_m
+  );
+
+  let grid_bmax = grid_bmin + vec3<f32>(
+    f32(gd.x) * chunk_size_m,
+    f32(gd.y) * chunk_size_m,
+    f32(gd.z) * chunk_size_m
+  );
+
+  let bias = max(SHADOW_BIAS, 0.50 * voxel_size);
+  let ro   = p + sun_dir * bias;
+  let rd   = sun_dir;
+
+  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  let t_enter = max(rtg.x, 0.0);
+  let t_exit  = rtg.y;
+  if (t_exit < t_enter) { return false; }
+
+  let start_t = t_enter + nudge_s;
+  let p0 = ro + start_t * rd;
+
+  var t_local: f32 = 0.0;
+  let t_exit_local = max(t_exit - start_t, 0.0);
+
+  var c = chunk_coord_from_pos(p0, chunk_size_m);
+  var cx: i32 = c.x;
+  var cy: i32 = c.y;
+  var cz: i32 = c.z;
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  let step_x: i32 = select(-1, 1, rd.x > 0.0);
+  let step_y: i32 = select(-1, 1, rd.y > 0.0);
+  let step_z: i32 = select(-1, 1, rd.z > 0.0);
+
+  let bx = select(f32(cx) * chunk_size_m, f32(cx + 1) * chunk_size_m, rd.x > 0.0);
+  let by = select(f32(cy) * chunk_size_m, f32(cy + 1) * chunk_size_m, rd.y > 0.0);
+  let bz = select(f32(cz) * chunk_size_m, f32(cz + 1) * chunk_size_m, rd.z > 0.0);
+
+  var tMaxX: f32 = (bx - p0.x) * inv.x;
+  var tMaxY: f32 = (by - p0.y) * inv.y;
+  var tMaxZ: f32 = (bz - p0.z) * inv.z;
+
+  let tDeltaX: f32 = abs(chunk_size_m * inv.x);
+  let tDeltaY: f32 = abs(chunk_size_m * inv.y);
+  let tDeltaZ: f32 = abs(chunk_size_m * inv.z);
+
+  if (abs(rd.x) < EPS_INV) { tMaxX = BIG_F32; }
+  if (abs(rd.y) < EPS_INV) { tMaxY = BIG_F32; }
+  if (abs(rd.z) < EPS_INV) { tMaxZ = BIG_F32; }
+
+  let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 1024u);
+
+  for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
+    if (t_local > t_exit_local) { break; }
+
+    let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
+
+    let slot = grid_lookup_slot(cx, cy, cz);
+    if (slot != INVALID_U32 && slot < cam.chunk_count) {
+      let ch = chunks[slot];
+
+      let cell_enter = start_t + t_local;
+      let cell_exit  = start_t + min(tNextLocal, t_exit_local);
+
+      if (trace_chunk_shadow_interval(ro, rd, ch, cell_enter, cell_exit)) {
+        return true;
+      }
+    }
+
+    if (tMaxX < tMaxY) {
+      if (tMaxX < tMaxZ) { cx += step_x; t_local = tMaxX; tMaxX += tDeltaX; }
+      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
+    } else {
+      if (tMaxY < tMaxZ) { cy += step_y; t_local = tMaxY; tMaxY += tDeltaY; }
+      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
+    }
+
+    let ox = cam.grid_origin_chunk.x;
+    let oy = cam.grid_origin_chunk.y;
+    let oz = cam.grid_origin_chunk.z;
+
+    let nx = i32(cam.grid_dims.x);
+    let ny = i32(cam.grid_dims.y);
+    let nz = i32(cam.grid_dims.z);
+
+    if (cx < ox || cy < oy || cz < oz || cx >= ox + nx || cy >= oy + ny || cz >= oz + nz) {
+      break;
+    }
+  }
+
+  return false;
+}
+
+// Transmittance step inside a chunk (UPDATED: respect SHADOW_DISPLACED_LEAVES for leaves)
 fn trace_chunk_shadow_trans_interval(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -435,21 +579,20 @@ fn trace_chunk_shadow_trans_interval(
           if (h2.hit) {
             trans *= LEAF_LIGHT_TRANSMIT;
           }
-          // advance anyway (using undisplaced exit is fine as an approximation)
+
           let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
           tcur = max(t_leave, tcur) + nudge_s;
           continue;
         } else {
-          // old behavior: leaf always contributes attenuation when sampled
           trans *= LEAF_LIGHT_TRANSMIT;
           let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
           tcur = max(t_leave, tcur) + nudge_s;
           continue;
         }
       }
+
       return 0.0;
     }
-
 
     let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
     tcur = max(t_leave, tcur) + nudge_s;
@@ -565,7 +708,6 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   return trans;
 }
 
-
 fn sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let Tc = cloud_sun_transmittance(p, sun_dir);
 
@@ -676,7 +818,7 @@ fn sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
 }
 
 // ------------------------------------------------------------
-// Shading
+// Shading (UPDATED: spec+fresnel + AO)
 // ------------------------------------------------------------
 
 fn color_for_material(m: u32) -> vec3<f32> {
@@ -694,7 +836,7 @@ fn color_for_material(m: u32) -> vec3<f32> {
 fn hemi_ambient(n: vec3<f32>) -> vec3<f32> {
   let upw = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
   let sky = sky_color(vec3<f32>(0.0, 1.0, 0.0));
-  let grd = FOG_COLOR_GROUND; // or a warmer ground tint
+  let grd = FOG_COLOR_GROUND;
   return mix(grd, sky, upw);
 }
 
@@ -705,31 +847,26 @@ fn hash31(p: vec3<f32>) -> f32 {
 
 fn material_variation(world_p: vec3<f32>, cell_size_m: f32) -> f32 {
   let cell = floor(world_p / cell_size_m);
-  return (hash31(cell) - 0.5) * 2.0; // now v in [-1, +1]
+  return (hash31(cell) - 0.5) * 2.0; // [-1,+1]
 }
 
 fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f32> {
   var c = base;
 
-  // One shared noise value per patch (stable, no shimmering)
-  let v = material_variation(hp, 0.05); // 0.05m patches for most things
+  let v = material_variation(hp, 0.05);
 
   if (mat == MAT_GRASS) {
-    // small additive tint + slight brightness
     c += vec3<f32>(0.02 * v, 0.05 * v, 0.01 * v);
     c *= (1.0 + 0.06 * v);
   } else if (mat == MAT_DIRT) {
     c += vec3<f32>(0.04 * v, 0.02 * v, 0.01 * v);
     c *= (1.0 + 0.08 * v);
   } else if (mat == MAT_STONE) {
-    // stone mostly brightness variation, little hue
     c *= (1.0 + 0.10 * v);
   } else if (mat == MAT_WOOD) {
-    // wood: warm variation
     c += vec3<f32>(0.05 * v, 0.02 * v, 0.00 * v);
     c *= (1.0 + 0.07 * v);
   } else if (mat == MAT_LEAF) {
-    // keep leaves subtle; they already have dapple + wind
     c += vec3<f32>(0.00 * v, 0.03 * v, 0.00 * v);
     c *= (1.0 + 0.04 * v);
   }
@@ -737,48 +874,103 @@ fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f3
   return clamp(c, vec3<f32>(0.0), vec3<f32>(1.5));
 }
 
+// (2) Cheap local AO around hit point (5 taps)
+fn voxel_ao_local(
+  hp: vec3<f32>,
+  n: vec3<f32>,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  node_base: u32
+) -> f32 {
+  let r = 0.75 * cam.voxel_params.x;
+
+  // Choose a stable tangent basis around n (avoid degeneracy when n ~ up).
+  let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
+  let t = normalize(cross(up_ref, n));
+  let b = normalize(cross(n, t));
+
+  // Sample directions: +/-t, +/-b, and a couple “upward” hemisphere probes.
+  // No arrays => no non-constant indexing.
+  var occ = 0.0;
+
+  // Each sample: if leaf is non-air, add occlusion.
+  // (You can make this smarter per-material later if you want.)
+  let q0 = query_leaf_at(hp + t * r, root_bmin, root_size, node_base);
+  occ += select(0.0, 1.0, q0.mat != MAT_AIR);
+
+  let q1 = query_leaf_at(hp - t * r, root_bmin, root_size, node_base);
+  occ += select(0.0, 1.0, q1.mat != MAT_AIR);
+
+  let q2 = query_leaf_at(hp + b * r, root_bmin, root_size, node_base);
+  occ += select(0.0, 1.0, q2.mat != MAT_AIR);
+
+  let q3 = query_leaf_at(hp - b * r, root_bmin, root_size, node_base);
+  occ += select(0.0, 1.0, q3.mat != MAT_AIR);
+
+  // Slightly biased “hemisphere” samples (toward normal)
+  let h0 = normalize(n + 0.65 * t + 0.35 * b);
+  let q4 = query_leaf_at(hp + h0 * r, root_bmin, root_size, node_base);
+  occ += select(0.0, 1.0, q4.mat != MAT_AIR);
+
+  let h1 = normalize(n - 0.65 * t + 0.35 * b);
+  let q5 = query_leaf_at(hp + h1 * r, root_bmin, root_size, node_base);
+  occ += select(0.0, 1.0, q5.mat != MAT_AIR);
+
+  // Normalize and map to AO.
+  // occ in [0..6]
+  let occ_n = occ * (1.0 / 6.0);
+
+  // Tuning: more samples hit => darker, but clamp so it doesn't crush.
+  return clamp(1.0 - 0.70 * occ_n, 0.35, 1.0);
+}
+
+
+// (1) Fresnel + spec helpers
+fn fresnel_schlick(ndv: f32, f0: f32) -> f32 {
+  return f0 + (1.0 - f0) * pow(1.0 - clamp(ndv, 0.0, 1.0), 5.0);
+}
+
+fn material_roughness(mat: u32) -> f32 {
+  if (mat == MAT_STONE) { return 0.45; }
+  if (mat == MAT_WOOD)  { return 0.70; }
+  if (mat == MAT_LEAF)  { return 0.80; }
+  if (mat == MAT_GRASS) { return 0.85; }
+  if (mat == MAT_DIRT)  { return 0.90; }
+  return 0.90;
+}
+
+fn material_f0(mat: u32) -> f32 {
+  if (mat == MAT_STONE) { return 0.04; }
+  if (mat == MAT_WOOD)  { return 0.03; }
+  if (mat == MAT_LEAF)  { return 0.05; }
+  if (mat == MAT_GRASS) { return 0.04; }
+  if (mat == MAT_DIRT)  { return 0.02; }
+  return 0.02;
+}
+
+// NOTE: shade_clip_hit lives in clipmap.wgsl in your original layout,
+// but you call it from ray_main. Keep its definition there.
+// Here we rewrite shade_hit only (voxel shading).
+
 fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
   let hp = ro + hg.t * rd;
+
   var base = color_for_material(hg.mat);
   base = apply_material_variation(base, hg.mat, hp);
 
   let voxel_size = cam.voxel_params.x;
   let hp_shadow  = hp + hg.n * (0.75 * voxel_size);
 
-  let vis = sun_transmittance(hp_shadow, SUN_DIR);   // includes clouds + canopy
+  let vis = sun_transmittance(hp_shadow, SUN_DIR);
 
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
-  let v = normalize(-rd);
-  let h = normalize(v + SUN_DIR);
-
-  let ndv = max(dot(hg.n, v), 0.0);
-  let ndh = max(dot(hg.n, h), 0.0);
-
-  // Per-material roughness-ish
-  var rough = 0.9;
-  if (hg.mat == MAT_STONE) { rough = 0.45; }
-  if (hg.mat == MAT_WOOD)  { rough = 0.70; }
-  if (hg.mat == MAT_LEAF)  { rough = 0.80; }
-  if (hg.mat == MAT_GRASS) { rough = 0.85; }
-
-  let shininess = mix(8.0, 96.0, 1.0 - rough);
-  let spec = pow(ndh, shininess);
-
-  // Fresnel (Schlick)
-  var F0 = 0.02;
-  if (hg.mat == MAT_STONE) { F0 = 0.04; }
-  if (hg.mat == MAT_WOOD)  { F0 = 0.03; }
-  if (hg.mat == MAT_LEAF)  { F0 = 0.05; }
-
-  let fres = F0 + (1.0 - F0) * pow(1.0 - ndv, 5.0);
-
-  // Gate spec by visibility + “sun”
-  let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis;
+  // AO
+  let ao = select(1.0, voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base), hg.hit != 0u);
 
   let amb_col = hemi_ambient(hg.n);
-  let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF); // tune
-  let ambient = amb_col * amb_strength;
+  let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
+  let ambient = amb_col * amb_strength * ao;
 
   var dapple = 1.0;
   if (hg.mat == MAT_LEAF) {
@@ -789,5 +981,22 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
   }
 
   let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis * dapple;
-  return base * (ambient + direct) + 0.35 * spec_col;;
+
+  // Spec + Fresnel
+  let v = normalize(-rd);
+  let h = normalize(v + SUN_DIR);
+
+  let ndv = max(dot(hg.n, v), 0.0);
+  let ndh = max(dot(hg.n, h), 0.0);
+
+  let rough = material_roughness(hg.mat);
+  let shininess = mix(8.0, 96.0, 1.0 - rough);
+  let spec = pow(ndh, shininess);
+
+  let f0 = material_f0(hg.mat);
+  let fres = fresnel_schlick(ndv, f0);
+
+  let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis;
+
+  return base * (ambient + direct) + 0.20 * spec_col;
 }

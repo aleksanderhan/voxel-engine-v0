@@ -1,6 +1,4 @@
 // src/shaders/ray_main.wgsl
-// -------------------------
-// ray_main.wgsl
 //
 // Compute entrypoints only.
 // Depends on: common.wgsl + ray_core.wgsl + clipmap.wgsl
@@ -16,8 +14,10 @@
 @group(2) @binding(1) var godray_tex : texture_2d<f32>;
 @group(2) @binding(2) var out_img    : texture_storage_2d<rgba16float, write>;
 
+// (6) Depth-aware godray upsample needs full-res depth in composite.
+@group(2) @binding(3) var depth_full : texture_2d<f32>;
+
 fn tonemap_aces(x: vec3<f32>) -> vec3<f32> {
-  // Narkowicz 2015-ish fit
   let a = 2.51;
   let b = 0.03;
   let c = 2.43;
@@ -30,11 +30,12 @@ fn gamma_encode(x: vec3<f32>) -> vec3<f32> {
   return pow(x, vec3<f32>(1.0 / 2.2));
 }
 
-fn tonemap_exp(hdr: vec3<f32>) -> vec3<f32> {
-  return vec3<f32>(1.0) - exp(-hdr * POST_EXPOSURE);
+// (7) Bloom helper
+fn bright_extract(x: vec3<f32>, thresh: f32) -> vec3<f32> {
+  return max(x - vec3<f32>(thresh), vec3<f32>(0.0));
 }
 
-// Quarter-res upsample (manual bilerp)
+// (6) Depth-aware quarter-res upsample (manual bilerp + depth similarity gate)
 fn godray_sample_bilerp(px_full: vec2<f32>) -> vec3<f32> {
   let q = px_full * 0.25;
   let q0 = vec2<i32>(i32(floor(q.x)), i32(floor(q.y)));
@@ -51,9 +52,42 @@ fn godray_sample_bilerp(px_full: vec2<f32>) -> vec3<f32> {
   let c01 = textureLoad(godray_tex, vec2<i32>(x0, y1), 0).xyz;
   let c11 = textureLoad(godray_tex, vec2<i32>(x1, y1), 0).xyz;
 
+  // depth similarity gate (edge-aware)
+  let ip = vec2<i32>(i32(floor(px_full.x)), i32(floor(px_full.y)));
+  let d0 = textureLoad(depth_full, ip, 0).x;
+
+  // approximate corresponding full-res positions for the quarter-res corners
+  let p00 = vec2<i32>(clamp(x0 * 4, 0, i32(textureDimensions(depth_full).x) - 1),
+                      clamp(y0 * 4, 0, i32(textureDimensions(depth_full).y) - 1));
+  let p10 = vec2<i32>(clamp(x1 * 4, 0, i32(textureDimensions(depth_full).x) - 1),
+                      clamp(y0 * 4, 0, i32(textureDimensions(depth_full).y) - 1));
+  let p01 = vec2<i32>(clamp(x0 * 4, 0, i32(textureDimensions(depth_full).x) - 1),
+                      clamp(y1 * 4, 0, i32(textureDimensions(depth_full).y) - 1));
+  let p11 = vec2<i32>(clamp(x1 * 4, 0, i32(textureDimensions(depth_full).x) - 1),
+                      clamp(y1 * 4, 0, i32(textureDimensions(depth_full).y) - 1));
+
+  let d00 = textureLoad(depth_full, p00, 0).x;
+  let d10 = textureLoad(depth_full, p10, 0).x;
+  let d01 = textureLoad(depth_full, p01, 0).x;
+  let d11 = textureLoad(depth_full, p11, 0).x;
+
+  // tolerance increases with distance
+  let tol = 0.02 + 0.06 * smoothstep(10.0, 80.0, d0);
+
+  let w00 = exp(-abs(d00 - d0) / tol);
+  let w10 = exp(-abs(d10 - d0) / tol);
+  let w01 = exp(-abs(d01 - d0) / tol);
+  let w11 = exp(-abs(d11 - d0) / tol);
+
   let cx0 = mix(c00, c10, f.x);
   let cx1 = mix(c01, c11, f.x);
-  return mix(cx0, cx1, f.y);
+  let c   = mix(cx0, cx1, f.y);
+
+  let wx0 = mix(w00, w10, f.x);
+  let wx1 = mix(w01, w11, f.x);
+  let w   = mix(wx0, wx1, f.y);
+
+  return c * clamp(w, 0.0, 1.0);
 }
 
 fn godray_integrate(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, j: f32) -> vec3<f32> {
@@ -85,7 +119,6 @@ fn godray_integrate(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, j: f32) -> vec3<f3
     let Ts_geom = sun_transmittance_geom_only(p, SUN_DIR);
     let Tc      = cloud_sun_transmittance(p, SUN_DIR);
 
-    // clouds only dim the light (and softly)
     let Tc_vol  = mix(1.0, Tc, CLOUD_GODRAY_W);
     let Ts_soft = pow(clamp(Ts_geom, 0.0, 1.0), 0.75);
 
@@ -96,10 +129,7 @@ fn godray_integrate(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, j: f32) -> vec3<f3
 
     var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
     shaft *= (1.0 - Ts_soft);
-
-    // contrast curve (bigger pop)
     shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
-
 
     shaft_lp = mix(shaft_lp, shaft, a_shaft);
     shaft = shaft_lp;
@@ -107,7 +137,7 @@ fn godray_integrate(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, j: f32) -> vec3<f3
     let haze_ramp = 1.0 - exp(-ti / GODRAY_HAZE_NEAR_FADE);
     let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts_lp, 2.0);
 
-    let shaft_sun_gate = smoothstep(0.35, 0.80, ts_lp); // shift up: only strong beams when sun mostly visible
+    let shaft_sun_gate = smoothstep(0.35, 0.80, ts_lp);
     let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
     let w = clamp(w_raw, 0.0, 1.0);
 
@@ -121,8 +151,8 @@ fn godray_integrate(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, j: f32) -> vec3<f3
 
     sum += (SUN_COLOR * SUN_INTENSITY)
      * (dens * dt) * Tv * ts_lp * phase * w
-     * Tc_vol;
-
+     * Tc_vol
+     * strength_scale;
   }
 
   return sum * GODRAY_STRENGTH;
@@ -153,9 +183,11 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let T = fog_transmittance_primary(ro, rd, t_scene);
     let fogc = fog_color(rd);
-    let fog_k = FOG_PRIMARY_VIS;           // treat as artistic scaler
+    let fog_k = FOG_PRIMARY_VIS;
     let Tf = clamp(1.0 - (1.0 - T) * fog_k, 0.0, 1.0);
-    let col = surface * Tf + fogc * (1.0 - Tf);
+
+    let ins = fog_inscatter(rd, fogc);
+    let col = surface * Tf + ins * (1.0 - Tf);
 
     let ip = vec2<i32>(i32(gid.x), i32(gid.y));
     textureStore(color_img, ip, vec4<f32>(col, 1.0));
@@ -193,10 +225,11 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let T = fog_transmittance_primary(ro, rd, t_scene);
     let fogc = fog_color(rd);
-    let fog_k = FOG_PRIMARY_VIS;           // treat as artistic scaler
+    let fog_k = FOG_PRIMARY_VIS;
     let Tf = clamp(1.0 - (1.0 - T) * fog_k, 0.0, 1.0);
-    let col = surface * Tf + fogc * (1.0 - Tf);
 
+    let ins = fog_inscatter(rd, fogc);
+    let col = surface * Tf + ins * (1.0 - Tf);
 
     let ip = vec2<i32>(i32(gid.x), i32(gid.y));
     textureStore(color_img, ip, vec4<f32>(col, 1.0));
@@ -235,7 +268,7 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (abs(rd.y) < EPS_INV) { tMaxY = BIG_F32; }
   if (abs(rd.z) < EPS_INV) { tMaxZ = BIG_F32; }
 
-  var best = HitGeom(false, BIG_F32, MAT_AIR, vec3<f32>(0.0));
+  var best = miss_hitgeom();
   let t_exit_local = max(t_exit - start_t, 0.0);
 
   let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 1024u);
@@ -244,7 +277,7 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (t_local > t_exit_local) { break; }
 
     let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
-    if (best.hit && (start_t + tNextLocal) >= best.t) { break; }
+    if (best.hit != 0u && (start_t + tNextLocal) >= best.t) { break; }
 
     let slot = grid_lookup_slot(cx, cy, cz);
     if (slot != INVALID_U32 && slot < cam.chunk_count) {
@@ -254,7 +287,7 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
       let cell_exit  = start_t + min(tNextLocal, t_exit_local);
 
       let h = trace_chunk_hybrid_interval(ro, rd, ch, cell_enter, cell_exit);
-      if (h.hit && h.t < best.t) { best = h; }
+      if (h.hit != 0u && h.t < best.t) { best = h; }
     }
 
     if (tMaxX < tMaxY) {
@@ -277,8 +310,8 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
   // If no voxel hit, try heightfield clipmap fallback.
   let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
-  let use_vox = best.hit;
-  let use_hf  = (!best.hit) && hf.hit;
+  let use_vox = (best.hit != 0u);
+  let use_hf  = (!use_vox) && hf.hit;
 
   let surface = select(
     sky,
@@ -294,10 +327,11 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let T = fog_transmittance_primary(ro, rd, t_scene);
   let fogc = fog_color(rd);
-
-  let fog_k = FOG_PRIMARY_VIS;           // treat as artistic scaler
+  let fog_k = FOG_PRIMARY_VIS;
   let Tf = clamp(1.0 - (1.0 - T) * fog_k, 0.0, 1.0);
-  let col = surface * Tf + fogc * (1.0 - Tf);
+
+  let ins = fog_inscatter(rd, fogc);
+  let col = surface * Tf + ins * (1.0 - Tf);
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
   textureStore(color_img, ip, vec4<f32>(col, 1.0));
@@ -385,7 +419,10 @@ fn main_godray(@builtin(global_invocation_id) gid: vec3<u32>) {
     wsum += 1.0;
   }
 
-  let cur = max(select(vec3<f32>(0.0), acc / wsum, wsum > 0.0), vec3<f32>(0.0));
+  let cur_lin = max(select(vec3<f32>(0.0), acc / wsum, wsum > 0.0), vec3<f32>(0.0));
+
+  // (5) Compress before temporal blending to reduce “screeny” noise
+  let cur = cur_lin / (cur_lin + vec3<f32>(0.25));
 
   let hist = textureLoad(godray_hist_tex, hip, 0).xyz;
 
@@ -419,6 +456,7 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let px = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
 
+  // Godrays upsample (depth-aware)
   let g = godray_sample_bilerp(px);
 
   let gx = godray_sample_bilerp(px + vec2<f32>( 1.0, 0.0)) + godray_sample_bilerp(px + vec2<f32>(-1.0, 0.0));
@@ -426,14 +464,66 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
   let blur = 0.25 * (gx + gy);
 
   var god_raw = max(g + COMPOSITE_SHARPEN * (g - blur), vec3<f32>(0.0));
-
   god_raw = max(god_raw - vec3<f32>(GODRAY_BLACK_LEVEL), vec3<f32>(0.0));
-
   let god = (vec3<f32>(1.0) - exp(-god_raw));
 
-  let hdr = max(base + COMPOSITE_GOD_SCALE * god, vec3<f32>(0.0));
-  let mapped = tonemap_aces(hdr * POST_EXPOSURE);
-  let ldr = gamma_encode(mapped);
+  // HDR scene
+  var hdr = max(base + COMPOSITE_GOD_SCALE * god, vec3<f32>(0.0));
 
+  // (7) Cheap bloom on bright parts (5-tap, full-res)
+  let bloom_thresh = 1.1;
+  let bloom_k = 0.35;
+
+  let b0 = bright_extract(hdr, bloom_thresh);
+
+  let ipx1 = vec2<i32>(clamp(ip.x + 2, 0, i32(dims.x) - 1), ip.y);
+  let ipx0 = vec2<i32>(clamp(ip.x - 2, 0, i32(dims.x) - 1), ip.y);
+  let ipy1 = vec2<i32>(ip.x, clamp(ip.y + 2, 0, i32(dims.y) - 1));
+  let ipy0 = vec2<i32>(ip.x, clamp(ip.y - 2, 0, i32(dims.y) - 1));
+
+  // approximate neighbor HDR similarly (base + god at those pixels)
+  let nbx1 = textureLoad(color_tex, ipx1, 0).xyz;
+  let nbx0 = textureLoad(color_tex, ipx0, 0).xyz;
+  let nby1 = textureLoad(color_tex, ipy1, 0).xyz;
+  let nby0 = textureLoad(color_tex, ipy0, 0).xyz;
+
+  let gpx1 = godray_sample_bilerp(px + vec2<f32>( 2.0, 0.0));
+  let gpx0 = godray_sample_bilerp(px + vec2<f32>(-2.0, 0.0));
+  let gpy1 = godray_sample_bilerp(px + vec2<f32>(0.0,  2.0));
+  let gpy0 = godray_sample_bilerp(px + vec2<f32>(0.0, -2.0));
+
+  let godx1 = (vec3<f32>(1.0) - exp(-max(gpx1 - vec3<f32>(GODRAY_BLACK_LEVEL), vec3<f32>(0.0))));
+  let godx0 = (vec3<f32>(1.0) - exp(-max(gpx0 - vec3<f32>(GODRAY_BLACK_LEVEL), vec3<f32>(0.0))));
+  let gody1 = (vec3<f32>(1.0) - exp(-max(gpy1 - vec3<f32>(GODRAY_BLACK_LEVEL), vec3<f32>(0.0))));
+  let gody0 = (vec3<f32>(1.0) - exp(-max(gpy0 - vec3<f32>(GODRAY_BLACK_LEVEL), vec3<f32>(0.0))));
+
+  let hx1 = max(nbx1 + COMPOSITE_GOD_SCALE * godx1, vec3<f32>(0.0));
+  let hx0 = max(nbx0 + COMPOSITE_GOD_SCALE * godx0, vec3<f32>(0.0));
+  let hy1 = max(nby1 + COMPOSITE_GOD_SCALE * gody1, vec3<f32>(0.0));
+  let hy0 = max(nby0 + COMPOSITE_GOD_SCALE * gody0, vec3<f32>(0.0));
+
+  let bloom = (b0 + bright_extract(hx1, bloom_thresh) + bright_extract(hx0, bloom_thresh) +
+               bright_extract(hy1, bloom_thresh) + bright_extract(hy0, bloom_thresh)) / 5.0;
+
+  hdr += bloom_k * bloom;
+
+  // Tonemap
+  var c = tonemap_aces(hdr * POST_EXPOSURE);
+
+  // (7) Mild grade: lift shadows, warm highlights, slight saturation
+  c = pow(c, vec3<f32>(0.95));
+
+  let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+  let hi = smoothstep(0.55, 1.0, l);
+  c += hi * vec3<f32>(0.02, 0.01, -0.01);
+
+  let gray = vec3<f32>(l);
+  c = mix(gray, c, 1.05);
+
+  // (8) Dither/grain before gamma to reduce banding
+  let n = hash12(px * 1.7 + vec2<f32>(cam.voxel_params.y, 0.0)) - 0.5;
+  c += vec3<f32>(n / 255.0);
+
+  let ldr = gamma_encode(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
   textureStore(out_img, ip, vec4<f32>(ldr, 1.0));
 }

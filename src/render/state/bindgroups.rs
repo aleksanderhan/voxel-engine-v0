@@ -124,27 +124,22 @@ fn make_composite_bg(
     color_view: &wgpu::TextureView,
     godray_view: &wgpu::TextureView,
     output_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView, // NEW
     label: &str,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label),
         layout,
         entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(color_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(godray_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(output_view),
-            },
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(color_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(godray_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(output_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
         ],
     })
 }
+
+
 
 fn make_blit_bg(
     device: &wgpu::Device,
@@ -215,6 +210,7 @@ pub fn create_bind_groups(
             &textures.color.view,
             &textures.godray[0].view,
             &textures.output.view,
+            &textures.depth.view,
             "composite_bg_read_a",
         ),
         make_composite_bg(
@@ -223,6 +219,7 @@ pub fn create_bind_groups(
             &textures.color.view,
             &textures.godray[1].view,
             &textures.output.view,
+            &textures.depth.view,
             "composite_bg_read_b",
         ),
     ];

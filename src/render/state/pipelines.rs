@@ -111,7 +111,8 @@ pub fn create_pipelines(
         "composite_pipeline",
         cs_module,
         "main_composite",
-        &[&layouts.empty, &layouts.empty, &layouts.composite],
+        // group(0)=scene (cam + buffers), group(1)=empty, group(2)=composite textures
+        &[&layouts.scene, &layouts.empty, &layouts.composite],
     );
 
     // -------------------------------------------------------------------------

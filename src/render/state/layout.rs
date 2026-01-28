@@ -11,6 +11,16 @@ pub struct Layouts {
     pub blit: wgpu::BindGroupLayout,
 }
 
+fn bgl_sampler(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
+
 fn bgl_uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -162,6 +172,13 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
                 wgpu::TextureSampleType::Float { filterable: false },
             ),
             bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
+
+            // NEW: full-res depth for depth-aware upsample
+            bgl_tex_sample_2d(
+                3,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
         ],
     });
 
