@@ -8,9 +8,9 @@ const CHUNK_VOXELS : u32 = 32u;
 const CHUNK_DEPTH  : u32 = 5u;
 
 // MUST MATCH config.rs (r=8,2,8 => 17,5,17)
-const GRID_X       : u32 = 17u;
-const GRID_Y       : u32 = 5u;
-const GRID_Z       : u32 = 17u;
+const GRID_X : u32 = 25u;
+const GRID_Y : u32 = 7u;
+const GRID_Z : u32 = 25u;
 
 const MAX_CHUNKS   : u32 = GRID_X * GRID_Y * GRID_Z;
 
@@ -36,6 +36,10 @@ struct ChunkMeta {
 @group(0) @binding(1) var<storage, read_write> nodes : array<u32>;
 @group(0) @binding(2) var<storage, read_write> chunk_meta : array<ChunkMeta>;
 @group(0) @binding(6) var<storage, read> dirty_slots : array<u32>;
+
+// Height mip pyramid (min/max)
+@group(0) @binding(7) var<storage, read_write> height_min : array<f32>;
+@group(0) @binding(8) var<storage, read_write> height_max : array<f32>;
 
 fn imod(a: i32, m: i32) -> i32 { return (a % m + m) % m; }
 
@@ -102,7 +106,7 @@ fn node_index_from_coord(coord: vec3<u32>, levels: u32) -> u32 {
 }
 
 // -----------------------------------------------------------------------------
-// Procedural terrain
+// Procedural terrain (EXACT, used by height build)
 // -----------------------------------------------------------------------------
 
 fn terrain_height_m(x: f32, z: f32) -> f32 {
@@ -111,18 +115,49 @@ fn terrain_height_m(x: f32, z: f32) -> f32 {
   return h0 + h1;
 }
 
-fn voxel_material(world_p_m: vec3<f32>) -> u32 {
-  if (world_p_m.y < -10.0) { return 2u; }
+fn height_base(slot: u32) -> u32 {
+  return slot * HEIGHT_TEXELS;
+}
 
-  let h = terrain_height_m(world_p_m.x, world_p_m.z);
-  if (world_p_m.y < h) {
-    if (world_p_m.y > h - 1.2) { return 1u; }
-    return 2u;
+// -----------------------------------------------------------------------------
+// Height mip (min/max) per chunk: 2D pyramid
+// L0 32x32, L1 16x16, L2 8x8, L3 4x4, L4 2x2, L5 1x1
+// total texels = 1365
+// -----------------------------------------------------------------------------
+
+const HEIGHT_LEVELS : u32 = 6u;
+const HEIGHT_TEXELS : u32 = 1365u;
+
+fn height_level_offset(level: u32) -> u32 {
+  switch(level) {
+    case 0u: { return 0u; }
+    case 1u: { return 1024u; }
+    case 2u: { return 1280u; }
+    case 3u: { return 1344u; }
+    case 4u: { return 1360u; }
+    default: { return 1364u; } // level 5
   }
+}
 
-  let s = sin(world_p_m.x * 0.12) * cos(world_p_m.z * 0.12);
-  if (s > 0.985 && world_p_m.y < 6.0) { return 3u; }
-  return 0u;
+fn height_side(level: u32) -> u32 {
+  return 32u >> level; // 32,16,8,4,2,1
+}
+
+fn height_index(level: u32, x: u32, z: u32) -> u32 {
+  let side = height_side(level);
+  return height_level_offset(level) + z * side + x;
+}
+
+fn height_l0(slot: u32, x: u32, z: u32) -> f32 {
+  return height_min[height_base(slot) + height_index(0u, x, z)];
+}
+
+fn height_chunk_min(slot: u32) -> f32 {
+  return height_min[height_base(slot) + height_level_offset(5u)];
+}
+
+fn height_chunk_max(slot: u32) -> f32 {
+  return height_max[height_base(slot) + height_level_offset(5u)];
 }
 
 // -----------------------------------------------------------------------------
@@ -137,6 +172,96 @@ fn batch_index(local_i: u32) -> u32 {
 // Build passes (batched)
 // -----------------------------------------------------------------------------
 
+// Build height L0 (32x32) in meters at voxel centers (exact terrain function).
+@compute @workgroup_size(8, 8, 1)
+fn build_height_l0(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= 32u || gid.y >= 32u) { return; }
+
+  let local_chunk_i = gid.z;
+  if (local_chunk_i >= stream.build_count) { return; }
+
+  let di = batch_index(local_chunk_i);
+  if (di >= stream.dirty_count) { return; }
+
+  let slot = dirty_slots[di];
+  if (slot >= MAX_CHUNKS) { return; }
+
+  let cm = chunk_meta[slot];
+  if ((cm.flags & FLAG_ACTIVE) == 0u) { return; }
+  if ((cm.flags & FLAG_DIRTY) == 0u) { return; }
+
+  let cs = chunk_size_m();
+  let org = vec3<f32>(f32(cm.x) * cs, f32(cm.y) * cs, f32(cm.z) * cs);
+  let vs = cam.params.z;
+
+  let x_m = org.x + (f32(gid.x) + 0.5) * vs;
+  let z_m = org.z + (f32(gid.y) + 0.5) * vs;
+
+  let h = terrain_height_m(x_m, z_m);
+
+  let hb = height_base(slot);
+  let idx0 = height_index(0u, gid.x, gid.y);
+
+  // L0: min=max
+  height_min[hb + idx0] = h;
+  height_max[hb + idx0] = h;
+}
+
+fn reduce_height_level(slot: u32, hb: u32, prev_level: u32, level: u32) {
+  let prev_side = height_side(prev_level);
+  let side      = height_side(level);
+
+  let prev_off = hb + height_level_offset(prev_level);
+  let out_off  = hb + height_level_offset(level);
+
+  for (var z: u32 = 0u; z < side; z = z + 1u) {
+    for (var x: u32 = 0u; x < side; x = x + 1u) {
+      let x0 = 2u * x;
+      let z0 = 2u * z;
+
+      let i00 = prev_off + (z0 * prev_side + x0);
+      let i10 = prev_off + (z0 * prev_side + (x0 + 1u));
+      let i01 = prev_off + ((z0 + 1u) * prev_side + x0);
+      let i11 = prev_off + ((z0 + 1u) * prev_side + (x0 + 1u));
+
+      let mn0 = min(min(height_min[i00], height_min[i10]), min(height_min[i01], height_min[i11]));
+      let mx0 = max(max(height_max[i00], height_max[i10]), max(height_max[i01], height_max[i11]));
+
+      let out_i = out_off + (z * side + x);
+      height_min[out_i] = mn0;
+      height_max[out_i] = mx0;
+    }
+  }
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn build_height_mips(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let local_chunk_i = gid.x;
+  if (local_chunk_i >= stream.build_count) { return; }
+
+  let di = batch_index(local_chunk_i);
+  if (di >= stream.dirty_count) { return; }
+
+  let slot = dirty_slots[di];
+  if (slot >= MAX_CHUNKS) { return; }
+
+  let cm = chunk_meta[slot];
+  if ((cm.flags & FLAG_ACTIVE) == 0u) { return; }
+  if ((cm.flags & FLAG_DIRTY)  == 0u) { return; }
+
+  let hb = height_base(slot);
+
+  // Unrolled 0->1->2->3->4->5
+  reduce_height_level(slot, hb, 0u, 1u);
+  reduce_height_level(slot, hb, 1u, 2u);
+  reduce_height_level(slot, hb, 2u, 3u);
+  reduce_height_level(slot, hb, 3u, 4u);
+  reduce_height_level(slot, hb, 4u, 5u);
+}
+
+// Leaf material build:
+// - uses cached height L0 for exact ground height
+// - uses chunk-wide min/max (L5) to shortcut deep stone / high air
 @compute @workgroup_size(8, 8, 1)
 fn build_leaves(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= 32u || gid.y >= 32u) { return; }
@@ -162,14 +287,52 @@ fn build_leaves(@builtin(global_invocation_id) gid: vec3<u32>) {
   let origin = vec3<f32>(f32(cm.x) * cs, f32(cm.y) * cs, f32(cm.z) * cs);
   let vs = cam.params.z;
 
-  let local = vec3<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5, f32(vz) + 0.5);
-  let wp = origin + local * vs;
+  let wx = origin.x + (f32(gid.x) + 0.5) * vs;
+  let wy = origin.y + (f32(gid.y) + 0.5) * vs;
+  let wz = origin.z + (f32(vz)    + 0.5) * vs;
 
-  let mat = voxel_material(wp);
+  let gmin = height_chunk_min(slot);
+  let gmax = height_chunk_max(slot);
+
+  if (wy < -10.0) {
+    let leaf_idx0 = node_index_from_coord(vec3<u32>(gid.x, gid.y, vz), 5u);
+    nodes[base + leaf_idx0] = 2u;
+    return;
+  }
+
+  if (wy < (gmin - 1.2)) {
+    let leaf_idx1 = node_index_from_coord(vec3<u32>(gid.x, gid.y, vz), 5u);
+    nodes[base + leaf_idx1] = 2u;
+    return;
+  }
+
+  if (wy > max(gmax, 6.0)) {
+    let leaf_idx2 = node_index_from_coord(vec3<u32>(gid.x, gid.y, vz), 5u);
+    nodes[base + leaf_idx2] = 0u;
+    return;
+  }
+
+  let h = height_l0(slot, gid.x, vz);
+
+  var mat: u32 = 0u;
+
+  if (wy < h) {
+    if (wy > h - 1.2) { mat = 1u; }
+    else { mat = 2u; }
+  } else {
+    let s = sin(wx * 0.12) * cos(wz * 0.12);
+    if (s > 0.985 && wy < 6.0) { mat = 3u; }
+  }
+
   let leaf_idx = node_index_from_coord(vec3<u32>(gid.x, gid.y, vz), 5u);
   nodes[base + leaf_idx] = mat;
 }
 
+// -----------------------------------------------------------------------------
+// Build mask passes (batched), bottom-up from children (NO prefix sums)
+// -----------------------------------------------------------------------------
+
+// L4: 16x16x16 nodes, each covers size=2, children are leaves (size=1 voxel).
 @compute @workgroup_size(8, 8, 1)
 fn build_L4(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= 16u || gid.y >= 16u) { return; }
@@ -194,18 +357,35 @@ fn build_L4(@builtin(global_invocation_id) gid: vec3<u32>) {
   let coord4 = vec3<u32>(gid.x, gid.y, iz4);
   let n4 = node_index_from_coord(coord4, 4u);
 
+  let ox = coord4.x * 2u;
+  let oy = coord4.y * 2u;
+  let oz = coord4.z * 2u;
+
   var mask: u32 = 0u;
   for (var c: u32 = 0u; c < 8u; c = c + 1u) {
-    let li = child_index(n4, c);
-    let mat = nodes[base + li];
-    if (mat != 0u) { mask = mask | (1u << c); }
+    let xb = (c >> 2u) & 1u;
+    let yb = (c >> 1u) & 1u;
+    let zb =  c        & 1u;
+
+    let vx = ox + xb;
+    let vy = oy + yb;
+    let vz = oz + zb;
+
+    let leaf_idx = node_index_from_coord(vec3<u32>(vx, vy, vz), 5u);
+    if (nodes[base + leaf_idx] != 0u) {
+      mask = mask | (1u << c);
+    }
   }
 
   nodes[base + n4] = mask & 0xffu;
 }
 
-@compute @workgroup_size(1, 1, 1)
+// L3: 8x8x8 nodes, each covers size=4, children are L4 (size=2).
+// Parallelized: one invocation per node.
+@compute @workgroup_size(4, 4, 1)
 fn build_L3(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= 8u || gid.y >= 8u) { return; }
+
   let local_chunk_i = gid.z / 8u;
   let iz3           = gid.z - local_chunk_i * 8u;
 
@@ -223,24 +403,31 @@ fn build_L3(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let base = node_base(slot);
 
-  for (var ix: u32 = 0u; ix < 8u; ix = ix + 1u) {
-    for (var iy: u32 = 0u; iy < 8u; iy = iy + 1u) {
-      let coord3 = vec3<u32>(ix, iy, iz3);
-      let n3 = node_index_from_coord(coord3, 3u);
+  let coord3 = vec3<u32>(gid.x, gid.y, iz3);
+  let n3 = node_index_from_coord(coord3, 3u);
 
-      var mask: u32 = 0u;
-      for (var c: u32 = 0u; c < 8u; c = c + 1u) {
-        let n4 = child_index(n3, c);
-        let m4 = nodes[base + n4] & 0xffu;
-        if (m4 != 0u) { mask = mask | (1u << c); }
-      }
-      nodes[base + n3] = mask & 0xffu;
+  var mask: u32 = 0u;
+  for (var c: u32 = 0u; c < 8u; c = c + 1u) {
+    let xb = (c >> 2u) & 1u;
+    let yb = (c >> 1u) & 1u;
+    let zb =  c        & 1u;
+
+    let coord4 = vec3<u32>(coord3.x * 2u + xb, coord3.y * 2u + yb, coord3.z * 2u + zb);
+    let n4 = node_index_from_coord(coord4, 4u);
+
+    if ((nodes[base + n4] & 0xffu) != 0u) {
+      mask = mask | (1u << c);
     }
   }
+
+  nodes[base + n3] = mask & 0xffu;
 }
 
-@compute @workgroup_size(1, 1, 1)
+// L2: 4x4x4 nodes, each covers size=8, children are L3 (size=4).
+@compute @workgroup_size(4, 4, 1)
 fn build_L2(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= 4u || gid.y >= 4u) { return; }
+
   let local_chunk_i = gid.z / 4u;
   let iz2           = gid.z - local_chunk_i * 4u;
 
@@ -258,24 +445,31 @@ fn build_L2(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let base = node_base(slot);
 
-  for (var ix: u32 = 0u; ix < 4u; ix = ix + 1u) {
-    for (var iy: u32 = 0u; iy < 4u; iy = iy + 1u) {
-      let coord2 = vec3<u32>(ix, iy, iz2);
-      let n2 = node_index_from_coord(coord2, 2u);
+  let coord2 = vec3<u32>(gid.x, gid.y, iz2);
+  let n2 = node_index_from_coord(coord2, 2u);
 
-      var mask: u32 = 0u;
-      for (var c: u32 = 0u; c < 8u; c = c + 1u) {
-        let n3 = child_index(n2, c);
-        let m3 = nodes[base + n3] & 0xffu;
-        if (m3 != 0u) { mask = mask | (1u << c); }
-      }
-      nodes[base + n2] = mask & 0xffu;
+  var mask: u32 = 0u;
+  for (var c: u32 = 0u; c < 8u; c = c + 1u) {
+    let xb = (c >> 2u) & 1u;
+    let yb = (c >> 1u) & 1u;
+    let zb =  c        & 1u;
+
+    let coord3 = vec3<u32>(coord2.x * 2u + xb, coord2.y * 2u + yb, coord2.z * 2u + zb);
+    let n3 = node_index_from_coord(coord3, 3u);
+
+    if ((nodes[base + n3] & 0xffu) != 0u) {
+      mask = mask | (1u << c);
     }
   }
+
+  nodes[base + n2] = mask & 0xffu;
 }
 
-@compute @workgroup_size(1, 1, 1)
+// L1: 2x2x2 nodes, each covers size=16, children are L2 (size=8).
+@compute @workgroup_size(2, 2, 1)
 fn build_L1(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= 2u || gid.y >= 2u) { return; }
+
   let local_chunk_i = gid.z / 2u;
   let iz1           = gid.z - local_chunk_i * 2u;
 
@@ -293,22 +487,27 @@ fn build_L1(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let base = node_base(slot);
 
-  for (var ix: u32 = 0u; ix < 2u; ix = ix + 1u) {
-    for (var iy: u32 = 0u; iy < 2u; iy = iy + 1u) {
-      let coord1 = vec3<u32>(ix, iy, iz1);
-      let n1 = node_index_from_coord(coord1, 1u);
+  let coord1 = vec3<u32>(gid.x, gid.y, iz1);
+  let n1 = node_index_from_coord(coord1, 1u);
 
-      var mask: u32 = 0u;
-      for (var c: u32 = 0u; c < 8u; c = c + 1u) {
-        let n2 = child_index(n1, c);
-        let m2 = nodes[base + n2] & 0xffu;
-        if (m2 != 0u) { mask = mask | (1u << c); }
-      }
-      nodes[base + n1] = mask & 0xffu;
+  var mask: u32 = 0u;
+  for (var c: u32 = 0u; c < 8u; c = c + 1u) {
+    let xb = (c >> 2u) & 1u;
+    let yb = (c >> 1u) & 1u;
+    let zb =  c        & 1u;
+
+    let coord2 = vec3<u32>(coord1.x * 2u + xb, coord1.y * 2u + yb, coord1.z * 2u + zb);
+    let n2 = node_index_from_coord(coord2, 2u);
+
+    if ((nodes[base + n2] & 0xffu) != 0u) {
+      mask = mask | (1u << c);
     }
   }
+
+  nodes[base + n1] = mask & 0xffu;
 }
 
+// L0: root node, children are L1 nodes.
 @compute @workgroup_size(1, 1, 1)
 fn build_L0(@builtin(global_invocation_id) gid: vec3<u32>) {
   let local_chunk_i = gid.x;
@@ -329,10 +528,18 @@ fn build_L0(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   var mask: u32 = 0u;
   for (var c: u32 = 0u; c < 8u; c = c + 1u) {
-    let n1 = child_index(root, c);
-    let m1 = nodes[base + n1] & 0xffu;
-    if (m1 != 0u) { mask = mask | (1u << c); }
+    let xb = (c >> 2u) & 1u;
+    let yb = (c >> 1u) & 1u;
+    let zb =  c        & 1u;
+
+    let coord1 = vec3<u32>(xb, yb, zb);
+    let n1 = node_index_from_coord(coord1, 1u);
+
+    if ((nodes[base + n1] & 0xffu) != 0u) {
+      mask = mask | (1u << c);
+    }
   }
+
   nodes[base + root] = mask & 0xffu;
 }
 
@@ -351,7 +558,6 @@ fn clear_dirty(@builtin(global_invocation_id) gid: vec3<u32>) {
   cm.flags = (cm.flags & (~FLAG_DIRTY)) | FLAG_READY;
   chunk_meta[slot] = cm;
 }
-
 
 // -----------------------------------------------------------------------------
 // Ray tracing
@@ -526,7 +732,7 @@ fn trace_chunk_svo(ro: vec3<f32>, rd: vec3<f32>, slot: u32, cc: vec3<i32>, seg_t
 
     for (var k: i32 = i32(count) - 1; k >= 0; k = k - 1) {
       if (sp + 1 >= i32(MAX_STACK)) { break; }
-      sp = sp + 1;
+      sp = sp - 0 + 1;
 
       let c = cid[u32(k)];
       let cn = child_index(n, c);

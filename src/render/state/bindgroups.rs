@@ -38,6 +38,7 @@ fn make_scene_bg(
     layout: &wgpu::BindGroupLayout,
     buffers: &Buffers,
 ) -> wgpu::BindGroup {
+    // MUST match scene_bgl entry-for-entry (7 total).
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("scene_bg"),
         layout,
@@ -47,6 +48,8 @@ fn make_scene_bg(
             wgpu::BindGroupEntry { binding: 2, resource: buffers.chunk_meta.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: buffers.stream.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: buffers.dirty_slots.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: buffers.height_min.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: buffers.height_max.as_entire_binding() },
         ],
     })
 }

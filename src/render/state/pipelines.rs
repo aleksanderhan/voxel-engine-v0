@@ -4,6 +4,10 @@
 use super::layout::Layouts;
 
 pub struct Pipelines {
+    // Height acceleration passes
+    pub build_height_l0: wgpu::ComputePipeline,
+    pub build_height_mips: wgpu::ComputePipeline,
+
     pub build_leaves: wgpu::ComputePipeline,
     pub build_l4: wgpu::ComputePipeline,
     pub build_l3: wgpu::ComputePipeline,
@@ -49,6 +53,13 @@ pub fn create_pipelines(
     fs_module: &wgpu::ShaderModule,
     surface_format: wgpu::TextureFormat,
 ) -> Pipelines {
+    // Height build
+    let build_height_l0 =
+        make_compute_pipeline(device, "build_height_l0", cs_module, "build_height_l0", &[&layouts.scene]);
+    let build_height_mips =
+        make_compute_pipeline(device, "build_height_mips", cs_module, "build_height_mips", &[&layouts.scene]);
+
+    // SVO build
     let build_leaves =
         make_compute_pipeline(device, "build_leaves", cs_module, "build_leaves", &[&layouts.scene]);
     let build_l4 =
@@ -121,6 +132,8 @@ pub fn create_pipelines(
     });
 
     Pipelines {
+        build_height_l0,
+        build_height_mips,
         build_leaves,
         build_l4,
         build_l3,

@@ -14,6 +14,10 @@ pub struct Buffers {
     pub nodes: wgpu::Buffer,
     pub chunk_meta: wgpu::Buffer,
     pub dirty_slots: wgpu::Buffer,
+
+    // Height mip pyramid (min/max) per chunk.
+    pub height_min: wgpu::Buffer,
+    pub height_max: wgpu::Buffer,
 }
 
 fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
@@ -55,6 +59,19 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
 
+    // Height mip: f32 texels
+    let height_zero = vec![0.0f32; config::HEIGHT_MIP_TOTAL_TEXELS as usize];
+    let height_min = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("height_min_buf"),
+        contents: bytemuck::cast_slice(&height_zero),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let height_max = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("height_max_buf"),
+        contents: bytemuck::cast_slice(&height_zero),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
     Buffers {
         camera,
         overlay,
@@ -62,5 +79,7 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         nodes,
         chunk_meta,
         dirty_slots,
+        height_min,
+        height_max,
     }
 }

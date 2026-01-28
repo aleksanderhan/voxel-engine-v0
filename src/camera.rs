@@ -27,15 +27,16 @@ pub struct CameraFrame {
 
 impl Camera {
     pub fn new(_aspect: f32) -> Self {
-        // NOTE:
-        // Your streamed neighborhood is centered on the camera chunk.
-        // Terrain heights are around ~[-10..+6] meters, so starting at y=20
-        // streams only high-altitude chunks that are completely empty.
-        // Start near the surface so initial chunks contain voxels.
+        // Start near the surface using the exact same terrain function as the GPU.
+        let x0 = 0.0;
+        let z0 = -10.0;
+        let ground = crate::config::terrain_height_m(x0, z0);
+        let eye = 2.0; // meters above ground
+
         Self {
-            pos: Vec3::new(0.0, 6.0, -10.0),
+            pos: Vec3::new(x0, ground + eye, z0),
             yaw: 0.0,
-            pitch: -0.20, // look slightly down so you see terrain immediately
+            pitch: -0.20,
             fovy_rad: 60.0_f32.to_radians(),
             z_near: 0.1,
             z_far: 1000.0,

@@ -77,6 +77,20 @@ fn bgl_storage_tex_wo(
 pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     let cs = wgpu::ShaderStages::COMPUTE;
 
+    // NOTE:
+    // scene_bgl MUST match scene_bg in bindgroups.rs 1:1.
+    // It intentionally has NON-CONTIGUOUS binding numbers, but the *entry count* must match.
+    //
+    // Bindings present:
+    // 0 camera (uniform)
+    // 1 nodes (storage rw)
+    // 2 chunk_meta (storage rw)
+    // 3 stream (uniform)
+    // 6 dirty_slots (storage read)
+    // 7 height_min (storage rw)
+    // 8 height_max (storage rw)
+    //
+    // TOTAL ENTRIES = 7
     let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("scene_bgl"),
         entries: &[
@@ -85,9 +99,12 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             bgl_storage_buf(2, cs, false),
             bgl_uniform(3, cs),
             bgl_storage_buf(6, cs, true),
+            bgl_storage_buf(7, cs, false),
+            bgl_storage_buf(8, cs, false),
         ],
     });
 
+    // Primary compute layout (raymarch output)
     let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("primary_bgl"),
         entries: &[

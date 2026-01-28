@@ -144,7 +144,7 @@ impl Renderer {
             return;
         }
 
-        // Upload meta + dirty list (CPU meta now preserves READY thanks to mark_built_range)
+        // Upload meta + dirty list (CPU meta preserves READY thanks to mark_built_range)
         self.queue.write_buffer(
             &self.buffers.chunk_meta,
             0,
@@ -157,7 +157,7 @@ impl Renderer {
             bytemuck::cast_slice(self.streaming.dirty_slots()),
         );
 
-        // Restart batching for *this* dirty list
+        // Restart batching for this dirty list
         self.stream_base = self.streaming.stream_gpu();
         self.dirty_total = self.stream_base.dirty_count;
         self.dirty_offset = 0;
@@ -231,7 +231,39 @@ impl Renderer {
         let build_count = remaining.min(self.build_batch);
         self.write_stream_batch(self.dirty_offset, build_count);
 
-        // build_leaves
+        // ---------------------------------------------------------------------
+        // Height min/max mip pyramid (per chunk)
+        // ---------------------------------------------------------------------
+
+        // build_height_l0 (32x32 per chunk)
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("build_height_l0_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipelines.build_height_l0);
+            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
+            let gx = (32 + 7) / 8;
+            let gy = (32 + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, build_count);
+        }
+
+        // build_height_mips (1 thread per chunk)
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("build_height_mips_pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipelines.build_height_mips);
+            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
+            cpass.dispatch_workgroups(build_count, 1, 1);
+        }
+
+        // ---------------------------------------------------------------------
+        // Leaves (materials)
+        // ---------------------------------------------------------------------
+
+        // build_leaves (material; uses cached height data)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("build_leaves_pass"),
@@ -245,7 +277,12 @@ impl Renderer {
             cpass.dispatch_workgroups(gx, gy, gz);
         }
 
-        // build_L4
+        // ---------------------------------------------------------------------
+        // Octree mask build (bottom-up), NO prefix sums:
+        // L4 from leaf materials, L3 from L4 masks, etc.
+        // ---------------------------------------------------------------------
+
+        // build_L4: 16x16x16 per chunk
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("build_L4_pass"),
@@ -259,7 +296,7 @@ impl Renderer {
             cpass.dispatch_workgroups(gx, gy, gz);
         }
 
-        // build_L3
+        // build_L3: 8x8x8 per chunk (parallelized)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("build_L3_pass"),
@@ -267,10 +304,11 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.build_l3);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-            cpass.dispatch_workgroups(1, 1, 8 * build_count);
+            // WGSL uses @workgroup_size(4,4,1) and gid.z encodes (chunk_i*8 + z)
+            cpass.dispatch_workgroups(2, 2, 8 * build_count);
         }
 
-        // build_L2
+        // build_L2: 4x4x4 per chunk (parallelized)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("build_L2_pass"),
@@ -278,10 +316,11 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.build_l2);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
+            // WGSL uses @workgroup_size(4,4,1)
             cpass.dispatch_workgroups(1, 1, 4 * build_count);
         }
 
-        // build_L1
+        // build_L1: 2x2x2 per chunk (parallelized)
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("build_L1_pass"),
@@ -289,10 +328,11 @@ impl Renderer {
             });
             cpass.set_pipeline(&self.pipelines.build_l1);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
+            // WGSL uses @workgroup_size(2,2,1)
             cpass.dispatch_workgroups(1, 1, 2 * build_count);
         }
 
-        // build_L0
+        // build_L0: 1 per chunk
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("build_L0_pass"),
@@ -315,8 +355,7 @@ impl Renderer {
             cpass.dispatch_workgroups(gx, 1, 1);
         }
 
-        // CRITICAL: mirror the same flag transition into CPU meta,
-        // so the next chunk_meta upload doesn't wipe READY.
+        // Mirror the same flag transition into CPU meta.
         self.streaming.mark_built_range(self.dirty_offset, build_count);
 
         self.dirty_offset += build_count;
