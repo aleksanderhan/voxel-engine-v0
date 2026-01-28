@@ -160,6 +160,9 @@ fn sort_queue_near_first(queue: &mut VecDeque<ChunkKey>, center: ChunkKey, cam_f
     let mut f = Vec2::new(cam_fwd.x, cam_fwd.z);
     if f.length_squared() > 1e-6 {
         f = f.normalize();
+    } else {
+        // If forward is degenerate, just treat as no directional bias.
+        f = Vec2::ZERO;
     }
 
     v.sort_by(|a, b| {
@@ -171,15 +174,32 @@ fn sort_queue_near_first(queue: &mut VecDeque<ChunkKey>, center: ChunkKey, cam_f
     queue.extend(v);
 }
 
-fn chunk_priority_score(k: ChunkKey, c: ChunkKey, _fwd_xz: Vec2) -> f32 {
+fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
     let dx = (k.x - c.x) as f32;
     let dz = (k.z - c.z) as f32;
     let dy = (k.y - c.y) as f32;
 
     // Lower score = higher priority.
     // Base distance (prefer close). Penalize vertical moves more.
-    dx.abs() + dz.abs() + 2.0 * dy.abs()
+    let base = dx.abs() + dz.abs() + 2.0 * dy.abs();
+
+    // Directional bias: chunks in front (positive dot) get a lower score.
+    // 1) compute signed "forward distance"
+    let dir = dx * fwd_xz.x + dz * fwd_xz.y; // dot(delta_xz, fwd)
+
+    // 2) tune weights
+    let front_bonus = 0.75;   // bigger => prefer in-front more
+    let behind_penalty = 0.25; // bigger => deprioritize behind more
+
+    let bias = if dir >= 0.0 {
+        -front_bonus * dir
+    } else {
+        -behind_penalty * dir // dir is negative, so this increases score
+    };
+
+    base + bias
 }
+
 
 pub struct ChunkManager {
     gen: Arc<WorldGen>,

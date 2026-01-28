@@ -28,8 +28,8 @@ const MAT_LEAF  : u32 = 5u;
 // ------------------------------------------------------------
 
 const SUN_DIR : vec3<f32> = vec3<f32>(0.61237244, 0.5, 0.61237244);
-const SUN_COLOR     : vec3<f32> = vec3<f32>(1.0, 0.98, 0.90);
-const SUN_INTENSITY : f32 = 5.5;
+const SUN_COLOR : vec3<f32> = vec3<f32>(1.0, 0.94, 0.72);
+const SUN_INTENSITY : f32 = 5.0;
 
 const SUN_DISC_ANGULAR_RADIUS : f32 = 0.009;
 const SUN_DISC_SOFTNESS       : f32 = 0.004;
@@ -199,7 +199,7 @@ const COMPOSITE_GOD_SCALE : f32 = 4.00;
 const COMPOSITE_BEAM_COMPRESS : bool = true;
 
 // Post
-const POST_EXPOSURE : f32 = 0.11;
+const POST_EXPOSURE : f32 = 0.10;
 
 // ------------------------------------------------------------
 // GPU structs (must match Rust layouts)
