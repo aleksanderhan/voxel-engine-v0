@@ -1,14 +1,19 @@
 // src/clipmap.rs
+// --------------
 //
 // CPU-updated 2D clipmap height texture data (nested levels around camera).
 //
-// Strategy here (simple + robust):
+// FP16 OPTIMIZATION:
+// - Each level stores CLIPMAP_RES * CLIPMAP_RES heights in *half float* (u16 bits).
+// - This halves upload bandwidth and reduces VRAM traffic.
+// - WGSL textureLoad still returns f32 when sampling R16Float.
+//
+// Strategy:
 // - Each level is a full CLIPMAP_RES x CLIPMAP_RES height map (meters).
 // - Level i has cell size = CLIPMAP_BASE_CELL_M * 2^i.
 // - We "snap" the level origin to cell boundaries so updates are stable.
 // - When the camera moves enough that a level origin changes, we refresh that entire level.
-//   (This is not the classic incremental ring update, but it is already far cheaper than SVO,
-//    and it keeps the implementation small and correct. You can upgrade to strip updates later.)
+//   (Not incremental ring updates; simple + robust.)
 
 use glam::Vec3;
 
@@ -34,8 +39,8 @@ pub struct ClipmapParamsCpu {
 
 pub struct ClipmapUpload {
     pub level: u32,
-    /// CLIPMAP_RES * CLIPMAP_RES heights in meters (row-major).
-    pub data_m: Vec<f32>,
+    /// CLIPMAP_RES * CLIPMAP_RES heights, FP16 bits (IEEE-754 half), row-major.
+    pub data_f16: Vec<u16>,
 }
 
 pub struct Clipmap {
@@ -74,6 +79,92 @@ impl Clipmap {
     #[inline]
     fn cell_to_origin_m(cell_x: i32, cell_z: i32, cell_m: f32) -> (f32, f32) {
         (cell_x as f32 * cell_m, cell_z as f32 * cell_m)
+    }
+
+    // -------------------------------------------------------------------------
+    // f32 -> f16 (bits) conversion, IEEE-754 half precision
+    // -------------------------------------------------------------------------
+    //
+    // Fast, dependency-free conversion.
+    // - Rounds to nearest-even.
+    // - Preserves NaN/Inf.
+    // - Handles subnormals.
+    //
+    // This is "good enough" for terrain heights.
+    #[inline]
+    fn f32_to_f16_bits(v: f32) -> u16 {
+        let x = v.to_bits();
+
+        let sign = ((x >> 16) & 0x8000) as u16;
+        let exp = ((x >> 23) & 0xFF) as i32;
+        let mant = x & 0x007F_FFFF;
+
+        // NaN/Inf
+        if exp == 255 {
+            if mant == 0 {
+                return sign | 0x7C00; // Inf
+            } else {
+                // quiet NaN, keep some payload
+                let payload = (mant >> 13) as u16;
+                return sign | 0x7C00 | (payload.max(1));
+            }
+        }
+
+        // Unbias exponent from f32, then bias to f16
+        let e = exp - 127;
+        let e16 = e + 15;
+
+        // Too large => Inf
+        if e16 >= 31 {
+            return sign | 0x7C00;
+        }
+
+        // Too small => subnormal or zero
+        if e16 <= 0 {
+            // If it's way too small, flush to zero
+            if e16 < -10 {
+                return sign;
+            }
+
+            // Subnormal: implicit leading 1 for mantissa in f32 normal range
+            // Build a 24-bit mantissa with leading 1
+            let m = mant | 0x0080_0000;
+
+            // Shift to get f16 subnormal mantissa (10 bits)
+            let shift = 14 - e16; // 1..24
+            let mut mant16 = (m >> shift) as u16;
+
+            // Round to nearest-even using the remainder
+            let rem_mask = (1u32 << shift) - 1;
+            let rem = m & rem_mask;
+            let half = 1u32 << (shift - 1);
+
+            if rem > half || (rem == half && (mant16 & 1) != 0) {
+                mant16 = mant16.wrapping_add(1);
+            }
+
+            return sign | mant16;
+        }
+
+        // Normal f16 number
+        let mut mant16 = (mant >> 13) as u16;
+
+        // Round to nearest-even based on lower bits
+        let round_bits = mant & 0x0000_1FFF;
+        if round_bits > 0x1000 || (round_bits == 0x1000 && (mant16 & 1) != 0) {
+            mant16 = mant16.wrapping_add(1);
+            // Mantissa overflow => bump exponent
+            if mant16 & 0x0400 != 0 {
+                mant16 = 0;
+                let e_out = (e16 + 1) as u16;
+                if e_out >= 31 {
+                    return sign | 0x7C00;
+                }
+                return sign | (e_out << 10) | mant16;
+            }
+        }
+
+        sign | ((e16 as u16) << 10) | (mant16 & 0x03FF)
     }
 
     /// Update clipmap data around camera.
@@ -131,7 +222,7 @@ impl Clipmap {
 
                 // Full refresh of this level.
                 let res = config::CLIPMAP_RES as usize;
-                let mut data = vec![0.0f32; res * res];
+                let mut data = vec![0u16; res * res];
 
                 // We sample the procedural ground height at world (x,z) mapped from cells.
                 // WorldGen::ground_height returns voxels, so convert to meters.
@@ -147,11 +238,16 @@ impl Clipmap {
                         let wx_vx = (wx_m / vs).floor() as i32;
 
                         let h_vx = world.ground_height(wx_vx, wz_vx);
-                        data[row + tx] = (h_vx as f32) * vs;
+                        let h_m = (h_vx as f32) * vs;
+
+                        data[row + tx] = Self::f32_to_f16_bits(h_m);
                     }
                 }
 
-                uploads.push(ClipmapUpload { level: i, data_m: data });
+                uploads.push(ClipmapUpload {
+                    level: i,
+                    data_f16: data,
+                });
             }
         }
 

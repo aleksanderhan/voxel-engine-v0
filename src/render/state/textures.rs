@@ -1,4 +1,5 @@
 // src/render/state/textures.rs
+// ----------------------------
 
 use crate::{
     config,
@@ -148,13 +149,14 @@ pub fn create_textures(device: &wgpu::Device, width: u32, height: u32) -> Textur
         ),
     ];
 
+    // FP16 clipmap height: R16Float (half bandwidth vs R32Float)
     let clip_height = make_tex2d_array(
         device,
         "clip_height",
         config::CLIPMAP_RES,
         config::CLIPMAP_RES,
         config::CLIPMAP_LEVELS,
-        wgpu::TextureFormat::R32Float,
+        wgpu::TextureFormat::R16Float,
         wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
     );
 

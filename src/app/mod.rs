@@ -1,5 +1,5 @@
-// --------------
 // src/app/mod.rs
+// --------------
 //
 // High-level application glue:
 // - Owns the window + wgpu surface configuration (swapchain-ish state).
@@ -208,7 +208,7 @@ impl App {
         self.renderer.write_clipmap(&clip_gpu);
 
         for up in clip_uploads {
-            self.renderer.write_clipmap_level(up.level, &up.data_m);
+            self.renderer.write_clipmap_level(up.level, &up.data_f16);
         }
 
         // 4) camera matrices -> CameraGpu

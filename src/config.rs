@@ -39,7 +39,7 @@ pub const CLIPMAP_LEVELS: u32 = 5;
 pub const CLIPMAP_LEVELS_USIZE: usize = CLIPMAP_LEVELS as usize;
 
 // Texture resolution per level (square).
-pub const CLIPMAP_RES: u32 = 256;
+pub const CLIPMAP_RES: u32 = 512;
 
 // Base cell size (meters) for level 0. Level i cell size = BASE * 2^i.
 pub const CLIPMAP_BASE_CELL_M: f32 = 0.50;

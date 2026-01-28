@@ -1,4 +1,6 @@
 // src/shaders/clipmap.wgsl
+// ------------------------
+// src/shaders/clipmap.wgsl
 //
 // Clipmap heightfield sampling + ray intersection fallback.
 //
@@ -15,34 +17,50 @@
 // - @binding(6) clipmap uniform
 // - @binding(7) clipmap height texture array
 
-const CLIP_LEVELS : u32 = 5u;
-const CLIP_RES    : i32 = 256; // must match config::CLIPMAP_RES
+// NOTE: levels/res are provided by the uniform, but we keep a compile-time max here
+// to match the fixed-size uniform array.
+const CLIP_LEVELS_MAX : u32 = 5u;
+
+// March tuning (performance critical)
+const HF_MAX_STEPS : u32 = 80u;
+const HF_BISECT    : u32 = 6u;
+
+// dt clamp (meters along ray)
+const HF_DT_MIN : f32 = 1.00;
+const HF_DT_MAX : f32 = 48.0;
 
 struct ClipmapParams {
-  levels     : u32,
-  res        : u32,
-  base_cell_m: f32,
-  _pad0      : f32,
+  levels      : u32,
+  res         : u32,
+  base_cell_m : f32,
+  _pad0       : f32,
   // x=origin_x_m, y=origin_z_m, z=cell_size_m, w=inv_cell_size_m
-  level      : array<vec4<f32>, 5>,
+  level       : array<vec4<f32>, 5>,
 };
 
 @group(0) @binding(6) var<uniform> clip : ClipmapParams;
 @group(0) @binding(7) var clip_height : texture_2d_array<f32>;
 
+// --------------------------
+// Level selection
+// --------------------------
+
 fn clip_choose_level(xz: vec2<f32>) -> u32 {
   // Choose the finest level that still comfortably contains the query point.
-  // We use a conservative "inner" coverage to avoid sampling right on the edges.
+  // Conservative inner coverage avoids sampling near edges.
   let cam_xz = vec2<f32>(cam.cam_pos.x, cam.cam_pos.z);
   let d = max(abs(xz.x - cam_xz.x), abs(xz.y - cam_xz.y));
 
-  // half coverage per level (in meters): (CLIP_RES * cell_size)/2
-  // inner = 0.45*half.
-  var best: u32 = CLIP_LEVELS - 1u;
+  let res_i = max(i32(clip.res), 1);
+  let res_f = f32(res_i);
 
-  for (var i: u32 = 0u; i < CLIP_LEVELS; i = i + 1u) {
+  // Default to coarsest.
+  var best: u32 = max(clip.levels, 1u) - 1u;
+
+  let n = min(clip.levels, CLIP_LEVELS_MAX);
+  for (var i: u32 = 0u; i < n; i = i + 1u) {
     let cell = clip.level[i].z;
-    let half = 0.5 * f32(CLIP_RES) * cell;
+    let half = 0.5 * res_f * cell;
     let inner = 0.45 * half;
     if (d <= inner) { best = i; break; }
   }
@@ -50,20 +68,28 @@ fn clip_choose_level(xz: vec2<f32>) -> u32 {
   return best;
 }
 
-fn clip_height_at_level(xz: vec2<f32>, level: u32) -> f32 {
+// --------------------------
+// Height sampling (fast path)
+// --------------------------
+
+fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
+  let res_i = max(i32(clip.res), 1);
+
   let p = clip.level[level];
-  let ox = p.x;
-  let oz = p.y;
-  let inv = p.w;
+  let origin = vec2<f32>(p.x, p.y);
+  let inv_cell = p.w;
 
-  let u = (xz.x - ox) * inv;
-  let v = (xz.y - oz) * inv;
+  // Map world -> texel
+  // CPU wrote heights for texel centers at (tx+0.5)*cell, but sampling by floor() here
+  // is consistent for heightfield marching and stable across movement due to snapping.
+  let uv = (world_xz - origin) * inv_cell;
 
-  let ix = clamp(i32(floor(u)), 0, CLIP_RES - 1);
-  let iz = clamp(i32(floor(v)), 0, CLIP_RES - 1);
+  var ix = i32(floor(uv.x));
+  var iz = i32(floor(uv.y));
 
-  // NOTE: texture_2d_array load signature is:
-  // textureLoad(tex, coords, array_index, mip_level)
+  ix = clamp(ix, 0, res_i - 1);
+  iz = clamp(iz, 0, res_i - 1);
+
   return textureLoad(clip_height, vec2<i32>(ix, iz), i32(level), 0).x;
 }
 
@@ -72,21 +98,32 @@ fn clip_height_at(xz: vec2<f32>) -> f32 {
   return clip_height_at_level(xz, lvl);
 }
 
+// --------------------------
+// Normal (2-tap)
+// --------------------------
+
+fn clip_normal_at_level_2tap(world_xz: vec2<f32>, level: u32) -> vec3<f32> {
+  let cell = clip.level[level].z;
+
+  // 2-tap forward differences (2 texture loads + 1 reuse)
+  let h  = clip_height_at_level(world_xz, level);
+  let hx = clip_height_at_level(world_xz + vec2<f32>(cell, 0.0), level);
+  let hz = clip_height_at_level(world_xz + vec2<f32>(0.0, cell), level);
+
+  let dhx = (hx - h) / max(cell, 1e-4);
+  let dhz = (hz - h) / max(cell, 1e-4);
+
+  return normalize(vec3<f32>(-dhx, 1.0, -dhz));
+}
+
 fn clip_normal_at(xz: vec2<f32>) -> vec3<f32> {
   let lvl = clip_choose_level(xz);
-  let p = clip.level[lvl];
-  let cell = p.z;
-
-  let hL = clip_height_at_level(xz + vec2<f32>(-cell, 0.0), lvl);
-  let hR = clip_height_at_level(xz + vec2<f32>( cell, 0.0), lvl);
-  let hD = clip_height_at_level(xz + vec2<f32>(0.0, -cell), lvl);
-  let hU = clip_height_at_level(xz + vec2<f32>(0.0,  cell), lvl);
-
-  let dx = (hR - hL) / max(2.0 * cell, 1e-4);
-  let dz = (hU - hD) / max(2.0 * cell, 1e-4);
-
-  return normalize(vec3<f32>(-dx, 1.0, -dz));
+  return clip_normal_at_level_2tap(xz, lvl);
 }
+
+// --------------------------
+// Trace
+// --------------------------
 
 struct ClipHit {
   hit : bool,
@@ -96,56 +133,76 @@ struct ClipHit {
 };
 
 fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> ClipHit {
-  // Only meaningful if we're not pointing upward too much.
+  // If we're not pointing downward, don't bother.
   if (rd.y >= -1e-4) {
     return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
   }
 
+  // Start
   var t = max(t_min, 0.0);
+
   var p = ro + rd * t;
-  var h = clip_height_at(p.xz);
+
+  // Cache the chosen clip level (avoid repeated clip_choose_level inside helpers)
+  var lvl: u32 = clip_choose_level(p.xz);
+
+  var h = clip_height_at_level(p.xz, lvl);
   var s_prev = p.y - h;
   var t_prev = t;
 
-  // Adaptive marching using vertical gap / rd.y as a step estimate.
-  for (var i: u32 = 0u; i < 160u; i = i + 1u) {
+  for (var i: u32 = 0u; i < HF_MAX_STEPS; i = i + 1u) {
     if (t > t_max) { break; }
 
     p = ro + rd * t;
-    h = clip_height_at(p.xz);
+
+    // Update cached level once per step (not per sample)
+    lvl = clip_choose_level(p.xz);
+
+    h = clip_height_at_level(p.xz, lvl);
     let s = p.y - h;
 
+    // Bracketed hit -> bisection refine
     if (s <= 0.0 && s_prev > 0.0) {
-      // Bracketed hit -> refine with bisection.
       var a = t_prev;
       var b = t;
-      for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+
+      for (var k: u32 = 0u; k < HF_BISECT; k = k + 1u) {
         let m = 0.5 * (a + b);
         let pm = ro + rd * m;
-        let hm = clip_height_at(pm.xz);
+
+        let mlvl = clip_choose_level(pm.xz);
+        let hm = clip_height_at_level(pm.xz, mlvl);
         let sm = pm.y - hm;
+
         if (sm > 0.0) { a = m; } else { b = m; }
       }
+
       let th = 0.5 * (a + b);
       let ph = ro + rd * th;
 
-      let n = clip_normal_at(ph.xz);
+      let hlvl = clip_choose_level(ph.xz);
+      let n = clip_normal_at_level_2tap(ph.xz, hlvl);
 
-      // Simple material choice (you can extend with a material-id clipmap later).
       return ClipHit(true, th, n, MAT_GRASS);
     }
 
     s_prev = s;
     t_prev = t;
 
-    // dt from vertical distance; clamp keeps it stable.
-    let vy = max(-rd.y, 0.15);
-    var dt = clamp(abs(s) / vy, 0.50, 16.0);
+    // Adaptive dt from vertical gap (more aggressive than before).
+    let vy = max(-rd.y, 0.12);
+    var dt = abs(s) / vy;
+    dt = clamp(dt, HF_DT_MIN, HF_DT_MAX);
+
     t = t + dt;
   }
 
   return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
 }
+
+// --------------------------
+// Shading
+// --------------------------
 
 // Far-terrain shading (no voxel occluder shadows).
 fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit) -> vec3<f32> {

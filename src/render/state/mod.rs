@@ -1,4 +1,5 @@
 // src/render/state/mod.rs
+// -----------------------
 mod bindgroups;
 mod buffers;
 mod layout;
@@ -143,14 +144,15 @@ impl Renderer {
             .write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
     }
 
-    pub fn write_clipmap_level(&self, level: u32, data_m: &[f32]) {
+    // FP16 clipmap upload: data is u16 bits (IEEE half), texture format is R16Float.
+    pub fn write_clipmap_level(&self, level: u32, data_f16: &[u16]) {
         let res = config::CLIPMAP_RES as usize;
         let expected = res * res;
-        if data_m.len() != expected {
+        if data_f16.len() != expected {
             return;
         }
 
-        let bytes: &[u8] = bytemuck::cast_slice(data_m);
+        let bytes: &[u8] = bytemuck::cast_slice(data_f16);
 
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
@@ -162,7 +164,8 @@ impl Renderer {
             bytes,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some((config::CLIPMAP_RES * 4) as u32),
+                // 2 bytes per texel (R16Float)
+                bytes_per_row: Some((config::CLIPMAP_RES * 2) as u32),
                 rows_per_image: Some(config::CLIPMAP_RES),
             },
             wgpu::Extent3d {
