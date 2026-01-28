@@ -5,10 +5,10 @@
 // level[i].w stores packed offsets (u16 off_x | (u16 off_z << 16)) via f32 bits.
 // We compute inv_cell = 1.0 / cell in shader (since CPU still keeps inv too).
 
-const CLIP_LEVELS_MAX : u32 = 8u;
+const CLIP_LEVELS_MAX : u32 = 16u;
 
 // March tuning
-const HF_MAX_STEPS : u32 = 80u;
+const HF_MAX_STEPS : u32 = 120u;
 const HF_BISECT    : u32 = 6u;
 
 // dt clamp (meters along ray)

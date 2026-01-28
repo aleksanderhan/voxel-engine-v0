@@ -42,7 +42,7 @@ pub const CLIPMAP_LEVELS_USIZE: usize = CLIPMAP_LEVELS as usize;
 pub const CLIPMAP_RES: u32 = 512;
 
 // Base cell size (meters) for level 0. Level i cell size = BASE * 2^i.
-pub const CLIPMAP_BASE_CELL_M: f32 = 0.25;
+pub const CLIPMAP_BASE_CELL_M: f32 = 0.10;
 
 // How often we allow a full refresh per level at most (seconds).
 // (Prevents thrashing if you ever tie updates to very tiny camera jitter.)
