@@ -21,7 +21,7 @@ struct ClipmapParams {
   base_cell_m : f32,
   _pad0       : f32,
   // x=origin_x_m, y=origin_z_m, z=cell_size_m, w=packed offsets bits (off_x/off_z)
-  level       : array<vec4<f32>, 5>,
+  level       : array<vec4<f32>, CLIP_LEVELS_MAX>,
 };
 
 @group(0) @binding(6) var<uniform> clip : ClipmapParams;

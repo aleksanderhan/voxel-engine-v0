@@ -35,14 +35,14 @@ pub const CHUNK_CACHE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1024 MB
 //
 // NOTE: These constants MUST match shader-side constants in `shaders/clipmap.wgsl`.
 
-pub const CLIPMAP_LEVELS: u32 = 8;
+pub const CLIPMAP_LEVELS: u32 = 16;
 pub const CLIPMAP_LEVELS_USIZE: usize = CLIPMAP_LEVELS as usize;
 
 // Texture resolution per level (square).
 pub const CLIPMAP_RES: u32 = 256;
 
 // Base cell size (meters) for level 0. Level i cell size = BASE * 2^i.
-pub const CLIPMAP_BASE_CELL_M: f32 = 0.3;
+pub const CLIPMAP_BASE_CELL_M: f32 = 0.5;
 
 // How often we allow a full refresh per level at most (seconds).
 // (Prevents thrashing if you ever tie updates to very tiny camera jitter.)

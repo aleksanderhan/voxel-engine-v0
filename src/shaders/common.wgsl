@@ -130,7 +130,7 @@ const CLOUD_SOFTNESS : f32 = 0.10;
 const CLOUD_HORIZON_Y0 : f32 = 0.02;
 const CLOUD_HORIZON_Y1 : f32 = 0.25;
 
-const CLOUD_SKY_DARKEN : f32 = 0.75;
+const CLOUD_SKY_DARKEN : f32 = 0.65;
 const CLOUD_ABSORB : f32 = 10.0;
 
 const CLOUD_BASE_COL   : vec3<f32> = vec3<f32>(0.72, 0.74, 0.76);
