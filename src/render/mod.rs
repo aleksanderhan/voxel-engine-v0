@@ -1,4 +1,5 @@
 // src/render/mod.rs
+// -----------------
 
 pub mod gpu_types;
 pub mod resources;

@@ -1,4 +1,6 @@
 // src/input.rs
+// ------------
+
 use winit::{
     event::{DeviceEvent, ElementState, KeyEvent, WindowEvent},
     keyboard::{KeyCode, PhysicalKey},
@@ -48,7 +50,6 @@ impl InputState {
         }
     }
 
-    /// Returns true if event is fully handled/consumed.
     pub fn on_window_event(&mut self, event: &WindowEvent, window: &Window) -> bool {
         match event {
             WindowEvent::Focused(f) => {

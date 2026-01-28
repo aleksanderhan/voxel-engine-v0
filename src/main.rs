@@ -1,15 +1,19 @@
 // src/main.rs
+// -----------
+
 mod app;
 mod camera;
 mod config;
 mod input;
 mod render;
-mod streaming;
-mod svo;
 mod world;
 
 use std::sync::Arc;
-use winit::{event_loop::EventLoop, window::{Fullscreen, WindowBuilder}, dpi::PhysicalSize};
+use winit::{
+    dpi::PhysicalSize,
+    event_loop::EventLoop,
+    window::{Fullscreen, WindowBuilder},
+};
 
 fn main() {
     let event_loop = EventLoop::new().unwrap();
@@ -21,6 +25,8 @@ fn main() {
             .build(&event_loop)
             .unwrap(),
     );
+
+    // Fullscreen swapchain, internal render scale controls perf.
     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
 
     pollster::block_on(app::run(event_loop, window));

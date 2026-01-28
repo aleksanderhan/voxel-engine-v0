@@ -1,16 +1,52 @@
 // src/config.rs
-pub const CHUNK_SIZE: u32 = 128;
-
-pub const ACTIVE_RADIUS: i32 = 3;
-pub const KEEP_RADIUS: i32 = ACTIVE_RADIUS + 6;
+// -------------
+//
+// World + voxel config shared across CPU and GPU assumptions.
 
 pub const VOXEL_SIZE_M_F32: f32 = 0.10;
-pub const VOXEL_SIZE_M_F64: f64 = 0.10;
 
-// Keep this explicit so you can change voxel size later without hunting constants.
-pub const VOXELS_PER_METER: i32 = 10; // 1.0 / 0.10
+// Fixed chunk resolution for the SVO build:
+// 32^3 voxels -> octree depth 5 (levels 0..5)
+pub const CHUNK_VOXELS: u32 = 32;
 
-pub const WORKER_THREADS: usize = 4;
-pub const MAX_IN_FLIGHT: usize = 8;
+// Compatibility constant used by CPU-side world code (voxel units).
+pub const CHUNK_RES_I32: i32 = CHUNK_VOXELS as i32;
 
-pub const NODE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
+// Chunk world size in meters (must match shader logic)
+pub const CHUNK_SIZE_M_F32: f32 = VOXEL_SIZE_M_F32 * CHUNK_VOXELS as f32;
+
+// -----------------------------------------------------------------------------
+// Render scale (internal resolution)
+// -----------------------------------------------------------------------------
+
+// Internal compute resolution fraction of window resolution.
+// 1.0 = native, 0.5 = 1/4 pixels, 0.35 ≈ 1/8 pixels.
+// If you're seeing <10 FPS, drop this further (0.25 is aggressive).
+pub const RENDER_SCALE: f32 = 0.35;
+
+pub fn render_dims(window_w: u32, window_h: u32) -> (u32, u32) {
+    let w = (window_w.max(1) as f32 * RENDER_SCALE).round() as u32;
+    let h = (window_h.max(1) as f32 * RENDER_SCALE).round() as u32;
+    (w.max(1), h.max(1))
+}
+
+// -----------------------------------------------------------------------------
+// Streaming policy (dense neighborhood grid)
+// -----------------------------------------------------------------------------
+
+pub const CHUNK_RADIUS_X: i32 = 4;
+pub const CHUNK_RADIUS_Y: i32 = 2;
+pub const CHUNK_RADIUS_Z: i32 = 4;
+
+pub const GRID_X: u32 = (CHUNK_RADIUS_X as u32) * 2 + 1; // 9
+pub const GRID_Y: u32 = (CHUNK_RADIUS_Y as u32) * 2 + 1; // 5
+pub const GRID_Z: u32 = (CHUNK_RADIUS_Z as u32) * 2 + 1; // 9
+
+pub const MAX_CHUNKS: u32 = GRID_X * GRID_Y * GRID_Z; // 405
+
+// -----------------------------------------------------------------------------
+// Octree sizes
+// -----------------------------------------------------------------------------
+
+pub const NODES_PER_CHUNK: u32 = 37449;
+pub const TOTAL_NODES: u32 = MAX_CHUNKS * NODES_PER_CHUNK;
