@@ -16,6 +16,20 @@
 @group(2) @binding(1) var godray_tex : texture_2d<f32>;
 @group(2) @binding(2) var out_img    : texture_storage_2d<rgba16float, write>;
 
+fn tonemap_aces(x: vec3<f32>) -> vec3<f32> {
+  // Narkowicz 2015-ish fit
+  let a = 2.51;
+  let b = 0.03;
+  let c = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  return clamp((x*(a*x + b)) / (x*(c*x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn gamma_encode(x: vec3<f32>) -> vec3<f32> {
+  return pow(x, vec3<f32>(1.0 / 2.2));
+}
+
 fn tonemap_exp(hdr: vec3<f32>) -> vec3<f32> {
   return vec3<f32>(1.0) - exp(-hdr * POST_EXPOSURE);
 }
@@ -127,8 +141,9 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let T = fog_transmittance_primary(ro, rd, t_scene);
     let fogc = fog_color(rd);
-    let fog_amt = (1.0 - T) * FOG_PRIMARY_VIS;
-    let col = mix(surface, fogc, fog_amt);
+    let fog_k = FOG_PRIMARY_VIS;           // treat as artistic scaler
+    let Tf = clamp(1.0 - (1.0 - T) * fog_k, 0.0, 1.0);
+    let col = surface * Tf + fogc * (1.0 - Tf);
 
     let ip = vec2<i32>(i32(gid.x), i32(gid.y));
     textureStore(color_img, ip, vec4<f32>(col, 1.0));
@@ -166,8 +181,10 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let T = fog_transmittance_primary(ro, rd, t_scene);
     let fogc = fog_color(rd);
-    let fog_amt = (1.0 - T) * FOG_PRIMARY_VIS;
-    let col = mix(surface, fogc, fog_amt);
+    let fog_k = FOG_PRIMARY_VIS;           // treat as artistic scaler
+    let Tf = clamp(1.0 - (1.0 - T) * fog_k, 0.0, 1.0);
+    let col = surface * Tf + fogc * (1.0 - Tf);
+
 
     let ip = vec2<i32>(i32(gid.x), i32(gid.y));
     textureStore(color_img, ip, vec4<f32>(col, 1.0));
@@ -266,8 +283,9 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
   let T = fog_transmittance_primary(ro, rd, t_scene);
   let fogc = fog_color(rd);
 
-  let fog_amt = (1.0 - T) * FOG_PRIMARY_VIS;
-  let col = mix(surface, fogc, fog_amt);
+  let fog_k = FOG_PRIMARY_VIS;           // treat as artistic scaler
+  let Tf = clamp(1.0 - (1.0 - T) * fog_k, 0.0, 1.0);
+  let col = surface * Tf + fogc * (1.0 - Tf);
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
   textureStore(color_img, ip, vec4<f32>(col, 1.0));
@@ -402,7 +420,8 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
   let god = (vec3<f32>(1.0) - exp(-god_raw));
 
   let hdr = max(base + COMPOSITE_GOD_SCALE * god, vec3<f32>(0.0));
-  let ldr = tonemap_exp(hdr);
+  let mapped = tonemap_aces(hdr * POST_EXPOSURE);
+  let ldr = gamma_encode(mapped);
 
   textureStore(out_img, ip, vec4<f32>(ldr, 1.0));
 }

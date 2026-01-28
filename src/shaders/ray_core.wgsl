@@ -665,19 +665,67 @@ fn color_for_material(m: u32) -> vec3<f32> {
   return vec3<f32>(1.0, 0.0, 1.0);
 }
 
+fn hemi_ambient(n: vec3<f32>) -> vec3<f32> {
+  let upw = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+  let sky = sky_color(vec3<f32>(0.0, 1.0, 0.0));
+  let grd = FOG_COLOR_GROUND; // or a warmer ground tint
+  return mix(grd, sky, upw);
+}
+
+fn hash31(p: vec3<f32>) -> f32 {
+  let h = dot(p, vec3<f32>(127.1, 311.7, 74.7));
+  return fract(sin(h) * 43758.5453);
+}
+
+fn material_variation(world_p: vec3<f32>, cell_size_m: f32) -> f32 {
+  let cell = floor(world_p / cell_size_m);
+  return (hash31(cell) - 0.5) * 2.0; // now v in [-1, +1]
+}
+
+fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f32> {
+  var c = base;
+
+  // One shared noise value per patch (stable, no shimmering)
+  let v = material_variation(hp, 0.05); // 0.05m patches for most things
+
+  if (mat == MAT_GRASS) {
+    // small additive tint + slight brightness
+    c += vec3<f32>(0.02 * v, 0.05 * v, 0.01 * v);
+    c *= (1.0 + 0.06 * v);
+  } else if (mat == MAT_DIRT) {
+    c += vec3<f32>(0.04 * v, 0.02 * v, 0.01 * v);
+    c *= (1.0 + 0.08 * v);
+  } else if (mat == MAT_STONE) {
+    // stone mostly brightness variation, little hue
+    c *= (1.0 + 0.10 * v);
+  } else if (mat == MAT_WOOD) {
+    // wood: warm variation
+    c += vec3<f32>(0.05 * v, 0.02 * v, 0.00 * v);
+    c *= (1.0 + 0.07 * v);
+  } else if (mat == MAT_LEAF) {
+    // keep leaves subtle; they already have dapple + wind
+    c += vec3<f32>(0.00 * v, 0.03 * v, 0.00 * v);
+    c *= (1.0 + 0.04 * v);
+  }
+
+  return clamp(c, vec3<f32>(0.0), vec3<f32>(1.5));
+}
+
 fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
   let hp = ro + hg.t * rd;
-  let base = color_for_material(hg.mat);
+  var base = color_for_material(hg.mat);
+  base = apply_material_variation(base, hg.mat, hp);
 
   let voxel_size = cam.voxel_params.x;
   let hp_shadow  = hp + hg.n * (0.75 * voxel_size);
 
-  let shadow = select(1.0, 0.0, in_shadow(hp_shadow, SUN_DIR));
-  let cloud = cloud_sun_transmittance(hp_shadow, SUN_DIR);
+  let vis = sun_transmittance(hp_shadow, SUN_DIR);   // includes clouds + canopy
 
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
-  let ambient = select(0.22, 0.28, hg.mat == MAT_LEAF);
+  let amb_col = hemi_ambient(hg.n);
+  let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF); // tune
+  let ambient = amb_col * amb_strength;
 
   var dapple = 1.0;
   if (hg.mat == MAT_LEAF) {
@@ -687,6 +735,6 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
     dapple = 0.90 + 0.10 * (0.6 * d0 + 0.4 * d1);
   }
 
-  let direct = SUN_COLOR * SUN_INTENSITY * diff * shadow * cloud;
-  return base * (ambient + (1.0 - ambient) * direct) * dapple;
+  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis * dapple;
+  return base * (ambient + direct);
 }

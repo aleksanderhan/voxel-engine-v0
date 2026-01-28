@@ -69,7 +69,7 @@ const FOG_PRIMARY_VIS   : f32 = 0.08;
 const FOG_COLOR_GROUND     : vec3<f32> = vec3<f32>(0.62, 0.64, 0.66);
 const FOG_COLOR_SKY_BLEND  : f32 = 0.20;
 
-const GODRAY_MAX_DIST    : f32 = 80.0;
+const GODRAY_MAX_DIST    : f32 = 120.0;
 const GODRAY_STRENGTH    : f32 = 4.0;
 
 const GODRAY_OFFAXIS_POW : f32 = 3.0;
@@ -91,8 +91,8 @@ const GODRAY_HAZE_NEAR_FADE: f32 = 18.0; // meters: haze ramps in with distance
 
 
 const INV_4PI      : f32 = 0.0795774715;
-const PHASE_G      : f32 = 0.10;
-const PHASE_MIE_W  : f32 = 0.25;
+const PHASE_G      : f32 = 0.55;
+const PHASE_MIE_W  : f32 = 0.60;
 
 // ------------------------------------------------------------
 // Fractal clouds
@@ -177,7 +177,7 @@ const COMPOSITE_GOD_SCALE : f32 = 3.0;
 const COMPOSITE_BEAM_COMPRESS : bool = true;
 
 // Post
-const POST_EXPOSURE : f32 = 1.15;
+const POST_EXPOSURE : f32 = 0.15;
 
 // ------------------------------------------------------------
 // GPU structs (must match Rust layouts)
