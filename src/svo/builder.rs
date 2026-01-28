@@ -1,6 +1,6 @@
 // src/svo/builder.rs
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{collections::HashMap, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
 use crate::{
     config,
@@ -146,13 +146,32 @@ fn prefix_sum_cube(prefix: &[u32], side: usize, x0: usize, y0: usize, z0: usize,
     s as u32
 }
 
+/// Optional immutable edit data for a single chunk (local voxel coords -> material).
+/// The presence of a key means “override procedural material”, even if value is AIR.
+pub type ChunkEditMap = Arc<HashMap<u32, u32>>;
+
+#[inline(always)]
+fn pack_local_64(lx: i32, ly: i32, lz: i32) -> u32 {
+    // CHUNK_SIZE must be 64 for this packing.
+    // bits: lx(6) | lz(6)<<6 | ly(6)<<12
+    (lx as u32) | ((lz as u32) << 6) | ((ly as u32) << 12)
+}
+
 /// Cancelable build with reusable scratch (fast path).
+///
+/// `chunk_edits`:
+/// - None => purely procedural world
+/// - Some(map) => overrides for this chunk (local coords), used for editing.
+///
+/// IMPORTANT correctness rule:
+/// If edits exist, we avoid procedural-only pruning early-outs (they can be wrong).
 pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     gen: &WorldGen,
     chunk_origin: [i32; 3],
     chunk_size: u32,
     cancel: &AtomicBool,
-    scratch: &mut BuildScratch,
+    scratch: &mut super::builder::BuildScratch,
+    chunk_edits: Option<&ChunkEditMap>,
 ) -> Vec<NodeGpu> {
     if should_cancel(cancel) {
         return Vec::new();
@@ -170,8 +189,19 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     let vpm: i32 = config::VOXELS_PER_METER as i32;
     debug_assert!(vpm > 0);
 
+    // Editing flag (used to disable procedural-only pruning).
+    let has_edits = chunk_edits
+        .map(|m| !m.is_empty())
+        .unwrap_or(false);
+
+    let edit_lookup = |lx: i32, ly: i32, lz: i32| -> Option<u32> {
+        let Some(m) = chunk_edits else { return None; };
+        let k = pack_local_64(lx, ly, lz);
+        m.get(&k).copied()
+    };
+
     // -------------------------------------------------------------------------
-    // Height cache (local array)
+    // Height cache (local array) for procedural ground_height() sampling
     // -------------------------------------------------------------------------
     let margin_m: i32 = 6;
     let margin: i32 = margin_m * vpm + (vpm - 1);
@@ -207,7 +237,6 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         }
     };
 
-
     // -------------------------------------------------------------------------
     // Tree cache/mask (fast O(1) material lookup)
     // -------------------------------------------------------------------------
@@ -221,9 +250,9 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     );
 
     // -------------------------------------------------------------------------
-    // 2D maps (ground)
+    // 2D ground maps (procedural; edits can override later in 3D material)
     // -------------------------------------------------------------------------
-    BuildScratch::ensure_2d(&mut scratch.ground, side, 0);
+    super::builder::BuildScratch::ensure_2d(&mut scratch.ground, side, 0);
 
     for lz in 0..cs_i {
         if (lz & 15) == 0 && should_cancel(cancel) {
@@ -247,9 +276,9 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     );
 
     // -------------------------------------------------------------------------
-    // Tree top stamp (2D) for fast “above everything” pruning
+    // Tree top stamp (2D) for fast “above everything” pruning (procedural only)
     // -------------------------------------------------------------------------
-    BuildScratch::ensure_2d(&mut scratch.tree_top, side, -1);
+    super::builder::BuildScratch::ensure_2d(&mut scratch.tree_top, side, -1);
 
     let pad_m = 4;
     let xm0 = (chunk_ox.div_euclid(vpm)) - pad_m;
@@ -311,9 +340,9 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         build_max_mip_inplace(&scratch.tree_top, cs_u, &mut scratch.tree_levels);
 
     // -------------------------------------------------------------------------
-    // Precompute per-voxel material + occupancy (terrain + trees only)
+    // Precompute per-voxel material + occupancy (terrain + trees + edits)
     // -------------------------------------------------------------------------
-    BuildScratch::ensure_3d_u32(&mut scratch.material, side, AIR);
+    super::builder::BuildScratch::ensure_3d_u32(&mut scratch.material, side, AIR);
 
     let dirt_depth = 3 * vpm;
 
@@ -326,13 +355,20 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
         for lz in 0..cs_i {
             for lx in 0..cs_i {
+                // First: edit override (presence means override, even AIR)
+                if let Some(ovr) = edit_lookup(lx, ly, lz) {
+                    let i3 = idx3(side, lx as usize, ly as usize, lz as usize);
+                    scratch.material[i3] = ovr;
+                    continue;
+                }
+
+                // Otherwise: procedural terrain + trees (fast)
                 let wx = chunk_ox + lx;
                 let wz = chunk_oz + lz;
 
                 let col = idx2(side, lx as usize, lz as usize);
                 let g = scratch.ground[col];
 
-                // base terrain + trees (FAST)
                 let m: u32 = if wy < g {
                     if wy >= g - dirt_depth { DIRT } else { STONE }
                 } else if wy == g {
@@ -352,7 +388,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     // -------------------------------------------------------------------------
     // Prefix sum over solid occupancy
     // -------------------------------------------------------------------------
-    BuildScratch::ensure_prefix(&mut scratch.prefix, side);
+    super::builder::BuildScratch::ensure_prefix(&mut scratch.prefix, side);
     let dim = side + 1;
 
     for z in 1..=side {
@@ -390,6 +426,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         tree_mip: &MaxMipView<'_>,
         dirt_depth: i32,
         cancel: &AtomicBool,
+        has_edits: bool,
     ) -> NodeGpu {
         if should_cancel(cancel) {
             return NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 };
@@ -397,24 +434,27 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
         let size_u = size as u32;
 
-        let (gmin, gmax) = ground_mip.query(ox, oz, size_u);
-        let tmax = tree_mip.query_max(ox, oz, size_u);
+        // If edits exist, these two procedural-only early-outs can be wrong.
+        if !has_edits {
+            let (gmin, gmax) = ground_mip.query(ox, oz, size_u);
+            let tmax = tree_mip.query_max(ox, oz, size_u);
 
-        let y0 = chunk_oy + oy;
-        let y1 = y0 + size - 1;
+            let y0 = chunk_oy + oy;
+            let y1 = y0 + size - 1;
 
-        // above everything (ground or tree top)
-        let top_solid = gmax.max(tmax);
-        if y0 > top_solid {
-            return NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 };
+            // above everything (ground or tree top)
+            let top_solid = gmax.max(tmax);
+            if y0 > top_solid {
+                return NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 };
+            }
+
+            // deep solid stone (below dirt band everywhere in this node footprint)
+            if y1 < gmin - dirt_depth {
+                return NodeGpu { child_base: LEAF, child_mask: 0, material: STONE, _pad: 0 };
+            }
         }
 
-        // deep solid stone (below dirt band everywhere in this node footprint)
-        if y1 < gmin - dirt_depth {
-            return NodeGpu { child_base: LEAF, child_mask: 0, material: STONE, _pad: 0 };
-        }
-
-        // empty check via prefix
+        // empty check via prefix (always correct)
         let sx = ox as usize;
         let sy = oy as usize;
         let sz = oz as usize;
@@ -457,6 +497,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
                 tree_mip,
                 dirt_depth,
                 cancel,
+                has_edits,
             );
         }
 
@@ -494,6 +535,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         &tree_mip,
         dirt_depth,
         cancel,
+        has_edits,
     );
 
     if should_cancel(cancel) {

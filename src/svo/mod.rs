@@ -1,6 +1,7 @@
 // src/svo/mod.rs
 pub mod builder;
 pub mod mips;
+pub mod raycast;
 
 pub use builder::{
     BuildScratch,

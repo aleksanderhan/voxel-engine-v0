@@ -5,5 +5,5 @@
 pub mod manager;
 pub mod node_arena;
 
-pub use manager::{ChunkManager, ChunkUpload};
+pub use manager::{ChunkManager, ChunkUpload, VoxelEdit};
 pub use node_arena::NodeArena;

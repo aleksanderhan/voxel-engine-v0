@@ -73,6 +73,7 @@ pub struct App {
 
     frame_index: u32,
 
+    edits: Arc<crate::edit::VoxelEdits>,
 }
 
 impl App {
@@ -119,6 +120,8 @@ impl App {
 
         let clipmap = Clipmap::new();
 
+        let edits = Arc::new(crate::edit::VoxelEdits::default());
+
         Self {
             window,
             start_time,
@@ -137,6 +140,7 @@ impl App {
             fps_frames: 0,
             fps_last: Instant::now(),
             frame_index: 0,
+            edits,
         }
     }
 
@@ -182,6 +186,73 @@ impl App {
         // 1) camera integrate
         self.camera.integrate_input(&mut self.input);
         self.frame_index = self.frame_index.wrapping_add(1);
+
+        use crate::streaming::manager::VoxelEdit;
+        use crate::world::materials::{AIR, DIRT};
+
+        let (dig, place) = self.input.take_mouse_clicks();
+        if (dig || place) {
+            println!("CLICK dig={} place={} focused={}", dig, place, self.input.focused);
+            let ray_o_m = self.camera.position();
+            let ray_d_m = self.camera.forward();
+
+            let vs = config::VOXEL_SIZE_M_F32;
+            let ray_o_vox = ray_o_m / vs;
+            let ray_d_vox = ray_d_m / vs;
+
+            let mut best: Option<crate::svo::raycast::Hit> = None;
+
+            for (chunk_origin_vox, nodes) in self.chunks.resident_chunks_for_raycast() {
+                if let Some((t_vox, voxel, normal, mat)) =
+                    crate::svo::raycast::raycast_chunk_svo_vox(&nodes, chunk_origin_vox, ray_o_vox, ray_d_vox)
+                {
+                    let t_m = t_vox * vs;
+                    if t_m >= 0.0 && best.map_or(true, |h| t_m < h.t_m) {
+                        best = Some(crate::svo::raycast::Hit { t_m, voxel, normal, material: mat });
+                    }
+                }
+            }
+
+            if let Some(hit) = best {
+                println!(
+                    "HIT t_m={} voxel={:?} normal={:?} mat={}",
+                    hit.t_m, hit.voxel, hit.normal, hit.material
+                );
+                let mut edits = Vec::with_capacity(1);
+
+                if dig {
+                    edits.push(VoxelEdit {
+                        x: hit.voxel[0],
+                        y: hit.voxel[1],
+                        z: hit.voxel[2],
+                        material: AIR,
+                    });
+                }
+
+                if place {
+                    let pv = [
+                        hit.voxel[0] + hit.normal[0],
+                        hit.voxel[1] + hit.normal[1],
+                        hit.voxel[2] + hit.normal[2],
+                    ];
+                    edits.push(VoxelEdit {
+                        x: pv[0],
+                        y: pv[1],
+                        z: pv[2],
+                        material: DIRT,
+                    });
+                }
+
+                if !edits.is_empty() {
+                    println!("APPLY edits={:?}", edits);
+                    self.chunks.apply_edits(&edits);
+                }
+            } else {
+                println!("NO HIT (no resident chunk intersected / all air?)");
+            }
+        }
+
+
 
         // 2) streaming update
         let cam_pos = self.camera.position();
@@ -291,5 +362,6 @@ impl App {
 
         self.renderer.queue().submit(Some(encoder.finish()));
         frame.present();
+        
     }
 }

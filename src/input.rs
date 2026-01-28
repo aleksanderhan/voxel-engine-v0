@@ -35,6 +35,11 @@ pub struct InputState {
     pub focused: bool,
     pub mouse_dx: f32,
     pub mouse_dy: f32,
+
+    pub lmb_down: bool,
+    pub rmb_down: bool,
+    pub lmb_pressed: bool, // edge
+    pub rmb_pressed: bool, // edge
 }
 
 impl InputState {
@@ -85,8 +90,44 @@ impl InputState {
                 false
             }
 
+            WindowEvent::MouseInput { state, button, .. } => {
+                let down = *state == ElementState::Pressed;
+
+                // click-to-capture
+                if down && !self.focused {
+                    self.focused = true;
+                    let _ = window
+                        .set_cursor_grab(CursorGrabMode::Locked)
+                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+                    window.set_cursor_visible(false);
+                    return true; // consume this click (so first click just captures)
+                }
+
+                match button {
+                    winit::event::MouseButton::Left => {
+                        self.lmb_pressed = down && !self.lmb_down;
+                        self.lmb_down = down;
+                    }
+                    winit::event::MouseButton::Right => {
+                        self.rmb_pressed = down && !self.rmb_down;
+                        self.rmb_down = down;
+                    }
+                    _ => {}
+                }
+                false
+            }
+
+
             _ => false,
         }
+    }
+
+    pub fn take_mouse_clicks(&mut self) -> (bool, bool) {
+        let l = self.lmb_pressed;
+        let r = self.rmb_pressed;
+        self.lmb_pressed = false;
+        self.rmb_pressed = false;
+        (l, r)
     }
 
     pub fn take_mouse_delta(&mut self) -> (f32, f32) {

@@ -8,6 +8,7 @@ mod render;
 mod streaming;
 mod svo;
 mod world;
+mod edit;
 
 use std::sync::Arc;
 use winit::{
