@@ -1,7 +1,4 @@
 // src/render/state/mod.rs
-// -----------------------
-// Multi-pass renderer built around compute shaders plus a final blit render pass.
-
 mod bindgroups;
 mod buffers;
 mod layout;
@@ -9,7 +6,8 @@ mod pipelines;
 pub mod textures;
 
 use crate::{
-    render::gpu_types::{CameraGpu, OverlayGpu},
+    config,
+    render::gpu_types::{CameraGpu, ClipmapGpu, OverlayGpu},
     streaming::ChunkUpload,
 };
 
@@ -140,20 +138,52 @@ impl Renderer {
             .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
     }
 
-    // UPDATED: nodes are Arc<[NodeGpu]> so we can upload without cloning large Vecs.
+    pub fn write_clipmap(&self, clip: &ClipmapGpu) {
+        self.queue
+            .write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
+    }
+
+    pub fn write_clipmap_level(&self, level: u32, data_m: &[f32]) {
+        let res = config::CLIPMAP_RES as usize;
+        let expected = res * res;
+        if data_m.len() != expected {
+            return;
+        }
+
+        let bytes: &[u8] = bytemuck::cast_slice(data_m);
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.textures.clip_height.tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: level },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some((config::CLIPMAP_RES * 4) as u32),
+                rows_per_image: Some(config::CLIPMAP_RES),
+            },
+            wgpu::Extent3d {
+                width: config::CLIPMAP_RES,
+                height: config::CLIPMAP_RES,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     pub fn apply_chunk_uploads(&self, uploads: Vec<ChunkUpload>) {
         let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
         let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
 
         for u in uploads {
-            // Chunk metadata write (always present).
             if u.slot < self.buffers.chunk_capacity {
                 let meta_off = (u.slot as u64) * meta_stride;
                 self.queue
                     .write_buffer(&self.buffers.chunk, meta_off, bytemuck::bytes_of(&u.meta));
             }
 
-            // Node payload write (only when nodes are included for this chunk).
             if !u.nodes.is_empty() {
                 let needed = u.nodes.len() as u32;
 

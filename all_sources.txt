@@ -1,4 +1,29 @@
-// src/app/mod.rs
+Im building a ratraced svo engine in rust. I want to render stuff outside the loaded svo chunks wihout loading them.
+
+
+2D clipmap height/normal texture (CPU-updated), shader intersects that
+
+A clipmap is a set of nested rings of textures around the camera (like a mipmapped donut) updated incrementally as the camera moves.
+
+You stream just 2D data:
+
+height (and optionally material id)
+
+maybe a normal map derived from height
+
+Then the shader, when outside SVO, intersects ray with that heightfield and shades it.
+
+Tradeoffs
+
+far terrain matches CPU worldgen exactly (because CPU writes heights)
+
+cheap memory and bandwidth (2D, not SVO nodes)
+
+you have to implement clipmap update logic (still simpler than SVO streaming)
+
+Here is the codebase:
+
+
 // --------------
 // src/app/mod.rs
 //
@@ -405,8 +430,7 @@ impl App {
     }
 }
 
-// src/camera.rs
-// -------------
+
 // src/camera.rs
 use glam::{Mat4, Vec3};
 
@@ -515,8 +539,7 @@ impl Camera {
     }
 }
 
-// src/config.rs
-// -------------
+
 // src/config.rs
 // -------------
 // Global config knobs for the voxel/SVO renderer + streaming.
@@ -542,110 +565,7 @@ pub const NODE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
 // This is the *total* bytes of cached NodeGpu arrays across all cached chunks.
 pub const CHUNK_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024; // 512 MB
 
-// src/input.rs
-// ------------
-// src/input.rs
-use winit::{
-    event::{DeviceEvent, ElementState, KeyEvent, WindowEvent},
-    keyboard::{KeyCode, PhysicalKey},
-    window::{CursorGrabMode, Window},
-};
 
-#[derive(Default, Clone, Copy)]
-pub struct KeyState {
-    pub w: bool,
-    pub a: bool,
-    pub s: bool,
-    pub d: bool,
-    pub space: bool,
-    pub alt: bool,
-}
-
-impl KeyState {
-    pub fn set(&mut self, code: KeyCode, down: bool) {
-        match code {
-            KeyCode::KeyW => self.w = down,
-            KeyCode::KeyA => self.a = down,
-            KeyCode::KeyS => self.s = down,
-            KeyCode::KeyD => self.d = down,
-            KeyCode::Space => self.space = down,
-            KeyCode::AltLeft | KeyCode::AltRight => self.alt = down,
-            _ => {}
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct InputState {
-    pub keys: KeyState,
-    pub focused: bool,
-    pub mouse_dx: f32,
-    pub mouse_dy: f32,
-}
-
-impl InputState {
-    pub fn on_device_event(&mut self, event: &DeviceEvent) {
-        if !self.focused {
-            return;
-        }
-        if let DeviceEvent::MouseMotion { delta } = event {
-            self.mouse_dx += delta.0 as f32;
-            self.mouse_dy += delta.1 as f32;
-        }
-    }
-
-    /// Returns true if event is fully handled/consumed.
-    pub fn on_window_event(&mut self, event: &WindowEvent, window: &Window) -> bool {
-        match event {
-            WindowEvent::Focused(f) => {
-                self.focused = *f;
-                if self.focused {
-                    let _ = window
-                        .set_cursor_grab(CursorGrabMode::Locked)
-                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
-                    window.set_cursor_visible(false);
-                } else {
-                    let _ = window.set_cursor_grab(CursorGrabMode::None);
-                    window.set_cursor_visible(true);
-                }
-                true
-            }
-
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let KeyEvent {
-                    physical_key: PhysicalKey::Code(code),
-                    state,
-                    ..
-                } = event
-                {
-                    let down = *state == ElementState::Pressed;
-                    self.keys.set(*code, down);
-
-                    if down && *code == KeyCode::Escape {
-                        self.focused = false;
-                        let _ = window.set_cursor_grab(CursorGrabMode::None);
-                        window.set_cursor_visible(true);
-                        return true;
-                    }
-                }
-                false
-            }
-
-            _ => false,
-        }
-    }
-
-    pub fn take_mouse_delta(&mut self) -> (f32, f32) {
-        let dx = self.mouse_dx;
-        let dy = self.mouse_dy;
-        self.mouse_dx = 0.0;
-        self.mouse_dy = 0.0;
-        (dx, dy)
-    }
-}
-
-// src/main.rs
-// -----------
 // src/main.rs
 mod app;
 mod camera;
@@ -674,219 +594,1601 @@ fn main() {
     pollster::block_on(app::run(event_loop, window));
 }
 
-// src/shaders/blit.wgsl
-// ---------------------
-// blit.wgsl
-//
-// Minimal fullscreen blit + tiny HUD:
-//
-// 1) Vertex shader emits a single fullscreen triangle (no vertex buffers).
-//    This is a common trick to avoid cracks/precision issues on a fullscreen quad.
-// 2) Fragment shader:
-//    - samples the HDR-ish compute output texture
-//    - applies a simple tonemap-like curve: c / (c + 1)
-//    - optionally draws a tiny 3x5-pixel-font FPS overlay in the top-right.
-//
-// Bindings (must match Rust bind group layout `layouts.blit`):
-//   @group(0) @binding(0): sampled output texture (img)
-//   @group(0) @binding(1): sampler (samp)
-//   @group(0) @binding(2): uniform overlay struct (fps + dimensions)
 
-@group(0) @binding(0) var img : texture_2d<f32>;
-@group(0) @binding(1) var samp : sampler;
-
-// Overlay uniform block written from CPU each frame (or periodically for fps).
-// `width/height` are used to place the overlay in screen space.
-// `_pad0` keeps the struct 16-byte aligned (nice for uniform layout rules).
-struct Overlay {
-  fps    : u32,
-  width  : u32,
-  height : u32,
-  _pad0  : u32,
-};
-@group(0) @binding(2) var<uniform> overlay : Overlay;
-
-
-// -----------------------------------------------------------------------------
-// 3x5 digit font helpers
-// -----------------------------------------------------------------------------
+// src/render/gpu_types.rs
 //
-// Digits are encoded as a 3x5 bitmap packed into 15 bits, row-major:
-//   bit = y*3 + x
-// with (x,y) = (0,0) being the top-left pixel of the digit cell.
+// GPU-facing data layouts shared between Rust and WGSL.
 //
-// Example for "0":
-//   111
-//   101
-//   101
-//   101
-//   111
+// These structs are written into uniform/storage buffers and read by shaders.
+// Requirements for correctness:
+// - `#[repr(C)]` fixes a predictable field order/layout.
+// - `Pod` + `Zeroable` (bytemuck) guarantee the types can be safely cast to bytes.
+// - Fields are sized/aligned to match WGSL expectations (notably 16-byte alignment rules).
 //
-// The returned constants are the 15-bit masks for digits 0..9.
+// Practical note about padding:
+// WGSL has strict alignment for uniform/storage layouts (e.g. vec3/vec4 alignment),
+// so we often include explicit `_pad*` fields to keep everything 16-byte aligned.
 
-fn digit_mask(d: u32) -> u32 {
-  // 3x5 digits packed into 15 bits (row-major), bit0 = top-left.
-  if (d == 0u) { return 0x7B6Fu; } // 111 101 101 101 111
-  if (d == 1u) { return 0x749Au; } // 010 110 010 010 111
-  if (d == 2u) { return 0x73E7u; } // 111 001 111 100 111
-  if (d == 3u) { return 0x79E7u; } // 111 001 111 001 111
-  if (d == 4u) { return 0x49EDu; } // 101 101 111 001 001
-  if (d == 5u) { return 0x79CFu; } // 111 100 111 001 111
-  if (d == 6u) { return 0x7BCFu; } // 111 100 111 101 111
-  if (d == 7u) { return 0x4927u; } // 111 001 001 001 001
-  if (d == 8u) { return 0x7BEFu; } // 111 101 111 101 111
-  if (d == 9u) { return 0x79EFu; } // 111 101 111 001 111
-  return 0u;
+use bytemuck::{Pod, Zeroable};
+
+/// Node in the GPU-side node arena (likely an SVO / tree / BVH-like structure).
+///
+/// Expected usage:
+/// - Stored in a STORAGE buffer (read-only from shaders in this codebase).
+/// - Addressed by index; child pointers are expressed as a base index + mask.
+///
+/// Field ideas (based on naming):
+/// - child_base: base index of this node's children in the global node arena.
+/// - child_mask: bitmask indicating which child slots are present/valid.
+/// - material: per-node material/voxel payload (id/flags/packed params).
+/// - _pad: explicit padding to keep 16-byte stride (nice for storage access patterns).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct NodeGpu {
+    pub child_base: u32,
+    pub child_mask: u32,
+    pub material: u32,
+    pub _pad: u32,
 }
 
-// Return true if the digit mask has a "pixel on" at (x,y) in a 3x5 grid.
-fn mask_bit(mask: u32, x: u32, y: u32) -> bool {
-  // x in [0..2], y in [0..4]
-  let bit = y * 3u + x;
-  return ((mask >> bit) & 1u) != 0u;
+/// Per-chunk metadata stored in a persistent STORAGE buffer.
+///
+/// Shaders use this to locate the chunk in world space and map the chunk to its nodes
+/// within the global node arena.
+///
+/// - origin: chunk origin in chunk coordinates (xyz) with a spare lane for alignment.
+/// - node_base/node_count: range into the node arena that belongs to this chunk.
+/// - _pad*: explicit padding to preserve alignment / struct stride.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct ChunkMetaGpu {
+    /// Chunk origin expressed as i32 for easy chunk-space arithmetic in shaders.
+    /// origin[3] is unused padding (keeps 16B alignment for the next fields).
+    pub origin: [i32; 4],
+
+    /// First node index in the node arena for this chunk.
+    pub node_base: u32,
+
+    /// Number of nodes belonging to this chunk.
+    pub node_count: u32,
+
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
+/// Camera + frame parameters packed for GPU consumption.
+///
+/// Stored as a UNIFORM buffer, updated once per frame.
+///
+/// Contents are tailored for screen-space ray generation / ray marching:
+/// - Inverse matrices let the shader reconstruct world-space rays from pixel coords.
+/// - cam_pos is vec4-aligned for uniform layout friendliness.
+/// - Chunk/grid parameters tell the shader how to interpret streamed chunk data.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct CameraGpu {
+    /// Inverse view matrix (camera -> world transform).
+    pub view_inv: [[f32; 4]; 4],
+
+    /// Inverse projection matrix (clip -> view transform).
+    pub proj_inv: [[f32; 4]; 4],
+
+    /// Camera position in world space. Fourth component is padding (or could be 1.0).
+    pub cam_pos: [f32; 4],
+
+    /// Voxel chunk edge length (in voxels) for index math in shaders.
+    pub chunk_size: u32,
+
+    /// Number of chunk slots currently considered resident/valid.
+    pub chunk_count: u32,
+
+    /// Max raymarch/trace steps for the primary shader.
+    pub max_steps: u32,
+
+    pub _pad0: u32,
+
+    /// Misc per-frame voxel/shader knobs.
+    /// (Meaning is shader-defined; typical uses: voxel size, time, density, jitter, etc.)
+    pub voxel_params: [f32; 4],
+
+    /// Chunk grid origin in chunk coordinates (cx0, cy0, cz0, unused).
+    /// This is the chunk-space coordinate of grid cell (0,0,0).
+    pub grid_origin_chunk: [i32; 4],
+
+    /// Chunk grid dimensions (nx, ny, nz, unused).
+    /// Used to bounds-check and map 3D grid coords -> linear index into chunk_grid buffer.
+    pub grid_dims: [u32; 4],
+}
+
+/// Tiny overlay uniform block for the final blit / UI overlay.
+///
+/// Stored as a UNIFORM buffer, updated periodically (FPS) and on resize (width/height).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct OverlayGpu {
+    /// FPS value displayed in the overlay.
+    pub fps: u32,
+
+    /// Output width in pixels.
+    pub width: u32,
+
+    /// Output height in pixels.
+    pub height: u32,
+
+    pub _pad0: u32,
 }
 
 
-// -----------------------------------------------------------------------------
-// Fullscreen triangle vertex shader
-// -----------------------------------------------------------------------------
+// src/render/mod.rs
+
+pub mod gpu_types;
+pub mod resources;
+pub mod shaders;
+pub mod state;
+
+pub use gpu_types::*;
+pub use state::Renderer;
+
+
+// src/render/resources.rs
 //
-// Output:
-// - @builtin(position): clip-space position
-// - @location(0): UV in [0..1] (with overshoot values on the other two verts)
-//   that interpolates correctly across the fullscreen triangle.
+// Small GPU resource helpers that don't fit cleanly into the renderer "state" modules.
+//
+// Right now this file provides the final full-resolution output texture:
+// - written as a STORAGE texture by the composite compute pass
+// - sampled as a regular texture by the final blit render pass
+//
+// Keeping this as a tiny helper makes the main texture set code a bit cleaner.
 
-struct VSOut {
-  @builtin(position) pos: vec4<f32>,
-  @location(0) uv: vec2<f32>,
-};
+/// Wrapper for the renderer's final output texture view.
+///
+/// The renderer stores only the TextureView; the view keeps the underlying texture alive
+/// for as long as it exists (wgpu uses ref-counted internal ownership).
+pub struct OutputTex {
+    /// Texture view bound in bind groups (storage write in compute, sampled in blit).
+    pub view: wgpu::TextureView,
+}
 
-@vertex
-fn vs_main(@builtin(vertex_index) i: u32) -> VSOut {
-  // Fullscreen triangle in clip space.
-  //
-  // (-1,-1) is bottom-left, (3,-1) and (-1,3) extend beyond the screen so the
-  // triangle fully covers the viewport after clipping.
-  var p = array<vec2<f32>, 3>(
-    vec2<f32>(-1.0, -1.0),
-    vec2<f32>( 3.0, -1.0),
-    vec2<f32>(-1.0,  3.0)
-  );
+/// Create the final output texture (full resolution).
+///
+/// Properties:
+/// - Format: RGBA16F (high dynamic range, good for post-processing)
+/// - Usage:
+///   - STORAGE_BINDING: composite pass writes into it as a storage texture
+///   - TEXTURE_BINDING: blit pass samples it in the fragment shader
+///
+/// Notes:
+/// - wgpu forbids zero-sized textures, so we clamp `w`/`h` to at least 1.
+pub fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> OutputTex {
+    // Avoid creating zero-sized textures (can happen during minimize/resizes).
+    let w = w.max(1);
+    let h = h.max(1);
 
-  // UVs chosen so the interpolated UV lands in [0..1] over the visible region.
-  // This avoids needing a quad/indices/vertex buffer.
-  var uv = array<vec2<f32>, 3>(
-    vec2<f32>(0.0, 1.0),
-    vec2<f32>(2.0, 1.0),
-    vec2<f32>(0.0, -1.0)
-  );
+    // Allocate the GPU texture backing store.
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("output_tex"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        // Must support both compute writes and render sampling.
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
 
-  var o: VSOut;
-  o.pos = vec4<f32>(p[i], 0.0, 1.0);
-  o.uv = uv[i];
-  return o;
+    // Default view covers the whole texture.
+    let view = tex.create_view(&Default::default());
+
+    OutputTex { view }
 }
 
 
-// -----------------------------------------------------------------------------
-// Fragment shader: sample + tonemap + FPS overlay
-// -----------------------------------------------------------------------------
+// src/render/shaders.rs
+//
+// Centralized shader sources. WGSL has no native include mechanism in wgpu,
+// so we concatenate multiple WGSL files into a single source string.
 
-@fragment
-fn fs_main(@builtin(position) frag_pos: vec4<f32>, @location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+pub const RAY_CS_WGSL: &str = concat!(
+    include_str!("../shaders/common.wgsl"),
+    "\n",
+    include_str!("../shaders/ray_core.wgsl"),
+    "\n",
+    include_str!("../shaders/ray_main.wgsl"),
+    "\n",
+);
 
-  // Sample the renderer's final output texture.
-  let c = textureSample(img, samp, uv);
+pub const BLIT_WGSL: &str = include_str!("../shaders/blit.wgsl");
 
-  // Simple tonemap-ish curve:
-  // - keeps values in [0..1)
-  // - preserves highlight detail somewhat for HDR-ish inputs
-  var rgb = c.rgb / (c.rgb + vec3<f32>(1.0));
+// Optional function wrappers (keeps call sites like shaders::ray_cs_wgsl()).
+#[inline]
+pub fn ray_cs_wgsl() -> &'static str {
+    RAY_CS_WGSL
+}
 
-  // ---- FPS overlay (top-right) ----
-  //
-  // The overlay draws up to 4 digits (clamped to 9999) using the 3x5 font,
-  // scaled by `scale`, with a small margin from the top-right corner.
-  //
-  // Coordinate note:
-  // `@builtin(position) frag_pos` is in framebuffer pixel coordinates.
-  // This code treats (0,0) as the *top-left* for overlay placement by using
-  // the provided overlay.height/width and direct pixel comparisons.
+#[inline]
+pub fn blit_wgsl() -> &'static str {
+    BLIT_WGSL
+}
 
-  // Screen size passed from CPU.
-  let dims = vec2<u32>(overlay.width, overlay.height);
+// src/render/state/bindgroups.rs
+//
+// Bind group creation.
+//
+// Bind groups are the concrete "argument packs" you bind before dispatching a
+// compute pass or drawing a render pass. Each bind group must match a specific
+// BindGroupLayout (the pipeline's expectation).
+//
+// This file is split out so resize() only needs to recreate textures and then
+// rebuild bind groups (since bind groups reference texture views).
 
-  // Current fragment coordinates as integer pixels.
-  let px = vec2<u32>(u32(frag_pos.x), u32(frag_pos.y));
+use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
 
-  // Layout parameters (edit to taste)
-  let scale: u32 = 8u;     // size multiplier for each font pixel
-  let digit_w: u32 = 3u * scale;
-  let digit_h: u32 = 5u * scale;
-  let gap: u32 = 1u * scale;
-  let margin: u32 = 12u;
+/// All bind groups used by the renderer.
+///
+/// Naming convention:
+/// - primary/scene are group(0) alternatives for different pipelines.
+/// - godray/composite are additional groups for post processing.
+/// - empty is a placeholder when a pipeline layout expects groups that a pass
+///   doesn't logically use.
+/// - blit is the final render pass bind group (sample output to swapchain).
+pub struct BindGroups {
+    /// group(0) for the primary compute pass.
+    /// Includes storage outputs (color/depth) so the compute shader can write to them.
+    pub primary: wgpu::BindGroup,
 
-  // We always reserve 4 digits worth of space (right-aligned by placement).
-  let num_digits: u32 = 4u;
-  let total_w: u32 = num_digits * digit_w + (num_digits - 1u) * gap;
+    /// group(0) for the godray compute pass.
+    /// Excludes storage outputs to avoid binding the same textures as both storage + sampled.
+    pub scene: wgpu::BindGroup,
 
-  // Compute overlay origin in signed integer space first to avoid u32 underflow.
-  // This allows small windows where (dims.x - margin - total_w) would go negative.
-  let ox_i: i32 = i32(dims.x) - i32(margin) - i32(total_w);
-  let oy_i: i32 = i32(margin);
+    /// group(1) for godray ping-pong history:
+    /// index selects which "direction" we are doing this frame (A->B or B->A).
+    pub godray: [wgpu::BindGroup; 2],
 
-  // Clamp origin to >= 0 to keep comparisons valid.
-  let origin_x: u32 = u32(max(ox_i, 0));
-  let origin_y: u32 = u32(max(oy_i, 0));
+    /// group(2) for composite:
+    /// index selects which godray texture (A or B) we read when composing into `output`.
+    pub composite: [wgpu::BindGroup; 2],
 
-  // Extract 4 digits from FPS (clamp to 0..9999).
-  // d0 is ones, d3 is thousands.
-  var v: u32 = min(overlay.fps, 9999u);
-  let d0: u32 = v % 10u; v = v / 10u;
-  let d1: u32 = v % 10u; v = v / 10u;
-  let d2: u32 = v % 10u; v = v / 10u;
-  let d3: u32 = v % 10u;
+    /// Empty bind group used as a placeholder for group(0/1) in the composite pass.
+    /// Some pipeline layouts are fixed to expect groups that a pass doesn't use.
+    pub empty: wgpu::BindGroup,
 
-  // Overlay bounds test: only do digit math if we're inside the overlay rectangle.
-  if (px.x >= origin_x && px.x < origin_x + total_w && px.y >= origin_y && px.y < origin_y + digit_h) {
-    // Local pixel coords relative to the overlay origin.
-    let local_x = px.x - origin_x;
-    let local_y = px.y - origin_y;
+    /// Bind group for the final blit render pass (texture + sampler + overlay uniform).
+    pub blit: wgpu::BindGroup,
+}
 
-    // Each digit occupies digit_w, followed by gap (except after last digit).
-    let stride = digit_w + gap;
+/// Create bind group for the primary compute pass.
+///
+/// Layout expectations_toggle (by binding index):
+/// 0: camera uniform/storage buffer
+/// 1: chunk buffer
+/// 2: node buffer
+/// 3: chunk grid buffer
+/// 4: color texture view (storage texture the compute shader writes into)
+/// 5: depth texture view (storage texture the compute shader writes into)
+fn make_primary_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffers: &Buffers,
+    textures: &TextureSet,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("primary_bg"),
+        layout,
+        entries: &[
+            // Camera parameters (matrices, position, etc.)
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffers.camera.as_entire_binding(),
+            },
+            // Chunk metadata buffer (streamed voxel/chunk data indexing)
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: buffers.chunk.as_entire_binding(),
+            },
+            // Node/acceleration structure data (whatever "node" represents in your scene)
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buffers.node.as_entire_binding(),
+            },
+            // Grid mapping from world chunk coords -> buffer indices / residency info
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: buffers.chunk_grid.as_entire_binding(),
+            },
+            // Primary color output (storage texture view)
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&textures.color.view),
+            },
+            // Primary depth output (storage texture view)
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&textures.depth.view),
+            },
+        ],
+    })
+}
 
-    // Which digit column is this pixel in? (0 = leftmost).
-    let digit_i = local_x / stride;
+/// Create bind group for "scene" inputs that are common across passes.
+///
+/// This intentionally *does not* include storage outputs, so it can be reused in
+/// compute passes that only read scene data and sample textures elsewhere.
+fn make_scene_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffers: &Buffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("scene_bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffers.camera.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: buffers.chunk.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buffers.node.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: buffers.chunk_grid.as_entire_binding(),
+            },
+        ],
+    })
+}
 
-    // Position within the digit+gap region.
-    let in_digit_x = local_x % stride;
+/// Create bind group for the godray compute pass.
+///
+/// Bindings (by index):
+/// 0: depth (read-only) - used for occlusion / ray marching limits.
+/// 1: history texture (read-only) - previous godray accumulation.
+/// 2: output texture (write) - current frame godray result.
+///
+/// The ping-pong scheme swaps which texture is "history" and which is "out"
+/// each frame to avoid read/write hazards on the same texture.
+fn make_godray_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    depth_view: &wgpu::TextureView,
+    hist_view: &wgpu::TextureView,
+    out_view: &wgpu::TextureView,
+    label: &str,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(hist_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(out_view),
+            },
+        ],
+    })
+}
 
-    // If we're in the gap column area, do nothing (leave underlying rgb).
-    if (in_digit_x < digit_w) {
-      // Map pixel coords into the 3x5 cell coordinates.
-      let cell_x = (in_digit_x / scale); // 0..2
-      let cell_y = (local_y / scale);    // 0..4
+/// Create bind group for the composite compute pass.
+///
+/// Bindings (by index):
+/// 0: base color texture (read-only) - the main scene color.
+/// 1: godray texture (read-only) - chosen ping-pong buffer (A or B).
+/// 2: output texture (write) - final composited frame texture.
+fn make_composite_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    color_view: &wgpu::TextureView,
+    godray_view: &wgpu::TextureView,
+    output_view: &wgpu::TextureView,
+    label: &str,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(godray_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(output_view),
+            },
+        ],
+    })
+}
 
-      // Choose the digit value for this column.
-      // digit_i = 0 is leftmost, so we use d3..d0 to display thousands..ones.
-      var dig: u32 = 0u;
-      if (digit_i == 0u) { dig = d3; }
-      if (digit_i == 1u) { dig = d2; }
-      if (digit_i == 2u) { dig = d1; }
-      if (digit_i == 3u) { dig = d0; }
+/// Create bind group for the final blit render pass.
+///
+/// Bindings (by index):
+/// 0: output texture (read-only) - full-screen texture to present.
+/// 1: sampler - filtering and addressing for sampling output.
+/// 2: overlay uniform buffer - small UI data (FPS/size) consumed by fragment shader.
+fn make_blit_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    output_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    overlay_buf: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("blit_bg"),
+        layout,
+        entries: &[
+            // Fullscreen texture to sample in the fragment shader.
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(output_view),
+            },
+            // Sampler used when sampling the output texture.
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            // Overlay uniforms (FPS, screen size, etc.).
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: overlay_buf.as_entire_binding(),
+            },
+        ],
+    })
+}
 
-      // If the corresponding font bit is set, paint the pixel white.
-      let m = digit_mask(dig);
-      if (mask_bit(m, cell_x, cell_y)) {
-        rgb = vec3<f32>(1.0, 1.0, 1.0);
-      }
+/// Top-level helper to (re)create all bind groups.
+///
+/// Called during initial renderer creation, and again after resize since texture
+/// views change (new textures -> new views -> old bind groups become invalid).
+pub fn create_bind_groups(
+    device: &wgpu::Device,
+    layouts: &Layouts,
+    buffers: &Buffers,
+    textures: &TextureSet,
+    sampler: &wgpu::Sampler,
+) -> BindGroups {
+    // Primary includes storage outputs (color/depth), so it must NOT be used in godray.
+    // Otherwise you'd risk binding the same resource in incompatible ways across passes.
+    let primary = make_primary_bg(device, &layouts.primary, buffers, textures);
+
+    // Scene excludes storage outputs; safe for passes that only need buffers.
+    let scene = make_scene_bg(device, &layouts.scene, buffers);
+
+    // Empty bind group used as placeholder for composite pipeline layout group(0/1).
+    // (Composite pass likely only uses group(2), but the pipeline layout includes 0..2.)
+    let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("empty_bg"),
+        layout: &layouts.empty,
+        entries: &[],
+    });
+
+    // Godray ping-pong:
+    // - godray[0] reads history=A, writes out=B
+    // - godray[1] reads history=B, writes out=A
+    //
+    // `textures.godray` is a pair of textures used to avoid reading and writing the same
+    // texture in a single dispatch.
+    let godray = [
+        make_godray_bg(
+            device,
+            &layouts.godray,
+            &textures.depth.view,
+            &textures.godray[0].view,
+            &textures.godray[1].view,
+            "godray_bg_a_to_b",
+        ),
+        make_godray_bg(
+            device,
+            &layouts.godray,
+            &textures.depth.view,
+            &textures.godray[1].view,
+            &textures.godray[0].view,
+            "godray_bg_b_to_a",
+        ),
+    ];
+
+    // Composite bind groups:
+    // Same pipeline/layout, but choose which godray texture to read (A or B).
+    let composite = [
+        make_composite_bg(
+            device,
+            &layouts.composite,
+            &textures.color.view,
+            &textures.godray[0].view,
+            &textures.output.view,
+            "composite_bg_read_a",
+        ),
+        make_composite_bg(
+            device,
+            &layouts.composite,
+            &textures.color.view,
+            &textures.godray[1].view,
+            &textures.output.view,
+            "composite_bg_read_b",
+        ),
+    ];
+
+    // Blit bind group:
+    // Samples final output into the swapchain; overlay buffer provides UI data.
+    let blit = make_blit_bg(
+        device,
+        &layouts.blit,
+        &textures.output.view,
+        sampler,
+        &buffers.overlay,
+    );
+
+    BindGroups {
+        primary,
+        scene,
+        godray,
+        composite,
+        empty,
+        blit,
     }
-  }
-
-  // Opaque output.
-  return vec4<f32>(rgb, 1.0);
 }
+
+
+// src/render/state/buffers.rs
+//
+// Persistent GPU buffers and capacities.
+//
+// This module owns the long-lived GPU buffers used across frames.
+// It's separated out so the renderer code can focus on passes/encoding, while
+// buffer sizing/allocation logic lives here.
+//
+// Buffer types used here:
+// - UNIFORM buffers: small per-frame parameter blocks (camera, overlay).
+// - STORAGE buffers: larger arenas updated incrementally (nodes, chunk metadata, chunk grid).
+
+use crate::{
+    config,
+    render::gpu_types::{ChunkMetaGpu, NodeGpu},
+};
+
+/// Collection of GPU buffers that persist for the lifetime of the renderer.
+///
+/// These buffers are recreated only when the renderer is created (or when you
+/// decide to change capacities). They are written to each frame via COPY_DST.
+pub struct Buffers {
+    // --- Uniforms (small, frequently updated) ---
+
+    /// Camera uniforms (inverse matrices, camera position, grid params, etc.).
+    /// Written each frame.
+    pub camera: wgpu::Buffer,
+
+    /// Overlay uniforms (FPS and screen size, etc.).
+    /// Written each frame.
+    pub overlay: wgpu::Buffer,
+
+    // --- Persistent storage buffers (larger arenas) ---
+
+    /// Node arena (likely an SVO / acceleration structure node pool).
+    /// Capacity is derived from a fixed byte budget.
+    pub node: wgpu::Buffer,
+
+    /// Chunk metadata array for all resident chunks (as determined by streaming).
+    pub chunk: wgpu::Buffer,
+
+    /// Chunk grid indirection table (u32 handles/indices mapping 3D grid -> chunk slot).
+    pub chunk_grid: wgpu::Buffer,
+
+    // --- Capacities (element counts, not bytes) ---
+
+    /// Number of NodeGpu elements the node arena can hold.
+    pub node_capacity: u32,
+
+    /// Number of ChunkMetaGpu elements the chunk metadata buffer can hold.
+    pub chunk_capacity: u32,
+
+    /// Number of u32 entries in the chunk grid buffer.
+    pub grid_capacity: u32,
+}
+
+/// Helper to create a fixed-size uniform buffer for some POD-ish type `T`.
+///
+/// Usage flags:
+/// - UNIFORM: bind as uniform buffer in shaders
+/// - COPY_DST: allow updating via queue.write_buffer / copy operations
+fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        // Uniform holds exactly one T.
+        size: std::mem::size_of::<T>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Helper to create a storage buffer of a specific byte size.
+///
+/// Usage flags:
+/// - STORAGE: bind as storage buffer (read/write in compute, read in fragment/vertex if allowed)
+/// - COPY_DST: allow CPU uploads
+fn make_storage_buffer(device: &wgpu::Device, label: &str, size_bytes: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Create all persistent buffers with capacities derived from config constants.
+///
+/// Important: this only allocates GPU memory. The actual contents are expected
+/// to be filled/updated by streaming + renderer code at runtime.
+pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
+    // --- Uniform buffers ---
+
+    // Camera uniform buffer (one CameraGpu struct).
+    let camera = make_uniform_buffer::<crate::render::gpu_types::CameraGpu>(device, "camera_buf");
+
+    // Overlay uniform buffer (one OverlayGpu struct).
+    let overlay =
+        make_uniform_buffer::<crate::render::gpu_types::OverlayGpu>(device, "overlay_buf");
+
+    // --- Storage buffers ---
+
+    // Node arena capacity derived from a fixed byte budget.
+    //
+    // NOTE: integer division truncates, which is fine: we allocate as many whole NodeGpu
+    // elements as fit into NODE_BUDGET_BYTES.
+    let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
+
+    // Allocate node arena buffer sized to hold `node_capacity` NodeGpu elements.
+    let node = make_storage_buffer(
+        device,
+        "svo_nodes_arena",
+        (node_capacity as u64) * (std::mem::size_of::<NodeGpu>() as u64),
+    );
+
+    // Chunk meta capacity: max resident chunks in the KEEP box (streaming working set).
+    //
+    // The formula here implies:
+    // - X dimension: (2*KEEP_RADIUS + 1)
+    // - Z dimension: (2*KEEP_RADIUS + 1)
+    // - Y dimension: 4 (hard-coded vertical span; likely number of chunk layers kept)
+    //
+    // So total = X * Y * Z.
+    let chunk_capacity =
+        (2 * config::KEEP_RADIUS + 1) as u32 * 4u32 * (2 * config::KEEP_RADIUS + 1) as u32;
+
+    // Allocate chunk metadata buffer sized to hold `chunk_capacity` ChunkMetaGpu elements.
+    let chunk = make_storage_buffer(
+        device,
+        "chunk_meta_persistent",
+        (chunk_capacity as u64) * (std::mem::size_of::<ChunkMetaGpu>() as u64),
+    );
+
+    // Chunk grid buffer (fixed capacity).
+    //
+    // Stored as u32 indices/handles, likely mapping each grid cell to a slot in `chunk`
+    // or a sentinel for "empty".
+    // Here it's set equal to chunk_capacity, meaning "one u32 per chunk slot".
+    let grid_capacity = chunk_capacity;
+
+    let chunk_grid = make_storage_buffer(
+        device,
+        "chunk_grid_buf",
+        (grid_capacity as u64) * (std::mem::size_of::<u32>() as u64),
+    );
+
+    // Return the assembled buffer set and their capacities.
+    Buffers {
+        camera,
+        overlay,
+        node,
+        chunk,
+        chunk_grid,
+        node_capacity,
+        chunk_capacity,
+        grid_capacity,
+    }
+}
+
+
+// src/render/state/layout.rs
+//
+// Bind group layouts and small "entry constructors" to reduce repetition.
+//
+// A BindGroupLayout is the *schema* for a bind group: it defines which resources
+// exist at which @group/@binding, and how shaders are allowed to access them.
+//
+// This module encodes the contract between WGSL `@group(n) @binding(m)`
+// declarations and the Rust-side wgpu setup. If bindings or types mismatch,
+// pipeline creation or bind group creation will fail (or validation will trip).
+
+pub struct Layouts {
+    /// group(0): scene inputs + storage outputs (color/depth). Used only by the primary pass.
+    pub primary: wgpu::BindGroupLayout,
+
+    /// group(0): scene inputs only (camera + buffers). Used by godray to avoid storage conflicts.
+    pub scene: wgpu::BindGroupLayout,
+
+    /// group(1): godray pass resources (depth sample + history sample + out storage).
+    pub godray: wgpu::BindGroupLayout,
+
+    /// group(2): composite pass resources (color sample + godray sample + output storage).
+    pub composite: wgpu::BindGroupLayout,
+
+    /// Empty layout: used as a placeholder when a pipeline layout expects group(0/1)
+    /// but the composite pass only meaningfully uses group(2).
+    pub empty: wgpu::BindGroupLayout,
+
+    /// Blit render pass layout: sample final output texture + sampler + overlay uniform.
+    pub blit: wgpu::BindGroupLayout,
+}
+
+// -----------------------------------------------------------------------------
+// BindGroupLayoutEntry helpers
+// -----------------------------------------------------------------------------
+//
+// These tiny constructors keep the layout definitions readable and ensure
+// consistent settings (no dynamic offsets, no min_binding_size, etc.).
+
+/// Convenience for a uniform-buffer entry.
+///
+/// - `binding`: WGSL @binding index
+/// - `visibility`: which shader stages can read this binding
+fn bgl_uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            // No dynamic offsets; the entire buffer is bound as-is.
+            has_dynamic_offset: false,
+            // None => let wgpu infer/validate size at bind time.
+            min_binding_size: None,
+        },
+        // Not an array binding.
+        count: None,
+    }
+}
+
+/// Convenience for a read-only storage-buffer entry.
+fn bgl_storage_ro(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+/// Convenience for a sampled 2D texture entry.
+///
+/// `sample_type` must match the WGSL texture type (float/int/uint + filterable or not).
+fn bgl_tex_sample(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+    sample_type: wgpu::TextureSampleType,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// Convenience for a write-only storage texture entry.
+///
+/// Storage textures are typically used as compute outputs.
+/// `format` must match the actual texture format and the WGSL storage texture declaration.
+fn bgl_storage_tex_wo(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+    format: wgpu::TextureFormat,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Layout creation
+// -----------------------------------------------------------------------------
+
+/// Create all bind group layouts used by the renderer.
+///
+/// The specific formats and binding indices here must match the WGSL shader code.
+/// Notes:
+/// - Most compute textures are declared non-filterable, since they are likely written
+///   as storage textures and/or sampled as exact texel values.
+/// - The final blit pass uses a filterable sampler + filterable texture sampling.
+pub fn create_layouts(device: &wgpu::Device) -> Layouts {
+    // Most passes in this file are compute passes; share the stage visibility constant.
+    let cs_vis = wgpu::ShaderStages::COMPUTE;
+
+    // Shared scene entries (group(0)) used by both `scene` and `primary`.
+    //
+    // These bindings must match your WGSL declarations, e.g.:
+    //   @group(0) @binding(0) var<uniform> camera : ...
+    //   @group(0) @binding(1) var<storage, read> chunks : ...
+    // etc.
+    let scene_entries: [wgpu::BindGroupLayoutEntry; 4] = [
+        bgl_uniform(0, cs_vis),    // camera uniform
+        bgl_storage_ro(1, cs_vis), // chunks meta (read-only)
+        bgl_storage_ro(2, cs_vis), // nodes arena (read-only)
+        bgl_storage_ro(3, cs_vis), // chunk grid (read-only)
+    ];
+
+    // group(0) SCENE:
+    // Camera + buffers only.
+    //
+    // Godray pass uses this so it can bind depth/history textures in other groups
+    // without also binding storage outputs that could cause read/write conflicts.
+    let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("scene_bgl"),
+        entries: &scene_entries,
+    });
+
+    // group(0) PRIMARY:
+    // Scene inputs + storage outputs for color/depth.
+    //
+    // This is the "main" compute pass that writes color and depth textures.
+    let mut primary_entries = Vec::with_capacity(6);
+    primary_entries.extend_from_slice(&scene_entries);
+
+    // binding(4): color storage output (rgba16f)
+    primary_entries.push(bgl_storage_tex_wo(
+        4,
+        cs_vis,
+        wgpu::TextureFormat::Rgba16Float,
+    ));
+
+    // binding(5): depth storage output (r32f)
+    primary_entries.push(bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float));
+
+    let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("primary_bgl"),
+        entries: &primary_entries,
+    });
+
+    // group(1) GODRAY:
+    // - depth sampled (r32f)
+    // - history sampled (rgba16f)
+    // - out storage (rgba16f)
+    //
+    // Sampling is marked filterable:false to match typical storage-written float textures.
+    let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("godray_bgl"),
+        entries: &[
+            // binding(0): depth texture (sampled)
+            bgl_tex_sample(
+                0,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            // binding(1): history texture (sampled)
+            bgl_tex_sample(
+                1,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            // binding(2): output storage texture (write-only)
+            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
+        ],
+    });
+
+    // group(2) COMPOSITE:
+    // - color sampled
+    // - godray sampled
+    // - output storage (final offscreen output)
+    let composite = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("composite_bgl"),
+        entries: &[
+            // binding(0): base color texture
+            bgl_tex_sample(
+                0,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            // binding(1): godray texture
+            bgl_tex_sample(
+                1,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            // binding(2): final output storage texture
+            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
+        ],
+    });
+
+    // Empty layout used as a placeholder bind group layout for group(0/1)
+    // in the composite pipeline layout.
+    let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("empty_bgl"),
+        entries: &[],
+    });
+
+    // Blit layout (render pass):
+    // - sampled output texture (filterable, because we likely scale to the swapchain)
+    // - filtering sampler
+    // - overlay uniform (fragment stage)
+    let blit = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("blit_bgl"),
+        entries: &[
+            // binding(0): output texture sampled in fragment shader
+            bgl_tex_sample(
+                0,
+                wgpu::ShaderStages::FRAGMENT,
+                wgpu::TextureSampleType::Float { filterable: true },
+            ),
+            // binding(1): sampler for output texture
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            // binding(2): overlay uniform (fps, dimensions, etc.)
+            bgl_uniform(2, wgpu::ShaderStages::FRAGMENT),
+        ],
+    });
+
+    Layouts {
+        primary,
+        scene,
+        godray,
+        composite,
+        empty,
+        blit,
+    }
+}
+
+
+// src/render/state/mod.rs
+// -----------------------
+// Multi-pass renderer built around compute shaders plus a final blit render pass.
+
+mod bindgroups;
+mod buffers;
+mod layout;
+mod pipelines;
+pub mod textures;
+
+use crate::{
+    render::gpu_types::{CameraGpu, OverlayGpu},
+    streaming::ChunkUpload,
+};
+
+use bindgroups::{create_bind_groups, BindGroups};
+use buffers::{create_persistent_buffers, Buffers};
+use layout::{create_layouts, Layouts};
+use pipelines::{create_pipelines, Pipelines};
+use textures::{create_textures, quarter_dim, TextureSet};
+
+pub struct Renderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+
+    sampler: wgpu::Sampler,
+
+    layouts: Layouts,
+    pipelines: Pipelines,
+    buffers: Buffers,
+    textures: TextureSet,
+    bind_groups: BindGroups,
+
+    ping: usize,
+}
+
+impl Renderer {
+    pub async fn new(
+        adapter: &wgpu::Adapter,
+        surface_format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let adapter_limits = adapter.limits();
+        let required_limits = wgpu::Limits {
+            max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+            max_buffer_size: adapter_limits.max_buffer_size,
+            ..wgpu::Limits::default()
+        };
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ray_cs"),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::ray_cs_wgsl().into()),
+        });
+
+        let fs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit"),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::blit_wgsl().into()),
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("nearest_sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let layouts = create_layouts(&device);
+        let buffers = create_persistent_buffers(&device);
+
+        let textures = create_textures(&device, width, height);
+
+        let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
+
+        let bind_groups = create_bind_groups(&device, &layouts, &buffers, &textures, &sampler);
+
+        Self {
+            device,
+            queue,
+            sampler,
+            layouts,
+            pipelines,
+            buffers,
+            textures,
+            bind_groups,
+            ping: 0,
+        }
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    pub fn resize_output(&mut self, width: u32, height: u32) {
+        self.textures = create_textures(&self.device, width, height);
+        self.bind_groups = create_bind_groups(
+            &self.device,
+            &self.layouts,
+            &self.buffers,
+            &self.textures,
+            &self.sampler,
+        );
+
+        self.ping = 0;
+    }
+
+    pub fn write_chunk_grid(&self, grid: &[u32]) {
+        let n = grid.len().min(self.buffers.grid_capacity as usize);
+        self.queue.write_buffer(
+            &self.buffers.chunk_grid,
+            0,
+            bytemuck::cast_slice(&grid[..n]),
+        );
+    }
+
+    pub fn write_camera(&self, cam: &CameraGpu) {
+        self.queue
+            .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
+    }
+
+    pub fn write_overlay(&self, ov: &OverlayGpu) {
+        self.queue
+            .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
+    }
+
+    // UPDATED: nodes are Arc<[NodeGpu]> so we can upload without cloning large Vecs.
+    pub fn apply_chunk_uploads(&self, uploads: Vec<ChunkUpload>) {
+        let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
+        let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
+
+        for u in uploads {
+            // Chunk metadata write (always present).
+            if u.slot < self.buffers.chunk_capacity {
+                let meta_off = (u.slot as u64) * meta_stride;
+                self.queue
+                    .write_buffer(&self.buffers.chunk, meta_off, bytemuck::bytes_of(&u.meta));
+            }
+
+            // Node payload write (only when nodes are included for this chunk).
+            if !u.nodes.is_empty() {
+                let needed = u.nodes.len() as u32;
+
+                if u.node_base <= self.buffers.node_capacity
+                    && u.node_base + needed <= self.buffers.node_capacity
+                {
+                    let node_off = (u.node_base as u64) * node_stride;
+                    self.queue.write_buffer(
+                        &self.buffers.node,
+                        node_off,
+                        bytemuck::cast_slice(u.nodes.as_ref()),
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("primary_pass"),
+                timestamp_writes: None,
+            });
+
+            cpass.set_pipeline(&self.pipelines.primary);
+            cpass.set_bind_group(0, &self.bind_groups.primary, &[]);
+
+            let gx = (width + 7) / 8;
+            let gy = (height + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+        }
+
+        let ping = self.ping;
+        let pong = 1 - ping;
+
+        {
+            let qw = quarter_dim(width);
+            let qh = quarter_dim(height);
+
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("godray_pass"),
+                timestamp_writes: None,
+            });
+
+            cpass.set_pipeline(&self.pipelines.godray);
+            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
+            cpass.set_bind_group(1, &self.bind_groups.godray[ping], &[]);
+
+            let gx = (qw + 7) / 8;
+            let gy = (qh + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+        }
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("composite_pass"),
+                timestamp_writes: None,
+            });
+
+            cpass.set_pipeline(&self.pipelines.composite);
+
+            cpass.set_bind_group(0, &self.bind_groups.empty, &[]);
+            cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
+            cpass.set_bind_group(2, &self.bind_groups.composite[pong], &[]);
+
+            let gx = (width + 7) / 8;
+            let gy = (height + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+        }
+
+        self.ping = pong;
+    }
+
+    pub fn encode_blit(&self, encoder: &mut wgpu::CommandEncoder, frame_view: &wgpu::TextureView) {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("blit_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: frame_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        rpass.set_pipeline(&self.pipelines.blit);
+        rpass.set_bind_group(0, &self.bind_groups.blit, &[]);
+        rpass.draw(0..3, 0..1);
+    }
+}
+
+
+// src/render/state/pipelines.rs
+//
+// Pipeline creation.
+// This is intentionally isolated so the renderer logic (per-frame encoding) isn't
+// buried under wgpu setup boilerplate.
+//
+// Terminology:
+// - BindGroupLayout (BGL): describes what resources exist at @group/@binding.
+// - PipelineLayout (PL): ordered list of BGLs for group(0), group(1), ...
+// - Pipeline: compiled/validated shader entry point + fixed state + pipeline layout.
+//
+// Rule of thumb:
+// The order of BGLs in `bind_group_layouts` must match the group indices used in WGSL.
+// If a shader references @group(2), then the pipeline layout must include entries
+// for group(0) and group(1) as well (even if they're "empty" placeholders).
+
+use super::layout::Layouts;
+
+pub struct Pipelines {
+    /// Compute pipeline for the primary full-resolution pass (writes color/depth).
+    pub primary: wgpu::ComputePipeline,
+
+    /// Compute pipeline for the quarter-resolution godray pass (ping-pong temporal).
+    pub godray: wgpu::ComputePipeline,
+
+    /// Compute pipeline for the full-resolution composite pass (writes final output).
+    pub composite: wgpu::ComputePipeline,
+
+    /// Render pipeline for the final blit to the swapchain (fullscreen triangle).
+    pub blit: wgpu::RenderPipeline,
+}
+
+/// Helper to build a compute pipeline with a specific entry point and bind group layout list.
+///
+/// `bgls` order defines the pipeline layout's group indices:
+/// - bgls[0] => group(0)
+/// - bgls[1] => group(1)
+/// - ...
+fn make_compute_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    module: &wgpu::ShaderModule,
+    entry: &str,
+    bgls: &[&wgpu::BindGroupLayout],
+) -> wgpu::ComputePipeline {
+    // Create a pipeline layout named "{label}_pl" that fixes the bind group schema.
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&format!("{label}_pl")),
+        bind_group_layouts: bgls,
+        // No push constants used by these shaders.
+        push_constant_ranges: &[],
+    });
+
+    // Create the compute pipeline referencing the WGSL entry point.
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pl),
+        module,
+        entry_point: entry,
+        compilation_options: Default::default(),
+    })
+}
+
+/// Create all pipelines (compute + blit).
+///
+/// Inputs:
+/// - `cs_module`: WGSL module containing compute entry points.
+/// - `fs_module`: WGSL module containing vertex/fragment entry points for blit.
+/// - `surface_format`: swapchain format used for the final render target.
+pub fn create_pipelines(
+    device: &wgpu::Device,
+    layouts: &Layouts,
+    cs_module: &wgpu::ShaderModule,
+    fs_module: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+) -> Pipelines {
+    // -------------------------------------------------------------------------
+    // Compute pipelines
+    // -------------------------------------------------------------------------
+
+    // Primary pass:
+    // Uses group(0) = layouts.primary, which includes:
+    // - camera + scene buffers
+    // - storage outputs for color/depth
+    let primary = make_compute_pipeline(
+        device,
+        "primary_pipeline",
+        cs_module,
+        "main_primary",
+        &[&layouts.primary],
+    );
+
+    // Godray pass:
+    // Uses:
+    //   group(0) = layouts.scene  (camera + scene buffers only)
+    //   group(1) = layouts.godray (depth sample + history sample + out storage)
+    let godray = make_compute_pipeline(
+        device,
+        "godray_pipeline",
+        cs_module,
+        "main_godray",
+        &[&layouts.scene, &layouts.godray],
+    );
+
+    // Composite pass:
+    // Shader reads from @group(2) (color + godray + output storage).
+    // wgpu requires the pipeline layout to include group(0) and group(1) slots too,
+    // so we provide empty placeholder layouts for those indices.
+    let composite = make_compute_pipeline(
+        device,
+        "composite_pipeline",
+        cs_module,
+        "main_composite",
+        &[&layouts.empty, &layouts.empty, &layouts.composite],
+    );
+
+    // -------------------------------------------------------------------------
+    // Render pipeline: blit
+    // -------------------------------------------------------------------------
+    //
+    // Full-screen triangle approach:
+    // - No vertex buffers.
+    // - Vertex shader generates positions from vertex_index.
+    // - Fragment shader samples the renderer output texture.
+
+    // Pipeline layout for blit uses a single bind group: group(0) = layouts.blit.
+    let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("blit_pl"),
+        bind_group_layouts: &[&layouts.blit],
+        push_constant_ranges: &[],
+    });
+
+    // Render pipeline state:
+    // - Targets the swapchain format.
+    // - Uses REPLACE blending (overwrite framebuffer).
+    // - Default primitive/multisample state is fine for a simple fullscreen draw.
+    let blit = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("blit_pipeline"),
+        layout: Some(&blit_pl),
+        vertex: wgpu::VertexState {
+            module: fs_module,
+            entry_point: "vs_main",
+            // No vertex buffers; vertices are synthesized in the vertex shader.
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: fs_module,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                // Overwrite swapchain pixel with sampled color.
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        // Default triangle list, CCW front face, etc. (fullscreen triangle doesn't care much).
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    Pipelines {
+        primary,
+        godray,
+        composite,
+        blit,
+    }
+}
+
+// src/render/state/textures.rs
+//
+// Texture creation and sizing policy for the renderer.
+//
+// Everything in here is "size-dependent": if the window/output resolution changes,
+// these textures must be recreated, and any bind groups that reference their views
+// must be rebuilt.
+//
+// Texture roles in the frame graph:
+// - color_tex (full-res, RGBA16F): written by primary pass, sampled by composite.
+// - depth_tex (full-res, R32F)   : written by primary pass, sampled by godray.
+// - godray[A/B] (quarter-res, RGBA16F): temporal accumulation ping-pong.
+// - output (full-res)           : written by composite, sampled by blit.
+//
+// Usage policy:
+// - Intermediates are both STORAGE_BINDING and TEXTURE_BINDING so they can be
+//   written as storage textures in compute and later sampled as regular textures.
+
+use crate::render::resources::{create_output_texture, OutputTex};
+
+/// Minimal wrapper around a 2D texture view.
+///
+/// Note: we only store the TextureView, not the Texture handle itself.
+/// In wgpu, the view keeps the underlying texture alive as long as the view exists.
+pub struct Tex2D {
+    /// View used for binding (storage or sampled).
+    pub view: wgpu::TextureView,
+}
+
+/// Bundle of all size-dependent textures used by the renderer.
+pub struct TextureSet {
+    // -------------------------------------------------------------------------
+    // Final output
+    // -------------------------------------------------------------------------
+
+    /// Final output texture:
+    /// - composite pass writes here (storage)
+    /// - blit pass samples from it (filterable sampling in fragment shader)
+    pub output: OutputTex,
+
+    // -------------------------------------------------------------------------
+    // Full-resolution intermediates
+    // -------------------------------------------------------------------------
+
+    /// Primary color accumulation buffer (RGBA16F).
+    /// Written by primary compute pass.
+    pub color: Tex2D,
+
+    /// Primary depth buffer (R32F).
+    /// Written by primary compute pass and sampled by godray.
+    pub depth: Tex2D,
+
+    // -------------------------------------------------------------------------
+    // Quarter-resolution intermediates (temporal ping-pong)
+    // -------------------------------------------------------------------------
+
+    /// Godray accumulation textures (RGBA16F), quarter resolution.
+    ///
+    /// Index meaning:
+    /// - 0 = A
+    /// - 1 = B
+    ///
+    /// Each frame:
+    /// - one is sampled as history
+    /// - the other is written as the new result
+    pub godray: [Tex2D; 2],
+}
+
+/// Compute the quarter-resolution dimension for an axis.
+///
+/// This uses ceil(x/4) so small sizes don't collapse to zero and so coverage remains
+/// conservative (quarter-res still covers the full-res domain when upsampled).
+pub fn quarter_dim(x: u32) -> u32 {
+    // ceil(x / 4)
+    (x + 3) / 4
+}
+
+/// Create a 2D texture and return only its view wrapper.
+///
+/// `usage` is passed through so the same helper can build both sampled-only or
+/// read/write compute textures.
+///
+/// Zero-sized textures are invalid in wgpu, so width/height are clamped to >= 1.
+fn make_tex2d(
+    device: &wgpu::Device,
+    label: &str,
+    w: u32,
+    h: u32,
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+) -> Tex2D {
+    // Avoid creating zero-sized textures (wgpu disallows it).
+    let w = w.max(1);
+    let h = h.max(1);
+
+    // Allocate the texture backing storage.
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    });
+
+    // Default view (whole texture, base mip, 2D).
+    let view = tex.create_view(&Default::default());
+
+    Tex2D { view }
+}
+
+/// Create the full size-dependent texture set for the renderer.
+///
+/// Sizing policy:
+/// - color/depth are full resolution (match output size)
+/// - godray textures are quarter resolution (ceil(width/4), ceil(height/4))
+/// - godray uses two textures for ping-pong temporal accumulation
+///
+/// Usage policy for intermediates:
+/// - STORAGE_BINDING: compute passes write to them as storage textures
+/// - TEXTURE_BINDING: later passes sample them as regular textures
+pub fn create_textures(device: &wgpu::Device, width: u32, height: u32) -> TextureSet {
+    // Clamp to avoid invalid zero-sized allocations during minimize/resizes.
+    let width = width.max(1);
+    let height = height.max(1);
+
+    // Intermediates are written by compute (storage) and read by later passes (sampled).
+    let rw_tex_usage =
+        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
+
+    // Final output texture used by composite -> blit.
+    // (Implementation details live in render::resources.)
+    let output = create_output_texture(device, width, height);
+
+    // Full-res primary color buffer.
+    let color = make_tex2d(
+        device,
+        "color_tex",
+        width,
+        height,
+        wgpu::TextureFormat::Rgba16Float,
+        rw_tex_usage,
+    );
+
+    // Full-res primary depth buffer.
+    let depth = make_tex2d(
+        device,
+        "depth_tex",
+        width,
+        height,
+        wgpu::TextureFormat::R32Float,
+        rw_tex_usage,
+    );
+
+    // Quarter-res sizes for godrays.
+    let qw = quarter_dim(width);
+    let qh = quarter_dim(height);
+
+    // Godray ping-pong textures (same format/usage; only roles swap per frame).
+    let godray = [
+        make_tex2d(
+            device,
+            "godray_a",
+            qw,
+            qh,
+            wgpu::TextureFormat::Rgba16Float,
+            rw_tex_usage,
+        ),
+        make_tex2d(
+            device,
+            "godray_b",
+            qw,
+            qh,
+            wgpu::TextureFormat::Rgba16Float,
+            rw_tex_usage,
+        ),
+    ];
+
+    TextureSet {
+        output,
+        color,
+        depth,
+        godray,
+    }
+}
+
 
 // src/shaders/common.wgsl
 // -----------------------
@@ -2517,8 +3819,7 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
   textureStore(out_img, ip, vec4<f32>(ldr, 1.0));
 }
 
-// src/streaming/manager.rs
-// ------------------------
+
 // src/streaming/manager.rs
 // ------------------------
 // Chunk streaming + background SVO building + CPU cache.
@@ -3370,8 +4671,7 @@ impl ChunkManager {
     }
 }
 
-// src/streaming/mod.rs
-// --------------------
+
 // src/streaming/mod.rs
 // --------------------
 // Chunk streaming + node arena + uploads.
@@ -3382,8 +4682,7 @@ pub mod node_arena;
 pub use manager::{ChunkManager, ChunkUpload};
 pub use node_arena::NodeArena;
 
-// src/streaming/node_arena.rs
-// ---------------------------
+
 // src/streaming/node_arena.rs
 //
 // Very simple free-list arena for node ranges (in units of NodeGpu elements).
@@ -3512,8 +4811,7 @@ impl NodeArena {
     }
 }
 
-// src/svo/builder.rs
-// ------------------
+
 // src/svo/builder.rs
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -4021,8 +5319,6 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 }
 
 // src/svo/mips.rs
-// ---------------
-// src/svo/mips.rs
 
 pub struct MinMaxMipView<'a> {
     pub root_side: u32,
@@ -4216,8 +5512,7 @@ impl<'a> MaxMipView<'a> {
     }
 }
 
-// src/svo/mod.rs
-// --------------
+
 // src/svo/mod.rs
 pub mod builder;
 pub mod mips;
@@ -4227,8 +5522,7 @@ pub use builder::{
     build_chunk_svo_sparse_cancelable_with_scratch,
 };
 
-// src/world/generator.rs
-// ----------------------
+
 // src/world/generator.rs
 
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
@@ -4266,38 +5560,7 @@ impl WorldGen {
     }
 }
 
-// src/world/hash.rs
-// -----------------
-// src/world/hash.rs
-#[inline]
-pub fn hash_u32(mut v: u32) -> u32 {
-    v ^= v >> 16;
-    v = v.wrapping_mul(0x7feb_352d);
-    v ^= v >> 15;
-    v = v.wrapping_mul(0x846c_a68b);
-    v ^= v >> 16;
-    v
-}
 
-#[inline]
-pub fn hash2(seed: u32, x: i32, z: i32) -> u32 {
-    let a = (x as u32).wrapping_mul(0x9e37_79b1);
-    let b = (z as u32).wrapping_mul(0x85eb_ca6b);
-    hash_u32(seed ^ a ^ b)
-}
-
-#[inline]
-pub fn hash3(seed: u32, x: i32, y: i32, z: i32) -> u32 {
-    let a = (x as u32).wrapping_mul(0x9e37_79b1);
-    let b = (y as u32).wrapping_mul(0x85eb_ca6b);
-    let c = (z as u32).wrapping_mul(0xc2b2_ae35);
-    hash_u32(seed ^ a ^ b ^ c)
-}
-
-#[inline]
-pub fn u01(v: u32) -> f32 {
-    (v as f32) * (1.0 / 4294967296.0)
-}
 
 // src/world/materials.rs
 // ----------------------
@@ -4309,8 +5572,7 @@ pub const STONE: u32 = 3;
 pub const WOOD: u32 = 4;
 pub const LEAF: u32 = 5;
 
-// src/world/mod.rs
-// ----------------
+
 // src/world/mod.rs
 pub mod generator;
 pub mod materials;
@@ -4318,1206 +5580,4 @@ pub mod hash;
 pub mod trees;
 
 pub use generator::WorldGen;
-
-// src/world/trees.rs
-// ------------------
-// src/world/trees.rs
-use crate::config;
-
-use super::{
-    generator::WorldGen,
-    hash::{hash2, hash3, hash_u32, u01},
-    materials::{AIR, LEAF, WOOD},
-};
-
-// ================================================================================================
-// TREE TUNING KNOBS
-// ================================================================================================
-// Conventions
-// - vpm = voxels per meter (VOXELS_PER_METER)
-// - Fast probability via bitmask:
-//      (hash & mask) == 0  => true with probability 1/(mask+1)
-//
-// Notes:
-// - AABB = axis-aligned bounding box
-// - BFS = breadth-first search
-// - SVO = Sparse Voxel Octree
-// ================================================================================================
-
-// Tree density: 1 tree per N meter-cells (lower => more trees)
-const TREE_CELL_MOD: u32 = 256;
-
-// ----------------------------------------
-// Primary branches (depth=0)
-// ----------------------------------------
-
-// Fewer primaries, but less “spike crown”
-const PRIMARY_MIN: usize = 6;
-const PRIMARY_MAX: usize = 14;
-const PRIMARY_MAX_CLAMP: usize = 18;
-
-// Start height along trunk (% of trunk height)
-// IMPORTANT: allow starts right near the top so the trunk doesn't look “pruned”
-const PRIMARY_START_Y_LO_FRAC: i32 = 28;
-const PRIMARY_START_Y_HI_FRAC: i32 = 99; // was 92
-const PRIMARY_START_JITTER_FRAC: f32 = 0.10;
-
-// Shape
-const PRIMARY_ANG_JITTER: f32 = 1.05; // more irregular azimuth (less radial symmetry)
-
-// SHORTER primaries (big lever for “branches too long”)
-const PRIMARY_LEN_M_MIN: f32 = 1.40;
-const PRIMARY_LEN_M_RAND: f32 = 2.20;
-
-// More vertical variation + less spear-like
-const PRIMARY_PITCH_BASE: f32 = 0.10;
-const PRIMARY_PITCH_H_SCALE: f32 = 0.18;
-const PRIMARY_PITCH_QUAD_BASE: f32 = 0.44;
-const PRIMARY_PITCH_QUAD_H_SCALE: f32 = 0.22;
-
-const PRIMARY_R0_M_MIN: f32 = 0.13;
-const PRIMARY_R0_M_RAND: f32 = 0.22;
-const PRIMARY_R1_SCALE_MIN: f32 = 0.28;
-const PRIMARY_R1_SCALE_RAND: f32 = 0.22;
-
-// More curvature so branches feel “grown”, not extruded
-const PRIMARY_BEND_M_MIN: f32 = 1.05;
-const PRIMARY_BEND_M_RAND: f32 = 1.85;
-const PRIMARY_C1_T: f32 = 0.28;
-const PRIMARY_C2_T: f32 = 0.72;
-const PRIMARY_C1_BEND_SCALE: f32 = 1.10;
-const PRIMARY_C2_BEND_SCALE: f32 = 0.85;
-const PRIMARY_C1_Y_BEND_SCALE: f32 = 0.44;
-const PRIMARY_C2_Y_BEND_SCALE: f32 = 0.34;
-
-// ----------------------------------------
-// Recursion / complexity
-// ----------------------------------------
-
-const MAX_BRANCH_DEPTH: u8 = 4;
-const BRANCH_CAP: usize = 520;
-
-// How many child candidates per parent depth: min + uniform(0..rand)
-// Index = parent.depth clamped to 0..3
-const CHILD_COUNT_MIN: [usize; 4] = [3, 3, 2, 1];
-const CHILD_COUNT_RAND: [usize; 4] = [3, 3, 3, 3];
-
-// Aggressive thinning (keeps overall sparse structure)
-// Keep child only if (sj & mask) == 0
-const CHILD_SPAWN_THIN_MASK: [u32; 4] = [
-    3,  // depth=0: keep ~1/4
-    7,  // depth=1: keep ~1/8
-    15, // depth=2: keep ~1/16
-    31, // depth>=3: keep ~1/32
-];
-
-// Spawn position along parent
-const CHILD_SPAWN_T_MIN: f32 = 0.32;
-const CHILD_SPAWN_T_RAND: f32 = 0.58;
-
-// SHORTER children
-const CHILD_LEN_M_MIN: f32 = 0.35;
-const CHILD_LEN_M_RAND: f32 = 1.05;
-const CHILD_LEN_M_FLOOR: f32 = 0.28;
-
-// Clamp children harder vs parent length
-const CHILD_MAXLEN_A: f32 = 0.48;
-const CHILD_MAXLEN_B: f32 = 0.18;
-
-// Direction shaping
-const CHILD_FAN_AMP_BASE: f32 = 0.95;
-const CHILD_FAN_AMP_DEPTH: f32 = 0.38;
-
-const CHILD_UP_BASE: f32 = 0.10;
-const CHILD_UP_DEPTH: f32 = 0.10;
-const CHILD_UP_RAND: f32 = 0.28;
-
-// Radius shrink factor by child depth (depth=1..)
-const CHILD_SHRINK: [f32; 4] = [0.58, 0.52, 0.46, 0.40];
-
-const CHILD_R0_MIN_VOX: f32 = 0.70;
-const CHILD_R1_MIN_VOX: f32 = 0.50;
-const CHILD_R1_SCALE_BASE: f32 = 0.34;
-const CHILD_R1_SCALE_RAND: f32 = 0.16;
-
-// Curvature
-const CHILD_BEND_M_MIN: f32 = 0.45;
-const CHILD_BEND_M_RAND: f32 = 1.25;
-const CHILD_C1_T: f32 = 0.28;
-const CHILD_C2_T: f32 = 0.72;
-const CHILD_C1_BEND_SCALE: f32 = 1.05;
-const CHILD_C2_BEND_SCALE: f32 = 0.78;
-const CHILD_C1_Y_BEND_SCALE: f32 = 0.34;
-const CHILD_C2_Y_BEND_SCALE: f32 = 0.26;
-
-// ----------------------------------------
-// Branch rasterization
-// ----------------------------------------
-
-const BRANCH_STEPS_MIN: i32 = 8;
-const BRANCH_STEPS_MAX: i32 = 30;
-const BRANCH_STEPS_BASE: f32 = 10.0;
-const BRANCH_STEPS_LEN_DIV_M: f32 = 0.30;
-const BRANCH_RADIUS_MIN_VOX: f32 = 0.55;
-
-// ----------------------------------------
-// Leaves
-// ----------------------------------------
-
-const LEAF_ALWAYS_TIP_FOR_ALL_BRANCHES: bool = true;
-const LEAF_RARE_SKIP_MASK: u32 = 16383;
-
-// Canopy extent along branches: more sleeves, distributed earlier
-const LEAF_SLEEVE_N: [usize; 5] = [3, 3, 4, 4, 5];
-const LEAF_SLEEVE_T_MIN: f32 = 0.14;
-const LEAF_SLEEVE_T_RAND: f32 = 0.78;
-
-// Disable extra offset tip tuft (tends to create little dense “buttons”)
-const LEAF_OFFSET_TIP_MASK: u32 = 0;
-
-// Bigger offsets = wider canopy without adding branches
-const LEAF_OFFSET_M_XZ: f32 = 0.95;
-const LEAF_OFFSET_M_Y: f32 = 0.46;
-
-const LEAF_SLEEVE_OFFSET_M_XZ: f32 = 0.62;
-const LEAF_SLEEVE_OFFSET_M_Y: f32 = 0.34;
-
-// Big tufts (canopy size)
-const TUFT_R_BASE: [f32; 5] = [0.42, 0.50, 0.60, 0.66, 0.72];
-const TUFT_R_RAND: [f32; 5] = [0.30, 0.36, 0.52, 0.60, 0.66];
-
-// Sparse/airy fill
-const LEAF_SPHERE_Y_SCALE: f32 = 1.16;
-const LEAF_SHELL_THRESH: f32 = 0.90;
-
-// TIP: visible but airy
-const TIP_GUARANTEED_GATE_MASK: u32 = 1;           // keep ~1/2 candidates
-const TIP_GUARANTEED_INTERIOR_KEEP_MASK: u32 = 31; // keep 1/32 interior
-const TIP_GUARANTEED_SHELL_DROP_MASK: u32 = 3;     // drop 1/4 near shell
-
-// SLEEVE: very sparse
-const TUFT_SPARSE_GATE_MASK: u32 = 15;             // keep ~1/16 candidates
-const TUFT_SPARSE_INTERIOR_KEEP_MASK: u32 = 255;   // keep 1/256 interior
-const TUFT_SPARSE_SHELL_DROP_MASK: u32 = 3;        // drop 1/4 near shell
-
-// Trunk wobble (meters)
-const TRUNK_WOBBLE_M_MAX: f32 = 0.25;
-
-// ----------------------------------------
-// Crown at trunk tip (prevents "pruned top")
-// ----------------------------------------
-
-const TOP_CROWN_ENABLE: bool = true;
-const TOP_CROWN_RING_TUFTS: usize = 6;
-const TOP_CROWN_R_SCALE: f32 = 1.65;
-const TOP_CROWN_RING_RAD_SCALE: f32 = 0.85;
-const TOP_CROWN_LIFT_M: f32 = 0.45;
-
-// ================================================================================================
-
-/// Procedural tree instance (voxel units for positions/sizes).
-#[derive(Clone, Copy)]
-struct Tree {
-    tx: i32,
-    tz: i32,
-    base_y: i32,   // touches ground
-    trunk_h: i32,  // voxels
-    crown_r: i32,  // voxels (horizontal extent)
-    canopy_h: i32, // conservative bounds / variety
-    trunk_r0: f32, // voxels radius at base
-    trunk_r1: f32, // voxels radius near top
-    seed: u32,
-}
-
-/// A single curved branch segment (cubic bezier), plus metadata for recursion.
-#[derive(Clone, Copy)]
-struct Branch {
-    ax: f32,
-    ay: f32,
-    az: f32,
-    c1x: f32,
-    c1y: f32,
-    c1z: f32,
-    c2x: f32,
-    c2y: f32,
-    c2z: f32,
-    bx: f32,
-    by: f32,
-    bz: f32,
-    r0: f32,
-    r1: f32,
-    len: f32,
-    depth: u8,
-    seed: u32,
-}
-
-/// Per-chunk cache of trees that can affect material queries.
-pub struct TreeCache {
-    trees: Vec<Tree>,
-}
-
-/// Chunk-local voxel mask for trees (fast O(1) queries in the chunk build).
-/// mask codes: 0 = none, 1 = wood, 2 = leaf
-pub struct TreeMaskCache {
-    pub origin: [i32; 3], // chunk origin in world-voxel coords
-    pub size: i32,        // chunk side in voxels
-    mask: Vec<u8>,
-    stride_z: usize,
-    stride_y: usize,
-}
-
-#[inline(always)]
-fn idx3_strided(stride_z: usize, stride_y: usize, x: i32, y: i32, z: i32) -> usize {
-    (y as usize) * stride_y + (z as usize) * stride_z + (x as usize)
-}
-
-impl TreeMaskCache {
-    #[inline(always)]
-    pub fn contains_point_fast(&self, x: i32, y: i32, z: i32) -> u8 {
-        let lx = x - self.origin[0];
-        let ly = y - self.origin[1];
-        let lz = z - self.origin[2];
-        if (lx | ly | lz) < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
-            return 0;
-        }
-        self.mask[idx3_strided(self.stride_z, self.stride_y, lx, ly, lz)]
-    }
-
-    #[inline(always)]
-    pub fn material_fast(&self, x: i32, y: i32, z: i32) -> u32 {
-        match self.contains_point_fast(x, y, z) {
-            1 => WOOD,
-            2 => LEAF,
-            _ => AIR,
-        }
-    }
-
-    #[inline(always)]
-    fn write_leaf(&mut self, lx: i32, ly: i32, lz: i32) {
-        if (lx | ly | lz) < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
-            return;
-        }
-        let i = idx3_strided(self.stride_z, self.stride_y, lx, ly, lz);
-        if self.mask[i] != 1 {
-            self.mask[i] = 2;
-        }
-    }
-
-    #[inline(always)]
-    fn write_wood(&mut self, lx: i32, ly: i32, lz: i32) {
-        if (lx | ly | lz) < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
-            return;
-        }
-        let i = idx3_strided(self.stride_z, self.stride_y, lx, ly, lz);
-        self.mask[i] = 1;
-    }
-}
-
-impl WorldGen {
-    // -------------------------------------------------------------------------
-    // Small math helpers
-    // -------------------------------------------------------------------------
-
-    #[inline(always)]
-    fn lerp(a: f32, b: f32, t: f32) -> f32 {
-        a + (b - a) * t
-    }
-
-    #[inline(always)]
-    fn s11(n: u32) -> f32 {
-        (u01(n) - 0.5) * 2.0
-    }
-
-    #[inline(always)]
-    fn bezier3(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
-        let u = 1.0 - t;
-        u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
-    }
-
-    #[inline(always)]
-    fn bezier3_tangent(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
-        let u = 1.0 - t;
-        3.0 * u * u * (b - a) + 6.0 * u * t * (c - b) + 3.0 * t * t * (d - c)
-    }
-
-    #[inline(always)]
-    fn bez_point(b: &Branch, t: f32) -> (f32, f32, f32) {
-        (
-            Self::bezier3(b.ax, b.c1x, b.c2x, b.bx, t),
-            Self::bezier3(b.ay, b.c1y, b.c2y, b.by, t),
-            Self::bezier3(b.az, b.c1z, b.c2z, b.bz, t),
-        )
-    }
-
-    #[inline(always)]
-    fn bez_tangent(b: &Branch, t: f32) -> (f32, f32, f32) {
-        (
-            Self::bezier3_tangent(b.ax, b.c1x, b.c2x, b.bx, t),
-            Self::bezier3_tangent(b.ay, b.c1y, b.c2y, b.by, t),
-            Self::bezier3_tangent(b.az, b.c1z, b.c2z, b.bz, t),
-        )
-    }
-
-    #[inline(always)]
-    fn norm3(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
-        let inv = 1.0 / (x * x + y * y + z * z).sqrt().max(1e-6);
-        (x * inv, y * inv, z * inv)
-    }
-
-    #[inline(always)]
-    fn cross3(ax: f32, ay: f32, az: f32, bx: f32, by: f32, bz: f32) -> (f32, f32, f32) {
-        (ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx)
-    }
-
-    /// Orthonormal basis around direction `w` (unit). Returns (u, v, w).
-    #[inline(always)]
-    fn basis_from_w(
-        w: (f32, f32, f32),
-    ) -> ((f32, f32, f32), (f32, f32, f32), (f32, f32, f32)) {
-        let (wx, wy, wz) = w;
-        let (hx, hy, hz) = if wy.abs() < 0.95 {
-            (0.0, 1.0, 0.0)
-        } else {
-            (1.0, 0.0, 0.0)
-        };
-        let (ux, uy, uz) = Self::cross3(hx, hy, hz, wx, wy, wz);
-        let (ux, uy, uz) = Self::norm3(ux, uy, uz);
-        let (vx, vy, vz) = Self::cross3(wx, wy, wz, ux, uy, uz);
-        ((ux, uy, uz), (vx, vy, vz), (wx, wy, wz))
-    }
-
-    // -------------------------------------------------------------------------
-    // Knob helpers (compact)
-    // -------------------------------------------------------------------------
-
-    #[inline(always)]
-    fn idx4(d: u8) -> usize {
-        (d as usize).min(3)
-    }
-    #[inline(always)]
-    fn idx5(d: u8) -> usize {
-        (d as usize).min(4)
-    }
-
-    #[inline(always)]
-    fn child_count_for_depth(depth: u8, base: u32) -> usize {
-        let i = Self::idx4(depth);
-        CHILD_COUNT_MIN[i] + (base % (CHILD_COUNT_RAND[i] as u32 + 1)) as usize
-    }
-
-    #[inline(always)]
-    fn spawn_thin_mask(depth: u8) -> u32 {
-        CHILD_SPAWN_THIN_MASK[Self::idx4(depth)]
-    }
-
-    #[inline(always)]
-    fn shrink_for_child_depth(depth: u8) -> f32 {
-        // child depth starts at 1, so map 1->0, 2->1, 3->2, 4+->3
-        let i = ((depth as usize).saturating_sub(1)).min(3);
-        CHILD_SHRINK[i]
-    }
-
-    #[inline(always)]
-    fn sleeve_n(depth: u8) -> usize {
-        LEAF_SLEEVE_N[Self::idx5(depth)]
-    }
-
-    #[inline(always)]
-    fn tuft_r_m(depth: u8, seed: u32) -> f32 {
-        let i = Self::idx5(depth);
-        TUFT_R_BASE[i] + TUFT_R_RAND[i] * u01(hash_u32(seed))
-    }
-
-    // -------------------------------------------------------------------------
-    // Tree placement + params
-    // -------------------------------------------------------------------------
-
-    #[inline]
-    fn tree_at_meter_cell(
-        &self,
-        xm: i32,
-        zm: i32,
-    ) -> Option<(u32 /*seed*/, i32 /*trunk_h_vox*/, i32 /*crown_r_vox*/)> {
-        let r = hash2(self.seed, xm, zm);
-        if (r % TREE_CELL_MOD) != 0 {
-            return None;
-        }
-
-        let trunk_h_m = 5 + (hash_u32(r) % 6) as i32; // 5..10m
-        let crown_r_m = 3 + (hash_u32(r ^ 0xBEEF) % 4) as i32; // 3..6m
-        let vpm = config::VOXELS_PER_METER;
-
-        Some((r, trunk_h_m * vpm, crown_r_m * vpm))
-    }
-
-    #[inline]
-    fn tree_params_at_trunk(&self, tx: i32, tz: i32, ground: i32) -> Option<Tree> {
-        let xm = tx.div_euclid(config::VOXELS_PER_METER);
-        let zm = tz.div_euclid(config::VOXELS_PER_METER);
-        let (seed, trunk_h, crown_r) = self.tree_at_meter_cell(xm, zm)?;
-
-        let vpm = config::VOXELS_PER_METER as f32;
-
-        // trunk radii (voxels): base ~0.45..0.75m, top ~0.18..0.30m
-        let r0 = 0.45 * vpm + u01(hash_u32(seed ^ 0x1111)) * (0.30 * vpm);
-        let r1 = 0.18 * vpm + u01(hash_u32(seed ^ 0x2222)) * (0.12 * vpm);
-
-        // kept for conservative bounds / variety
-        let canopy_h =
-            ((2.5 * vpm) + u01(hash_u32(seed ^ 0x3333)) * (2.0 * vpm)).round() as i32;
-
-        Some(Tree {
-            tx,
-            tz,
-            base_y: ground,
-            trunk_h,
-            crown_r,
-            canopy_h,
-            trunk_r0: r0.max(1.0),
-            trunk_r1: r1.max(1.0),
-            seed,
-        })
-    }
-
-    /// Build a per-chunk tree cache. Call once per chunk build.
-    pub fn build_tree_cache<F: Fn(i32, i32) -> i32>(
-        &self,
-        chunk_ox: i32,
-        chunk_oz: i32,
-        chunk_size: i32,
-        height_at: &F,
-    ) -> TreeCache {
-        let vpm = config::VOXELS_PER_METER;
-
-        // Extra slack because canopy tufts can extend beyond crown_r
-        let pad_m = 10;
-
-        let xm0 = chunk_ox.div_euclid(vpm) - pad_m;
-        let xm1 = (chunk_ox + chunk_size).div_euclid(vpm) + pad_m;
-        let zm0 = chunk_oz.div_euclid(vpm) - pad_m;
-        let zm1 = (chunk_oz + chunk_size).div_euclid(vpm) + pad_m;
-
-        let mut trees = Vec::new();
-
-        for zm in zm0..=zm1 {
-            for xm in xm0..=xm1 {
-                if self.tree_at_meter_cell(xm, zm).is_none() {
-                    continue;
-                }
-
-                let tx = xm * vpm;
-                let tz = zm * vpm;
-                let ground = height_at(tx, tz);
-
-                let Some(t) = self.tree_params_at_trunk(tx, tz, ground) else {
-                    continue;
-                };
-
-                // Conservative XZ AABB reject vs chunk footprint
-                let r = t.crown_r + 5 * vpm; // extra slack for large tufts
-                let x0 = t.tx - r;
-                let x1 = t.tx + r;
-                let z0 = t.tz - r;
-                let z1 = t.tz + r;
-
-                let cx0 = chunk_ox;
-                let cx1 = chunk_ox + chunk_size;
-                let cz0 = chunk_oz;
-                let cz1 = chunk_oz + chunk_size;
-
-                if x1 < cx0 || x0 > cx1 || z1 < cz0 || z0 > cz1 {
-                    continue;
-                }
-
-                trees.push(t);
-            }
-        }
-
-        TreeCache { trees }
-    }
-
-    /// Build a tree cache + chunk-local voxel mask (fast O(1) tree material queries).
-    pub fn build_tree_cache_with_mask<F: Fn(i32, i32) -> i32>(
-        &self,
-        chunk_ox: i32,
-        chunk_oy: i32,
-        chunk_oz: i32,
-        chunk_size: i32,
-        height_at: &F,
-        cancel: &std::sync::atomic::AtomicBool,
-    ) -> (TreeCache, TreeMaskCache) {
-        let cache = self.build_tree_cache(chunk_ox, chunk_oz, chunk_size, height_at);
-
-        let side = chunk_size.max(1) as i32;
-        let side_u = side as usize;
-
-        let mask = vec![0u8; side_u * side_u * side_u];
-
-        let mut out = TreeMaskCache {
-            origin: [chunk_ox, chunk_oy, chunk_oz],
-            size: side,
-            mask,
-            stride_z: side_u,
-            stride_y: side_u * side_u,
-        };
-
-        for t in &cache.trees {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            self.raster_tree_into_mask(t, &mut out);
-        }
-
-        (cache, out)
-    }
-
-    // -------------------------------------------------------------------------
-    // Geometry helpers
-    // -------------------------------------------------------------------------
-
-    #[inline]
-    fn trunk_radius_at(tree: &Tree, y: i32) -> f32 {
-        let t = ((y - tree.base_y) as f32 / (tree.trunk_h as f32)).clamp(0.0, 1.0);
-        tree.trunk_r0 + (tree.trunk_r1 - tree.trunk_r0) * t
-    }
-
-    #[inline]
-    fn trunk_wobble(&self, tree: &Tree, y: i32) -> (f32, f32) {
-        let t = ((y - tree.base_y) as f32 / (tree.trunk_h as f32)).clamp(0.0, 1.0);
-
-        let a = u01(hash_u32(tree.seed ^ 0xA001 ^ (y as u32).wrapping_mul(97)));
-        let b = u01(hash_u32(tree.seed ^ 0xA002 ^ (y as u32).wrapping_mul(193)));
-
-        let amp = TRUNK_WOBBLE_M_MAX * (config::VOXELS_PER_METER as f32) * t;
-        ((a - 0.5) * 2.0 * amp, (b - 0.5) * 2.0 * amp)
-    }
-
-    #[inline]
-    fn dist2_point_segment(
-        px: f32,
-        py: f32,
-        pz: f32,
-        ax: f32,
-        ay: f32,
-        az: f32,
-        bx: f32,
-        by: f32,
-        bz: f32,
-    ) -> (f32 /*d2*/, f32 /*t*/) {
-        let abx = bx - ax;
-        let aby = by - ay;
-        let abz = bz - az;
-
-        let apx = px - ax;
-        let apy = py - ay;
-        let apz = pz - az;
-
-        let ab2 = abx * abx + aby * aby + abz * abz;
-        if ab2 <= 1e-8 {
-            return (apx * apx + apy * apy + apz * apz, 0.0);
-        }
-
-        let t = ((apx * abx + apy * aby + apz * abz) / ab2).clamp(0.0, 1.0);
-        let cx = ax + t * abx;
-        let cy = ay + t * aby;
-        let cz = az + t * abz;
-
-        let dx = px - cx;
-        let dy = py - cy;
-        let dz = pz - cz;
-
-        (dx * dx + dy * dy + dz * dz, t)
-    }
-
-    // -------------------------------------------------------------------------
-    // Primary layout
-    // -------------------------------------------------------------------------
-
-    #[inline]
-    fn primary_count(&self, tree: &Tree) -> usize {
-        let r = hash_u32(tree.seed ^ 0xBABA_1234);
-        let span = (PRIMARY_MAX - PRIMARY_MIN + 1) as u32;
-        let mut n = PRIMARY_MIN + (r % span) as usize;
-
-        // tiny bias extremes sometimes
-        if (r & 31) == 0 {
-            n = PRIMARY_MIN;
-        } else if (r & 63) == 1 {
-            n = PRIMARY_MAX;
-        }
-        n.min(PRIMARY_MAX_CLAMP)
-    }
-
-    fn primary_starts(&self, tree: &Tree, count: usize) -> [i32; 32] {
-        let mut out = [tree.base_y; 32];
-
-        let y_lo = tree.base_y + (tree.trunk_h * PRIMARY_START_Y_LO_FRAC) / 100;
-        let y_hi = tree.base_y + (tree.trunk_h * PRIMARY_START_Y_HI_FRAC) / 100;
-
-        for i in 0..count.min(32) {
-            let t = if count <= 1 {
-                0.5
-            } else {
-                (i as f32) / ((count - 1) as f32)
-            };
-            let y_base = (Self::lerp(y_lo as f32, y_hi as f32, t)) as i32;
-
-            let r = hash_u32(tree.seed ^ 0xC0DE_0001 ^ (i as u32).wrapping_mul(0x9E37_79B9));
-            let jitter =
-                (Self::s11(r ^ 0x1111) * PRIMARY_START_JITTER_FRAC * (tree.trunk_h as f32)) as i32;
-            out[i] = (y_base + jitter).clamp(y_lo, y_hi);
-        }
-
-        // insertion sort ascending
-        for i in 1..count.min(32) {
-            let mut j = i;
-            while j > 0 && out[j - 1] > out[j] {
-                out.swap(j - 1, j);
-                j -= 1;
-            }
-        }
-
-        out
-    }
-
-    // -------------------------------------------------------------------------
-    // Branch generation
-    // -------------------------------------------------------------------------
-
-    fn child_branches_from_parent(&self, parent: &Branch, tree_seed: u32, out: &mut Vec<Branch>) {
-        if parent.depth >= MAX_BRANCH_DEPTH {
-            return;
-        }
-
-        let vpm = config::VOXELS_PER_METER as f32;
-        let base = hash_u32(parent.seed ^ 0xCC11_0000);
-
-        let child_count = Self::child_count_for_depth(parent.depth, base);
-
-        for j in 0..child_count {
-            let sj = hash_u32(base ^ (j as u32).wrapping_mul(0x9E37_79B9));
-
-            if (sj & Self::spawn_thin_mask(parent.depth)) != 0 {
-                continue;
-            }
-
-            let t = (CHILD_SPAWN_T_MIN + CHILD_SPAWN_T_RAND * u01(sj ^ 0x1111)).clamp(0.0, 1.0);
-
-            let (ax, ay, az) = Self::bez_point(parent, t);
-            let (tx, ty, tz) = Self::bez_tangent(parent, t);
-            let w = Self::norm3(tx, ty, tz);
-            let (u, v, w) = Self::basis_from_w(w);
-
-            let phi = u01(sj ^ 0xFACE_B00C) * std::f32::consts::TAU;
-            let (cs, sn) = (phi.cos(), phi.sin());
-            let sideways = (u.0 * cs + v.0 * sn, u.1 * cs + v.1 * sn, u.2 * cs + v.2 * sn);
-
-            let depth = parent.depth + 1;
-
-            let max_from_parent = parent.len * (CHILD_MAXLEN_A - CHILD_MAXLEN_B * (depth as f32));
-            let mut len =
-                (CHILD_LEN_M_MIN * vpm + u01(sj ^ 0x2222) * (CHILD_LEN_M_RAND * vpm)).min(
-                    max_from_parent,
-                );
-            len = len.max(CHILD_LEN_M_FLOOR * vpm);
-
-            let fan_amp = CHILD_FAN_AMP_BASE + CHILD_FAN_AMP_DEPTH * (depth as f32);
-            let fan = Self::s11(sj ^ 0x3333) * fan_amp;
-
-            let up = 1.65 * (CHILD_UP_BASE + CHILD_UP_DEPTH * (depth as f32))
-                + 1.25 * (CHILD_UP_RAND * u01(sj ^ 0x4444));
-
-            let dirx = (w.0 + sideways.0 * fan).clamp(-2.0, 2.0);
-            let diry = (w.1 + sideways.1 * fan + up).clamp(0.15, 3.0);
-            let dirz = (w.2 + sideways.2 * fan).clamp(-2.0, 2.0);
-            let (dirx, diry, dirz) = Self::norm3(dirx, diry, dirz);
-
-            let pr = parent.r0 + (parent.r1 - parent.r0) * t;
-
-            let shrink = Self::shrink_for_child_depth(depth);
-            let r0 = (pr * shrink).max(CHILD_R0_MIN_VOX);
-            let r1 =
-                (r0 * (CHILD_R1_SCALE_BASE + CHILD_R1_SCALE_RAND * u01(sj ^ 0x5555))).max(
-                    CHILD_R1_MIN_VOX,
-                );
-
-            let bx = ax + dirx * len;
-            let by = ay + diry * len;
-            let bz = az + dirz * len;
-
-            let bend = (CHILD_BEND_M_MIN * vpm) + (CHILD_BEND_M_RAND * vpm) * u01(sj ^ 0x6666);
-
-            let k1 = Self::s11(sj ^ 0x7777);
-            let k2 = Self::s11(sj ^ 0x8888);
-            let u1 = Self::s11(sj ^ 0x9999);
-            let u2 = Self::s11(sj ^ 0xAAAA);
-
-            let c1x = ax + dirx * (CHILD_C1_T * len)
-                + sideways.0 * (bend * CHILD_C1_BEND_SCALE * k1);
-            let c1y = ay + diry * (CHILD_C1_T * len) + (bend * CHILD_C1_Y_BEND_SCALE * u1.abs());
-            let c1z = az + dirz * (CHILD_C1_T * len)
-                + sideways.2 * (bend * CHILD_C1_BEND_SCALE * k1);
-
-            let c2x = ax + dirx * (CHILD_C2_T * len)
-                + sideways.0 * (bend * CHILD_C2_BEND_SCALE * k2);
-            let c2y = ay + diry * (CHILD_C2_T * len) + (bend * CHILD_C2_Y_BEND_SCALE * u2.abs());
-            let c2z = az + dirz * (CHILD_C2_T * len)
-                + sideways.2 * (bend * CHILD_C2_BEND_SCALE * k2);
-
-            out.push(Branch {
-                ax,
-                ay,
-                az,
-                c1x,
-                c1y,
-                c1z,
-                c2x,
-                c2y,
-                c2z,
-                bx,
-                by,
-                bz,
-                r0,
-                r1,
-                len,
-                depth,
-                seed: hash_u32(tree_seed ^ sj ^ 0xBEEF_1234),
-            });
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Rasterization into chunk-local mask
-    // -------------------------------------------------------------------------
-
-    fn raster_tree_into_mask(&self, tree: &Tree, out: &mut TreeMaskCache) {
-        let side = out.size;
-
-        // --- trunk ---
-        let top_y = tree.base_y + tree.trunk_h;
-        let y0 = tree.base_y.max(out.origin[1]);
-        let y1 = top_y.min(out.origin[1] + side - 1);
-
-        for wy in y0..=y1 {
-            let (wx, wz) = self.trunk_wobble(tree, wy);
-            let cx = tree.tx as f32 + wx;
-            let cz = tree.tz as f32 + wz;
-            let rr = Self::trunk_radius_at(tree, wy).max(1.0);
-            let r = rr.ceil() as i32;
-            let rr2 = rr * rr;
-
-            let minx = (cx.floor() as i32 - r).max(out.origin[0]);
-            let maxx = (cx.ceil() as i32 + r).min(out.origin[0] + side - 1);
-            let minz = (cz.floor() as i32 - r).max(out.origin[2]);
-            let maxz = (cz.ceil() as i32 + r).min(out.origin[2] + side - 1);
-
-            for x in minx..=maxx {
-                let dx = (x as f32) - cx;
-                let dx2 = dx * dx;
-                for z in minz..=maxz {
-                    let dz = (z as f32) - cz;
-                    if dx2 + dz * dz <= rr2 {
-                        out.write_wood(x - out.origin[0], wy - out.origin[1], z - out.origin[2]);
-                    }
-                }
-            }
-        }
-
-        // --- top crown (leaf cluster at trunk tip) ---
-        if TOP_CROWN_ENABLE {
-            let vpm_f = config::VOXELS_PER_METER as f32;
-
-            let tip_y = tree.base_y + tree.trunk_h;
-            let (twx, twz) = self.trunk_wobble(tree, tip_y);
-
-            let cx = tree.tx as f32 + twx;
-            let cy = tip_y as f32 + TOP_CROWN_LIFT_M * vpm_f;
-            let cz = tree.tz as f32 + twz;
-
-            let crown_r =
-                Self::tuft_r_m(0, tree.seed ^ 0xC0A7_0001) * vpm_f * TOP_CROWN_R_SCALE;
-
-            // center tuft (tip profile)
-            self.raster_sphere_leaf_tuft_with_masks(
-                out,
-                cx,
-                cy,
-                cz,
-                crown_r,
-                tree.seed ^ 0xC0A7_CE17,
-                TIP_GUARANTEED_GATE_MASK,
-                TIP_GUARANTEED_INTERIOR_KEEP_MASK,
-                TIP_GUARANTEED_SHELL_DROP_MASK,
-            );
-
-            // ring tufts (sleeve profile) for a crown silhouette
-            let ring_r = crown_r * TOP_CROWN_RING_RAD_SCALE;
-            for i in 0..TOP_CROWN_RING_TUFTS {
-                let rr = hash_u32(tree.seed ^ 0xC0A7_1E99 ^ (i as u32).wrapping_mul(0x9E37_79B9));
-                let ang = u01(rr ^ 0xA1) * std::f32::consts::TAU;
-
-                let ox = ang.cos() * ring_r;
-                let oz = ang.sin() * ring_r;
-                let oy = Self::s11(rr ^ 0xB2) * (0.18 * vpm_f);
-
-                self.raster_sphere_leaf_tuft_with_masks(
-                    out,
-                    cx + ox,
-                    cy + oy,
-                    cz + oz,
-                    crown_r * (0.70 + 0.15 * u01(rr ^ 0xC3)),
-                    tree.seed ^ rr ^ 0xC0A7_7AF7,
-                    TUFT_SPARSE_GATE_MASK,
-                    TUFT_SPARSE_INTERIOR_KEEP_MASK,
-                    TUFT_SPARSE_SHELL_DROP_MASK,
-                );
-            }
-        }
-
-        // --- branches ---
-        let vpm_f = config::VOXELS_PER_METER as f32;
-
-        let primary_count = self.primary_count(tree);
-        let starts = self.primary_starts(tree, primary_count);
-        let ang0 = u01(hash_u32(tree.seed ^ 0xA0A0_0001)) * std::f32::consts::TAU;
-
-        let mut branches: Vec<Branch> = Vec::with_capacity(BRANCH_CAP.min(1024));
-
-        // primary branches
-        for i in 0..primary_count.min(32) {
-            let sy = starts[i];
-            let br_seed = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
-
-            let ang_j = Self::s11(hash_u32(br_seed ^ 0xABCD_0001)) * PRIMARY_ANG_JITTER;
-            let ang =
-                ang0 + (i as f32) * (std::f32::consts::TAU / (primary_count as f32)) + ang_j;
-
-            let dirx = ang.cos();
-            let dirz = ang.sin();
-
-            let len = (PRIMARY_LEN_M_MIN * vpm_f)
-                + u01(hash_u32(br_seed ^ 0x1111)) * (PRIMARY_LEN_M_RAND * vpm_f);
-
-            let h = ((sy - tree.base_y) as f32 / (tree.trunk_h as f32)).clamp(0.0, 1.0);
-            let p = u01(hash_u32(br_seed ^ 0x2222));
-            let pitch = (PRIMARY_PITCH_BASE + PRIMARY_PITCH_H_SCALE * h)
-                + (p * p) * (PRIMARY_PITCH_QUAD_BASE + PRIMARY_PITCH_QUAD_H_SCALE * h);
-
-            let br0 = (PRIMARY_R0_M_MIN * vpm_f)
-                + u01(hash_u32(br_seed ^ 0x3333)) * (PRIMARY_R0_M_RAND * vpm_f);
-            let br1 = br0
-                * (PRIMARY_R1_SCALE_MIN + PRIMARY_R1_SCALE_RAND * u01(hash_u32(br_seed ^ 0x3334)));
-
-            let (twx, twz) = self.trunk_wobble(tree, sy);
-            let ax = tree.tx as f32 + twx;
-            let ay = sy as f32;
-            let az = tree.tz as f32 + twz;
-
-            let bx = ax + dirx * len;
-            let by = ay + pitch * len;
-            let bz = az + dirz * len;
-
-            let bend = (PRIMARY_BEND_M_MIN * vpm_f)
-                + (PRIMARY_BEND_M_RAND * vpm_f) * u01(hash_u32(br_seed ^ 0x9000));
-            let k1 = Self::s11(hash_u32(br_seed ^ 0x9001));
-            let k2 = Self::s11(hash_u32(br_seed ^ 0x9002));
-            let u1 = Self::s11(hash_u32(br_seed ^ 0x9003));
-            let u2 = Self::s11(hash_u32(br_seed ^ 0x9004));
-
-            let perpx = -dirz;
-            let perpz = dirx;
-
-            let c1x = ax + dirx * (PRIMARY_C1_T * len)
-                + perpx * (bend * (PRIMARY_C1_BEND_SCALE * k1));
-            let c1z = az + dirz * (PRIMARY_C1_T * len)
-                + perpz * (bend * (PRIMARY_C1_BEND_SCALE * k1));
-            let c1y = ay + (pitch * len) * PRIMARY_C1_T + (PRIMARY_C1_Y_BEND_SCALE * bend * u1);
-
-            let c2x = ax + dirx * (PRIMARY_C2_T * len)
-                + perpx * (bend * (PRIMARY_C2_BEND_SCALE * k2));
-            let c2z = az + dirz * (PRIMARY_C2_T * len)
-                + perpz * (bend * (PRIMARY_C2_BEND_SCALE * k2));
-            let c2y = ay + (pitch * len) * PRIMARY_C2_T + (PRIMARY_C2_Y_BEND_SCALE * bend * u2);
-
-            branches.push(Branch {
-                ax,
-                ay,
-                az,
-                c1x,
-                c1y,
-                c1z,
-                c2x,
-                c2y,
-                c2z,
-                bx,
-                by,
-                bz,
-                r0: br0.max(1.0),
-                r1: br1.max(0.80),
-                len,
-                depth: 0,
-                seed: hash_u32(tree.seed ^ br_seed ^ 0x1A2B_3C4D),
-            });
-        }
-
-        // BFS recursion (generate)
-        let mut k = 0usize;
-        while k < branches.len() && branches.len() < BRANCH_CAP {
-            let b = branches[k];
-            self.child_branches_from_parent(&b, tree.seed, &mut branches);
-            k += 1;
-        }
-
-        // wood raster
-        for b in &branches {
-            let len_m = b.len / vpm_f;
-            let steps = (BRANCH_STEPS_BASE + (len_m / BRANCH_STEPS_LEN_DIV_M)).round() as i32;
-            let steps = steps.clamp(BRANCH_STEPS_MIN, BRANCH_STEPS_MAX);
-            self.raster_bezier_wood(out, b, steps);
-        }
-
-        // leaves raster
-        for b in &branches {
-            if (hash_u32(b.seed ^ 0x1357_2468) & LEAF_RARE_SKIP_MASK) == 0 {
-                continue;
-            }
-
-            let tuft_r = Self::tuft_r_m(b.depth, b.seed ^ 0x4440) * vpm_f;
-
-            // tip tuft
-            if LEAF_ALWAYS_TIP_FOR_ALL_BRANCHES {
-                self.raster_sphere_leaf_tuft_with_masks(
-                    out,
-                    b.bx,
-                    b.by,
-                    b.bz,
-                    tuft_r,
-                    b.seed ^ 0x1EE7_1EAF,
-                    TIP_GUARANTEED_GATE_MASK,
-                    TIP_GUARANTEED_INTERIOR_KEEP_MASK,
-                    TIP_GUARANTEED_SHELL_DROP_MASK,
-                );
-            }
-
-            // sleeve tufts along branch
-            let sleeve_n = Self::sleeve_n(b.depth);
-            for si in 0..sleeve_n {
-                let rr = hash_u32(b.seed ^ 0x9000_1000 ^ (si as u32).wrapping_mul(0x9E37_79B9));
-                let t = LEAF_SLEEVE_T_MIN + LEAF_SLEEVE_T_RAND * u01(rr ^ 0x0101);
-                let (mx, my, mz) = Self::bez_point(b, t);
-
-                let ox = Self::s11(rr ^ 0x0202) * (LEAF_SLEEVE_OFFSET_M_XZ * vpm_f);
-                let oy = u01(rr ^ 0x0303) * (LEAF_SLEEVE_OFFSET_M_Y * vpm_f);
-                let oz = Self::s11(rr ^ 0x0404) * (LEAF_SLEEVE_OFFSET_M_XZ * vpm_f);
-
-                self.raster_sphere_leaf_tuft_with_masks(
-                    out,
-                    mx + ox,
-                    my + oy,
-                    mz + oz,
-                    tuft_r * (0.55 + 0.10 * (si as f32)),
-                    b.seed ^ rr ^ 0x2AA2_2AA2,
-                    TUFT_SPARSE_GATE_MASK,
-                    TUFT_SPARSE_INTERIOR_KEEP_MASK,
-                    TUFT_SPARSE_SHELL_DROP_MASK,
-                );
-            }
-
-            // extra offset tip tuft (disabled by LEAF_OFFSET_TIP_MASK=0)
-            let h = hash_u32(b.seed ^ 0xABC0_0001);
-            if (h & LEAF_OFFSET_TIP_MASK) != 0 {
-                let rr = hash_u32(b.seed ^ 0xABC0_0002);
-                let ox = Self::s11(rr ^ 0xABC1) * (LEAF_OFFSET_M_XZ * vpm_f);
-                let oy = u01(rr ^ 0xABC2) * (LEAF_OFFSET_M_Y * vpm_f);
-                let oz = Self::s11(rr ^ 0xABC3) * (LEAF_OFFSET_M_XZ * vpm_f);
-
-                self.raster_sphere_leaf_tuft_with_masks(
-                    out,
-                    b.bx + ox,
-                    b.by + oy,
-                    b.bz + oz,
-                    tuft_r * 0.75,
-                    b.seed ^ 0x600D_600D,
-                    TUFT_SPARSE_GATE_MASK,
-                    TUFT_SPARSE_INTERIOR_KEEP_MASK,
-                    TUFT_SPARSE_SHELL_DROP_MASK,
-                );
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Wood rasterization
-    // -------------------------------------------------------------------------
-
-    fn raster_bezier_wood(&self, out: &mut TreeMaskCache, b: &Branch, steps: i32) {
-        let steps = steps.max(2);
-        let inv = 1.0 / (steps as f32);
-
-        let mut px = b.ax;
-        let mut py = b.ay;
-        let mut pz = b.az;
-
-        for i in 1..=steps {
-            let t = (i as f32) * inv;
-
-            let qx = Self::bezier3(b.ax, b.c1x, b.c2x, b.bx, t);
-            let qy = Self::bezier3(b.ay, b.c1y, b.c2y, b.by, t);
-            let qz = Self::bezier3(b.az, b.c1z, b.c2z, b.bz, t);
-
-            let rr0 = b.r0 + (b.r1 - b.r0) * (((i - 1) as f32) * inv);
-            let rr1 = b.r0 + (b.r1 - b.r0) * t;
-
-            Self::raster_segment_wood_capsule_stamps(out, px, py, pz, qx, qy, qz, rr0, rr1);
-
-            px = qx;
-            py = qy;
-            pz = qz;
-        }
-    }
-
-    fn raster_segment_wood_capsule_stamps(
-        out: &mut TreeMaskCache,
-        ax: f32, ay: f32, az: f32,
-        bx: f32, by: f32, bz: f32,
-        r0: f32, r1: f32,
-    ) {
-        let vx = bx - ax;
-        let vy = by - ay;
-        let vz = bz - az;
-
-        let len2 = vx*vx + vy*vy + vz*vz;
-        if len2 <= 1e-8 {
-            Self::stamp_sphere_wood(out, ax, ay, az, r0.max(r1));
-            return;
-        }
-        let len = len2.sqrt();
-
-        // Step size in voxels. 0.75 tends to be safe (no holes) but not too expensive.
-        let step = 0.75_f32;
-        let n = (len / step).ceil() as i32;
-
-        let inv_n = 1.0 / (n as f32);
-
-        for i in 0..=n {
-            let t = (i as f32) * inv_n;
-            let cx = ax + vx * t;
-            let cy = ay + vy * t;
-            let cz = az + vz * t;
-
-            let r = r0 + (r1 - r0) * t;
-            Self::stamp_sphere_wood(out, cx, cy, cz, r);
-        }
-    }
-
-    fn stamp_sphere_wood(out: &mut TreeMaskCache, cx: f32, cy: f32, cz: f32, r: f32) {
-        let rr = r.max(1.0);
-        let ir = rr.ceil() as i32;
-        let r2 = rr * rr;
-
-        let minx = (cx.floor() as i32 - ir).max(out.origin[0]);
-        let maxx = (cx.ceil()  as i32 + ir).min(out.origin[0] + out.size - 1);
-        let miny = (cy.floor() as i32 - ir).max(out.origin[1]);
-        let maxy = (cy.ceil()  as i32 + ir).min(out.origin[1] + out.size - 1);
-        let minz = (cz.floor() as i32 - ir).max(out.origin[2]);
-        let maxz = (cz.ceil()  as i32 + ir).min(out.origin[2] + out.size - 1);
-
-        for y in miny..=maxy {
-            let dy = (y as f32) - cy;
-            let dy2 = dy * dy;
-            for x in minx..=maxx {
-                let dx = (x as f32) - cx;
-                let dx2 = dx * dx;
-                for z in minz..=maxz {
-                    let dz = (z as f32) - cz;
-                    if dx2 + dy2 + dz*dz <= r2 {
-                        out.write_wood(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
-                    }
-                }
-            }
-        }
-    }
-
-
-    // -------------------------------------------------------------------------
-    // Leaf rasterization
-    // -------------------------------------------------------------------------
-
-    fn raster_sphere_leaf_tuft_with_masks(
-        &self,
-        out: &mut TreeMaskCache,
-        cx: f32,
-        cy: f32,
-        cz: f32,
-        r: f32,
-        seed: u32,
-        gate_mask: u32,
-        interior_keep_mask: u32,
-        shell_drop_mask: u32,
-    ) {
-        let rr = r.max(1.0);
-        let ir = rr.ceil() as i32;
-
-        let minx = (cx.floor() as i32 - ir).max(out.origin[0]);
-        let maxx = (cx.ceil() as i32 + ir).min(out.origin[0] + out.size - 1);
-        let miny = (cy.floor() as i32 - ir).max(out.origin[1]);
-        let maxy = (cy.ceil() as i32 + ir).min(out.origin[1] + out.size - 1);
-        let minz = (cz.floor() as i32 - ir).max(out.origin[2]);
-        let maxz = (cz.ceil() as i32 + ir).min(out.origin[2] + out.size - 1);
-
-        let r2 = rr * rr;
-
-        for y in miny..=maxy {
-            let py = y as f32;
-            let dy = (py - cy) * LEAF_SPHERE_Y_SCALE;
-            let dy2 = dy * dy;
-
-            for x in minx..=maxx {
-                let px = x as f32;
-                let dx = px - cx;
-                let dx2 = dx * dx;
-
-                for z in minz..=maxz {
-                    let pz = z as f32;
-                    let dz = pz - cz;
-                    let d2 = dx2 + dy2 + dz * dz;
-                    if d2 > r2 {
-                        continue;
-                    }
-
-                    // gate AFTER sphere test
-                    if (hash3(seed ^ 0xA11C_E5ED, x, y, z) & gate_mask) != 0 {
-                        continue;
-                    }
-
-                    // only now do sqrt + interior/shell hashing
-                    let shell2 = (LEAF_SHELL_THRESH * rr) * (LEAF_SHELL_THRESH * rr);
-                    if d2 < shell2 {
-                        let n = hash3(seed ^ 0xCAFE_BABE, x, y, z);
-                        if (n & interior_keep_mask) != 0 {
-                            continue;
-                        }
-                    } else {
-                        let n = hash3(seed ^ 0xD00D_F00D, x, y, z);
-                        if (n & shell_drop_mask) == 0 {
-                            continue;
-                        }
-                    }
-
-                    out.write_leaf(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
-                }
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // SVO bounds helper
-    // -------------------------------------------------------------------------
-
-    /// Used by the SVO builder to stamp conservative tree-top bounds.
-    pub fn tree_instance_at_meter(&self, xm: i32, zm: i32) -> Option<(i32, i32)> {
-        let (_seed, trunk_h_vox, crown_r_vox) = self.tree_at_meter_cell(xm, zm)?;
-        Some((trunk_h_vox, crown_r_vox))
-    }
-}
 

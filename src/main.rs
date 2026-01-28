@@ -1,6 +1,7 @@
 // src/main.rs
 mod app;
 mod camera;
+mod clipmap;
 mod config;
 mod input;
 mod render;
@@ -9,7 +10,11 @@ mod svo;
 mod world;
 
 use std::sync::Arc;
-use winit::{event_loop::EventLoop, window::{Fullscreen, WindowBuilder}, dpi::PhysicalSize};
+use winit::{
+    dpi::PhysicalSize,
+    event_loop::EventLoop,
+    window::{Fullscreen, WindowBuilder},
+};
 
 fn main() {
     let event_loop = EventLoop::new().unwrap();

@@ -1,7 +1,9 @@
+// src/shaders/ray_main.wgsl
+// -------------------------
 // ray_main.wgsl
 //
 // Compute entrypoints only.
-// Depends on: common.wgsl + ray_core.wgsl
+// Depends on: common.wgsl + ray_core.wgsl + clipmap.wgsl
 
 @group(0) @binding(4) var color_img : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var depth_img : texture_storage_2d<r32float, write>;
@@ -51,15 +53,11 @@ fn godray_integrate(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, j: f32) -> vec3<f3
 
   var sum = vec3<f32>(0.0);
 
-  // Stronger stabilization to kill shimmer:
-  // - LP Ts (sun visibility)
-  // - LP shaft weight itself
   var ts_lp: f32    = 1.0;
   var shaft_lp: f32 = 0.0;
 
-  // Make smoothing scale with step length so it behaves consistently as t_end changes.
-  let a_ts    = 1.0 - exp(-dt * 3.0);  // Ts smoothing
-  let a_shaft = 1.0 - exp(-dt * 5.0);  // shaft smoothing
+  let a_ts    = 1.0 - exp(-dt * 3.0);
+  let a_shaft = 1.0 - exp(-dt * 5.0);
 
   for (var i: u32 = 0u; i < GODRAY_STEPS_FAST; i = i + 1u) {
     let ti = (f32(i) + 0.5 + j) * dt;
@@ -70,45 +68,32 @@ fn godray_integrate(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, j: f32) -> vec3<f3
     let Tv = fog_transmittance_godray(ro, rd, ti);
     if (Tv < GODRAY_TV_CUTOFF) { break; }
 
-    // Sun visibility (occluders + clouds).
     let Ts0 = sun_transmittance(p, SUN_DIR);
-
-    // Soften hard leaf cutouts a bit (helps “go through leaves” look).
-    // < 1.0 makes dimmer-but-present transmission survive.
     let Ts_soft = pow(clamp(Ts0, 0.0, 1.0), 0.75);
 
-    // LP Ts heavily to remove per-frame sparkle from undersampling/jitter.
     let ts_prev = ts_lp;
     ts_lp = mix(ts_lp, Ts_soft, a_ts);
 
-    // Edge energy from *stabilized* Ts change (this is where shafts come from).
-    // Using ts_prev avoids “derivative of already-updated state” weirdness.
     let dTs = abs(Ts_soft - ts_prev);
 
-    // Convert edge energy into a soft mask, then LP that too.
     var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
-    shaft = sqrt(shaft); // widen/soften
+    shaft = sqrt(shaft);
     shaft_lp = mix(shaft_lp, shaft, a_shaft);
     shaft = shaft_lp;
 
-    // Small baseline haze so it stays volumetric (but doesn’t milk out the scene).
     let haze_ramp = 1.0 - exp(-ti / GODRAY_HAZE_NEAR_FADE);
     let haze = GODRAY_BASE_HAZE * haze_ramp;
 
-    // Prevent shafts from looking “painted on” in fully-dark regions:
-    // tie shaft contribution to how much sun is actually present.
     let shaft_sun_gate = smoothstep(0.10, 0.55, ts_lp);
 
     let w = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
 
-    // Godray scatter density with its own height behavior.
     let hfall = GODRAY_SCATTER_HEIGHT_FALLOFF;
     let hmin  = GODRAY_SCATTER_MIN_FRAC;
     let height_term = max(exp(-hfall * p.y), hmin);
 
     let dens = base * height_term;
 
-    // Slight strength reduction here (so you don't have to rebalance everything else).
     let strength_scale = 0.70;
 
     sum += (SUN_COLOR * SUN_INTENSITY) * (dens * dt) * Tv * ts_lp * phase * w * strength_scale;
@@ -116,7 +101,6 @@ fn godray_integrate(ro: vec3<f32>, rd: vec3<f32>, t_end: f32, j: f32) -> vec3<f3
 
   return sum * GODRAY_STRENGTH;
 }
-
 
 @compute @workgroup_size(8, 8, 1)
 fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -134,10 +118,21 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
   let voxel_size = cam.voxel_params.x;
   let nudge_p = PRIMARY_NUDGE_VOXEL_FRAC * voxel_size;
 
+  // If no SVO chunks, still render clipmap terrain.
   if (cam.chunk_count == 0u) {
+    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+
+    let surface = select(sky, shade_clip_hit(ro, rd, hf), hf.hit);
+    let t_scene = select(FOG_MAX_DIST, min(hf.t, FOG_MAX_DIST), hf.hit);
+
+    let T = fog_transmittance_primary(ro, rd, t_scene);
+    let fogc = fog_color(rd);
+    let fog_amt = (1.0 - T) * FOG_PRIMARY_VIS;
+    let col = mix(surface, fogc, fog_amt);
+
     let ip = vec2<i32>(i32(gid.x), i32(gid.y));
-    textureStore(color_img, ip, vec4<f32>(sky, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
+    textureStore(color_img, ip, vec4<f32>(col, 1.0));
+    textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     return;
   }
 
@@ -162,10 +157,21 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
   var t_enter = max(rtg.x, 0.0);
   let t_exit  = rtg.y;
 
+  // Outside streamed SVO grid => clipmap fallback.
   if (t_exit < t_enter) {
+    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+
+    let surface = select(sky, shade_clip_hit(ro, rd, hf), hf.hit);
+    let t_scene = select(FOG_MAX_DIST, min(hf.t, FOG_MAX_DIST), hf.hit);
+
+    let T = fog_transmittance_primary(ro, rd, t_scene);
+    let fogc = fog_color(rd);
+    let fog_amt = (1.0 - T) * FOG_PRIMARY_VIS;
+    let col = mix(surface, fogc, fog_amt);
+
     let ip = vec2<i32>(i32(gid.x), i32(gid.y));
-    textureStore(color_img, ip, vec4<f32>(sky, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
+    textureStore(color_img, ip, vec4<f32>(col, 1.0));
+    textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     return;
   }
 
@@ -239,8 +245,23 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (cx < ox || cy < oy || cz < oz || cx >= ox + nx || cy >= oy + ny || cz >= oz + nz) { break; }
   }
 
-  let surface = select(sky, shade_hit(ro, rd, best), best.hit);
-  let t_scene = select(min(t_exit, FOG_MAX_DIST), min(best.t, FOG_MAX_DIST), best.hit);
+  // If no voxel hit, try heightfield clipmap fallback.
+  let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+
+  let use_vox = best.hit;
+  let use_hf  = (!best.hit) && hf.hit;
+
+  let surface = select(
+    sky,
+    select(shade_clip_hit(ro, rd, hf), shade_hit(ro, rd, best), use_vox),
+    (use_vox || use_hf)
+  );
+
+  let t_scene = select(
+    min(t_exit, FOG_MAX_DIST),
+    select(min(hf.t, FOG_MAX_DIST), min(best.t, FOG_MAX_DIST), use_vox),
+    (use_vox || use_hf)
+  );
 
   let T = fog_transmittance_primary(ro, rd, t_scene);
   let fogc = fog_color(rd);
@@ -261,22 +282,18 @@ fn main_godray(@builtin(global_invocation_id) gid: vec3<u32>) {
   let fdims = textureDimensions(depth_tex);
   let ro = cam.cam_pos.xyz;
 
-  // quarter-res pixel
   let hip  = vec2<i32>(i32(gid.x), i32(gid.y));
   let qpx  = vec2<f32>(f32(gid.x), f32(gid.y));
 
-  // frame-stable-ish pattern selector
   let frame = floor(cam.voxel_params.y * GODRAY_FRAME_FPS);
   let flip = select(
     0.0, 1.0,
     hash12(qpx * GODRAY_PATTERN_HASH_SCALE + vec2<f32>(frame, frame * 0.21)) > 0.5
   );
 
-  // map quarter-res pixel -> a 4x4 block in full-res
   let base_x = i32(gid.x) * GODRAY_BLOCK_SIZE;
   let base_y = i32(gid.y) * GODRAY_BLOCK_SIZE;
 
-  // 4 taps in the block (your existing pattern)
   let ax0 = select(1, 2, flip > 0.5);
   let ay0 = 1;
   let ax1 = select(3, 1, flip > 0.5);
@@ -297,19 +314,16 @@ fn main_godray(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let res_full = vec2<f32>(f32(fdims.x), f32(fdims.y));
 
-  // per-tap jitter
   let j0 = (hash12(qpx * J0_SCALE + vec2<f32>(frame * J0_F.x, frame * J0_F.y)) - 0.5);
   let j1 = (hash12(qpx * J1_SCALE + vec2<f32>(frame * J1_F.x, frame * J1_F.y)) - 0.5);
   let j2 = (hash12(qpx * J2_SCALE + vec2<f32>(frame * J2_F.x, frame * J2_F.y)) - 0.5);
   let j3 = (hash12(qpx * J3_SCALE + vec2<f32>(frame * J3_F.x, frame * J3_F.y)) - 0.5);
 
-  // read depth for each tap (also used for a cheap "edge/disocclusion" heuristic)
   let t_scene0 = textureLoad(depth_tex, fp0, 0).x;
   let t_scene1 = textureLoad(depth_tex, fp1, 0).x;
   let t_scene2 = textureLoad(depth_tex, fp2, 0).x;
   let t_scene3 = textureLoad(depth_tex, fp3, 0).x;
 
-  // integrate godrays for the taps
   var acc = vec3<f32>(0.0);
   var wsum = 0.0;
 
@@ -343,41 +357,27 @@ fn main_godray(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let cur = max(select(vec3<f32>(0.0), acc / wsum, wsum > 0.0), vec3<f32>(0.0));
 
-  // -------------------------------
-  // Temporal resolve (reduced ghosting)
-  // -------------------------------
-
-  // history (quarter-res)
   let hist = textureLoad(godray_hist_tex, hip, 0).xyz;
 
-  // (A) depth-edge heuristic inside this quarter-res block:
-  // large depth span => likely edge/disocclusion => reduce history
   let dmin = min(min(t_scene0, t_scene1), min(t_scene2, t_scene3));
   let dmax = max(max(t_scene0, t_scene1), max(t_scene2, t_scene3));
   let span = (dmax - dmin) / max(dmin, 1e-3);
-  let edge = smoothstep(0.03, 0.15, span); // tune
+  let edge = smoothstep(0.03, 0.15, span);
 
-  // (B) reactive heuristic: large change in godray energy => reduce history
   let delta = length(cur - hist);
-  let react = smoothstep(0.03, 0.18, delta); // tune
+  let react = smoothstep(0.03, 0.18, delta);
 
-  // stable = 1 when safe to accumulate, 0 when we should mostly trust current
   let stable = 1.0 - max(edge, react);
 
-  // clamp history near current to prevent trails / overshoot
-  let clamp_w = max(cur * 0.75, vec3<f32>(0.02)); // tune (bigger = less ghosting, more flicker)
+  let clamp_w = max(cur * 0.75, vec3<f32>(0.02));
   let hist_clamped = clamp(hist, cur - clamp_w, cur + clamp_w);
 
-  // history weight (how much of hist_clamped survives)
-  // GODRAY_TS_LP_ALPHA is your knob: higher = smoother but more ghost risk.
   let hist_w = clamp(GODRAY_TS_LP_ALPHA * stable, 0.0, 0.90);
 
-  // final
   let blended = mix(cur, hist_clamped, hist_w);
 
   textureStore(godray_out, hip, vec4<f32>(blended, 1.0));
 }
-
 
 @compute @workgroup_size(8, 8, 1)
 fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -397,7 +397,6 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   var god_raw = max(g + COMPOSITE_SHARPEN * (g - blur), vec3<f32>(0.0));
 
-  // remove baseline haze (keeps only “excess” beam energy)
   god_raw = max(god_raw - vec3<f32>(GODRAY_BLACK_LEVEL), vec3<f32>(0.0));
 
   let god = (vec3<f32>(1.0) - exp(-god_raw));
