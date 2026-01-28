@@ -34,13 +34,23 @@ pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
     let mut app = App::new(window).await;
 
     // winit's `run` never returns in normal operation (it exits the process/event loop).
-    // We set control flow to Poll so we get `AboutToWait` continuously and can render frames.
-    event_loop
-        .run(move |event, elwt| {
-            elwt.set_control_flow(ControlFlow::Poll);
-            app.handle_event(event, elwt);
-        })
-        .unwrap();
+    event_loop.run(move |event, elwt| {
+        elwt.set_control_flow(ControlFlow::Wait);
+
+        match &event {
+            Event::AboutToWait => {
+                // ask for one redraw; OS will pace this (vsync / compositor)
+                app.window.request_redraw();
+            }
+            Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
+                app.frame(elwt);
+            }
+            _ => {
+                app.handle_event(event, elwt);
+            }
+        }
+    }).unwrap();
+
 }
 
 /// Application state that lives for the duration of the event loop.

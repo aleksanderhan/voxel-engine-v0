@@ -1,23 +1,14 @@
 // src/streaming/manager.rs
+// ------------------------
+// Chunk streaming + background SVO building + CPU cache.
 //
-// Chunk streaming + background SVO (Sparse Voxel Octree) building.
-//
-// Key perf change (for the renderer optimization pass):
-// - update(...) now returns `bool grid_changed` so the app can skip uploading `chunk_grid`
-//   every frame. We track a `grid_dirty` flag and only rebuild the GPU (Graphics Processing Unit)
-//   lookup grid when something that affects it actually changed (origin shift or resident set / slot moves).
-//
-// Important correctness fix:
-// - Always send a BuildDone for every BuildJob that is received by a worker, even if it was canceled.
-//   Otherwise `in_flight` can get "stuck" at MAX_IN_FLIGHT and chunk streaming will halt.
-//
-// Additional perf / stall fixes:
-// - Deduplicate and purge stale entries in build_queue.
-// - Only (purge + sort) the queue when the center chunk changes.
-// - Never leave chunks stuck in Building when a job is canceled.
-// - On node arena pressure, evict farthest resident chunks and avoid infinite rebuild/requeue loops.
+// New behavior:
+// - Chunks are built once, then stored in a CPU cache (budgeted, LRU-ish).
+// - When chunks come back into range, we "promote" from cache: allocate GPU node arena
+//   range + upload nodes/meta, without rebuilding on worker threads.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem::size_of;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -83,7 +74,18 @@ pub struct ChunkUpload {
     pub meta: ChunkMetaGpu,
 
     pub node_base: u32,
-    pub nodes: Vec<NodeGpu>,
+    pub nodes: Arc<[NodeGpu]>,
+}
+
+// -----------------------------
+// CPU cache (budgeted, LRU-ish)
+// -----------------------------
+
+#[derive(Clone)]
+struct CachedChunk {
+    nodes: Arc<[NodeGpu]>,
+    bytes: usize,
+    stamp: u64,
 }
 
 fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender<BuildDone>) {
@@ -218,6 +220,14 @@ pub struct ChunkManager {
     grid_origin_chunk: [i32; 3],
     grid_dims: [u32; 3],
     chunk_grid: Vec<u32>,
+
+    // ----------------
+    // CPU chunk cache
+    // ----------------
+    cache: HashMap<ChunkKey, CachedChunk>,
+    cache_lru: VecDeque<(ChunkKey, u64)>, // (key, stamp) entries; duplicates are allowed
+    cache_stamp: u64,
+    cache_bytes: usize,
 }
 
 impl ChunkManager {
@@ -227,7 +237,7 @@ impl ChunkManager {
         spawn_workers(gen.clone(), rx_job, tx_done);
 
         // Arena capacity in NodeGpu elements.
-        let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
+        let node_capacity = (config::NODE_BUDGET_BYTES / size_of::<NodeGpu>()) as u32;
 
         // Grid size (KEEP box).
         let nx = (2 * config::KEEP_RADIUS + 1) as u32;
@@ -258,6 +268,11 @@ impl ChunkManager {
             grid_origin_chunk: [0, 0, 0],
             grid_dims: [nx, ny, nz],
             chunk_grid: vec![INVALID_U32; grid_len],
+
+            cache: HashMap::new(),
+            cache_lru: VecDeque::new(),
+            cache_stamp: 1,
+            cache_bytes: 0,
         }
     }
 
@@ -317,10 +332,21 @@ impl ChunkManager {
         let keep = Self::desired_chunks(center, config::KEEP_RADIUS);
         let keep_set: HashSet<ChunkKey> = keep.iter().copied().collect();
 
-        // Queue missing desired (reset cancel token to false).
+        // Promote cached desired chunks immediately (no rebuild).
+        // For missing desired chunks that are not cached, queue a build.
         for k in &desired {
             match self.chunks.get(k) {
+                Some(ChunkState::Resident(_)) | Some(ChunkState::Queued) | Some(ChunkState::Building) => {
+                    // Already handled / in progress.
+                }
                 None | Some(ChunkState::Missing) => {
+                    // Cache hit: try promote from cache (alloc arena + upload), DO NOT queue build.
+                    if self.cache.contains_key(k) {
+                        let _ = self.try_promote_from_cache(center, *k);
+                        continue;
+                    }
+
+                    // Cache miss: queue build.
                     let c = self.cancel_token(*k);
                     c.store(false, Ordering::Relaxed);
 
@@ -331,7 +357,6 @@ impl ChunkManager {
                         self.build_queue.push_back(*k);
                     }
                 }
-                _ => {}
             }
         }
 
@@ -363,7 +388,7 @@ impl ChunkManager {
             sort_queue_near_first(&mut self.build_queue, center, cam_fwd);
         }
 
-        // Dispatch builds.
+        // Dispatch builds (only for cache misses).
         while self.in_flight < config::MAX_IN_FLIGHT {
             let Some(k) = self.build_queue.pop_front() else { break; };
 
@@ -374,6 +399,14 @@ impl ChunkManager {
                 // Cancel if it was pending.
                 self.cancel_token(k).store(true, Ordering::Relaxed);
                 self.chunks.insert(k, ChunkState::Missing);
+                continue;
+            }
+
+            // If it became cached since it was queued (rare, but possible if you later add disk caching),
+            // don't rebuild it.
+            if self.cache.contains_key(&k) {
+                self.chunks.insert(k, ChunkState::Missing);
+                let _ = self.try_promote_from_cache(center, k);
                 continue;
             }
 
@@ -414,9 +447,7 @@ impl ChunkManager {
             // If the job was canceled (either before start or mid-build),
             // the chunk MUST NOT stay in Building forever.
             if done.canceled || done.cancel.load(Ordering::Relaxed) {
-                if matches!(self.chunks.get(&done.key), Some(ChunkState::Building)) {
-                    self.chunks.insert(done.key, ChunkState::Missing);
-                } else if self.chunks.get(&done.key).is_some() {
+                if self.chunks.get(&done.key).is_some() {
                     self.chunks.insert(done.key, ChunkState::Missing);
                 }
                 continue;
@@ -429,7 +460,7 @@ impl ChunkManager {
                 continue;
             }
 
-            // Still relevant.
+            // Still relevant: cache + try resident.
             self.on_build_done(center, done.key, done.nodes);
         }
 
@@ -505,22 +536,94 @@ impl ChunkManager {
         false
     }
 
-    fn on_build_done(&mut self, center: ChunkKey, key: ChunkKey, nodes: Vec<NodeGpu>) {
-        // If this chunk got cancelled while the result was in flight, drop it.
-        if let Some(c) = self.cancels.get(&key) {
-            if c.load(Ordering::Relaxed) {
-                self.chunks.insert(key, ChunkState::Missing);
-                return;
+    // ----------------
+    // Cache helpers
+    // ----------------
+
+    fn cache_touch(&mut self, key: ChunkKey) {
+        if let Some(e) = self.cache.get_mut(&key) {
+            self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
+            e.stamp = self.cache_stamp;
+            self.cache_lru.push_back((key, e.stamp));
+        }
+    }
+
+    fn cache_put(&mut self, key: ChunkKey, nodes: Arc<[NodeGpu]>) {
+        let bytes = nodes.len() * size_of::<NodeGpu>();
+
+        // If replacing an existing entry, subtract its bytes first.
+        if let Some(old) = self.cache.remove(&key) {
+            self.cache_bytes = self.cache_bytes.saturating_sub(old.bytes);
+        }
+
+        self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
+        let stamp = self.cache_stamp;
+
+        self.cache.insert(
+            key,
+            CachedChunk {
+                nodes,
+                bytes,
+                stamp,
+            },
+        );
+
+        self.cache_bytes = self.cache_bytes.saturating_add(bytes);
+        self.cache_lru.push_back((key, stamp));
+
+        self.evict_cache_as_needed();
+    }
+
+    fn evict_cache_as_needed(&mut self) {
+        let budget = config::CHUNK_CACHE_BUDGET_BYTES;
+
+        while self.cache_bytes > budget {
+            let Some((k, stamp)) = self.cache_lru.pop_front() else { break; };
+
+            // Only evict if this LRU record matches the current entry stamp.
+            let should_evict = self
+                .cache
+                .get(&k)
+                .map(|e| e.stamp == stamp)
+                .unwrap_or(false);
+
+            if !should_evict {
+                continue;
             }
+
+            if let Some(ev) = self.cache.remove(&k) {
+                self.cache_bytes = self.cache_bytes.saturating_sub(ev.bytes);
+            }
+        }
+    }
+
+    // -------------------------------
+    // Resident creation / promotion
+    // -------------------------------
+
+    fn try_make_resident(
+        &mut self,
+        center: ChunkKey,
+        key: ChunkKey,
+        nodes: Arc<[NodeGpu]>,
+    ) -> bool {
+        // If already resident, nothing to do.
+        if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
+            return true;
         }
 
         let need = nodes.len() as u32;
+
+        // If we have nothing (shouldn't happen for non-air chunks, but be safe).
+        if need == 0 {
+            self.chunks.insert(key, ChunkState::Missing);
+            return false;
+        }
 
         // Try allocate; if fails, evict farthest chunks and retry a few times.
         let mut node_base = self.arena.alloc(need);
         if node_base.is_none() {
             for _ in 0..EVICT_ATTEMPTS {
-                // If we can't evict anything, stop.
                 if !self.evict_one_farthest(center, key) {
                     break;
                 }
@@ -532,10 +635,9 @@ impl ChunkManager {
         }
 
         let Some(node_base) = node_base else {
-            // Important: do NOT requeue and spin forever rebuilding.
-            // Mark Missing; desired() will re-queue naturally once the system has room.
+            // Can't fit right now; keep cache so we can promote later.
             self.chunks.insert(key, ChunkState::Missing);
-            return;
+            return false;
         };
 
         // Allocate slot (dense).
@@ -579,6 +681,47 @@ impl ChunkManager {
         // Resident set changed => grid mapping may change.
         self.grid_dirty = true;
         self.changed = true;
+
+        true
+    }
+
+    fn try_promote_from_cache(&mut self, center: ChunkKey, key: ChunkKey) -> bool {
+        let Some(entry) = self.cache.get(&key).cloned() else {
+            return false;
+        };
+
+        // Touch LRU.
+        self.cache_touch(key);
+
+        // Try to make resident from cached nodes.
+        self.try_make_resident(center, key, entry.nodes)
+    }
+
+    fn on_build_done(&mut self, center: ChunkKey, key: ChunkKey, nodes: Vec<NodeGpu>) {
+        // If this chunk got cancelled while the result was in flight, drop it.
+        if let Some(c) = self.cancels.get(&key) {
+            if c.load(Ordering::Relaxed) {
+                self.chunks.insert(key, ChunkState::Missing);
+                return;
+            }
+        }
+
+        // Convert to Arc slice once (cheap clones thereafter).
+        let nodes_arc: Arc<[NodeGpu]> = nodes.into();
+
+        // Cache it (so we never rebuild this chunk again unless evicted).
+        self.cache_put(key, nodes_arc.clone());
+
+        // If already resident (should be rare), don't allocate/upload again.
+        if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
+            return;
+        }
+
+        // Try to allocate + upload now; if we can't fit, keep it cached and mark missing.
+        let ok = self.try_make_resident(center, key, nodes_arc);
+        if !ok {
+            self.chunks.insert(key, ChunkState::Missing);
+        }
     }
 
     fn unload_chunk(&mut self, key: ChunkKey) {
@@ -613,7 +756,7 @@ impl ChunkManager {
                         slot: dead_slot as u32,
                         meta: self.chunk_meta[dead_slot],
                         node_base: 0,
-                        nodes: Vec::new(), // meta-only update
+                        nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
                     });
                 }
 

@@ -36,13 +36,23 @@ pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
     let mut app = App::new(window).await;
 
     // winit's `run` never returns in normal operation (it exits the process/event loop).
-    // We set control flow to Poll so we get `AboutToWait` continuously and can render frames.
-    event_loop
-        .run(move |event, elwt| {
-            elwt.set_control_flow(ControlFlow::Poll);
-            app.handle_event(event, elwt);
-        })
-        .unwrap();
+    event_loop.run(move |event, elwt| {
+        elwt.set_control_flow(ControlFlow::Wait);
+
+        match &event {
+            Event::AboutToWait => {
+                // ask for one redraw; OS will pace this (vsync / compositor)
+                app.window.request_redraw();
+            }
+            Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
+                app.frame(elwt);
+            }
+            _ => {
+                app.handle_event(event, elwt);
+            }
+        }
+    }).unwrap();
+
 }
 
 /// Application state that lives for the duration of the event loop.
@@ -508,10 +518,13 @@ impl Camera {
 // src/config.rs
 // -------------
 // src/config.rs
+// -------------
+// Global config knobs for the voxel/SVO renderer + streaming.
+
 pub const CHUNK_SIZE: u32 = 128;
 
-pub const ACTIVE_RADIUS: i32 = 3;
-pub const KEEP_RADIUS: i32 = ACTIVE_RADIUS + 6;
+pub const ACTIVE_RADIUS: i32 = 4;
+pub const KEEP_RADIUS: i32 = ACTIVE_RADIUS + 13;
 
 pub const VOXEL_SIZE_M_F32: f32 = 0.10;
 pub const VOXEL_SIZE_M_F64: f64 = 0.10;
@@ -522,7 +535,12 @@ pub const VOXELS_PER_METER: i32 = 10; // 1.0 / 0.10
 pub const WORKER_THREADS: usize = 4;
 pub const MAX_IN_FLIGHT: usize = 8;
 
+// GPU node arena budget (storage buffer capacity).
 pub const NODE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
+
+// CPU chunk cache budget (SVO nodes stored on CPU so we don't rebuild chunks).
+// This is the *total* bytes of cached NodeGpu arrays across all cached chunks.
+pub const CHUNK_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024; // 512 MB
 
 // src/input.rs
 // ------------
@@ -654,1798 +672,6 @@ fn main() {
     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
 
     pollster::block_on(app::run(event_loop, window));
-}
-
-// src/render/gpu_types.rs
-// -----------------------
-// src/render/gpu_types.rs
-//
-// GPU-facing data layouts shared between Rust and WGSL.
-//
-// These structs are written into uniform/storage buffers and read by shaders.
-// Requirements for correctness:
-// - `#[repr(C)]` fixes a predictable field order/layout.
-// - `Pod` + `Zeroable` (bytemuck) guarantee the types can be safely cast to bytes.
-// - Fields are sized/aligned to match WGSL expectations (notably 16-byte alignment rules).
-//
-// Practical note about padding:
-// WGSL has strict alignment for uniform/storage layouts (e.g. vec3/vec4 alignment),
-// so we often include explicit `_pad*` fields to keep everything 16-byte aligned.
-
-use bytemuck::{Pod, Zeroable};
-
-/// Node in the GPU-side node arena (likely an SVO / tree / BVH-like structure).
-///
-/// Expected usage:
-/// - Stored in a STORAGE buffer (read-only from shaders in this codebase).
-/// - Addressed by index; child pointers are expressed as a base index + mask.
-///
-/// Field ideas (based on naming):
-/// - child_base: base index of this node's children in the global node arena.
-/// - child_mask: bitmask indicating which child slots are present/valid.
-/// - material: per-node material/voxel payload (id/flags/packed params).
-/// - _pad: explicit padding to keep 16-byte stride (nice for storage access patterns).
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
-pub struct NodeGpu {
-    pub child_base: u32,
-    pub child_mask: u32,
-    pub material: u32,
-    pub _pad: u32,
-}
-
-/// Per-chunk metadata stored in a persistent STORAGE buffer.
-///
-/// Shaders use this to locate the chunk in world space and map the chunk to its nodes
-/// within the global node arena.
-///
-/// - origin: chunk origin in chunk coordinates (xyz) with a spare lane for alignment.
-/// - node_base/node_count: range into the node arena that belongs to this chunk.
-/// - _pad*: explicit padding to preserve alignment / struct stride.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct ChunkMetaGpu {
-    /// Chunk origin expressed as i32 for easy chunk-space arithmetic in shaders.
-    /// origin[3] is unused padding (keeps 16B alignment for the next fields).
-    pub origin: [i32; 4],
-
-    /// First node index in the node arena for this chunk.
-    pub node_base: u32,
-
-    /// Number of nodes belonging to this chunk.
-    pub node_count: u32,
-
-    pub _pad0: u32,
-    pub _pad1: u32,
-}
-
-/// Camera + frame parameters packed for GPU consumption.
-///
-/// Stored as a UNIFORM buffer, updated once per frame.
-///
-/// Contents are tailored for screen-space ray generation / ray marching:
-/// - Inverse matrices let the shader reconstruct world-space rays from pixel coords.
-/// - cam_pos is vec4-aligned for uniform layout friendliness.
-/// - Chunk/grid parameters tell the shader how to interpret streamed chunk data.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct CameraGpu {
-    /// Inverse view matrix (camera -> world transform).
-    pub view_inv: [[f32; 4]; 4],
-
-    /// Inverse projection matrix (clip -> view transform).
-    pub proj_inv: [[f32; 4]; 4],
-
-    /// Camera position in world space. Fourth component is padding (or could be 1.0).
-    pub cam_pos: [f32; 4],
-
-    /// Voxel chunk edge length (in voxels) for index math in shaders.
-    pub chunk_size: u32,
-
-    /// Number of chunk slots currently considered resident/valid.
-    pub chunk_count: u32,
-
-    /// Max raymarch/trace steps for the primary shader.
-    pub max_steps: u32,
-
-    pub _pad0: u32,
-
-    /// Misc per-frame voxel/shader knobs.
-    /// (Meaning is shader-defined; typical uses: voxel size, time, density, jitter, etc.)
-    pub voxel_params: [f32; 4],
-
-    /// Chunk grid origin in chunk coordinates (cx0, cy0, cz0, unused).
-    /// This is the chunk-space coordinate of grid cell (0,0,0).
-    pub grid_origin_chunk: [i32; 4],
-
-    /// Chunk grid dimensions (nx, ny, nz, unused).
-    /// Used to bounds-check and map 3D grid coords -> linear index into chunk_grid buffer.
-    pub grid_dims: [u32; 4],
-}
-
-/// Tiny overlay uniform block for the final blit / UI overlay.
-///
-/// Stored as a UNIFORM buffer, updated periodically (FPS) and on resize (width/height).
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct OverlayGpu {
-    /// FPS value displayed in the overlay.
-    pub fps: u32,
-
-    /// Output width in pixels.
-    pub width: u32,
-
-    /// Output height in pixels.
-    pub height: u32,
-
-    pub _pad0: u32,
-}
-
-// src/render/mod.rs
-// -----------------
-// src/render/mod.rs
-
-pub mod gpu_types;
-pub mod resources;
-pub mod shaders;
-pub mod state;
-
-pub use gpu_types::*;
-pub use state::Renderer;
-
-// src/render/resources.rs
-// -----------------------
-// src/render/resources.rs
-//
-// Small GPU resource helpers that don't fit cleanly into the renderer "state" modules.
-//
-// Right now this file provides the final full-resolution output texture:
-// - written as a STORAGE texture by the composite compute pass
-// - sampled as a regular texture by the final blit render pass
-//
-// Keeping this as a tiny helper makes the main texture set code a bit cleaner.
-
-/// Wrapper for the renderer's final output texture view.
-///
-/// The renderer stores only the TextureView; the view keeps the underlying texture alive
-/// for as long as it exists (wgpu uses ref-counted internal ownership).
-pub struct OutputTex {
-    /// Texture view bound in bind groups (storage write in compute, sampled in blit).
-    pub view: wgpu::TextureView,
-}
-
-/// Create the final output texture (full resolution).
-///
-/// Properties:
-/// - Format: RGBA16F (high dynamic range, good for post-processing)
-/// - Usage:
-///   - STORAGE_BINDING: composite pass writes into it as a storage texture
-///   - TEXTURE_BINDING: blit pass samples it in the fragment shader
-///
-/// Notes:
-/// - wgpu forbids zero-sized textures, so we clamp `w`/`h` to at least 1.
-pub fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> OutputTex {
-    // Avoid creating zero-sized textures (can happen during minimize/resizes).
-    let w = w.max(1);
-    let h = h.max(1);
-
-    // Allocate the GPU texture backing store.
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("output_tex"),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
-        // Must support both compute writes and render sampling.
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-
-    // Default view covers the whole texture.
-    let view = tex.create_view(&Default::default());
-
-    OutputTex { view }
-}
-
-// src/render/shaders.rs
-// ---------------------
-// src/render/shaders.rs
-//
-// Centralized shader sources. WGSL has no native include mechanism in wgpu,
-// so we concatenate multiple WGSL files into a single source string.
-
-pub const RAY_CS_WGSL: &str = concat!(
-    include_str!("../shaders/common.wgsl"),
-    "\n",
-    include_str!("../shaders/ray_core.wgsl"),
-    "\n",
-    include_str!("../shaders/ray_main.wgsl"),
-    "\n",
-);
-
-pub const BLIT_WGSL: &str = include_str!("../shaders/blit.wgsl");
-
-// Optional function wrappers (keeps call sites like shaders::ray_cs_wgsl()).
-#[inline]
-pub fn ray_cs_wgsl() -> &'static str {
-    RAY_CS_WGSL
-}
-
-#[inline]
-pub fn blit_wgsl() -> &'static str {
-    BLIT_WGSL
-}
-
-// src/render/state/bindgroups.rs
-// ------------------------------
-// src/render/state/bindgroups.rs
-//
-// Bind group creation.
-//
-// Bind groups are the concrete "argument packs" you bind before dispatching a
-// compute pass or drawing a render pass. Each bind group must match a specific
-// BindGroupLayout (the pipeline's expectation).
-//
-// This file is split out so resize() only needs to recreate textures and then
-// rebuild bind groups (since bind groups reference texture views).
-
-use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
-
-/// All bind groups used by the renderer.
-///
-/// Naming convention:
-/// - primary/scene are group(0) alternatives for different pipelines.
-/// - godray/composite are additional groups for post processing.
-/// - empty is a placeholder when a pipeline layout expects groups that a pass
-///   doesn't logically use.
-/// - blit is the final render pass bind group (sample output to swapchain).
-pub struct BindGroups {
-    /// group(0) for the primary compute pass.
-    /// Includes storage outputs (color/depth) so the compute shader can write to them.
-    pub primary: wgpu::BindGroup,
-
-    /// group(0) for the godray compute pass.
-    /// Excludes storage outputs to avoid binding the same textures as both storage + sampled.
-    pub scene: wgpu::BindGroup,
-
-    /// group(1) for godray ping-pong history:
-    /// index selects which "direction" we are doing this frame (A->B or B->A).
-    pub godray: [wgpu::BindGroup; 2],
-
-    /// group(2) for composite:
-    /// index selects which godray texture (A or B) we read when composing into `output`.
-    pub composite: [wgpu::BindGroup; 2],
-
-    /// Empty bind group used as a placeholder for group(0/1) in the composite pass.
-    /// Some pipeline layouts are fixed to expect groups that a pass doesn't use.
-    pub empty: wgpu::BindGroup,
-
-    /// Bind group for the final blit render pass (texture + sampler + overlay uniform).
-    pub blit: wgpu::BindGroup,
-}
-
-/// Create bind group for the primary compute pass.
-///
-/// Layout expectations_toggle (by binding index):
-/// 0: camera uniform/storage buffer
-/// 1: chunk buffer
-/// 2: node buffer
-/// 3: chunk grid buffer
-/// 4: color texture view (storage texture the compute shader writes into)
-/// 5: depth texture view (storage texture the compute shader writes into)
-fn make_primary_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    buffers: &Buffers,
-    textures: &TextureSet,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("primary_bg"),
-        layout,
-        entries: &[
-            // Camera parameters (matrices, position, etc.)
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffers.camera.as_entire_binding(),
-            },
-            // Chunk metadata buffer (streamed voxel/chunk data indexing)
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buffers.chunk.as_entire_binding(),
-            },
-            // Node/acceleration structure data (whatever "node" represents in your scene)
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: buffers.node.as_entire_binding(),
-            },
-            // Grid mapping from world chunk coords -> buffer indices / residency info
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: buffers.chunk_grid.as_entire_binding(),
-            },
-            // Primary color output (storage texture view)
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&textures.color.view),
-            },
-            // Primary depth output (storage texture view)
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: wgpu::BindingResource::TextureView(&textures.depth.view),
-            },
-        ],
-    })
-}
-
-/// Create bind group for "scene" inputs that are common across passes.
-///
-/// This intentionally *does not* include storage outputs, so it can be reused in
-/// compute passes that only read scene data and sample textures elsewhere.
-fn make_scene_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    buffers: &Buffers,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("scene_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffers.camera.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buffers.chunk.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: buffers.node.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: buffers.chunk_grid.as_entire_binding(),
-            },
-        ],
-    })
-}
-
-/// Create bind group for the godray compute pass.
-///
-/// Bindings (by index):
-/// 0: depth (read-only) - used for occlusion / ray marching limits.
-/// 1: history texture (read-only) - previous godray accumulation.
-/// 2: output texture (write) - current frame godray result.
-///
-/// The ping-pong scheme swaps which texture is "history" and which is "out"
-/// each frame to avoid read/write hazards on the same texture.
-fn make_godray_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    depth_view: &wgpu::TextureView,
-    hist_view: &wgpu::TextureView,
-    out_view: &wgpu::TextureView,
-    label: &str,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(depth_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(hist_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(out_view),
-            },
-        ],
-    })
-}
-
-/// Create bind group for the composite compute pass.
-///
-/// Bindings (by index):
-/// 0: base color texture (read-only) - the main scene color.
-/// 1: godray texture (read-only) - chosen ping-pong buffer (A or B).
-/// 2: output texture (write) - final composited frame texture.
-fn make_composite_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    color_view: &wgpu::TextureView,
-    godray_view: &wgpu::TextureView,
-    output_view: &wgpu::TextureView,
-    label: &str,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(color_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(godray_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(output_view),
-            },
-        ],
-    })
-}
-
-/// Create bind group for the final blit render pass.
-///
-/// Bindings (by index):
-/// 0: output texture (read-only) - full-screen texture to present.
-/// 1: sampler - filtering and addressing for sampling output.
-/// 2: overlay uniform buffer - small UI data (FPS/size) consumed by fragment shader.
-fn make_blit_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    output_view: &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-    overlay_buf: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("blit_bg"),
-        layout,
-        entries: &[
-            // Fullscreen texture to sample in the fragment shader.
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(output_view),
-            },
-            // Sampler used when sampling the output texture.
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-            // Overlay uniforms (FPS, screen size, etc.).
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: overlay_buf.as_entire_binding(),
-            },
-        ],
-    })
-}
-
-/// Top-level helper to (re)create all bind groups.
-///
-/// Called during initial renderer creation, and again after resize since texture
-/// views change (new textures -> new views -> old bind groups become invalid).
-pub fn create_bind_groups(
-    device: &wgpu::Device,
-    layouts: &Layouts,
-    buffers: &Buffers,
-    textures: &TextureSet,
-    sampler: &wgpu::Sampler,
-) -> BindGroups {
-    // Primary includes storage outputs (color/depth), so it must NOT be used in godray.
-    // Otherwise you'd risk binding the same resource in incompatible ways across passes.
-    let primary = make_primary_bg(device, &layouts.primary, buffers, textures);
-
-    // Scene excludes storage outputs; safe for passes that only need buffers.
-    let scene = make_scene_bg(device, &layouts.scene, buffers);
-
-    // Empty bind group used as placeholder for composite pipeline layout group(0/1).
-    // (Composite pass likely only uses group(2), but the pipeline layout includes 0..2.)
-    let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("empty_bg"),
-        layout: &layouts.empty,
-        entries: &[],
-    });
-
-    // Godray ping-pong:
-    // - godray[0] reads history=A, writes out=B
-    // - godray[1] reads history=B, writes out=A
-    //
-    // `textures.godray` is a pair of textures used to avoid reading and writing the same
-    // texture in a single dispatch.
-    let godray = [
-        make_godray_bg(
-            device,
-            &layouts.godray,
-            &textures.depth.view,
-            &textures.godray[0].view,
-            &textures.godray[1].view,
-            "godray_bg_a_to_b",
-        ),
-        make_godray_bg(
-            device,
-            &layouts.godray,
-            &textures.depth.view,
-            &textures.godray[1].view,
-            &textures.godray[0].view,
-            "godray_bg_b_to_a",
-        ),
-    ];
-
-    // Composite bind groups:
-    // Same pipeline/layout, but choose which godray texture to read (A or B).
-    let composite = [
-        make_composite_bg(
-            device,
-            &layouts.composite,
-            &textures.color.view,
-            &textures.godray[0].view,
-            &textures.output.view,
-            "composite_bg_read_a",
-        ),
-        make_composite_bg(
-            device,
-            &layouts.composite,
-            &textures.color.view,
-            &textures.godray[1].view,
-            &textures.output.view,
-            "composite_bg_read_b",
-        ),
-    ];
-
-    // Blit bind group:
-    // Samples final output into the swapchain; overlay buffer provides UI data.
-    let blit = make_blit_bg(
-        device,
-        &layouts.blit,
-        &textures.output.view,
-        sampler,
-        &buffers.overlay,
-    );
-
-    BindGroups {
-        primary,
-        scene,
-        godray,
-        composite,
-        empty,
-        blit,
-    }
-}
-
-// src/render/state/buffers.rs
-// ---------------------------
-// src/render/state/buffers.rs
-//
-// Persistent GPU buffers and capacities.
-//
-// This module owns the long-lived GPU buffers used across frames.
-// It's separated out so the renderer code can focus on passes/encoding, while
-// buffer sizing/allocation logic lives here.
-//
-// Buffer types used here:
-// - UNIFORM buffers: small per-frame parameter blocks (camera, overlay).
-// - STORAGE buffers: larger arenas updated incrementally (nodes, chunk metadata, chunk grid).
-
-use crate::{
-    config,
-    render::gpu_types::{ChunkMetaGpu, NodeGpu},
-};
-
-/// Collection of GPU buffers that persist for the lifetime of the renderer.
-///
-/// These buffers are recreated only when the renderer is created (or when you
-/// decide to change capacities). They are written to each frame via COPY_DST.
-pub struct Buffers {
-    // --- Uniforms (small, frequently updated) ---
-
-    /// Camera uniforms (inverse matrices, camera position, grid params, etc.).
-    /// Written each frame.
-    pub camera: wgpu::Buffer,
-
-    /// Overlay uniforms (FPS and screen size, etc.).
-    /// Written each frame.
-    pub overlay: wgpu::Buffer,
-
-    // --- Persistent storage buffers (larger arenas) ---
-
-    /// Node arena (likely an SVO / acceleration structure node pool).
-    /// Capacity is derived from a fixed byte budget.
-    pub node: wgpu::Buffer,
-
-    /// Chunk metadata array for all resident chunks (as determined by streaming).
-    pub chunk: wgpu::Buffer,
-
-    /// Chunk grid indirection table (u32 handles/indices mapping 3D grid -> chunk slot).
-    pub chunk_grid: wgpu::Buffer,
-
-    // --- Capacities (element counts, not bytes) ---
-
-    /// Number of NodeGpu elements the node arena can hold.
-    pub node_capacity: u32,
-
-    /// Number of ChunkMetaGpu elements the chunk metadata buffer can hold.
-    pub chunk_capacity: u32,
-
-    /// Number of u32 entries in the chunk grid buffer.
-    pub grid_capacity: u32,
-}
-
-/// Helper to create a fixed-size uniform buffer for some POD-ish type `T`.
-///
-/// Usage flags:
-/// - UNIFORM: bind as uniform buffer in shaders
-/// - COPY_DST: allow updating via queue.write_buffer / copy operations
-fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        // Uniform holds exactly one T.
-        size: std::mem::size_of::<T>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
-
-/// Helper to create a storage buffer of a specific byte size.
-///
-/// Usage flags:
-/// - STORAGE: bind as storage buffer (read/write in compute, read in fragment/vertex if allowed)
-/// - COPY_DST: allow CPU uploads
-fn make_storage_buffer(device: &wgpu::Device, label: &str, size_bytes: u64) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: size_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
-
-/// Create all persistent buffers with capacities derived from config constants.
-///
-/// Important: this only allocates GPU memory. The actual contents are expected
-/// to be filled/updated by streaming + renderer code at runtime.
-pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
-    // --- Uniform buffers ---
-
-    // Camera uniform buffer (one CameraGpu struct).
-    let camera = make_uniform_buffer::<crate::render::gpu_types::CameraGpu>(device, "camera_buf");
-
-    // Overlay uniform buffer (one OverlayGpu struct).
-    let overlay =
-        make_uniform_buffer::<crate::render::gpu_types::OverlayGpu>(device, "overlay_buf");
-
-    // --- Storage buffers ---
-
-    // Node arena capacity derived from a fixed byte budget.
-    //
-    // NOTE: integer division truncates, which is fine: we allocate as many whole NodeGpu
-    // elements as fit into NODE_BUDGET_BYTES.
-    let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
-
-    // Allocate node arena buffer sized to hold `node_capacity` NodeGpu elements.
-    let node = make_storage_buffer(
-        device,
-        "svo_nodes_arena",
-        (node_capacity as u64) * (std::mem::size_of::<NodeGpu>() as u64),
-    );
-
-    // Chunk meta capacity: max resident chunks in the KEEP box (streaming working set).
-    //
-    // The formula here implies:
-    // - X dimension: (2*KEEP_RADIUS + 1)
-    // - Z dimension: (2*KEEP_RADIUS + 1)
-    // - Y dimension: 4 (hard-coded vertical span; likely number of chunk layers kept)
-    //
-    // So total = X * Y * Z.
-    let chunk_capacity =
-        (2 * config::KEEP_RADIUS + 1) as u32 * 4u32 * (2 * config::KEEP_RADIUS + 1) as u32;
-
-    // Allocate chunk metadata buffer sized to hold `chunk_capacity` ChunkMetaGpu elements.
-    let chunk = make_storage_buffer(
-        device,
-        "chunk_meta_persistent",
-        (chunk_capacity as u64) * (std::mem::size_of::<ChunkMetaGpu>() as u64),
-    );
-
-    // Chunk grid buffer (fixed capacity).
-    //
-    // Stored as u32 indices/handles, likely mapping each grid cell to a slot in `chunk`
-    // or a sentinel for "empty".
-    // Here it's set equal to chunk_capacity, meaning "one u32 per chunk slot".
-    let grid_capacity = chunk_capacity;
-
-    let chunk_grid = make_storage_buffer(
-        device,
-        "chunk_grid_buf",
-        (grid_capacity as u64) * (std::mem::size_of::<u32>() as u64),
-    );
-
-    // Return the assembled buffer set and their capacities.
-    Buffers {
-        camera,
-        overlay,
-        node,
-        chunk,
-        chunk_grid,
-        node_capacity,
-        chunk_capacity,
-        grid_capacity,
-    }
-}
-
-// src/render/state/layout.rs
-// --------------------------
-// src/render/state/layout.rs
-//
-// Bind group layouts and small "entry constructors" to reduce repetition.
-//
-// A BindGroupLayout is the *schema* for a bind group: it defines which resources
-// exist at which @group/@binding, and how shaders are allowed to access them.
-//
-// This module encodes the contract between WGSL `@group(n) @binding(m)`
-// declarations and the Rust-side wgpu setup. If bindings or types mismatch,
-// pipeline creation or bind group creation will fail (or validation will trip).
-
-pub struct Layouts {
-    /// group(0): scene inputs + storage outputs (color/depth). Used only by the primary pass.
-    pub primary: wgpu::BindGroupLayout,
-
-    /// group(0): scene inputs only (camera + buffers). Used by godray to avoid storage conflicts.
-    pub scene: wgpu::BindGroupLayout,
-
-    /// group(1): godray pass resources (depth sample + history sample + out storage).
-    pub godray: wgpu::BindGroupLayout,
-
-    /// group(2): composite pass resources (color sample + godray sample + output storage).
-    pub composite: wgpu::BindGroupLayout,
-
-    /// Empty layout: used as a placeholder when a pipeline layout expects group(0/1)
-    /// but the composite pass only meaningfully uses group(2).
-    pub empty: wgpu::BindGroupLayout,
-
-    /// Blit render pass layout: sample final output texture + sampler + overlay uniform.
-    pub blit: wgpu::BindGroupLayout,
-}
-
-// -----------------------------------------------------------------------------
-// BindGroupLayoutEntry helpers
-// -----------------------------------------------------------------------------
-//
-// These tiny constructors keep the layout definitions readable and ensure
-// consistent settings (no dynamic offsets, no min_binding_size, etc.).
-
-/// Convenience for a uniform-buffer entry.
-///
-/// - `binding`: WGSL @binding index
-/// - `visibility`: which shader stages can read this binding
-fn bgl_uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            // No dynamic offsets; the entire buffer is bound as-is.
-            has_dynamic_offset: false,
-            // None => let wgpu infer/validate size at bind time.
-            min_binding_size: None,
-        },
-        // Not an array binding.
-        count: None,
-    }
-}
-
-/// Convenience for a read-only storage-buffer entry.
-fn bgl_storage_ro(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-/// Convenience for a sampled 2D texture entry.
-///
-/// `sample_type` must match the WGSL texture type (float/int/uint + filterable or not).
-fn bgl_tex_sample(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    sample_type: wgpu::TextureSampleType,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Texture {
-            sample_type,
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
-
-/// Convenience for a write-only storage texture entry.
-///
-/// Storage textures are typically used as compute outputs.
-/// `format` must match the actual texture format and the WGSL storage texture declaration.
-fn bgl_storage_tex_wo(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    format: wgpu::TextureFormat,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::StorageTexture {
-            access: wgpu::StorageTextureAccess::WriteOnly,
-            format,
-            view_dimension: wgpu::TextureViewDimension::D2,
-        },
-        count: None,
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Layout creation
-// -----------------------------------------------------------------------------
-
-/// Create all bind group layouts used by the renderer.
-///
-/// The specific formats and binding indices here must match the WGSL shader code.
-/// Notes:
-/// - Most compute textures are declared non-filterable, since they are likely written
-///   as storage textures and/or sampled as exact texel values.
-/// - The final blit pass uses a filterable sampler + filterable texture sampling.
-pub fn create_layouts(device: &wgpu::Device) -> Layouts {
-    // Most passes in this file are compute passes; share the stage visibility constant.
-    let cs_vis = wgpu::ShaderStages::COMPUTE;
-
-    // Shared scene entries (group(0)) used by both `scene` and `primary`.
-    //
-    // These bindings must match your WGSL declarations, e.g.:
-    //   @group(0) @binding(0) var<uniform> camera : ...
-    //   @group(0) @binding(1) var<storage, read> chunks : ...
-    // etc.
-    let scene_entries: [wgpu::BindGroupLayoutEntry; 4] = [
-        bgl_uniform(0, cs_vis),    // camera uniform
-        bgl_storage_ro(1, cs_vis), // chunks meta (read-only)
-        bgl_storage_ro(2, cs_vis), // nodes arena (read-only)
-        bgl_storage_ro(3, cs_vis), // chunk grid (read-only)
-    ];
-
-    // group(0) SCENE:
-    // Camera + buffers only.
-    //
-    // Godray pass uses this so it can bind depth/history textures in other groups
-    // without also binding storage outputs that could cause read/write conflicts.
-    let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("scene_bgl"),
-        entries: &scene_entries,
-    });
-
-    // group(0) PRIMARY:
-    // Scene inputs + storage outputs for color/depth.
-    //
-    // This is the "main" compute pass that writes color and depth textures.
-    let mut primary_entries = Vec::with_capacity(6);
-    primary_entries.extend_from_slice(&scene_entries);
-
-    // binding(4): color storage output (rgba16f)
-    primary_entries.push(bgl_storage_tex_wo(
-        4,
-        cs_vis,
-        wgpu::TextureFormat::Rgba16Float,
-    ));
-
-    // binding(5): depth storage output (r32f)
-    primary_entries.push(bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float));
-
-    let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("primary_bgl"),
-        entries: &primary_entries,
-    });
-
-    // group(1) GODRAY:
-    // - depth sampled (r32f)
-    // - history sampled (rgba16f)
-    // - out storage (rgba16f)
-    //
-    // Sampling is marked filterable:false to match typical storage-written float textures.
-    let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("godray_bgl"),
-        entries: &[
-            // binding(0): depth texture (sampled)
-            bgl_tex_sample(
-                0,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            // binding(1): history texture (sampled)
-            bgl_tex_sample(
-                1,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            // binding(2): output storage texture (write-only)
-            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
-        ],
-    });
-
-    // group(2) COMPOSITE:
-    // - color sampled
-    // - godray sampled
-    // - output storage (final offscreen output)
-    let composite = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("composite_bgl"),
-        entries: &[
-            // binding(0): base color texture
-            bgl_tex_sample(
-                0,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            // binding(1): godray texture
-            bgl_tex_sample(
-                1,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            // binding(2): final output storage texture
-            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
-        ],
-    });
-
-    // Empty layout used as a placeholder bind group layout for group(0/1)
-    // in the composite pipeline layout.
-    let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("empty_bgl"),
-        entries: &[],
-    });
-
-    // Blit layout (render pass):
-    // - sampled output texture (filterable, because we likely scale to the swapchain)
-    // - filtering sampler
-    // - overlay uniform (fragment stage)
-    let blit = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("blit_bgl"),
-        entries: &[
-            // binding(0): output texture sampled in fragment shader
-            bgl_tex_sample(
-                0,
-                wgpu::ShaderStages::FRAGMENT,
-                wgpu::TextureSampleType::Float { filterable: true },
-            ),
-            // binding(1): sampler for output texture
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            // binding(2): overlay uniform (fps, dimensions, etc.)
-            bgl_uniform(2, wgpu::ShaderStages::FRAGMENT),
-        ],
-    });
-
-    Layouts {
-        primary,
-        scene,
-        godray,
-        composite,
-        empty,
-        blit,
-    }
-}
-
-// src/render/state/mod.rs
-// -----------------------
-// src/render/state/mod.rs
-//
-// Multi-pass renderer built around compute shaders plus a final blit render pass.
-//
-// High-level data flow (textures):
-//   primary   (full-res)   : scene tracing + fog
-//     writes -> color_tex (RGBA16F) and depth_tex (R32F)
-//
-//   godray    (quarter-res): light shafts + temporal accumulation (ping-pong)
-//     reads  -> depth_tex + godray_history
-//     writes -> godray_out
-//
-//   composite (full-res)   : combine base color with upsampled godrays
-//     reads  -> color_tex + godray_out
-//     writes -> output_tex (RGBA16F)
-//
-//   blit      (render)     : present output_tex to the swapchain
-//
-// Why the bind groups are split the way they are (wgpu hazard rule):
-//   In a single pass/dispatch, a texture cannot be bound for STORAGE write access
-//   and also be bound for sampling (or any other conflicting usage).
-//
-//   The primary pass bind group (primary_bg) includes storage bindings for color/depth.
-//   The godray pass must sample depth_tex, so it must *not* use primary_bg.
-//   Instead, godray uses scene_bg (buffers only) + a separate godray_bg that samples depth.
-//
-// Bind groups and shader group indices (must match WGSL @group/@binding):
-//   group(0) primary_bg   : camera + scene storage buffers + primary storage outputs (primary pass only)
-//   group(0) scene_bg     : camera + scene storage buffers (NO storage textures)     (godray pass)
-//   group(1) godray_bg    : depth sampled + history sampled + out storage           (godray pass)
-//   group(2) composite_bg : color sampled + godray sampled + output storage         (composite pass)
-//
-// Composite special-case (pipeline layout vs shader usage):
-//   The composite pipeline layout includes group(0), group(1), group(2),
-//   but the composite shader only actually needs group(2).
-//   wgpu still requires bind groups to be set for earlier groups, so we bind empty_bg
-//   for group(0) and group(1) as placeholders.
-
-mod bindgroups;
-mod buffers;
-mod layout;
-mod pipelines;
-pub mod textures;
-
-use crate::{
-    render::gpu_types::{CameraGpu, OverlayGpu},
-    streaming::ChunkUpload,
-};
-
-use bindgroups::{create_bind_groups, BindGroups};
-use buffers::{create_persistent_buffers, Buffers};
-use layout::{create_layouts, Layouts};
-use pipelines::{create_pipelines, Pipelines};
-use textures::{create_textures, quarter_dim, TextureSet};
-
-/// Renderer owns the wgpu Device/Queue and all GPU-side resources needed to render frames.
-///
-/// Design goals:
-/// - Keep per-frame work to "write updated buffers + encode passes".
-/// - Keep persistent GPU buffers (nodes/chunks/grid) allocated once.
-/// - Recreate only size-dependent resources (textures + bind groups) on resize.
-/// - Encapsulate ping-pong state for temporal effects (godray history).
-pub struct Renderer {
-    /// Logical device used to create and encode GPU work.
-    device: wgpu::Device,
-    /// Submission queue for buffer uploads and command buffers.
-    queue: wgpu::Queue,
-
-    // -------------------------------------------------------------------------
-    // Shared resources
-    // -------------------------------------------------------------------------
-
-    /// Sampler used by the final blit pass (and any other filterable sampling).
-    sampler: wgpu::Sampler,
-
-    // -------------------------------------------------------------------------
-    // Resource sets (split for clarity and to make resize rebuilds local)
-    // -------------------------------------------------------------------------
-
-    /// Bind group layouts (the "ABI" between WGSL bindings and wgpu).
-    layouts: Layouts,
-    /// Pipelines for each pass (compute primary/godray/composite + render blit).
-    pipelines: Pipelines,
-    /// Persistent GPU buffers (camera, overlay, nodes, chunk meta, chunk grid).
-    buffers: Buffers,
-    /// Size-dependent textures (color/depth/godray ping-pong/output).
-    textures: TextureSet,
-    /// Concrete bind groups pointing at the current buffers + texture views.
-    bind_groups: BindGroups,
-
-    // -------------------------------------------------------------------------
-    // Ping-pong state for temporal accumulation
-    // -------------------------------------------------------------------------
-
-    /// Index of the "history" godray texture for *this* frame.
-    /// The other index is the "write target" for this frame.
-    ping: usize,
-}
-
-impl Renderer {
-    /// Create a renderer using an already-selected adapter and the chosen surface format.
-    ///
-    /// `width`/`height` are the initial output resolution; textures and bind groups are
-    /// built for this size.
-    pub async fn new(
-        adapter: &wgpu::Adapter,
-        surface_format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) -> Self {
-        // WGPU limits:
-        // We mostly keep defaults, but explicitly preserve the adapter's max buffer sizes
-        // so large STORAGE buffers (node arena, chunk meta) are allowed.
-        let adapter_limits = adapter.limits();
-        let required_limits = wgpu::Limits {
-            max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
-            max_buffer_size: adapter_limits.max_buffer_size,
-            ..wgpu::Limits::default()
-        };
-
-        // Request a device/queue pair. No special features required here.
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-
-        // ---------------------------------------------------------------------
-        // Shader modules
-        // ---------------------------------------------------------------------
-
-        // Single WGSL module that contains the compute entry points (primary/godray/composite).
-        let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ray_cs"),
-            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::ray_cs_wgsl().into()),
-        });
-
-        // WGSL module for the final fullscreen blit render pipeline.
-        let fs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit"),
-            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::blit_wgsl().into()),
-        });
-
-        // Sampler used in the blit pass.
-        // Compute passes intentionally use unfiltered sampling (declared via TextureSampleType).
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("nearest_sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        // ---------------------------------------------------------------------
-        // One-time, size-independent resources
-        // ---------------------------------------------------------------------
-
-        // Layouts define the binding contract. Buffers are long-lived arenas.
-        let layouts = create_layouts(&device);
-        let buffers = create_persistent_buffers(&device);
-
-        // ---------------------------------------------------------------------
-        // Size-dependent resources
-        // ---------------------------------------------------------------------
-
-        // Textures depend on output size; bind groups depend on texture views.
-        let textures = create_textures(&device, width, height);
-
-        // Pipelines depend on layouts + shader modules (+ surface format for blit).
-        let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
-
-        // Bind groups connect layouts to the actual buffers/textures currently in use.
-        let bind_groups = create_bind_groups(&device, &layouts, &buffers, &textures, &sampler);
-
-        Self {
-            device,
-            queue,
-            sampler,
-            layouts,
-            pipelines,
-            buffers,
-            textures,
-            bind_groups,
-            ping: 0,
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Accessors
-    // -------------------------------------------------------------------------
-
-    /// Expose device so the app can configure the surface, create encoders, etc.
-    pub fn device(&self) -> &wgpu::Device {
-        &self.device
-    }
-
-    /// Expose queue for submissions and CPU->GPU buffer writes.
-    pub fn queue(&self) -> &wgpu::Queue {
-        &self.queue
-    }
-
-    // -------------------------------------------------------------------------
-    // Resizing
-    // -------------------------------------------------------------------------
-
-    /// Handle output resize.
-    ///
-    /// What changes with size:
-    /// - Textures (color/depth/godray/output) must be recreated.
-    /// - Bind groups that reference those texture views must be recreated.
-    ///
-    /// What does *not* change with size:
-    /// - Persistent buffers (nodes/chunks/grid) and pipelines/layouts.
-    pub fn resize_output(&mut self, width: u32, height: u32) {
-        // Recreate textures and all bind groups that depend on texture views.
-        self.textures = create_textures(&self.device, width, height);
-        self.bind_groups = create_bind_groups(
-            &self.device,
-            &self.layouts,
-            &self.buffers,
-            &self.textures,
-            &self.sampler,
-        );
-
-        // Reset ping-pong after resize so we don't blend history from an incompatible size.
-        self.ping = 0;
-    }
-
-    // -------------------------------------------------------------------------
-    // Upload / write helpers
-    // -------------------------------------------------------------------------
-
-    /// Update the chunk grid indirection table on the GPU.
-    ///
-    /// The grid is clamped to the allocated capacity to avoid OOB writes.
-    pub fn write_chunk_grid(&self, grid: &[u32]) {
-        let n = grid.len().min(self.buffers.grid_capacity as usize);
-        self.queue.write_buffer(
-            &self.buffers.chunk_grid,
-            0,
-            bytemuck::cast_slice(&grid[..n]),
-        );
-    }
-
-    /// Update camera uniforms (typically once per frame).
-    pub fn write_camera(&self, cam: &CameraGpu) {
-        self.queue
-            .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
-    }
-
-    /// Update overlay uniforms (FPS, dimensions, etc.).
-    pub fn write_overlay(&self, ov: &OverlayGpu) {
-        self.queue
-            .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
-    }
-
-    /// Apply streamed chunk uploads into the persistent GPU arenas.
-    ///
-    /// Each upload can contain:
-    /// - `meta` written into the chunk metadata array at `slot`
-    /// - optional `nodes` written into the node arena starting at `node_base`
-    ///
-    /// Bounds checks prevent writing past allocated capacities (silently drops overflow).
-    pub fn apply_chunk_uploads(&self, uploads: Vec<ChunkUpload>) {
-        let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
-        let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
-
-        for u in uploads {
-            // Chunk metadata write (always present).
-            if u.slot < self.buffers.chunk_capacity {
-                let meta_off = (u.slot as u64) * meta_stride;
-                self.queue
-                    .write_buffer(&self.buffers.chunk, meta_off, bytemuck::bytes_of(&u.meta));
-            }
-
-            // Node payload write (only when nodes are included for this chunk).
-            if !u.nodes.is_empty() {
-                let needed = u.nodes.len() as u32;
-
-                // Ensure [node_base, node_base + needed) fits within the node arena.
-                if u.node_base <= self.buffers.node_capacity
-                    && u.node_base + needed <= self.buffers.node_capacity
-                {
-                    let node_off = (u.node_base as u64) * node_stride;
-                    self.queue
-                        .write_buffer(&self.buffers.node, node_off, bytemuck::cast_slice(&u.nodes));
-                }
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Encode passes
-    // -------------------------------------------------------------------------
-
-    /// Encode the compute pipeline sequence: primary -> godray -> composite.
-    ///
-    /// Expectations:
-    /// - `width`/`height` match the current full-resolution output size.
-    /// - Godray pass runs at quarter resolution (see `quarter_dim`).
-    /// - Godray uses ping-pong textures:
-    ///     ping = history (read)
-    ///     pong = output  (write)
-    pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
-        // ---------------------------------------------------------------------
-        // Pass 1: primary (full-res)
-        //
-        // Writes:
-        //   color_tex (storage rgba16f)
-        //   depth_tex (storage r32f)
-        // ---------------------------------------------------------------------
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("primary_pass"),
-                timestamp_writes: None,
-            });
-
-            cpass.set_pipeline(&self.pipelines.primary);
-            cpass.set_bind_group(0, &self.bind_groups.primary, &[]);
-
-            // Dispatch grid assumes 8x8 workgroup size in WGSL.
-            let gx = (width + 7) / 8;
-            let gy = (height + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
-        }
-
-        // ---------------------------------------------------------------------
-        // Pass 2: godray (quarter-res)
-        //
-        // Reads:
-        //   depth_tex (sampled)
-        //   godray_history (sampled)
-        // Writes:
-        //   godray_out (storage)
-        //
-        // Binding split:
-        //   group(0) = scene_bg (buffers only)
-        //   group(1) = godray_bg[ping] (depth + history + out)
-        // ---------------------------------------------------------------------
-        let ping = self.ping;
-        let pong = 1 - ping;
-
-        {
-            let qw = quarter_dim(width);
-            let qh = quarter_dim(height);
-
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("godray_pass"),
-                timestamp_writes: None,
-            });
-
-            cpass.set_pipeline(&self.pipelines.godray);
-
-            // group(0): camera + world buffers (no storage textures)
-            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-
-            // group(1): ping-pong bindings
-            // `godray_bg[ping]` reads history=godray[ping], writes out=godray[pong].
-            cpass.set_bind_group(1, &self.bind_groups.godray[ping], &[]);
-
-            let gx = (qw + 7) / 8;
-            let gy = (qh + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
-        }
-
-        // ---------------------------------------------------------------------
-        // Pass 3: composite (full-res)
-        //
-        // Reads:
-        //   color_tex (sampled)
-        //   godray[pong] (sampled)  <- result written in the godray pass above
-        // Writes:
-        //   output_tex (storage)
-        //
-        // Pipeline layout expects group(0), group(1), group(2).
-        // Shader only uses group(2), so we bind empty groups for 0 and 1.
-        // ---------------------------------------------------------------------
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("composite_pass"),
-                timestamp_writes: None,
-            });
-
-            cpass.set_pipeline(&self.pipelines.composite);
-
-            // Satisfy pipeline layout slots even if unused by the shader.
-            cpass.set_bind_group(0, &self.bind_groups.empty, &[]);
-            cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
-
-            // group(2): color + godray[pong] + output
-            cpass.set_bind_group(2, &self.bind_groups.composite[pong], &[]);
-
-            let gx = (width + 7) / 8;
-            let gy = (height + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
-        }
-
-        // Advance ping-pong:
-        // The texture we wrote this frame becomes "history" next frame.
-        self.ping = pong;
-    }
-
-    /// Encode the final blit render pass.
-    ///
-    /// This draws a fullscreen triangle and samples the renderer's `output` texture
-    /// into the swapchain `frame_view`. Overlay uniforms are read in the fragment shader.
-    pub fn encode_blit(&self, encoder: &mut wgpu::CommandEncoder, frame_view: &wgpu::TextureView) {
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("blit_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: frame_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    // Clear first (helps avoid undefined pixels if something goes wrong).
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
-        rpass.set_pipeline(&self.pipelines.blit);
-        rpass.set_bind_group(0, &self.bind_groups.blit, &[]);
-        // Fullscreen triangle (3 vertices), one instance.
-        rpass.draw(0..3, 0..1);
-    }
-}
-
-// src/render/state/pipelines.rs
-// -----------------------------
-// src/render/state/pipelines.rs
-//
-// Pipeline creation.
-// This is intentionally isolated so the renderer logic (per-frame encoding) isn't
-// buried under wgpu setup boilerplate.
-//
-// Terminology:
-// - BindGroupLayout (BGL): describes what resources exist at @group/@binding.
-// - PipelineLayout (PL): ordered list of BGLs for group(0), group(1), ...
-// - Pipeline: compiled/validated shader entry point + fixed state + pipeline layout.
-//
-// Rule of thumb:
-// The order of BGLs in `bind_group_layouts` must match the group indices used in WGSL.
-// If a shader references @group(2), then the pipeline layout must include entries
-// for group(0) and group(1) as well (even if they're "empty" placeholders).
-
-use super::layout::Layouts;
-
-pub struct Pipelines {
-    /// Compute pipeline for the primary full-resolution pass (writes color/depth).
-    pub primary: wgpu::ComputePipeline,
-
-    /// Compute pipeline for the quarter-resolution godray pass (ping-pong temporal).
-    pub godray: wgpu::ComputePipeline,
-
-    /// Compute pipeline for the full-resolution composite pass (writes final output).
-    pub composite: wgpu::ComputePipeline,
-
-    /// Render pipeline for the final blit to the swapchain (fullscreen triangle).
-    pub blit: wgpu::RenderPipeline,
-}
-
-/// Helper to build a compute pipeline with a specific entry point and bind group layout list.
-///
-/// `bgls` order defines the pipeline layout's group indices:
-/// - bgls[0] => group(0)
-/// - bgls[1] => group(1)
-/// - ...
-fn make_compute_pipeline(
-    device: &wgpu::Device,
-    label: &str,
-    module: &wgpu::ShaderModule,
-    entry: &str,
-    bgls: &[&wgpu::BindGroupLayout],
-) -> wgpu::ComputePipeline {
-    // Create a pipeline layout named "{label}_pl" that fixes the bind group schema.
-    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(&format!("{label}_pl")),
-        bind_group_layouts: bgls,
-        // No push constants used by these shaders.
-        push_constant_ranges: &[],
-    });
-
-    // Create the compute pipeline referencing the WGSL entry point.
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(label),
-        layout: Some(&pl),
-        module,
-        entry_point: entry,
-        compilation_options: Default::default(),
-    })
-}
-
-/// Create all pipelines (compute + blit).
-///
-/// Inputs:
-/// - `cs_module`: WGSL module containing compute entry points.
-/// - `fs_module`: WGSL module containing vertex/fragment entry points for blit.
-/// - `surface_format`: swapchain format used for the final render target.
-pub fn create_pipelines(
-    device: &wgpu::Device,
-    layouts: &Layouts,
-    cs_module: &wgpu::ShaderModule,
-    fs_module: &wgpu::ShaderModule,
-    surface_format: wgpu::TextureFormat,
-) -> Pipelines {
-    // -------------------------------------------------------------------------
-    // Compute pipelines
-    // -------------------------------------------------------------------------
-
-    // Primary pass:
-    // Uses group(0) = layouts.primary, which includes:
-    // - camera + scene buffers
-    // - storage outputs for color/depth
-    let primary = make_compute_pipeline(
-        device,
-        "primary_pipeline",
-        cs_module,
-        "main_primary",
-        &[&layouts.primary],
-    );
-
-    // Godray pass:
-    // Uses:
-    //   group(0) = layouts.scene  (camera + scene buffers only)
-    //   group(1) = layouts.godray (depth sample + history sample + out storage)
-    let godray = make_compute_pipeline(
-        device,
-        "godray_pipeline",
-        cs_module,
-        "main_godray",
-        &[&layouts.scene, &layouts.godray],
-    );
-
-    // Composite pass:
-    // Shader reads from @group(2) (color + godray + output storage).
-    // wgpu requires the pipeline layout to include group(0) and group(1) slots too,
-    // so we provide empty placeholder layouts for those indices.
-    let composite = make_compute_pipeline(
-        device,
-        "composite_pipeline",
-        cs_module,
-        "main_composite",
-        &[&layouts.empty, &layouts.empty, &layouts.composite],
-    );
-
-    // -------------------------------------------------------------------------
-    // Render pipeline: blit
-    // -------------------------------------------------------------------------
-    //
-    // Full-screen triangle approach:
-    // - No vertex buffers.
-    // - Vertex shader generates positions from vertex_index.
-    // - Fragment shader samples the renderer output texture.
-
-    // Pipeline layout for blit uses a single bind group: group(0) = layouts.blit.
-    let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("blit_pl"),
-        bind_group_layouts: &[&layouts.blit],
-        push_constant_ranges: &[],
-    });
-
-    // Render pipeline state:
-    // - Targets the swapchain format.
-    // - Uses REPLACE blending (overwrite framebuffer).
-    // - Default primitive/multisample state is fine for a simple fullscreen draw.
-    let blit = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("blit_pipeline"),
-        layout: Some(&blit_pl),
-        vertex: wgpu::VertexState {
-            module: fs_module,
-            entry_point: "vs_main",
-            // No vertex buffers; vertices are synthesized in the vertex shader.
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: fs_module,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                // Overwrite swapchain pixel with sampled color.
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        // Default triangle list, CCW front face, etc. (fullscreen triangle doesn't care much).
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-    });
-
-    Pipelines {
-        primary,
-        godray,
-        composite,
-        blit,
-    }
-}
-
-// src/render/state/textures.rs
-// ----------------------------
-// src/render/state/textures.rs
-//
-// Texture creation and sizing policy for the renderer.
-//
-// Everything in here is "size-dependent": if the window/output resolution changes,
-// these textures must be recreated, and any bind groups that reference their views
-// must be rebuilt.
-//
-// Texture roles in the frame graph:
-// - color_tex (full-res, RGBA16F): written by primary pass, sampled by composite.
-// - depth_tex (full-res, R32F)   : written by primary pass, sampled by godray.
-// - godray[A/B] (quarter-res, RGBA16F): temporal accumulation ping-pong.
-// - output (full-res)           : written by composite, sampled by blit.
-//
-// Usage policy:
-// - Intermediates are both STORAGE_BINDING and TEXTURE_BINDING so they can be
-//   written as storage textures in compute and later sampled as regular textures.
-
-use crate::render::resources::{create_output_texture, OutputTex};
-
-/// Minimal wrapper around a 2D texture view.
-///
-/// Note: we only store the TextureView, not the Texture handle itself.
-/// In wgpu, the view keeps the underlying texture alive as long as the view exists.
-pub struct Tex2D {
-    /// View used for binding (storage or sampled).
-    pub view: wgpu::TextureView,
-}
-
-/// Bundle of all size-dependent textures used by the renderer.
-pub struct TextureSet {
-    // -------------------------------------------------------------------------
-    // Final output
-    // -------------------------------------------------------------------------
-
-    /// Final output texture:
-    /// - composite pass writes here (storage)
-    /// - blit pass samples from it (filterable sampling in fragment shader)
-    pub output: OutputTex,
-
-    // -------------------------------------------------------------------------
-    // Full-resolution intermediates
-    // -------------------------------------------------------------------------
-
-    /// Primary color accumulation buffer (RGBA16F).
-    /// Written by primary compute pass.
-    pub color: Tex2D,
-
-    /// Primary depth buffer (R32F).
-    /// Written by primary compute pass and sampled by godray.
-    pub depth: Tex2D,
-
-    // -------------------------------------------------------------------------
-    // Quarter-resolution intermediates (temporal ping-pong)
-    // -------------------------------------------------------------------------
-
-    /// Godray accumulation textures (RGBA16F), quarter resolution.
-    ///
-    /// Index meaning:
-    /// - 0 = A
-    /// - 1 = B
-    ///
-    /// Each frame:
-    /// - one is sampled as history
-    /// - the other is written as the new result
-    pub godray: [Tex2D; 2],
-}
-
-/// Compute the quarter-resolution dimension for an axis.
-///
-/// This uses ceil(x/4) so small sizes don't collapse to zero and so coverage remains
-/// conservative (quarter-res still covers the full-res domain when upsampled).
-pub fn quarter_dim(x: u32) -> u32 {
-    // ceil(x / 4)
-    (x + 3) / 4
-}
-
-/// Create a 2D texture and return only its view wrapper.
-///
-/// `usage` is passed through so the same helper can build both sampled-only or
-/// read/write compute textures.
-///
-/// Zero-sized textures are invalid in wgpu, so width/height are clamped to >= 1.
-fn make_tex2d(
-    device: &wgpu::Device,
-    label: &str,
-    w: u32,
-    h: u32,
-    format: wgpu::TextureFormat,
-    usage: wgpu::TextureUsages,
-) -> Tex2D {
-    // Avoid creating zero-sized textures (wgpu disallows it).
-    let w = w.max(1);
-    let h = h.max(1);
-
-    // Allocate the texture backing storage.
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage,
-        view_formats: &[],
-    });
-
-    // Default view (whole texture, base mip, 2D).
-    let view = tex.create_view(&Default::default());
-
-    Tex2D { view }
-}
-
-/// Create the full size-dependent texture set for the renderer.
-///
-/// Sizing policy:
-/// - color/depth are full resolution (match output size)
-/// - godray textures are quarter resolution (ceil(width/4), ceil(height/4))
-/// - godray uses two textures for ping-pong temporal accumulation
-///
-/// Usage policy for intermediates:
-/// - STORAGE_BINDING: compute passes write to them as storage textures
-/// - TEXTURE_BINDING: later passes sample them as regular textures
-pub fn create_textures(device: &wgpu::Device, width: u32, height: u32) -> TextureSet {
-    // Clamp to avoid invalid zero-sized allocations during minimize/resizes.
-    let width = width.max(1);
-    let height = height.max(1);
-
-    // Intermediates are written by compute (storage) and read by later passes (sampled).
-    let rw_tex_usage =
-        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
-
-    // Final output texture used by composite -> blit.
-    // (Implementation details live in render::resources.)
-    let output = create_output_texture(device, width, height);
-
-    // Full-res primary color buffer.
-    let color = make_tex2d(
-        device,
-        "color_tex",
-        width,
-        height,
-        wgpu::TextureFormat::Rgba16Float,
-        rw_tex_usage,
-    );
-
-    // Full-res primary depth buffer.
-    let depth = make_tex2d(
-        device,
-        "depth_tex",
-        width,
-        height,
-        wgpu::TextureFormat::R32Float,
-        rw_tex_usage,
-    );
-
-    // Quarter-res sizes for godrays.
-    let qw = quarter_dim(width);
-    let qh = quarter_dim(height);
-
-    // Godray ping-pong textures (same format/usage; only roles swap per frame).
-    let godray = [
-        make_tex2d(
-            device,
-            "godray_a",
-            qw,
-            qh,
-            wgpu::TextureFormat::Rgba16Float,
-            rw_tex_usage,
-        ),
-        make_tex2d(
-            device,
-            "godray_b",
-            qw,
-            qh,
-            wgpu::TextureFormat::Rgba16Float,
-            rw_tex_usage,
-        ),
-    ];
-
-    TextureSet {
-        output,
-        color,
-        depth,
-        godray,
-    }
 }
 
 // src/shaders/blit.wgsl
@@ -4294,25 +2520,16 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
 // src/streaming/manager.rs
 // ------------------------
 // src/streaming/manager.rs
+// ------------------------
+// Chunk streaming + background SVO building + CPU cache.
 //
-// Chunk streaming + background SVO (Sparse Voxel Octree) building.
-//
-// Key perf change (for the renderer optimization pass):
-// - update(...) now returns `bool grid_changed` so the app can skip uploading `chunk_grid`
-//   every frame. We track a `grid_dirty` flag and only rebuild the GPU (Graphics Processing Unit)
-//   lookup grid when something that affects it actually changed (origin shift or resident set / slot moves).
-//
-// Important correctness fix:
-// - Always send a BuildDone for every BuildJob that is received by a worker, even if it was canceled.
-//   Otherwise `in_flight` can get "stuck" at MAX_IN_FLIGHT and chunk streaming will halt.
-//
-// Additional perf / stall fixes:
-// - Deduplicate and purge stale entries in build_queue.
-// - Only (purge + sort) the queue when the center chunk changes.
-// - Never leave chunks stuck in Building when a job is canceled.
-// - On node arena pressure, evict farthest resident chunks and avoid infinite rebuild/requeue loops.
+// New behavior:
+// - Chunks are built once, then stored in a CPU cache (budgeted, LRU-ish).
+// - When chunks come back into range, we "promote" from cache: allocate GPU node arena
+//   range + upload nodes/meta, without rebuilding on worker threads.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem::size_of;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -4378,7 +2595,18 @@ pub struct ChunkUpload {
     pub meta: ChunkMetaGpu,
 
     pub node_base: u32,
-    pub nodes: Vec<NodeGpu>,
+    pub nodes: Arc<[NodeGpu]>,
+}
+
+// -----------------------------
+// CPU cache (budgeted, LRU-ish)
+// -----------------------------
+
+#[derive(Clone)]
+struct CachedChunk {
+    nodes: Arc<[NodeGpu]>,
+    bytes: usize,
+    stamp: u64,
 }
 
 fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender<BuildDone>) {
@@ -4513,6 +2741,14 @@ pub struct ChunkManager {
     grid_origin_chunk: [i32; 3],
     grid_dims: [u32; 3],
     chunk_grid: Vec<u32>,
+
+    // ----------------
+    // CPU chunk cache
+    // ----------------
+    cache: HashMap<ChunkKey, CachedChunk>,
+    cache_lru: VecDeque<(ChunkKey, u64)>, // (key, stamp) entries; duplicates are allowed
+    cache_stamp: u64,
+    cache_bytes: usize,
 }
 
 impl ChunkManager {
@@ -4522,7 +2758,7 @@ impl ChunkManager {
         spawn_workers(gen.clone(), rx_job, tx_done);
 
         // Arena capacity in NodeGpu elements.
-        let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
+        let node_capacity = (config::NODE_BUDGET_BYTES / size_of::<NodeGpu>()) as u32;
 
         // Grid size (KEEP box).
         let nx = (2 * config::KEEP_RADIUS + 1) as u32;
@@ -4553,6 +2789,11 @@ impl ChunkManager {
             grid_origin_chunk: [0, 0, 0],
             grid_dims: [nx, ny, nz],
             chunk_grid: vec![INVALID_U32; grid_len],
+
+            cache: HashMap::new(),
+            cache_lru: VecDeque::new(),
+            cache_stamp: 1,
+            cache_bytes: 0,
         }
     }
 
@@ -4612,10 +2853,21 @@ impl ChunkManager {
         let keep = Self::desired_chunks(center, config::KEEP_RADIUS);
         let keep_set: HashSet<ChunkKey> = keep.iter().copied().collect();
 
-        // Queue missing desired (reset cancel token to false).
+        // Promote cached desired chunks immediately (no rebuild).
+        // For missing desired chunks that are not cached, queue a build.
         for k in &desired {
             match self.chunks.get(k) {
+                Some(ChunkState::Resident(_)) | Some(ChunkState::Queued) | Some(ChunkState::Building) => {
+                    // Already handled / in progress.
+                }
                 None | Some(ChunkState::Missing) => {
+                    // Cache hit: try promote from cache (alloc arena + upload), DO NOT queue build.
+                    if self.cache.contains_key(k) {
+                        let _ = self.try_promote_from_cache(center, *k);
+                        continue;
+                    }
+
+                    // Cache miss: queue build.
                     let c = self.cancel_token(*k);
                     c.store(false, Ordering::Relaxed);
 
@@ -4626,7 +2878,6 @@ impl ChunkManager {
                         self.build_queue.push_back(*k);
                     }
                 }
-                _ => {}
             }
         }
 
@@ -4658,7 +2909,7 @@ impl ChunkManager {
             sort_queue_near_first(&mut self.build_queue, center, cam_fwd);
         }
 
-        // Dispatch builds.
+        // Dispatch builds (only for cache misses).
         while self.in_flight < config::MAX_IN_FLIGHT {
             let Some(k) = self.build_queue.pop_front() else { break; };
 
@@ -4669,6 +2920,14 @@ impl ChunkManager {
                 // Cancel if it was pending.
                 self.cancel_token(k).store(true, Ordering::Relaxed);
                 self.chunks.insert(k, ChunkState::Missing);
+                continue;
+            }
+
+            // If it became cached since it was queued (rare, but possible if you later add disk caching),
+            // don't rebuild it.
+            if self.cache.contains_key(&k) {
+                self.chunks.insert(k, ChunkState::Missing);
+                let _ = self.try_promote_from_cache(center, k);
                 continue;
             }
 
@@ -4709,9 +2968,7 @@ impl ChunkManager {
             // If the job was canceled (either before start or mid-build),
             // the chunk MUST NOT stay in Building forever.
             if done.canceled || done.cancel.load(Ordering::Relaxed) {
-                if matches!(self.chunks.get(&done.key), Some(ChunkState::Building)) {
-                    self.chunks.insert(done.key, ChunkState::Missing);
-                } else if self.chunks.get(&done.key).is_some() {
+                if self.chunks.get(&done.key).is_some() {
                     self.chunks.insert(done.key, ChunkState::Missing);
                 }
                 continue;
@@ -4724,7 +2981,7 @@ impl ChunkManager {
                 continue;
             }
 
-            // Still relevant.
+            // Still relevant: cache + try resident.
             self.on_build_done(center, done.key, done.nodes);
         }
 
@@ -4800,22 +3057,94 @@ impl ChunkManager {
         false
     }
 
-    fn on_build_done(&mut self, center: ChunkKey, key: ChunkKey, nodes: Vec<NodeGpu>) {
-        // If this chunk got cancelled while the result was in flight, drop it.
-        if let Some(c) = self.cancels.get(&key) {
-            if c.load(Ordering::Relaxed) {
-                self.chunks.insert(key, ChunkState::Missing);
-                return;
+    // ----------------
+    // Cache helpers
+    // ----------------
+
+    fn cache_touch(&mut self, key: ChunkKey) {
+        if let Some(e) = self.cache.get_mut(&key) {
+            self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
+            e.stamp = self.cache_stamp;
+            self.cache_lru.push_back((key, e.stamp));
+        }
+    }
+
+    fn cache_put(&mut self, key: ChunkKey, nodes: Arc<[NodeGpu]>) {
+        let bytes = nodes.len() * size_of::<NodeGpu>();
+
+        // If replacing an existing entry, subtract its bytes first.
+        if let Some(old) = self.cache.remove(&key) {
+            self.cache_bytes = self.cache_bytes.saturating_sub(old.bytes);
+        }
+
+        self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
+        let stamp = self.cache_stamp;
+
+        self.cache.insert(
+            key,
+            CachedChunk {
+                nodes,
+                bytes,
+                stamp,
+            },
+        );
+
+        self.cache_bytes = self.cache_bytes.saturating_add(bytes);
+        self.cache_lru.push_back((key, stamp));
+
+        self.evict_cache_as_needed();
+    }
+
+    fn evict_cache_as_needed(&mut self) {
+        let budget = config::CHUNK_CACHE_BUDGET_BYTES;
+
+        while self.cache_bytes > budget {
+            let Some((k, stamp)) = self.cache_lru.pop_front() else { break; };
+
+            // Only evict if this LRU record matches the current entry stamp.
+            let should_evict = self
+                .cache
+                .get(&k)
+                .map(|e| e.stamp == stamp)
+                .unwrap_or(false);
+
+            if !should_evict {
+                continue;
             }
+
+            if let Some(ev) = self.cache.remove(&k) {
+                self.cache_bytes = self.cache_bytes.saturating_sub(ev.bytes);
+            }
+        }
+    }
+
+    // -------------------------------
+    // Resident creation / promotion
+    // -------------------------------
+
+    fn try_make_resident(
+        &mut self,
+        center: ChunkKey,
+        key: ChunkKey,
+        nodes: Arc<[NodeGpu]>,
+    ) -> bool {
+        // If already resident, nothing to do.
+        if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
+            return true;
         }
 
         let need = nodes.len() as u32;
+
+        // If we have nothing (shouldn't happen for non-air chunks, but be safe).
+        if need == 0 {
+            self.chunks.insert(key, ChunkState::Missing);
+            return false;
+        }
 
         // Try allocate; if fails, evict farthest chunks and retry a few times.
         let mut node_base = self.arena.alloc(need);
         if node_base.is_none() {
             for _ in 0..EVICT_ATTEMPTS {
-                // If we can't evict anything, stop.
                 if !self.evict_one_farthest(center, key) {
                     break;
                 }
@@ -4827,10 +3156,9 @@ impl ChunkManager {
         }
 
         let Some(node_base) = node_base else {
-            // Important: do NOT requeue and spin forever rebuilding.
-            // Mark Missing; desired() will re-queue naturally once the system has room.
+            // Can't fit right now; keep cache so we can promote later.
             self.chunks.insert(key, ChunkState::Missing);
-            return;
+            return false;
         };
 
         // Allocate slot (dense).
@@ -4874,6 +3202,47 @@ impl ChunkManager {
         // Resident set changed => grid mapping may change.
         self.grid_dirty = true;
         self.changed = true;
+
+        true
+    }
+
+    fn try_promote_from_cache(&mut self, center: ChunkKey, key: ChunkKey) -> bool {
+        let Some(entry) = self.cache.get(&key).cloned() else {
+            return false;
+        };
+
+        // Touch LRU.
+        self.cache_touch(key);
+
+        // Try to make resident from cached nodes.
+        self.try_make_resident(center, key, entry.nodes)
+    }
+
+    fn on_build_done(&mut self, center: ChunkKey, key: ChunkKey, nodes: Vec<NodeGpu>) {
+        // If this chunk got cancelled while the result was in flight, drop it.
+        if let Some(c) = self.cancels.get(&key) {
+            if c.load(Ordering::Relaxed) {
+                self.chunks.insert(key, ChunkState::Missing);
+                return;
+            }
+        }
+
+        // Convert to Arc slice once (cheap clones thereafter).
+        let nodes_arc: Arc<[NodeGpu]> = nodes.into();
+
+        // Cache it (so we never rebuild this chunk again unless evicted).
+        self.cache_put(key, nodes_arc.clone());
+
+        // If already resident (should be rare), don't allocate/upload again.
+        if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
+            return;
+        }
+
+        // Try to allocate + upload now; if we can't fit, keep it cached and mark missing.
+        let ok = self.try_make_resident(center, key, nodes_arc);
+        if !ok {
+            self.chunks.insert(key, ChunkState::Missing);
+        }
     }
 
     fn unload_chunk(&mut self, key: ChunkKey) {
@@ -4908,7 +3277,7 @@ impl ChunkManager {
                         slot: dead_slot as u32,
                         meta: self.chunk_meta[dead_slot],
                         node_base: 0,
-                        nodes: Vec::new(), // meta-only update
+                        nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
                     });
                 }
 
@@ -5004,6 +3373,9 @@ impl ChunkManager {
 // src/streaming/mod.rs
 // --------------------
 // src/streaming/mod.rs
+// --------------------
+// Chunk streaming + node arena + uploads.
+
 pub mod manager;
 pub mod node_arena;
 
@@ -5872,7 +4244,7 @@ pub struct WorldGen {
 
 impl WorldGen {
     pub fn new(seed: u32) -> Self {
-        let height = Fbm::<Perlin>::new(seed).set_octaves(8).set_frequency(0.025);
+        let height = Fbm::<Perlin>::new(seed).set_octaves(7).set_frequency(0.010);
         let detail = Fbm::<Perlin>::new(seed ^ 0xA5A5_A5A5).set_octaves(3).set_frequency(0.02);
 
         Self { seed, height, detail }

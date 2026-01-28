@@ -13,7 +13,7 @@ pub struct WorldGen {
 
 impl WorldGen {
     pub fn new(seed: u32) -> Self {
-        let height = Fbm::<Perlin>::new(seed).set_octaves(8).set_frequency(0.025);
+        let height = Fbm::<Perlin>::new(seed).set_octaves(7).set_frequency(0.010);
         let detail = Fbm::<Perlin>::new(seed ^ 0xA5A5_A5A5).set_octaves(3).set_frequency(0.02);
 
         Self { seed, height, detail }
