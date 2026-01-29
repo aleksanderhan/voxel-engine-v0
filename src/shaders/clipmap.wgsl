@@ -40,21 +40,40 @@ fn clip_unpack_offsets(level: u32) -> vec2<i32> {
   return vec2<i32>(off_x, off_z);
 }
 
+fn clip_level_contains(xz: vec2<f32>, level: u32, guard: i32) -> bool {
+  let res_i = max(i32(clip.res), 1);
+  let p = clip.level[level];
+  let origin = vec2<f32>(p.x, p.y);
+  let cell   = max(p.z, 1e-6);
+
+  let uv = (xz - origin) / cell;
+  let ix = i32(floor(uv.x));
+  let iz = i32(floor(uv.y));
+
+  return (ix >= guard) && (iz >= guard) && (ix < (res_i - guard)) && (iz < (res_i - guard));
+}
+
 fn clip_choose_level(xz: vec2<f32>) -> u32 {
   let cam_xz = vec2<f32>(cam.cam_pos.x, cam.cam_pos.z);
   let d = max(abs(xz.x - cam_xz.x), abs(xz.y - cam_xz.y));
 
-  let res_i = max(i32(clip.res), 1);
-  let res_f = f32(res_i);
+  let res_f = f32(max(i32(clip.res), 1));
+  let n = min(clip.levels, CLIP_LEVELS_MAX);
+
+  // guard=2 keeps normal/AO taps (+/-cell) in-bounds
+  let guard: i32 = 2;
 
   var best: u32 = max(clip.levels, 1u) - 1u;
 
-  let n = min(clip.levels, CLIP_LEVELS_MAX);
   for (var i: u32 = 0u; i < n; i = i + 1u) {
     let cell = clip.level[i].z;
     let half = 0.5 * res_f * cell;
     let inner = 0.45 * half;
-    if (d <= inner) { best = i; break; }
+
+    if (d <= inner && clip_level_contains(xz, i, guard)) {
+      best = i;
+      break;
+    }
   }
 
   return best;
@@ -62,20 +81,19 @@ fn clip_choose_level(xz: vec2<f32>) -> u32 {
 
 fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
   let res_i = max(i32(clip.res), 1);
-
   let p = clip.level[level];
   let origin = vec2<f32>(p.x, p.y);
   let cell   = max(p.z, 1e-6);
-  let inv_cell = 1.0 / cell;
 
-  // world -> logical texel
-  let uv = (world_xz - origin) * inv_cell;
+  let uv = (world_xz - origin) / cell;
+  let ix = i32(floor(uv.x));
+  let iz = i32(floor(uv.y));
 
-  var ix = i32(floor(uv.x));
-  var iz = i32(floor(uv.y));
-
-  ix = clamp(ix, 0, res_i - 1);
-  iz = clamp(iz, 0, res_i - 1);
+  // IMPORTANT: don't clamp to edge (that creates the mangling).
+  // If we're outside the committed window, return very low terrain.
+  if (ix < 0 || iz < 0 || ix >= res_i || iz >= res_i) {
+    return -BIG_F32;
+  }
 
   let off = clip_unpack_offsets(level);
   let sx = imod(ix + off.x, res_i);
