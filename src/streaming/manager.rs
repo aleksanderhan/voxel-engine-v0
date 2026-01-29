@@ -6,6 +6,10 @@
 // - Chunks are built once, then stored in a CPU cache (budgeted, LRU-ish).
 // - When chunks come back into range, we "promote" from cache: allocate GPU node arena
 //   range + upload nodes/meta, without rebuilding on worker threads.
+//
+// Important invariant (perf):
+// - `self.chunks` stores ONLY non-missing states: {Queued, Building, Resident}.
+// - Missing == absence from the map (prevents unbounded growth).
 
 use std::collections::VecDeque;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -45,7 +49,6 @@ struct ChunkKey {
 }
 
 enum ChunkState {
-    Missing,
     Queued,
     Building,
     Resident(Resident),
@@ -205,6 +208,7 @@ fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
 pub struct ChunkManager {
     gen: Arc<WorldGen>,
 
+    // Only non-missing states live here: Missing == absence from the map.
     chunks: HashMap<ChunkKey, ChunkState>,
     build_queue: VecDeque<ChunkKey>,
 
@@ -396,8 +400,7 @@ impl ChunkManager {
         let center = ChunkKey { x: ccx, y: ground_cy, z: ccz };
 
         // ---------------------------------------------------------------------
-        // Desired (ACTIVE): iterate precomputed offsets without borrowing self
-        // for the duration of the loop (avoids E0502).
+        // Desired (ACTIVE): iterate precomputed offsets
         // ---------------------------------------------------------------------
         let n_active = self.active_offsets.len();
         for i in 0..n_active {
@@ -410,10 +413,8 @@ impl ChunkManager {
             };
 
             match self.chunks.get(&k) {
-                Some(ChunkState::Resident(_))
-                | Some(ChunkState::Queued)
-                | Some(ChunkState::Building) => {}
-                None | Some(ChunkState::Missing) => {
+                Some(ChunkState::Resident(_)) | Some(ChunkState::Queued) | Some(ChunkState::Building) => {}
+                None => {
                     // Cache hit: promote now, no build.
                     if self.cache.get(&k).is_some() {
                         let _ = self.try_promote_from_cache(center, k);
@@ -435,8 +436,7 @@ impl ChunkManager {
         }
 
         // ---------------------------------------------------------------------
-        // Unload outside KEEP: reuse to_unload (no per-frame alloc) and avoid E0499
-        // by taking the vec before calling unload_chunk.
+        // Unload outside KEEP: reuse to_unload (no per-frame alloc)
         // ---------------------------------------------------------------------
         self.to_unload.clear();
         for &k in self.chunks.keys() {
@@ -449,7 +449,6 @@ impl ChunkManager {
         for k in unload_list.drain(..) {
             self.unload_chunk(k);
         }
-        // keep capacity for next frame
         self.to_unload = unload_list;
 
         // Only purge + sort when the center chunk changes.
@@ -457,7 +456,7 @@ impl ChunkManager {
         if center_changed {
             self.last_center = Some(center);
 
-            // Purge stale keys aggressively: keep only keys that are still queued and still in KEEP.
+            // Purge stale keys: keep only keys still queued and still in KEEP.
             self.build_queue.retain(|k| {
                 Self::in_keep(center, *k) && matches!(self.chunks.get(k), Some(ChunkState::Queued))
             });
@@ -478,15 +477,15 @@ impl ChunkManager {
             self.queued_set.remove(&k);
 
             if !Self::in_keep(center, k) {
-                // Cancel if it was pending.
+                // Cancel if it was pending, then drop from state map (missing).
                 self.cancel_token(k).store(true, Ordering::Relaxed);
-                self.chunks.insert(k, ChunkState::Missing);
+                self.chunks.remove(&k);
                 continue;
             }
 
             // If it became cached since it was queued, don't rebuild it.
             if self.cache.get(&k).is_some() {
-                self.chunks.insert(k, ChunkState::Missing);
+                self.chunks.remove(&k);
                 let _ = self.try_promote_from_cache(center, k);
                 continue;
             }
@@ -507,15 +506,16 @@ impl ChunkManager {
                 {
                     self.in_flight += 1;
                 } else {
-                    // Channel closed; keep it queued.
+                    // Channel closed; keep it queued + requeue (dedup-safe).
                     self.chunks.insert(k, ChunkState::Queued);
 
-                    // Put it back (dedup-safe).
                     if self.queued_set.insert(k) {
                         self.build_queue.push_back(k);
                     }
                     break;
                 }
+            } else {
+                // State got changed (unloaded/canceled) since it was enqueued; just drop it.
             }
         }
 
@@ -525,19 +525,17 @@ impl ChunkManager {
                 self.in_flight -= 1;
             }
 
-            // If the job was canceled (either before start or mid-build),
-            // the chunk MUST NOT stay in Building forever.
+            // If the job was canceled (either before start or mid-build), ensure it doesn't
+            // stick around. Missing = remove from map.
             if done.canceled || done.cancel.load(Ordering::Relaxed) {
-                if self.chunks.get(&done.key).is_some() {
-                    self.chunks.insert(done.key, ChunkState::Missing);
-                }
+                self.chunks.remove(&done.key);
                 continue;
             }
 
-            // If it finished but is no longer in KEEP, drop it and mark Missing.
+            // If it finished but is no longer in KEEP, drop it and mark missing.
             if !Self::in_keep(center, done.key) {
                 self.cancel_token(done.key).store(true, Ordering::Relaxed);
-                self.chunks.insert(done.key, ChunkState::Missing);
+                self.chunks.remove(&done.key);
                 continue;
             }
 
@@ -559,7 +557,6 @@ impl ChunkManager {
 
         grid_changed
     }
-
 
     // -------------------------------------------------------------------------
     // Internals
@@ -681,7 +678,8 @@ impl ChunkManager {
         let need = nodes.len() as u32;
 
         if need == 0 {
-            self.chunks.insert(key, ChunkState::Missing);
+            // Missing = remove from map.
+            self.chunks.remove(&key);
             return false;
         }
 
@@ -701,7 +699,7 @@ impl ChunkManager {
 
         let Some(node_base) = node_base else {
             // Can't fit right now; keep cache so we can promote later.
-            self.chunks.insert(key, ChunkState::Missing);
+            self.chunks.remove(&key);
             return false;
         };
 
@@ -765,7 +763,7 @@ impl ChunkManager {
         // If this chunk got cancelled while the result was in flight, drop it.
         if let Some(c) = self.cancels.get(&key) {
             if c.load(Ordering::Relaxed) {
-                self.chunks.insert(key, ChunkState::Missing);
+                self.chunks.remove(&key);
                 return;
             }
         }
@@ -784,14 +782,15 @@ impl ChunkManager {
         // Try to allocate + upload now; if we can't fit, keep it cached and mark missing.
         let ok = self.try_make_resident(center, key, nodes_arc);
         if !ok {
-            self.chunks.insert(key, ChunkState::Missing);
+            self.chunks.remove(&key);
         }
     }
 
     fn unload_chunk(&mut self, key: ChunkKey) {
-        let Some(state) = self.chunks.get(&key) else { return; };
+        // Missing == absence; remove first, then act on prior state.
+        let Some(state) = self.chunks.remove(&key) else { return; };
 
-        match *state {
+        match state {
             ChunkState::Resident(res) => {
                 // Free node arena range.
                 self.arena.free(res.node_base, res.node_count);
@@ -809,8 +808,8 @@ impl ChunkManager {
                     self.chunk_meta[dead_slot] = moved_meta;
 
                     // Update moved chunk's Resident.slot.
-                    if let Some(state) = self.chunks.get_mut(&moved_key) {
-                        if let ChunkState::Resident(mr) = state {
+                    if let Some(st) = self.chunks.get_mut(&moved_key) {
+                        if let ChunkState::Resident(mr) = st {
                             mr.slot = dead_slot as u32;
                         }
                     }
@@ -827,8 +826,6 @@ impl ChunkManager {
                 self.slot_to_key.pop();
                 self.chunk_meta.pop();
 
-                self.chunks.insert(key, ChunkState::Missing);
-
                 // Slot mapping changed => grid mapping changed.
                 self.grid_dirty = true;
                 self.changed = true;
@@ -841,14 +838,10 @@ impl ChunkManager {
                 // If it was queued, prevent duplicate re-adds.
                 self.queued_set.remove(&key);
 
-                self.chunks.insert(key, ChunkState::Missing);
-
                 // Conservative dirty.
                 self.grid_dirty = true;
                 self.changed = true;
             }
-
-            _ => {}
         }
     }
 

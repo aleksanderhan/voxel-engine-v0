@@ -4,12 +4,14 @@
 // ------------------------
 // Chunk streaming + background SVO building + CPU cache.
 //
-// New behavior:
+// Behavior:
 // - Chunks are built once, then stored in a CPU cache (budgeted, LRU-ish).
 // - When chunks come back into range, we "promote" from cache: allocate GPU node arena
 //   range + upload nodes/meta, without rebuilding on worker threads.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+
 use std::mem::size_of;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -124,11 +126,12 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                     k.x * config::CHUNK_SIZE as i32,
                     k.y * config::CHUNK_SIZE as i32,
                     k.z * config::CHUNK_SIZE as i32,
+                    0,
                 ];
 
                 let nodes = build_chunk_svo_sparse_cancelable_with_scratch(
                     &gen,
-                    origin,
+                    [origin[0], origin[1], origin[2]],
                     config::CHUNK_SIZE,
                     job.cancel.as_ref(),
                     &mut scratch,
@@ -186,12 +189,11 @@ fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
     let base = dx.abs() + dz.abs() + 2.0 * dy.abs();
 
     // Directional bias: chunks in front (positive dot) get a lower score.
-    // 1) compute signed "forward distance"
     let dir = dx * fwd_xz.x + dz * fwd_xz.y; // dot(delta_xz, fwd)
 
-    // 2) tune weights
-    let front_bonus = 0.75;   // bigger => prefer in-front more
-    let behind_penalty = 0.25; // bigger => deprioritize behind more
+    // Tune weights.
+    let front_bonus = 0.75;
+    let behind_penalty = 0.25;
 
     let bias = if dir >= 0.0 {
         -front_bonus * dir
@@ -202,7 +204,6 @@ fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
     base + bias
 }
 
-
 pub struct ChunkManager {
     gen: Arc<WorldGen>,
 
@@ -210,6 +211,7 @@ pub struct ChunkManager {
     build_queue: VecDeque<ChunkKey>,
 
     // Deduplicate queued keys (prevents unbounded queue growth).
+    // (Not per-frame; leave it as-is.)
     queued_set: HashSet<ChunkKey>,
 
     // Only sort/purge when center chunk changes.
@@ -227,18 +229,13 @@ pub struct ChunkManager {
     chunk_meta: Vec<ChunkMetaGpu>, // slot -> meta
     uploads: Vec<ChunkUpload>,     // pending GPU writes this frame
 
-    // General “something changed” flag (kept for other systems).
     changed: bool,
-
-    // Grid dirty flag:
-    // - true when the GPU lookup grid needs rebuilding (origin shift or resident slot mapping changed)
-    // - update() returns this so the renderer can skip `write_chunk_grid()` on most frames.
     grid_dirty: bool,
 
     // Node arena (in units of NodeGpu elements)
     arena: NodeArena,
 
-    // Chunk grid for GPU lookup: maps grid cell -> resident slot index (or INVALID_U32).
+    // Chunk grid for GPU lookup
     grid_origin_chunk: [i32; 3],
     grid_dims: [u32; 3],
     chunk_grid: Vec<u32>,
@@ -247,9 +244,18 @@ pub struct ChunkManager {
     // CPU chunk cache
     // ----------------
     cache: HashMap<ChunkKey, CachedChunk>,
-    cache_lru: VecDeque<(ChunkKey, u64)>, // (key, stamp) entries; duplicates are allowed
+    cache_lru: VecDeque<(ChunkKey, u64)>,
     cache_stamp: u64,
     cache_bytes: usize,
+
+    // -----------------------------
+    // Perf: precomputed region offsets
+    // -----------------------------
+    active_offsets: Vec<(i32, i32, i32)>, // dx,dy,dz for ACTIVE
+    keep_offsets: Vec<(i32, i32, i32)>,   // dx,dy,dz for KEEP (currently used only if you want)
+
+    // Perf: reusable unload list (avoids per-frame alloc)
+    to_unload: Vec<ChunkKey>,
 }
 
 impl ChunkManager {
@@ -267,14 +273,17 @@ impl ChunkManager {
         let ny = GRID_Y_COUNT;
         let grid_len = (nx * ny * nz) as usize;
 
+        let active_offsets = Self::build_offsets(config::ACTIVE_RADIUS);
+        let keep_offsets = Self::build_offsets(config::KEEP_RADIUS);
+
         Self {
             gen,
-            chunks: HashMap::new(),
+            chunks: HashMap::default(),
             build_queue: VecDeque::new(),
-            queued_set: HashSet::new(),
+            queued_set: HashSet::default(),
             last_center: None,
 
-            cancels: HashMap::new(),
+            cancels: HashMap::default(),
             tx_job,
             rx_done,
             in_flight: 0,
@@ -282,54 +291,97 @@ impl ChunkManager {
             slot_to_key: Vec::new(),
             chunk_meta: Vec::new(),
             uploads: Vec::new(),
-            changed: false,
 
-            grid_dirty: true, // first update should build + upload the grid
+            changed: false,
+            grid_dirty: true,
+
             arena: NodeArena::new(node_capacity),
 
             grid_origin_chunk: [0, 0, 0],
             grid_dims: [nx, ny, nz],
             chunk_grid: vec![INVALID_U32; grid_len],
 
-            cache: HashMap::new(),
-            cache_lru: VecDeque::new(),
+            cache: HashMap::default(),
+            cache_lru: VecDeque::default(),
             cache_stamp: 1,
             cache_bytes: 0,
+
+            active_offsets,
+            keep_offsets,
+
+            to_unload: Vec::new(),
         }
     }
 
     // -------------------------------------------------------------------------
-    // Public API
+    // Precomputed offsets
     // -------------------------------------------------------------------------
 
-    pub fn chunk_count(&self) -> u32 {
-        self.slot_to_key.len() as u32
+    #[inline]
+    fn build_offsets(radius: i32) -> Vec<(i32, i32, i32)> {
+        let mut v = Vec::new();
+        v.reserve(
+            (GRID_Y_COUNT as usize)
+                * ((2 * radius + 1) as usize)
+                * ((2 * radius + 1) as usize),
+        );
+
+        for dy in GRID_Y_MIN_DY..=(GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1) {
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    v.push((dx, dy, dz));
+                }
+            }
+        }
+        v
     }
 
-    pub fn grid_origin(&self) -> [i32; 3] {
-        self.grid_origin_chunk
+    // -------------------------------------------------------------------------
+    // Cheap region checks (no per-frame keep_set HashSet)
+    // -------------------------------------------------------------------------
+
+    #[inline(always)]
+    fn y_band_min() -> i32 {
+        GRID_Y_MIN_DY
     }
 
-    pub fn grid_dims(&self) -> [u32; 3] {
-        self.grid_dims
+    #[inline(always)]
+    fn y_band_max() -> i32 {
+        GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1
     }
 
-    pub fn chunk_grid(&self) -> &[u32] {
-        &self.chunk_grid
+    #[inline(always)]
+    fn in_keep(center: ChunkKey, k: ChunkKey) -> bool {
+        let dx = k.x - center.x;
+        let dz = k.z - center.z;
+        let dy = k.y - center.y;
+
+        dx >= -config::KEEP_RADIUS
+            && dx <= config::KEEP_RADIUS
+            && dz >= -config::KEEP_RADIUS
+            && dz <= config::KEEP_RADIUS
+            && dy >= Self::y_band_min()
+            && dy <= Self::y_band_max()
     }
 
-    pub fn take_uploads(&mut self) -> Vec<ChunkUpload> {
-        std::mem::take(&mut self.uploads)
+    // (Not currently used below, but kept for completeness.)
+    #[inline(always)]
+    fn in_active(center: ChunkKey, k: ChunkKey) -> bool {
+        let dx = k.x - center.x;
+        let dz = k.z - center.z;
+        let dy = k.y - center.y;
+
+        dx >= -config::ACTIVE_RADIUS
+            && dx <= config::ACTIVE_RADIUS
+            && dz >= -config::ACTIVE_RADIUS
+            && dz <= config::ACTIVE_RADIUS
+            && dy >= Self::y_band_min()
+            && dy <= Self::y_band_max()
     }
 
     // -------------------------------------------------------------------------
     // Streaming update
     // -------------------------------------------------------------------------
-    //
-    // Returns:
-    // - true  if the chunk_grid mapping changed (origin shift and/or resident slot mapping changed)
-    // - false if chunk_grid is identical to last frame (safe to skip GPU upload)
-
     pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
         self.uploads.clear();
 
@@ -343,54 +395,64 @@ impl ChunkManager {
         let ground_y_vox = world.ground_height(cam_vx, cam_vz);
         let ground_cy = ground_y_vox.div_euclid(config::CHUNK_SIZE as i32);
 
-        let center = ChunkKey {
-            x: ccx,
-            y: ground_cy,
-            z: ccz,
-        };
+        let center = ChunkKey { x: ccx, y: ground_cy, z: ccz };
 
-        // Desired vs keep sets.
-        let desired = Self::desired_chunks(center, config::ACTIVE_RADIUS);
-        let keep = Self::desired_chunks(center, config::KEEP_RADIUS);
-        let keep_set: HashSet<ChunkKey> = keep.iter().copied().collect();
+        // ---------------------------------------------------------------------
+        // Desired (ACTIVE): iterate precomputed offsets without borrowing self
+        // for the duration of the loop (avoids E0502).
+        // ---------------------------------------------------------------------
+        let n_active = self.active_offsets.len();
+        for i in 0..n_active {
+            let (dx, dy, dz) = self.active_offsets[i];
 
-        // Promote cached desired chunks immediately (no rebuild).
-        // For missing desired chunks that are not cached, queue a build.
-        for k in &desired {
-            match self.chunks.get(k) {
-                Some(ChunkState::Resident(_)) | Some(ChunkState::Queued) | Some(ChunkState::Building) => {
-                    // Already handled / in progress.
-                }
+            let k = ChunkKey {
+                x: center.x + dx,
+                y: center.y + dy,
+                z: center.z + dz,
+            };
+
+            match self.chunks.get(&k) {
+                Some(ChunkState::Resident(_))
+                | Some(ChunkState::Queued)
+                | Some(ChunkState::Building) => {}
                 None | Some(ChunkState::Missing) => {
-                    // Cache hit: try promote from cache (alloc arena + upload), DO NOT queue build.
-                    if self.cache.contains_key(k) {
-                        let _ = self.try_promote_from_cache(center, *k);
+                    // Cache hit: promote now, no build.
+                    if self.cache.get(&k).is_some() {
+                        let _ = self.try_promote_from_cache(center, k);
                         continue;
                     }
 
                     // Cache miss: queue build.
-                    let c = self.cancel_token(*k);
+                    let c = self.cancel_token(k);
                     c.store(false, Ordering::Relaxed);
 
-                    self.chunks.insert(*k, ChunkState::Queued);
+                    self.chunks.insert(k, ChunkState::Queued);
 
                     // Dedupe queue entries.
-                    if self.queued_set.insert(*k) {
-                        self.build_queue.push_back(*k);
+                    if self.queued_set.insert(k) {
+                        self.build_queue.push_back(k);
                     }
                 }
             }
         }
 
-        // Unload outside keep (also cancel queued/building).
-        {
-            let keys_snapshot: Vec<ChunkKey> = self.chunks.keys().copied().collect();
-            for k in keys_snapshot {
-                if !keep_set.contains(&k) {
-                    self.unload_chunk(k);
-                }
+        // ---------------------------------------------------------------------
+        // Unload outside KEEP: reuse to_unload (no per-frame alloc) and avoid E0499
+        // by taking the vec before calling unload_chunk.
+        // ---------------------------------------------------------------------
+        self.to_unload.clear();
+        for &k in self.chunks.keys() {
+            if !Self::in_keep(center, k) {
+                self.to_unload.push(k);
             }
         }
+
+        let mut unload_list = std::mem::take(&mut self.to_unload);
+        for k in unload_list.drain(..) {
+            self.unload_chunk(k);
+        }
+        // keep capacity for next frame
+        self.to_unload = unload_list;
 
         // Only purge + sort when the center chunk changes.
         let center_changed = self.last_center.map_or(true, |c| c != center);
@@ -399,7 +461,7 @@ impl ChunkManager {
 
             // Purge stale keys aggressively: keep only keys that are still queued and still in KEEP.
             self.build_queue.retain(|k| {
-                keep_set.contains(k) && matches!(self.chunks.get(k), Some(ChunkState::Queued))
+                Self::in_keep(center, *k) && matches!(self.chunks.get(k), Some(ChunkState::Queued))
             });
 
             // Rebuild queued_set from the queue so it matches reality.
@@ -417,16 +479,15 @@ impl ChunkManager {
             // Popped => no longer queued.
             self.queued_set.remove(&k);
 
-            if !keep_set.contains(&k) {
+            if !Self::in_keep(center, k) {
                 // Cancel if it was pending.
                 self.cancel_token(k).store(true, Ordering::Relaxed);
                 self.chunks.insert(k, ChunkState::Missing);
                 continue;
             }
 
-            // If it became cached since it was queued (rare, but possible if you later add disk caching),
-            // don't rebuild it.
-            if self.cache.contains_key(&k) {
+            // If it became cached since it was queued, don't rebuild it.
+            if self.cache.get(&k).is_some() {
                 self.chunks.insert(k, ChunkState::Missing);
                 let _ = self.try_promote_from_cache(center, k);
                 continue;
@@ -476,7 +537,7 @@ impl ChunkManager {
             }
 
             // If it finished but is no longer in KEEP, drop it and mark Missing.
-            if !keep_set.contains(&done.key) {
+            if !Self::in_keep(center, done.key) {
                 self.cancel_token(done.key).store(true, Ordering::Relaxed);
                 self.chunks.insert(done.key, ChunkState::Missing);
                 continue;
@@ -501,6 +562,7 @@ impl ChunkManager {
         grid_changed
     }
 
+
     // -------------------------------------------------------------------------
     // Internals
     // -------------------------------------------------------------------------
@@ -510,22 +572,6 @@ impl ChunkManager {
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicBool::new(false)))
             .clone()
-    }
-
-    fn desired_chunks(center: ChunkKey, radius: i32) -> Vec<ChunkKey> {
-        let mut out = Vec::new();
-        for dy in GRID_Y_MIN_DY..=(GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1) {
-            for dz in -radius..=radius {
-                for dx in -radius..=radius {
-                    out.push(ChunkKey {
-                        x: center.x + dx,
-                        y: center.y + dy,
-                        z: center.z + dz,
-                    });
-                }
-            }
-        }
-        out
     }
 
     fn evict_one_farthest(&mut self, center: ChunkKey, protect: ChunkKey) -> bool {
@@ -636,7 +682,6 @@ impl ChunkManager {
 
         let need = nodes.len() as u32;
 
-        // If we have nothing (shouldn't happen for non-air chunks, but be safe).
         if need == 0 {
             self.chunks.insert(key, ChunkState::Missing);
             return false;
@@ -708,15 +753,14 @@ impl ChunkManager {
     }
 
     fn try_promote_from_cache(&mut self, center: ChunkKey, key: ChunkKey) -> bool {
-        let Some(entry) = self.cache.get(&key).cloned() else {
-            return false;
+        // Avoid cloning the whole CachedChunk; just clone the Arc.
+        let nodes = match self.cache.get(&key) {
+            Some(e) => e.nodes.clone(),
+            None => return false,
         };
 
-        // Touch LRU.
         self.cache_touch(key);
-
-        // Try to make resident from cached nodes.
-        self.try_make_resident(center, key, entry.nodes)
+        self.try_make_resident(center, key, nodes)
     }
 
     fn on_build_done(&mut self, center: ChunkKey, key: ChunkKey, nodes: Vec<NodeGpu>) {
@@ -810,7 +854,7 @@ impl ChunkManager {
         }
     }
 
-    /// Compute the KEEP-grid origin for a given center (helper so we can detect origin shifts).
+    /// Compute the KEEP-grid origin for a given center.
     #[inline]
     fn keep_origin_for(&self, center: ChunkKey) -> [i32; 3] {
         let ox = center.x - config::KEEP_RADIUS;
@@ -820,9 +864,6 @@ impl ChunkManager {
     }
 
     /// Rebuild the chunk_grid mapping for the current KEEP volume.
-    ///
-    /// This is intentionally called only when `grid_dirty` is set, because it is O(ncells + nchunks)
-    /// and it forces a full GPU upload if you do it every frame.
     fn rebuild_grid(&mut self, center: ChunkKey) {
         let nx = (2 * config::KEEP_RADIUS + 1) as u32;
         let nz = nx;
@@ -868,6 +909,30 @@ impl ChunkManager {
 
         let idx = (iz * ny * nx) + (iy * nx) + ix;
         Some(idx as usize)
+    }
+
+    // -------------------------------------------------------------------------
+    // Public API
+    // -------------------------------------------------------------------------
+
+    pub fn chunk_count(&self) -> u32 {
+        self.slot_to_key.len() as u32
+    }
+
+    pub fn grid_origin(&self) -> [i32; 3] {
+        self.grid_origin_chunk
+    }
+
+    pub fn grid_dims(&self) -> [u32; 3] {
+        self.grid_dims
+    }
+
+    pub fn chunk_grid(&self) -> &[u32] {
+        &self.chunk_grid
+    }
+
+    pub fn take_uploads(&mut self) -> Vec<ChunkUpload> {
+        std::mem::take(&mut self.uploads)
     }
 }
 
@@ -955,11 +1020,12 @@ impl NodeArena {
             return;
         }
 
-        // Insert sorted by start.
-        let mut idx = 0usize;
-        while idx < self.free.len() && self.free[idx].start < start {
-            idx += 1;
-        }
+        // Insert sorted by start (log n search).
+        let idx = self
+            .free
+            .binary_search_by_key(&start, |r| r.start)
+            .unwrap_or_else(|i| i);
+
         self.free.insert(idx, Range { start, len });
 
         // Fully coalesce with neighbors (both directions).
@@ -1041,6 +1107,7 @@ fn is_empty_leaf(n: &NodeGpu) -> bool {
 fn should_cancel(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed)
 }
+
 
 /// Reusable scratch buffers for chunk building (reduces allocations & improves locality).
 pub struct BuildScratch {
@@ -1353,10 +1420,10 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
                 let m: u32 = if wy < g {
                     if wy >= g - dirt_depth { DIRT } else { STONE }
                 } else if wy == g {
-                    let tm = tree_mask.material_fast(wx, wy, wz);
+                    let tm = tree_mask.material_local(lx as usize, ly as usize, lz as usize);
                     if tm == WOOD { WOOD } else { GRASS }
                 } else {
-                    let tm = tree_mask.material_fast(wx, wy, wz);
+                    let tm = tree_mask.material_local(lx as usize, ly as usize, lz as usize);
                     if tm != AIR { tm } else { AIR }
                 };
 
@@ -2074,6 +2141,17 @@ fn idx3_strided(stride_z: usize, stride_y: usize, x: i32, y: i32, z: i32) -> usi
 
 impl TreeMaskCache {
     #[inline(always)]
+    pub fn material_local(&self, lx: usize, ly: usize, lz: usize) -> u32 {
+        // caller guarantees in-bounds
+        let i = ly * self.stride_y + lz * self.stride_z + lx;
+        match unsafe { *self.mask.get_unchecked(i) } {
+            1 => WOOD,
+            2 => LEAF,
+            _ => AIR,
+        }
+    }
+
+    #[inline(always)]
     pub fn contains_point_fast(&self, x: i32, y: i32, z: i32) -> u8 {
         let lx = x - self.origin[0];
         let ly = y - self.origin[1];
@@ -2391,43 +2469,6 @@ impl WorldGen {
 
         let amp = TRUNK_WOBBLE_M_MAX * (config::VOXELS_PER_METER as f32) * t;
         ((a - 0.5) * 2.0 * amp, (b - 0.5) * 2.0 * amp)
-    }
-
-    #[inline]
-    fn dist2_point_segment(
-        px: f32,
-        py: f32,
-        pz: f32,
-        ax: f32,
-        ay: f32,
-        az: f32,
-        bx: f32,
-        by: f32,
-        bz: f32,
-    ) -> (f32 /*d2*/, f32 /*t*/) {
-        let abx = bx - ax;
-        let aby = by - ay;
-        let abz = bz - az;
-
-        let apx = px - ax;
-        let apy = py - ay;
-        let apz = pz - az;
-
-        let ab2 = abx * abx + aby * aby + abz * abz;
-        if ab2 <= 1e-8 {
-            return (apx * apx + apy * apy + apz * apz, 0.0);
-        }
-
-        let t = ((apx * abx + apy * aby + apz * abz) / ab2).clamp(0.0, 1.0);
-        let cx = ax + t * abx;
-        let cy = ay + t * aby;
-        let cz = az + t * abz;
-
-        let dx = px - cx;
-        let dy = py - cy;
-        let dz = pz - cz;
-
-        (dx * dx + dy * dy + dz * dz, t)
     }
 
     // -------------------------------------------------------------------------
@@ -2895,7 +2936,7 @@ impl WorldGen {
         let len = len2.sqrt();
 
         // Step size in voxels. 0.75 tends to be safe (no holes) but not too expensive.
-        let step = 0.75_f32;
+        let step = (0.75_f32).max(0.40_f32 * r0.max(r1)); // tune
         let n = (len / step).ceil() as i32;
 
         let inv_n = 1.0 / (n as f32);
@@ -2920,25 +2961,27 @@ impl WorldGen {
         let maxx = (cx.ceil()  as i32 + ir).min(out.origin[0] + out.size - 1);
         let miny = (cy.floor() as i32 - ir).max(out.origin[1]);
         let maxy = (cy.ceil()  as i32 + ir).min(out.origin[1] + out.size - 1);
-        let minz = (cz.floor() as i32 - ir).max(out.origin[2]);
-        let maxz = (cz.ceil()  as i32 + ir).min(out.origin[2] + out.size - 1);
 
         for y in miny..=maxy {
             let dy = (y as f32) - cy;
-            let dy2 = dy * dy;
+            let dy2 = dy*dy;
             for x in minx..=maxx {
                 let dx = (x as f32) - cx;
-                let dx2 = dx * dx;
+                let dxy2 = dx*dx + dy2;
+                if dxy2 > r2 { continue; }
+
+                let zext = (r2 - dxy2).sqrt();
+                let minz = ((cz - zext).floor() as i32).max(out.origin[2]);
+                let maxz = ((cz + zext).ceil()  as i32).min(out.origin[2] + out.size - 1);
+
+                let lx = (x - out.origin[0]) as i32;
+                let ly = (y - out.origin[1]) as i32;
                 for z in minz..=maxz {
-                    let dz = (z as f32) - cz;
-                    if dx2 + dy2 + dz*dz <= r2 {
-                        out.write_wood(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
-                    }
+                    out.write_wood(lx, ly, z - out.origin[2]);
                 }
             }
         }
     }
-
 
     // -------------------------------------------------------------------------
     // Leaf rasterization
