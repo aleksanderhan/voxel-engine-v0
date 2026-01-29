@@ -89,10 +89,56 @@ impl ClipmapGpu {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct OverlayGpu {
-    pub fps: u32,
-    pub width: u32,
-    pub height: u32,
-    pub _pad0: u32,
+    // packed digits: d0 | d1<<8 | d2<<16 | d3<<24 (d0=ones, d3=thousands)
+    pub digits_packed: u32,
+
+    // HUD rectangle in framebuffer pixel coords (top-left origin)
+    pub origin_x: u32,
+    pub origin_y: u32,
+    pub total_w:  u32,
+
+    pub digit_h:  u32,
+    pub scale:    u32,
+    pub stride:   u32, // digit_w + gap
+    pub _pad0:    u32, // explicit padding to 32 bytes
+}
+
+impl OverlayGpu {
+    pub fn from_fps_and_dims(fps: u32, width: u32, _height: u32, scale: u32) -> Self {
+        // digits
+        let mut v = fps.min(9999);
+        let d0 = (v % 10) as u32; v /= 10;
+        let d1 = (v % 10) as u32; v /= 10;
+        let d2 = (v % 10) as u32; v /= 10;
+        let d3 = (v % 10) as u32;
+
+        let digits_packed = d0 | (d1 << 8) | (d2 << 16) | (d3 << 24);
+
+        // layout
+        let margin: u32 = 12;
+        let digit_w = 3 * scale;
+        let digit_h = 5 * scale;
+        let gap     = 1 * scale;
+        let stride  = digit_w + gap;
+        let total_w = 4 * digit_w + 3 * gap;
+
+        let ox_i = width as i32 - margin as i32 - total_w as i32;
+        let oy_i = margin as i32;
+
+        let origin_x = ox_i.max(0) as u32;
+        let origin_y = oy_i.max(0) as u32;
+
+        Self {
+            digits_packed,
+            origin_x,
+            origin_y,
+            total_w,
+            digit_h,
+            scale,
+            stride,
+            _pad0: 0,
+        }
+    }
 }

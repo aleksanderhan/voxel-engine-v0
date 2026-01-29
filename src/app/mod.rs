@@ -247,13 +247,14 @@ impl App {
             self.fps_last = Instant::now();
         }
 
-        let overlay = OverlayGpu {
-            fps: self.fps_value,
-            width: self.config.width,
-            height: self.config.height,
-            _pad0: 0,
-        };
+        let overlay = OverlayGpu::from_fps_and_dims(
+            self.fps_value,
+            self.config.width,
+            self.config.height,
+            8, // scale (match what you want)
+        );
         self.renderer.write_overlay(&overlay);
+
 
         // 6) update scene buffers if changed
         self.renderer.apply_chunk_uploads(self.chunks.take_uploads());
