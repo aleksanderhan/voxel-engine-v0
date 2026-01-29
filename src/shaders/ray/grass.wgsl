@@ -58,11 +58,12 @@ fn grass_root_uv(cell_id_vox: vec3<f32>, i: u32) -> vec2<f32> {
   return vec2<f32>(u, v);
 }
 
-fn grass_bend_offset(root_m: vec3<f32>, t: f32, height01: f32, strength: f32) -> vec3<f32> {
+fn grass_wind_xz(root_m: vec3<f32>, t: f32, strength: f32) -> vec2<f32> {
+  // wind_field returns vec3; we only use XZ for bending
   let w = wind_field(root_m, t) * strength;
-  let tip = w * (0.55 + 0.45 * height01);
-  return vec3<f32>(tip.x, 0.15 * tip.y, tip.z);
+  return vec2<f32>(w.x, w.z);
 }
+
 
 fn grass_sdf_lod(
   p_m: vec3<f32>,
@@ -81,7 +82,7 @@ fn grass_sdf_lod(
   let y01 = (p_m.y - top_y) / max(layer_h, 1e-6);
   if (y01 < 0.0 || y01 > 1.0) { return BIG_F32; }
 
-  // Cheap horizontal reject (avoid SDF loops when outside slab footprint)
+  // Cheap horizontal reject
   let over = GRASS_OVERHANG_VOX * vs;
   if (p_m.x < cell_bmin_m.x - over || p_m.x > cell_bmin_m.x + vs + over ||
       p_m.z < cell_bmin_m.z - over || p_m.z > cell_bmin_m.z + vs + over) {
@@ -90,7 +91,7 @@ fn grass_sdf_lod(
 
   let blade_len = layer_h * (0.65 + 0.35 * hash31(cell_id_vox + vec3<f32>(9.1, 3.7, 5.2)));
 
-  // Choose blade count + seg count by LOD
+  // LOD selection (as before)
   var blade_count: u32 = GRASS_BLADE_COUNT;
   var segs: u32 = u32(max(3.0, floor(GRASS_VOXEL_SEGS)));
   if (lod == 1u) {
@@ -102,17 +103,21 @@ fn grass_sdf_lod(
   }
 
   let half_xz = GRASS_VOXEL_THICKNESS_VOX * vs;
-  let seg_h   = blade_len / max(f32(segs), 1.0);
+  let inv_segs = 1.0 / max(f32(segs), 1.0);
+  let seg_h   = blade_len * inv_segs;
   let half_y  = 0.5 * seg_h;
 
   var dmin = BIG_F32;
 
-  for (var i: u32 = 0u; i < blade_count; i = i + 1u) {
-    let uv = grass_root_uv(cell_id_vox, i);
+  // constants used every blade
+  let inset = 0.12;
 
-    let inset = 0.12;
-    let ux = mix(inset, 1.0 - inset, uv.x);
-    let uz = mix(inset, 1.0 - inset, uv.y);
+  for (var i: u32 = 0u; i < blade_count; i = i + 1u) {
+    // One hash => u,v,phase
+    let uvp = grass_blade_params(cell_id_vox, i);
+
+    let ux = mix(inset, 1.0 - inset, uvp.x);
+    let uz = mix(inset, 1.0 - inset, uvp.y);
 
     let root = vec3<f32>(
       cell_bmin_m.x + ux * vs,
@@ -120,19 +125,30 @@ fn grass_sdf_lod(
       cell_bmin_m.z + uz * vs
     );
 
-    let ph = hash31(cell_id_vox + vec3<f32>(f32(i) * 7.3, 1.1, 2.9));
+    // Phase as a small Y offset into the wind field (keeps variety)
+    let ph = uvp.z;
 
+    // Compute wind ONCE per blade (XZ only)
+    let w_xz = grass_wind_xz(root + vec3<f32>(0.0, ph, 0.0), time_s, strength);
+
+    // Segment loop: only cheap math + sdf_box
     for (var s: u32 = 0u; s < segs; s = s + 1u) {
-      let t01 = (f32(s) + 0.5) / max(f32(segs), 1.0);
+      let t01 = (f32(s) + 0.5) * inv_segs;
       let y   = t01 * blade_len;
 
-      let bend = grass_bend_offset(root + vec3<f32>(0.0, ph, 0.0), time_s, t01, strength);
-      let off  = bend * (blade_len * t01);
+      // Same “shape” as before:
+      // - height factor: (0.55 + 0.45*t01)
+      // - then scaled by (blade_len * t01)
+      let height_factor = (0.55 + 0.45 * t01);
+      let bend_mag      = (blade_len * t01) * height_factor;
 
-      let c = root + vec3<f32>(0.0, y, 0.0) + vec3<f32>(off.x, 0.0, off.z);
+      let off_xz = w_xz * bend_mag;
+
+      let c = root + vec3<f32>(off_xz.x, y, off_xz.y);
 
       let taper = mix(1.0, GRASS_VOXEL_TAPER, t01);
-      let b = vec3<f32>(half_xz * taper, half_y, half_xz * taper);
+      let bxz = half_xz * taper;
+      let b = vec3<f32>(bxz, half_y, bxz);
 
       dmin = min(dmin, sdf_box(p_m, c, b));
     }
@@ -141,6 +157,20 @@ fn grass_sdf_lod(
   return dmin;
 }
 
+
+fn grass_blade_params(cell_id_vox: vec3<f32>, i: u32) -> vec3<f32> {
+  // returns (u, v, phase)
+  let fi = f32(i);
+
+  // One hash per blade
+  let h = hash31(cell_id_vox + vec3<f32>(fi * 7.3, 1.1, 2.9));
+
+  // Derive 3 decorrelated-ish values from h
+  let u = fract(h * 1.61803398875);  // golden ratio-ish
+  let v = fract(h * 2.41421356237);  // sqrt(2)+1-ish
+  let p = fract(h * 3.14159265359);  // pi-ish
+  return vec3<f32>(u, v, p);
+}
 
 fn grass_sdf_normal_lod(
   p_m: vec3<f32>,

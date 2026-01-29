@@ -341,9 +341,10 @@ fn trace_chunk_rope_interval(
         }
       }
 
-
       // ---- Rope traversal for AIR
       let face = exit_face_from_slab(rd, slab);
+
+      // Advance to just past the current leaf
       tcur = max(t_leave, tcur) + eps_step;
 
       if (!leaf.has_node) {
@@ -357,12 +358,23 @@ fn trace_chunk_rope_interval(
         continue;
       }
 
+      // Recompute the query point *after* advancing tcur
+      let p_next  = ro + tcur * rd;
+      let pq_next = p_next + rd * (1e-4 * vs);
+
+      // If we've left the chunk interval, stop early
+      if (tcur > t_exit) {
+        break;
+      }
+
       let nk = node_at(ch.node_base, nidx).key;
       let c  = node_cube_from_key(root_bmin, root_size, nk);
 
-      leaf = descend_leaf_sparse(pq, ch.node_base, nidx, c.xyz, c.w);
+      // Descend starting from the neighbor node's cube, using the UPDATED point
+      leaf = descend_leaf_sparse(pq_next, ch.node_base, nidx, c.xyz, c.w);
       have_leaf = true;
       continue;
+
     }
 
     // ----------------------------------------------------------------------
