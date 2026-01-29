@@ -4,8 +4,8 @@
 // - SVO queries + hybrid traversal
 // - Leaf wind + displaced hit
 // - Shadows + sun transmittance
-// - Material palette + shading (UPDATED: spec+fresnel + AO)
-// - Procedural grass blades on exposed top grass surfaces (robust gating)
+// - Material palette + shading (spec + fresnel + AO)
+// - Procedural grass blades on exposed top grass voxel surfaces (FIXED: stable voxel picking across chunk boundaries)
 
 fn safe_inv(x: f32) -> f32 {
   return select(1.0 / x, BIG_F32, abs(x) < EPS_INV);
@@ -245,7 +245,7 @@ fn leaf_displaced_cube_hit(
 }
 
 // ------------------------------------------------------------
-// Grass helpers (robust top-surface gating)
+// Grass helpers
 // ------------------------------------------------------------
 
 fn is_air(p: vec3<f32>, root_bmin: vec3<f32>, root_size: f32, node_base: u32) -> bool {
@@ -256,11 +256,54 @@ fn is_grass(p: vec3<f32>, root_bmin: vec3<f32>, root_size: f32, node_base: u32) 
   return query_leaf_at(p, root_bmin, root_size, node_base).mat == MAT_GRASS;
 }
 
+// --- replace pick_grass_cell_in_chunk with this version ---
+struct GrassCell {
+  bmin_m : vec3<f32>,  // world meters
+  id_vox : vec3<f32>,  // world voxel coords as floats (stable RNG seed)
+};
 
+fn pick_grass_cell_in_chunk(
+  hp_m: vec3<f32>,
+  rd: vec3<f32>,
+  root_bmin_m: vec3<f32>,
+  ch_origin_vox: vec3<i32>,
+  voxel_size_m: f32,
+  chunk_size_vox: i32
+) -> GrassCell {
+  let root_size_m = f32(chunk_size_vox) * voxel_size_m;
+
+  // XZ: bias slightly opposite ray to pick the visible cell at edges, then clamp to chunk.
+  let bias = 0.05 * voxel_size_m;
+  var local_xz = (hp_m - root_bmin_m) - rd * bias;
+  local_xz.x = clamp(local_xz.x, 0.0, root_size_m - 1e-6);
+  local_xz.z = clamp(local_xz.z, 0.0, root_size_m - 1e-6);
+
+  // Y: ALWAYS choose the voxel directly *below* the hitpoint (top face hit),
+  // independent of SVO leaf size.
+  let y_in = hp_m.y - 1e-4 * voxel_size_m;
+  var local_y = clamp(y_in - root_bmin_m.y, 0.0, root_size_m - 1e-6);
+
+  var ix = i32(floor(local_xz.x / voxel_size_m));
+  var iy = i32(floor(local_y    / voxel_size_m));
+  var iz = i32(floor(local_xz.z / voxel_size_m));
+
+  ix = clamp(ix, 0, chunk_size_vox - 1);
+  iy = clamp(iy, 0, chunk_size_vox - 1);
+  iz = clamp(iz, 0, chunk_size_vox - 1);
+
+  let bmin_m = root_bmin_m + vec3<f32>(f32(ix), f32(iy), f32(iz)) * voxel_size_m;
+  let id_vox = vec3<f32>(
+    f32(ch_origin_vox.x + ix),
+    f32(ch_origin_vox.y + iy),
+    f32(ch_origin_vox.z + iz)
+  );
+
+  return GrassCell(bmin_m, id_vox);
+}
 
 
 // ------------------------------------------------------------
-// Procedural grass SDF + raymarch
+// Procedural grass SDF + raymarch (COMPLETE BODIES)
 // ------------------------------------------------------------
 
 // Signed distance to a capsule (segment AB with radius r).
@@ -276,10 +319,10 @@ fn hash13(p: vec3<f32>) -> f32 {
 }
 
 // Generate a blade root inside the voxel top face (local xz in [0,1]).
-fn grass_root_uv(cell_id: vec3<f32>, i: u32) -> vec2<f32> {
+fn grass_root_uv(cell_id_vox: vec3<f32>, i: u32) -> vec2<f32> {
   let fi = f32(i);
-  let u = hash13(cell_id + vec3<f32>(fi, 0.0, 0.0));
-  let v = hash13(cell_id + vec3<f32>(0.0, fi, 0.0));
+  let u = hash13(cell_id_vox + vec3<f32>(fi, 0.0, 0.0));
+  let v = hash13(cell_id_vox + vec3<f32>(0.0, fi, 0.0));
   return vec2<f32>(u, v);
 }
 
@@ -291,10 +334,10 @@ fn grass_bend_offset(root_m: vec3<f32>, t: f32, height01: f32, strength: f32) ->
 }
 
 // Distance to nearest grass blade in this voxel.
-// We build GRASS_BLADE_COUNT capsules from root->tip.
 fn grass_sdf(
   p_m: vec3<f32>,
   cell_bmin_m: vec3<f32>,
+  cell_id_vox: vec3<f32>,
   time_s: f32,
   strength: f32
 ) -> f32 {
@@ -303,18 +346,17 @@ fn grass_sdf(
   let top_y   = cell_bmin_m.y + vs;
   let layer_h = GRASS_LAYER_HEIGHT_VOX * vs;
 
+  // only evaluate within [top, top+layer_h]
   let y01 = (p_m.y - top_y) / max(layer_h, 1e-6);
   if (y01 < 0.0 || y01 > 1.0) { return BIG_F32; }
 
-  let cell_id = floor(cell_bmin_m / vs);
-
-  let blade_len = layer_h * (0.65 + 0.35 * hash13(cell_id + vec3<f32>(9.1, 3.7, 5.2)));
+  let blade_len = layer_h * (0.65 + 0.35 * hash13(cell_id_vox + vec3<f32>(9.1, 3.7, 5.2)));
   let r = GRASS_BLADE_RADIUS_VOX * vs;
 
   var dmin = BIG_F32;
 
   for (var i: u32 = 0u; i < GRASS_BLADE_COUNT; i = i + 1u) {
-    let uv = grass_root_uv(cell_id, i);
+    let uv = grass_root_uv(cell_id_vox, i);
 
     let inset = 0.12;
     let ux = mix(inset, 1.0 - inset, uv.x);
@@ -328,7 +370,7 @@ fn grass_sdf(
 
     let base_tip = root + vec3<f32>(0.0, blade_len, 0.0);
 
-    let ph = hash13(cell_id + vec3<f32>(f32(i) * 7.3, 1.1, 2.9));
+    let ph = hash13(cell_id_vox + vec3<f32>(f32(i) * 7.3, 1.1, 2.9));
     let bend = grass_bend_offset(root + vec3<f32>(0.0, ph, 0.0), time_s, y01, strength);
 
     let tip = base_tip + bend * blade_len;
@@ -342,17 +384,23 @@ fn grass_sdf(
 fn grass_sdf_normal(
   p_m: vec3<f32>,
   cell_bmin_m: vec3<f32>,
+  cell_id_vox: vec3<f32>,
   time_s: f32,
   strength: f32
 ) -> vec3<f32> {
   let e = 0.02 * cam.voxel_params.x;
 
-  let dx = grass_sdf(p_m + vec3<f32>(e, 0.0, 0.0), cell_bmin_m, time_s, strength)
-         - grass_sdf(p_m - vec3<f32>(e, 0.0, 0.0), cell_bmin_m, time_s, strength);
-  let dy = grass_sdf(p_m + vec3<f32>(0.0, e, 0.0), cell_bmin_m, time_s, strength)
-         - grass_sdf(p_m - vec3<f32>(0.0, e, 0.0), cell_bmin_m, time_s, strength);
-  let dz = grass_sdf(p_m + vec3<f32>(0.0, 0.0, e), cell_bmin_m, time_s, strength)
-         - grass_sdf(p_m - vec3<f32>(0.0, 0.0, e), cell_bmin_m, time_s, strength);
+  let dx =
+    grass_sdf(p_m + vec3<f32>(e, 0.0, 0.0), cell_bmin_m, cell_id_vox, time_s, strength) -
+    grass_sdf(p_m - vec3<f32>(e, 0.0, 0.0), cell_bmin_m, cell_id_vox, time_s, strength);
+
+  let dy =
+    grass_sdf(p_m + vec3<f32>(0.0, e, 0.0), cell_bmin_m, cell_id_vox, time_s, strength) -
+    grass_sdf(p_m - vec3<f32>(0.0, e, 0.0), cell_bmin_m, cell_id_vox, time_s, strength);
+
+  let dz =
+    grass_sdf(p_m + vec3<f32>(0.0, 0.0, e), cell_bmin_m, cell_id_vox, time_s, strength) -
+    grass_sdf(p_m - vec3<f32>(0.0, 0.0, e), cell_bmin_m, cell_id_vox, time_s, strength);
 
   return normalize(vec3<f32>(dx, dy, dz));
 }
@@ -369,6 +417,7 @@ fn grass_layer_trace(
   t_start: f32,
   t_end: f32,
   cell_bmin_m: vec3<f32>,
+  cell_id_vox: vec3<f32>,
   cell_size_m: f32,
   time_s: f32,
   strength: f32
@@ -381,11 +430,11 @@ fn grass_layer_trace(
 
     let p = ro + rd * t;
 
-    let d = grass_sdf(p, cell_bmin_m, time_s, strength);
+    let d = grass_sdf(p, cell_bmin_m, cell_id_vox, time_s, strength);
 
     let hit_eps = GRASS_HIT_EPS_VOX * vs;
     if (d < hit_eps) {
-      let n = grass_sdf_normal(p, cell_bmin_m, time_s, strength);
+      let n = grass_sdf_normal(p, cell_bmin_m, cell_id_vox, time_s, strength);
       return GrassHit(true, t, n);
     }
 
@@ -395,6 +444,7 @@ fn grass_layer_trace(
 
   return GrassHit(false, BIG_F32, vec3<f32>(0.0));
 }
+
 
 // ------------------------------------------------------------
 // Chunk tracing: hybrid point-query + interval stepping
@@ -495,46 +545,55 @@ fn trace_chunk_hybrid_interval(
       );
 
       if (bh.hit) {
-        // --- Procedural blades refinement for GRASS ---
-        if (q.mat == MAT_GRASS && rd.y < -0.02) {
+        // --- Procedural blades refinement for GRASS (SLAB INTERSECTION: works from side views) ---
+        if (q.mat == MAT_GRASS) {
           let time_s   = cam.voxel_params.y;
           let strength = cam.voxel_params.z;
           let vs       = cam.voxel_params.x;
 
-          // Use the actual hitpoint on the (compressed) leaf AABB, but choose a *world voxel cell*.
-          let hp0 = ro + bh.t * rd;
+          let hp = ro + bh.t * rd;
 
-          // Bias slightly toward the ray origin in XZ so edge hits pick the visible surface cell.
-          let eps_air = 0.06 * vs;
-          let hp_air  = hp0 - rd * eps_air;
+          // Pick voxel XZ under the hit (chunk-local, clamped)
+          let bias = 0.05 * vs;
+          var local = (hp - root_bmin) - rd * bias;
+          local.x = clamp(local.x, 0.0, root_size - 1e-6);
+          local.z = clamp(local.z, 0.0, root_size - 1e-6);
 
-          // Bias slightly downward in Y so we land inside the grass voxel (not the air just above).
-          let y_in = hp0.y - 1e-4 * vs;
+          var ix = i32(floor(local.x / vs));
+          var iz = i32(floor(local.z / vs));
 
-          var cell_bmin = vec3<f32>(
-            floor(hp_air.x / vs) * vs,
-            floor(y_in     / vs) * vs,
-            floor(hp_air.z / vs) * vs
+          ix = clamp(ix, 0, i32(cam.chunk_size) - 1);
+          iz = clamp(iz, 0, i32(cam.chunk_size) - 1);
+
+          // Y: use the TOP of the *grass leaf cube* (q.bmin+q.size), then take the voxel just under it.
+          // This avoids needing "air above" queries that break with coarse leaves.
+          let y_leaf_top = q.bmin.y + q.size;
+          let local_y_top = clamp((y_leaf_top - 1e-4 * vs) - root_bmin.y, 0.0, root_size - 1e-6);
+          var iy = i32(floor(local_y_top / vs));
+          iy = clamp(iy, 0, i32(cam.chunk_size) - 1);
+
+          let cell_bmin = root_bmin + vec3<f32>(f32(ix), f32(iy), f32(iz)) * vs;
+
+          // stable RNG seed = global voxel id
+          let cell_id_vox = vec3<f32>(
+            f32(ch.origin.x + ix),
+            f32(ch.origin.y + iy),
+            f32(ch.origin.z + iz)
           );
 
-          // Gate: grass below + air above (prevents blades inside geometry / on side faces)
-          let c = cell_bmin + vec3<f32>(0.5 * vs, 0.0, 0.5 * vs);
-          let below_p = vec3<f32>(c.x, cell_bmin.y + 0.75 * vs, c.z);
-          let above_p = vec3<f32>(c.x, cell_bmin.y + 1.25 * vs, c.z);
+          // Build the grass slab AABB: [top of voxel .. top+layer_h] over this voxel's XZ
+          let layer_h = GRASS_LAYER_HEIGHT_VOX * vs;
 
-          if (is_grass(below_p, root_bmin, root_size, ch.node_base) &&
-              is_air  (above_p, root_bmin, root_size, ch.node_base)) {
+          let slab_bmin = vec3<f32>(cell_bmin.x, cell_bmin.y + vs, cell_bmin.z);
+          let slab_bmax = vec3<f32>(cell_bmin.x + vs, cell_bmin.y + vs + layer_h, cell_bmin.z + vs);
 
-            // March *in air* just before the surface hit.
-            let layer_h = GRASS_LAYER_HEIGHT_VOX * vs;
-            let denom   = max(-rd.y, 1e-3);
-            let span    = layer_h / denom;
+          // Intersect ray with slab, and only march the portion that is BEFORE the solid hit (bh.t)
+          let rt = intersect_aabb(ro, rd, slab_bmin, slab_bmax);
+          var t0 = max(rt.x, t_enter);
+          var t1 = min(rt.y, bh.t - 0.01 * vs); // keep strictly in front of voxel surface hit
 
-            // End slightly before the hit so we're guaranteed in air.
-            let t_end   = bh.t - 0.03 * vs;
-            let t_start = max(t_enter, t_end - span);
-
-            let gh = grass_layer_trace(ro, rd, t_start, t_end, cell_bmin, vs, time_s, strength);
+          if (t1 > t0) {
+            let gh = grass_layer_trace(ro, rd, t0, t1, cell_bmin, cell_id_vox, vs, time_s, strength);
             if (gh.hit) {
               var out = miss_hitgeom();
               out.hit = 1u;
@@ -548,6 +607,8 @@ fn trace_chunk_hybrid_interval(
             }
           }
         }
+
+
 
 
         // Fall back to voxel face hit
@@ -706,12 +767,12 @@ fn in_shadow(p: vec3<f32>, sun_dir: vec3<f32>) -> bool {
 
     let slot = grid_lookup_slot(cx, cy, cz);
     if (slot != INVALID_U32 && slot < cam.chunk_count) {
-      let ch = chunks[slot];
+      let ch2 = chunks[slot];
 
       let cell_enter = start_t + t_local;
-      let cell_exit  = start_t + min(tNextLocal, t_exit_local);
+      let cell_exit2 = start_t + min(tNextLocal, t_exit_local);
 
-      if (trace_chunk_shadow_interval(ro, rd, ch, cell_enter, cell_exit)) {
+      if (trace_chunk_shadow_interval(ro, rd, ch2, cell_enter, cell_exit2)) {
         return true;
       }
     }
@@ -740,7 +801,7 @@ fn in_shadow(p: vec3<f32>, sun_dir: vec3<f32>) -> bool {
   return false;
 }
 
-// Transmittance step inside a chunk (UPDATED: respect SHADOW_DISPLACED_LEAVES for leaves)
+// Transmittance step inside a chunk (respects displaced leaves option)
 fn trace_chunk_shadow_trans_interval(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -888,12 +949,12 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
     let slot = grid_lookup_slot(cx, cy, cz);
 
     if (slot != INVALID_U32 && slot < cam.chunk_count) {
-      let ch = chunks[slot];
+      let ch2 = chunks[slot];
 
       let cell_enter = start_t + t_local;
-      let cell_exit  = start_t + min(tNextLocal, t_exit_local);
+      let cell_exit2 = start_t + min(tNextLocal, t_exit_local);
 
-      trans *= trace_chunk_shadow_trans_interval(ro, rd, ch, cell_enter, cell_exit);
+      trans *= trace_chunk_shadow_trans_interval(ro, rd, ch2, cell_enter, cell_exit2);
       if (trans < MIN_TRANS) { break; }
     }
 
@@ -997,12 +1058,12 @@ fn sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
     let slot = grid_lookup_slot(cx, cy, cz);
 
     if (slot != INVALID_U32 && slot < cam.chunk_count) {
-      let ch = chunks[slot];
+      let ch2 = chunks[slot];
 
       let cell_enter = start_t + t_local;
-      let cell_exit  = start_t + min(tNextLocal, t_exit_local);
+      let cell_exit2 = start_t + min(tNextLocal, t_exit_local);
 
-      trans *= trace_chunk_shadow_trans_interval(ro, rd, ch, cell_enter, cell_exit);
+      trans *= trace_chunk_shadow_trans_interval(ro, rd, ch2, cell_enter, cell_exit2);
       if (trans < MIN_TRANS) { break; }
     }
 
@@ -1031,7 +1092,7 @@ fn sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
 }
 
 // ------------------------------------------------------------
-// Shading (UPDATED: spec+fresnel + AO)
+// Shading (spec + fresnel + AO)
 // ------------------------------------------------------------
 
 fn color_for_material(m: u32) -> vec3<f32> {
@@ -1203,4 +1264,66 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
   let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis;
 
   return base * (ambient + direct) + 0.20 * spec_col;
+}
+
+const GRASS_Y_SCAN_STEPS: u32 = 12u;
+
+struct GrassCellPick {
+  ok       : bool,
+  bmin_m   : vec3<f32>,
+  id_vox   : vec3<f32>,
+};
+
+fn find_exposed_grass_cell_in_chunk(
+  hp_m: vec3<f32>,
+  rd: vec3<f32>,
+  root_bmin_m: vec3<f32>,
+  root_size_m: f32,
+  ch_origin_vox: vec3<i32>,
+  voxel_size_m: f32,
+  chunk_size_vox: i32,
+  node_base: u32
+) -> GrassCellPick {
+  // Stable XZ pick (chunk-local, clamped so it never spills to neighbor chunks)
+  let bias = 0.05 * voxel_size_m;
+  var local = (hp_m - root_bmin_m) - rd * bias;
+
+  local.x = clamp(local.x, 0.0, root_size_m - 1e-6);
+  local.z = clamp(local.z, 0.0, root_size_m - 1e-6);
+
+  var ix = i32(floor(local.x / voxel_size_m));
+  var iz = i32(floor(local.z / voxel_size_m));
+
+  ix = clamp(ix, 0, chunk_size_vox - 1);
+  iz = clamp(iz, 0, chunk_size_vox - 1);
+
+  // Start Y from just below the hitpoint (but don’t trust SVO leaf size)
+  var local_y = clamp((hp_m.y - 1e-4 * voxel_size_m) - root_bmin_m.y, 0.0, root_size_m - 1e-6);
+  var iy0 = i32(floor(local_y / voxel_size_m));
+  iy0 = clamp(iy0, 0, chunk_size_vox - 1);
+
+  // Scan downward to find the topmost exposed grass voxel: grass below + air above
+  for (var k: u32 = 0u; k < GRASS_Y_SCAN_STEPS; k = k + 1u) {
+    let iy = iy0 - i32(k);
+    if (iy < 0) { break; }
+
+    let bmin_m = root_bmin_m + vec3<f32>(f32(ix), f32(iy), f32(iz)) * voxel_size_m;
+
+    let below_c = bmin_m + vec3<f32>(0.5 * voxel_size_m, 0.5 * voxel_size_m, 0.5 * voxel_size_m);
+    let above_c = bmin_m + vec3<f32>(0.5 * voxel_size_m, 1.5 * voxel_size_m, 0.5 * voxel_size_m);
+
+    if (is_grass(below_c, root_bmin_m, root_size_m, node_base) &&
+        is_air  (above_c, root_bmin_m, root_size_m, node_base)) {
+
+      let id_vox = vec3<f32>(
+        f32(ch_origin_vox.x + ix),
+        f32(ch_origin_vox.y + iy),
+        f32(ch_origin_vox.z + iz)
+      );
+
+      return GrassCellPick(true, bmin_m, id_vox);
+    }
+  }
+
+  return GrassCellPick(false, vec3<f32>(0.0), vec3<f32>(0.0));
 }
