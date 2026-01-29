@@ -117,7 +117,7 @@ const CLOUD_SOFTNESS : f32 = 0.10;
 const CLOUD_HORIZON_Y0 : f32 = 0.02;
 const CLOUD_HORIZON_Y1 : f32 = 0.25;
 
-const CLOUD_SKY_DARKEN : f32 = 0.65;
+const CLOUD_SKY_DARKEN : f32 = 0.45;
 const CLOUD_ABSORB     : f32 = 10.0;
 
 const CLOUD_BASE_COL   : vec3<f32> = vec3<f32>(0.72, 0.74, 0.76);
@@ -194,12 +194,12 @@ const GRASS_VOXEL_TAPER           : f32 = 0.90;
 const GRASS_OVERHANG_VOX          : f32 = 0.20;
 
 // Grass level-of-detail (LOD) distances in meters-ish (assuming rd normalized).
-const GRASS_LOD_MID_START : f32 = 18.0;
-const GRASS_LOD_FAR_START : f32 = 45.0;
+const GRASS_LOD_MID_START : f32 = 15.0;
+const GRASS_LOD_FAR_START : f32 = 40.0;
 
 // Mid/far quality knobs (tune freely)
-const GRASS_BLADE_COUNT_MID : u32 = 3u;
-const GRASS_BLADE_COUNT_FAR : u32 = 2u;
+const GRASS_BLADE_COUNT_MID : u32 = 2u;
+const GRASS_BLADE_COUNT_FAR : u32 = 1u;
 
 const GRASS_SEGS_MID : u32 = 4u;
 const GRASS_SEGS_FAR : u32 = 3u;

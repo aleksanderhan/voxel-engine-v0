@@ -1,4 +1,13 @@
 // src/shaders/ray/chunk_trace.wgsl
+// --------------------------------
+//
+// Implements:
+// - Hybrid chunk tracing
+// - Scene chunk-grid DDA (Digital Differential Analyzer) stepping
+// - NEW: SVO (Sparse Voxel Octree) ray traversal inside a chunk using
+//        midplane stepping (≤4 children per internal node), no 8-child slab tests,
+//        no sorting. (This is 3A+3B.)
+
 //// --------------------------------------------------------------------------
 //// HitGeom + hybrid chunk tracing
 //// --------------------------------------------------------------------------
@@ -22,7 +31,6 @@ struct HitGeom {
   _pad4      : vec2<u32>,
 };
 
-
 fn miss_hitgeom() -> HitGeom {
   var h : HitGeom;
   h.hit = 0u;
@@ -35,6 +43,252 @@ fn miss_hitgeom() -> HitGeom {
   h.macro_base = INVALID_U32;
   return h;
 }
+
+//// --------------------------------------------------------------------------
+//// NEW: Ray → SVO leaf iterator (fast child expansion: 3A+3B)
+//// --------------------------------------------------------------------------
+
+// Requirements assumed from your shared includes:
+// - struct Node { child_base: u32, child_mask: u32, material: u32, ... }
+// - var<storage, read> nodes : array<Node>;
+// - const LEAF_U32 : u32;
+// - const MAT_AIR : u32;
+// - const BIG_F32 : f32;
+// - const EPS_INV : f32;
+// - cube_slab_inv(ro, inv, bmin, size) -> CubeSlab { t_enter, t_exit, ... }
+
+struct StackEntry {
+  kind   : u32,        // 0 = node, 1 = air leaf (virtual missing child)
+  idx    : u32,        // node index when kind=0
+  mat    : u32,        // valid when kind=1
+  _pad0  : u32,
+
+  bmin   : vec3<f32>,
+  size   : f32,
+
+  t0     : f32,
+  t1     : f32,
+  _pad1  : vec2<f32>,
+};
+
+fn push_entry(stack: ptr<function, array<StackEntry, 64>>, sp: ptr<function, u32>, e: StackEntry) {
+  if (*sp < 64u) {
+    (*stack)[*sp] = e;
+    *sp = *sp + 1u;
+  }
+}
+
+fn pop_entry(stack: ptr<function, array<StackEntry, 64>>, sp: ptr<function, u32>) -> StackEntry {
+  *sp = *sp - 1u;
+  return (*stack)[*sp];
+}
+
+// rank = popcount(mask & ((1<<ci)-1))
+fn rank_child(mask: u32, ci: u32) -> u32 {
+  let before = (1u << ci) - 1u;
+  return countOneBits(mask & before);
+}
+
+// Which half (bit 0/1) do we enter first on this axis?
+fn axis_first_bit(rd_comp: f32, ro_comp: f32, t0: f32, mid_comp: f32) -> u32 {
+  // Parallel-ish: decide from entry position
+  if (abs(rd_comp) < EPS_INV) {
+    let x = ro_comp + rd_comp * t0;
+    return select(0u, 1u, x > mid_comp);
+  }
+  // If moving negative, we hit the "upper half" first (bit=1); else lower (bit=0)
+  return select(0u, 1u, rd_comp < 0.0);
+}
+
+// Return the t-interval inside chosen half-space on one axis, clipped to [t0,t1].
+// bit=0 => lower half, bit=1 => upper half.
+fn axis_interval_for_bit(
+  bit: u32,
+  rd_comp: f32,
+  ro_comp: f32,
+  t0: f32,
+  t1: f32,
+  tm_raw: f32,      // (mid - ro) * inv, NOT clipped
+  mid_comp: f32
+) -> vec2<f32> {
+  // Parallel-ish: constant side
+  if (abs(rd_comp) < EPS_INV) {
+    let x = ro_comp; // rd ~ 0
+    let in_upper = x > mid_comp;
+    let want_upper = (bit != 0u);
+    if (in_upper == want_upper) { return vec2<f32>(t0, t1); }
+    return vec2<f32>(BIG_F32, -BIG_F32);
+  }
+
+  // If the midplane crossing is outside this node interval, the ray stays in one half
+  if (tm_raw <= t0 || tm_raw >= t1) {
+    let x0 = ro_comp + rd_comp * t0;
+    let in_upper = x0 > mid_comp;
+    let want_upper = (bit != 0u);
+    if (in_upper == want_upper) { return vec2<f32>(t0, t1); }
+    return vec2<f32>(BIG_F32, -BIG_F32);
+  }
+
+  // Otherwise it crosses inside [t0,t1]; decide near vs far half
+  // If rd < 0, upper half is near interval [t0,tm]; if rd > 0, lower half is near [t0,tm]
+  let near_is_upper = (rd_comp < 0.0);
+  let want_upper    = (bit != 0u);
+  let want_near     = (want_upper == near_is_upper);
+
+  // near => [t0,tm], far => [tm,t1]
+  return select(vec2<f32>(tm_raw, t1), vec2<f32>(t0, tm_raw), want_near);
+}
+
+
+// Expand one internal node into ≤4 children, in correct near→far order, without sorting.
+// Pushes far→near to the stack so pop() yields near→far.
+fn push_children_along_ray(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  inv: vec3<f32>,
+  node_base: u32,
+  e: StackEntry,
+  n: Node,
+  stack: ptr<function, array<StackEntry, 64>>,
+  sp: ptr<function, u32>
+) {
+  let half = e.size * 0.5;
+  let mid  = e.bmin + vec3<f32>(half);
+
+  // Midplane crossing times (RAW, unclipped) used for interval building
+  let tmx_raw: f32 = (mid.x - ro.x) * inv.x;
+  let tmy_raw: f32 = (mid.y - ro.y) * inv.y;
+  let tmz_raw: f32 = (mid.z - ro.z) * inv.z;
+
+  // Midplane crossing times used ONLY for ordering (must be inside (e.t0, e.t1), else BIG)
+  var tmx: f32 = tmx_raw;
+  var tmy: f32 = tmy_raw;
+  var tmz: f32 = tmz_raw;
+
+  if (abs(rd.x) < EPS_INV || tmx <= e.t0 || tmx >= e.t1) { tmx = BIG_F32; }
+  if (abs(rd.y) < EPS_INV || tmy <= e.t0 || tmy >= e.t1) { tmy = BIG_F32; }
+  if (abs(rd.z) < EPS_INV || tmz <= e.t0 || tmz >= e.t1) { tmz = BIG_F32; }
+
+  // Initial child bits at node entry
+  let bx0 = axis_first_bit(rd.x, ro.x, e.t0, mid.x);
+  let by0 = axis_first_bit(rd.y, ro.y, e.t0, mid.y);
+  let bz0 = axis_first_bit(rd.z, ro.z, e.t0, mid.z);
+
+  var ci: u32 = bx0 | (by0 << 1u) | (bz0 << 2u);
+
+  var gen: array<StackEntry, 4>;
+  var gcount: u32 = 0u;
+
+  // Working copies of crossing times (disable after flipping)
+  var cxm: f32 = tmx;
+  var cym: f32 = tmy;
+  var czm: f32 = tmz;
+
+  for (var k: u32 = 0u; k < 4u; k = k + 1u) {
+    let hx = (ci & 1u);
+    let hy = (ci >> 1u) & 1u;
+    let hz = (ci >> 2u) & 1u;
+
+    let cbmin = e.bmin + vec3<f32>(
+      select(0.0, half, hx != 0u),
+      select(0.0, half, hy != 0u),
+      select(0.0, half, hz != 0u)
+    );
+
+    // Child interval = intersection of per-axis half-intervals
+    // IMPORTANT: use *tm_raw*, not recomputed values
+    let ix = axis_interval_for_bit(hx, rd.x, ro.x, e.t0, e.t1, tmx_raw, mid.x);
+    let iy = axis_interval_for_bit(hy, rd.y, ro.y, e.t0, e.t1, tmy_raw, mid.y);
+    let iz = axis_interval_for_bit(hz, rd.z, ro.z, e.t0, e.t1, tmz_raw, mid.z);
+
+    let t0 = max(e.t0, max(ix.x, max(iy.x, iz.x)));
+    let t1 = min(e.t1, min(ix.y, min(iy.y, iz.y)));
+
+    if (t1 > t0) {
+      let bit = 1u << ci;
+
+      if ((n.child_mask & bit) == 0u) {
+        gen[gcount] = StackEntry(1u, 0u, MAT_AIR, 0u, cbmin, half, t0, t1, vec2<f32>(0.0));
+      } else {
+        let r = rank_child(n.child_mask, ci);
+        let child_idx = node_base + (n.child_base + r);
+        gen[gcount] = StackEntry(0u, child_idx, 0u, 0u, cbmin, half, t0, t1, vec2<f32>(0.0));
+      }
+
+      gcount = gcount + 1u;
+      if (gcount == 4u) { break; }
+    }
+
+    // Decide which midplane we cross next (smallest remaining)
+    if (cxm < cym) {
+      if (cxm < czm) { ci = ci ^ 1u;        cxm = BIG_F32; }
+      else           { ci = ci ^ (1u<<2u);  czm = BIG_F32; }
+    } else {
+      if (cym < czm) { ci = ci ^ (1u<<1u);  cym = BIG_F32; }
+      else           { ci = ci ^ (1u<<2u);  czm = BIG_F32; }
+    }
+
+    if (cxm == BIG_F32 && cym == BIG_F32 && czm == BIG_F32) { break; }
+  }
+
+  // Push far→near so stack pops near→far
+  for (var i: i32 = i32(gcount) - 1; i >= 0; i = i - 1) {
+    push_entry(stack, sp, gen[u32(i)]);
+  }
+}
+
+
+struct LeafHit {
+  hit  : bool,
+  bmin : vec3<f32>,
+  size : f32,
+  mat  : u32,
+  t0   : f32,
+  t1   : f32,
+};
+
+fn next_leaf_in_chunk(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  inv: vec3<f32>,
+  node_base: u32,
+  macro_base: u32,   // kept for later; not used here
+  min_leaf: f32,
+  stack: ptr<function, array<StackEntry, 64>>,
+  sp: ptr<function, u32>
+) -> LeafHit {
+  loop {
+    if (*sp == 0u) { break; }
+
+    let e = pop_entry(stack, sp);
+
+    // virtual air leaf
+    if (e.kind == 1u) {
+      return LeafHit(true, e.bmin, e.size, e.mat, e.t0, e.t1);
+    }
+
+    let n = nodes[e.idx];
+
+    // real leaf
+    if (n.child_base == LEAF_U32) {
+      return LeafHit(true, e.bmin, e.size, n.material, e.t0, e.t1);
+    }
+
+    // reached minimum leaf size: treat as air
+    if (e.size <= min_leaf) {
+      return LeafHit(true, e.bmin, e.size, MAT_AIR, e.t0, e.t1);
+    }
+
+    // 3A+3B: expand children along ray (≤4), ordered, no sort, no 8 slabs
+    push_children_along_ray(ro, rd, inv, node_base, e, n, stack, sp);
+  }
+
+  return LeafHit(false, vec3<f32>(0.0), 0.0, MAT_AIR, BIG_F32, BIG_F32);
+}
+
+//// --------------------------------------------------------------------------
+//// Chunk tracing using the iterator
+//// --------------------------------------------------------------------------
 
 fn trace_chunk_hybrid_interval(
   ro: vec3<f32>,
@@ -49,27 +303,46 @@ fn trace_chunk_hybrid_interval(
   let root_bmin = root_bmin_vox * vs;
   let root_size = f32(cam.chunk_size) * vs;
 
-  let eps_step = 1e-4 * vs;
-  var tcur = max(t_enter, 0.0) + eps_step;
-
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let min_leaf = vs;
+
+  // Clip to chunk root AABB once
+  let root_slab = cube_slab_inv(ro, inv, root_bmin, root_size);
+  var rt0 = max(root_slab.t_enter, t_enter);
+  var rt1 = min(root_slab.t_exit,  t_exit);
+  if (rt1 <= rt0) { return miss_hitgeom(); }
+
+  // Stack init (root node index is ch.node_base)
+  var stack: array<StackEntry, 64>;
+  var sp: u32 = 0u;
+  push_entry(&stack, &sp,
+    StackEntry(0u, ch.node_base, 0u, 0u, root_bmin, root_size, rt0, rt1, vec2<f32>(0.0))
+  );
+
+  let eps_step = 1e-4 * vs;
   let chunk_size_i = i32(cam.chunk_size);
 
-  for (var step_i: u32 = 0u; step_i < cam.max_steps; step_i = step_i + 1u) {
-    if (tcur > t_exit) { break; }
+  loop {
+    let leaf = next_leaf_in_chunk(
+      ro, rd, inv,
+      ch.node_base,
+      ch.macro_base,
+      min_leaf,
+      &stack, &sp
+    );
+    if (!leaf.hit) { break; }
+
+    // Local “within-leaf” working t (for probes). Leaf stepping itself is via iterator.
+    let tcur = max(leaf.t0, 0.0) + eps_step;
+    if (tcur > leaf.t1) { continue; }
 
     let p  = ro + tcur * rd;
-    let pq = p + rd * (1e-4 * vs);
-
-    let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base, ch.macro_base);
-
-    // ---- NEW: compute slab ONCE for this leaf, reuse for stepping/probing
-    let slab    = cube_slab_inv(ro, inv, q.bmin, q.size);
-    let t_leave = slab.t_exit;
-    // ---------------------------------------------------------------
+    let pq = p + rd * (1e-4 * vs); // keep your original biasing
 
     // AIR: probe grass slab just below when in blade layer
-    if (q.mat == MAT_AIR) {
+    if (leaf.mat == MAT_AIR) {
+      // NOTE: your original code used q.bmin/q.size from query_leaf_at().
+      // Here, leaf.bmin/leaf.size are the leaf cube itself.
       let layer_h = GRASS_LAYER_HEIGHT_VOX * vs;
       let bias = 0.05 * vs;
 
@@ -96,9 +369,9 @@ fn trace_chunk_hybrid_interval(
             f32(ch.origin.z + iz)
           );
 
-          // was: exit_time_from_cube_inv(...)
-          let t_leave_air = t_leave;
-          let tmax_probe  = min(min(t_leave_air, t_exit), tcur + q.size + 2.0 * vs);
+          // Use leaf exit as probe max boundary (instead of recomputing exit_time)
+          let t_leave_air = leaf.t1;
+          let tmax_probe  = min(min(t_leave_air, t_exit), tcur + leaf.size + 2.0 * vs);
 
           let time_s   = cam.voxel_params.y;
           let strength = cam.voxel_params.z;
@@ -119,17 +392,16 @@ fn trace_chunk_hybrid_interval(
         }
       }
 
-      // was: exit_time_from_cube_inv(...)
-      tcur = max(t_leave, tcur) + eps_step;
+      // No manual stepping; iterator continues to next leaf
       continue;
     }
 
     // Leaves: displaced cube hit
-    if (q.mat == MAT_LEAF) {
+    if (leaf.mat == MAT_LEAF) {
       let time_s   = cam.voxel_params.y;
       let strength = cam.voxel_params.z;
 
-      let h2 = leaf_displaced_cube_hit(ro, rd, q.bmin, q.size, time_s, strength, t_enter, t_exit);
+      let h2 = leaf_displaced_cube_hit(ro, rd, leaf.bmin, leaf.size, time_s, strength, t_enter, t_exit);
 
       if (h2.hit) {
         var out = miss_hitgeom();
@@ -144,17 +416,16 @@ fn trace_chunk_hybrid_interval(
         return out;
       }
 
-      // was: exit_time_from_cube_inv(...)
-      tcur = max(t_leave, tcur) + eps_step;
       continue;
     }
 
-    // Solid: AABB face hit (use slab we already computed)
+    // Solid: AABB (Axis-Aligned Bounding Box) face hit on this leaf cube
+    let slab = cube_slab_inv(ro, inv, leaf.bmin, leaf.size);
     let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
 
     if (bh.hit) {
       // If grass solid, try blades above the voxel under this hit (from above)
-      if (q.mat == MAT_GRASS) {
+      if (leaf.mat == MAT_GRASS) {
         let time_s   = cam.voxel_params.y;
         let strength = cam.voxel_params.z;
 
@@ -187,7 +458,7 @@ fn trace_chunk_hybrid_interval(
       var out = miss_hitgeom();
       out.hit = 1u;
       out.t   = bh.t;
-      out.mat = q.mat;
+      out.mat = leaf.mat;
       out.n   = bh.n;
       out.root_bmin = root_bmin;
       out.root_size = root_size;
@@ -196,8 +467,7 @@ fn trace_chunk_hybrid_interval(
       return out;
     }
 
-    // Miss: step using the already-computed slab exit
-    tcur = max(t_leave, tcur) + eps_step;
+    // Miss: iterator continues
   }
 
   return miss_hitgeom();
@@ -213,7 +483,7 @@ struct VoxTraceResult {
   t_exit  : f32,
 };
 
-// DDA = Digital Differential Analyzer (grid-stepping along the ray)
+// DDA (Digital Differential Analyzer) = grid-stepping along the ray
 fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
   // Fast out if no chunks
   if (cam.chunk_count == 0u) {
@@ -347,4 +617,3 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
 
   return VoxTraceResult(true, best, t_exit);
 }
-
