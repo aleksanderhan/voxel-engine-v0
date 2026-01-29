@@ -229,7 +229,7 @@ fn apply_material_variation_clip(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> ve
   return c;
 }
 
-fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit) -> vec3<f32> {
+fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>) -> vec3<f32> {
   let hp = ro + ch.t * rd;
 
   // base + variation
@@ -263,7 +263,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit) -> vec3<f32> {
 
   let ao = clamp(1.0 - 0.65 * occ / max(cell, 1e-3), 0.45, 1.0);
 
-  let amb_col = hemi_ambient(ch.n);
+  let amb_col = hemi_ambient(ch.n, sky_up);
   let amb_strength = 0.10;
   let ambient = amb_col * amb_strength * ao;
 

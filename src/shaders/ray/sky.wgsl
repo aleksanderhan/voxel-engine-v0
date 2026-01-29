@@ -4,6 +4,7 @@
 //// --------------------------------------------------------------------------
 
 fn sky_color(rd: vec3<f32>) -> vec3<f32> {
+  // Base vertical gradient
   let tsky = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
   var col = mix(
     vec3<f32>(0.05, 0.08, 0.12),
@@ -11,6 +12,7 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
     tsky
   );
 
+  // Horizon/zenith shaping
   let y = clamp(rd.y, -0.2, 1.0);
   let horizon = exp(-abs(y) * 8.0);
   let zenith  = smoothstep(0.0, 1.0, y);
@@ -19,19 +21,26 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
 
   col *= SKY_EXPOSURE;
 
-  let mu  = dot(rd, SUN_DIR);
-  let ang = acos(clamp(mu, -1.0, 1.0));
+  // Sun term (NO acos): work directly in mu = cos(angle)
+  let mu = clamp(dot(rd, SUN_DIR), -1.0, 1.0);
 
   // Sun disc/halo (kept here to avoid magic numbers in main)
   let SUN_DISC_ANGULAR_RADIUS : f32 = 0.009;
   let SUN_DISC_SOFTNESS       : f32 = 0.004;
 
-  let disc = 1.0 - smoothstep(
-    SUN_DISC_ANGULAR_RADIUS,
-    SUN_DISC_ANGULAR_RADIUS + SUN_DISC_SOFTNESS,
-    ang
-  );
-  let halo = exp(-ang * 30.0) * 0.15;
+  // Convert angular edges to mu-space edges. cos() is decreasing on [0, pi],
+  // so edges are reversed for smoothstep in mu-space.
+  let mu_inner = cos(SUN_DISC_ANGULAR_RADIUS);
+  let mu_outer = cos(SUN_DISC_ANGULAR_RADIUS + SUN_DISC_SOFTNESS);
+
+  // Disc: 1 inside, smooth falloff over softness region
+  let disc = smoothstep(mu_outer, mu_inner, mu);
+
+  // Halo: approximate exp(-ang*k) without acos using exp in (1 - mu).
+  // For small angles: 1 - mu ~= ang^2 / 2, so this gives a tight halo.
+  // Tune k_halo if you want wider/narrower.
+  let k_halo = 9000.0;
+  let halo = 0.15 * exp(-k_halo * max(0.0, 1.0 - mu));
 
   var cloud = 0.0;
 

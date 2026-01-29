@@ -85,7 +85,7 @@ fn compute_godray_quarter_pixel(
   let base_x = i32(gid.x) * GODRAY_BLOCK_SIZE;
   let base_y = i32(gid.y) * GODRAY_BLOCK_SIZE;
 
-  // 5 taps
+  // 5 depth taps (same as before)
   let fp0 = vec2<i32>(clamp(base_x + 1, 0, i32(fdims.x) - 1),
                       clamp(base_y + 1, 0, i32(fdims.y) - 1));
   let fp1 = vec2<i32>(clamp(base_x + 3, 0, i32(fdims.x) - 1),
@@ -97,57 +97,48 @@ fn compute_godray_quarter_pixel(
   let fp4 = vec2<i32>(clamp(base_x + 2, 0, i32(fdims.x) - 1),
                       clamp(base_y + 1, 0, i32(fdims.y) - 1));
 
-  let res_full = vec2<f32>(f32(fdims.x), f32(fdims.y));
-
+  // Jitter as before
   let j0 = 0.20 * (hash12(qpx * J0_SCALE) - 0.5);
   let j1 = 0.20 * (hash12(qpx * J1_SCALE + vec2<f32>(11.0, 3.0)) - 0.5);
   let j2 = 0.20 * (hash12(qpx * J2_SCALE + vec2<f32>(5.0, 17.0)) - 0.5);
   let j3 = 0.20 * (hash12(qpx * J3_SCALE + vec2<f32>(23.0, 29.0)) - 0.5);
 
+  // Load depths (same)
   let t_scene0 = textureLoad(depth_tex, fp0, 0).x;
   let t_scene1 = textureLoad(depth_tex, fp1, 0).x;
   let t_scene2 = textureLoad(depth_tex, fp2, 0).x;
   let t_scene3 = textureLoad(depth_tex, fp3, 0).x;
   let t_scene4 = textureLoad(depth_tex, fp4, 0).x;
 
+  // Early-out: if no godray fog, just blend history toward 0 quickly
+  let fog_ok = fog_density_godray() > 0.0;
+
+  // Quantize end distances (same)
+  let qstep = 0.1;
+  let t_end0 = min(floor(t_scene0 / qstep) * qstep, GODRAY_MAX_DIST);
+  let t_end1 = min(floor(t_scene1 / qstep) * qstep, GODRAY_MAX_DIST);
+  let t_end2 = min(floor(t_scene2 / qstep) * qstep, GODRAY_MAX_DIST);
+  let t_end3 = min(floor(t_scene3 / qstep) * qstep, GODRAY_MAX_DIST);
+  let t_end4 = min(floor(t_scene4 / qstep) * qstep, GODRAY_MAX_DIST);
+
+  // -------------------------------------------------------------------------
+  // NEW: compute ray direction ONCE for the block center and reuse it
+  // Center of the 4x4 block (base + 2,2) in full-res pixel coords.
+  // -------------------------------------------------------------------------
+  let res_full = vec2<f32>(f32(fdims.x), f32(fdims.y));
+  let center_px = vec2<f32>(f32(base_x + 2) + 0.5, f32(base_y + 2) + 0.5);
+  let rd_center = ray_dir_from_pixel(center_px, res_full);
+  // -------------------------------------------------------------------------
+
   var acc = vec3<f32>(0.0);
   var wsum = 0.0;
 
-  let qstep = 0.1;
-
-  let t_end0 = min(floor(t_scene0 / qstep) * qstep, GODRAY_MAX_DIST);
-  if (t_end0 > 0.0 && fog_density_godray() > 0.0) {
-    let px0 = vec2<f32>(f32(fp0.x) + 0.5, f32(fp0.y) + 0.5);
-    acc += godray_integrate(ro, ray_dir_from_pixel(px0, res_full), t_end0, j0);
-    wsum += 1.0;
-  }
-
-  let t_end1 = min(floor(t_scene1 / qstep) * qstep, GODRAY_MAX_DIST);
-  if (t_end1 > 0.0 && fog_density_godray() > 0.0) {
-    let px1 = vec2<f32>(f32(fp1.x) + 0.5, f32(fp1.y) + 0.5);
-    acc += godray_integrate(ro, ray_dir_from_pixel(px1, res_full), t_end1, j1);
-    wsum += 1.0;
-  }
-
-  let t_end2 = min(floor(t_scene2 / qstep) * qstep, GODRAY_MAX_DIST);
-  if (t_end2 > 0.0 && fog_density_godray() > 0.0) {
-    let px2 = vec2<f32>(f32(fp2.x) + 0.5, f32(fp2.y) + 0.5);
-    acc += godray_integrate(ro, ray_dir_from_pixel(px2, res_full), t_end2, j2);
-    wsum += 1.0;
-  }
-
-  let t_end3 = min(floor(t_scene3 / qstep) * qstep, GODRAY_MAX_DIST);
-  if (t_end3 > 0.0 && fog_density_godray() > 0.0) {
-    let px3 = vec2<f32>(f32(fp3.x) + 0.5, f32(fp3.y) + 0.5);
-    acc += godray_integrate(ro, ray_dir_from_pixel(px3, res_full), t_end3, j3);
-    wsum += 1.0;
-  }
-
-  let t_end4 = min(floor(t_scene4 / qstep) * qstep, GODRAY_MAX_DIST);
-  if (t_end4 > 0.0 && fog_density_godray() > 0.0) {
-    let px4 = vec2<f32>(f32(fp4.x) + 0.5, f32(fp4.y) + 0.5);
-    acc += godray_integrate(ro, ray_dir_from_pixel(px4, res_full), t_end4, 0.0);
-    wsum += 1.0;
+  if (fog_ok) {
+    if (t_end0 > 0.0) { acc += godray_integrate(ro, rd_center, t_end0, j0); wsum += 1.0; }
+    if (t_end1 > 0.0) { acc += godray_integrate(ro, rd_center, t_end1, j1); wsum += 1.0; }
+    if (t_end2 > 0.0) { acc += godray_integrate(ro, rd_center, t_end2, j2); wsum += 1.0; }
+    if (t_end3 > 0.0) { acc += godray_integrate(ro, rd_center, t_end3, j3); wsum += 1.0; }
+    if (t_end4 > 0.0) { acc += godray_integrate(ro, rd_center, t_end4, 0.0); wsum += 1.0; }
   }
 
   let cur_lin = max(select(vec3<f32>(0.0), acc / wsum, wsum > 0.0), vec3<f32>(0.0));

@@ -28,16 +28,17 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px, res);
   let sky = sky_color(rd);
+  let sky_up = sky_color(vec3<f32>(0.0, 1.0, 0.0));
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
 
   // If no SVO chunks, still render clipmap terrain.
   if (cam.chunk_count == 0u) {
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
-    let surface = select(sky, shade_clip_hit(ro, rd, hf), hf.hit);
+    let surface = select(sky, shade_clip_hit(ro, rd, hf, sky_up), hf.hit);
     let t_scene = select(FOG_MAX_DIST, min(hf.t, FOG_MAX_DIST), hf.hit);
 
-    let col = apply_fog(surface, ro, rd, t_scene);
+    let col = apply_fog(surface, ro, rd, t_scene, sky);
 
     textureStore(color_img, ip, vec4<f32>(col, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
@@ -50,10 +51,10 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Outside streamed grid => clipmap fallback.
   if (!vt.in_grid) {
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
-    let surface = select(sky, shade_clip_hit(ro, rd, hf), hf.hit);
+    let surface = select(sky, shade_clip_hit(ro, rd, hf, sky_up), hf.hit);
     let t_scene = select(FOG_MAX_DIST, min(hf.t, FOG_MAX_DIST), hf.hit);
 
-    let col = apply_fog(surface, ro, rd, t_scene);
+    let col = apply_fog(surface, ro, rd, t_scene, sky);
 
     textureStore(color_img, ip, vec4<f32>(col, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
@@ -68,7 +69,7 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let surface = select(
     sky,
-    select(shade_clip_hit(ro, rd, hf), shade_hit(ro, rd, vt.best), use_vox),
+    select(shade_clip_hit(ro, rd, hf, sky_up), shade_hit(ro, rd, vt.best, sky), use_vox),
     (use_vox || use_hf)
   );
 
@@ -78,7 +79,7 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
     (use_vox || use_hf)
   );
 
-  let col = apply_fog(surface, ro, rd, t_scene);
+  let col = apply_fog(surface, ro, rd, t_scene, sky);
 
   textureStore(color_img, ip, vec4<f32>(col, 1.0));
   textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));

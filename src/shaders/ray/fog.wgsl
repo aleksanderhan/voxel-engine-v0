@@ -3,14 +3,15 @@
 //// Fog
 //// --------------------------------------------------------------------------
 
-fn fog_color(rd: vec3<f32>) -> vec3<f32> {
+fn fog_color_from_sky(rd: vec3<f32>, sky: vec3<f32>) -> vec3<f32> {
   let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
 
-  let sky = sky_color(rd);
+  // Keep your clamp behavior identical
   let sky_clamped = min(sky, vec3<f32>(0.45));
 
   return mix(FOG_COLOR_GROUND, sky_clamped, FOG_COLOR_SKY_BLEND * up);
 }
+
 
 fn fog_inscatter(rd: vec3<f32>, fogc: vec3<f32>) -> vec3<f32> {
   let mu = clamp(dot(rd, SUN_DIR), 0.0, 1.0);
@@ -52,9 +53,16 @@ fn fog_transmittance_godray(ro: vec3<f32>, rd: vec3<f32>, t: f32) -> f32 {
   return exp(-od);
 }
 
-fn apply_fog(surface: vec3<f32>, ro: vec3<f32>, rd: vec3<f32>, t_scene: f32) -> vec3<f32> {
+fn apply_fog(
+  surface: vec3<f32>,
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_scene: f32,
+  sky: vec3<f32>
+) -> vec3<f32> {
   let T    = fog_transmittance_primary(ro, rd, t_scene);
-  let fogc = fog_color(rd);
+  let fogc = fog_color_from_sky(rd, sky);
   let ins  = fog_inscatter(rd, fogc);
   return surface * T + ins * (1.0 - T);
 }
+

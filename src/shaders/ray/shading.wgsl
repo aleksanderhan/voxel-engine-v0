@@ -13,11 +13,10 @@ fn color_for_material(m: u32) -> vec3<f32> {
   return vec3<f32>(1.0, 0.0, 1.0);
 }
 
-fn hemi_ambient(n: vec3<f32>) -> vec3<f32> {
+fn hemi_ambient(n: vec3<f32>, sky_up: vec3<f32>) -> vec3<f32> {
   let upw = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
-  let sky = sky_color(vec3<f32>(0.0, 1.0, 0.0));
   let grd = FOG_COLOR_GROUND;
-  return mix(grd, sky, upw);
+  return mix(grd, sky_up, upw);
 }
 
 fn hash31(p: vec3<f32>) -> f32 {
@@ -114,7 +113,7 @@ fn material_f0(mat: u32) -> f32 {
   return 0.02;
 }
 
-fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
+fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>) -> vec3<f32> {
   let hp = ro + hg.t * rd;
 
   var base = color_for_material(hg.mat);
@@ -138,7 +137,7 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom) -> vec3<f32> {
 
   let ao = select(1.0, voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base), hg.hit != 0u);
 
-  let amb_col      = hemi_ambient(hg.n);
+  let amb_col      = hemi_ambient(hg.n, sky_up);
   let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
   let ambient      = amb_col * amb_strength * ao;
 
