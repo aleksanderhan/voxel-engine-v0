@@ -1,5 +1,7 @@
 // src/svo/mips.rs
 
+use rayon::prelude::*;
+
 pub struct MinMaxMipView<'a> {
     pub root_side: u32,
     pub min_levels: &'a [Vec<i32>],
@@ -25,69 +27,61 @@ pub fn build_minmax_mip_inplace<'a>(
     }
 
     // lvl 0
-    min_levels[0].clear();
-    min_levels[0].extend_from_slice(base);
+    min_levels[0].resize(base.len(), 0);
+    min_levels[0].copy_from_slice(base);
 
-    max_levels[0].clear();
-    max_levels[0].extend_from_slice(base);
+    max_levels[0].resize(base.len(), 0);
+    max_levels[0].copy_from_slice(base);
 
     let mut cur_side = side;
 
+    // Optimization (2): compute min+max for each level in one traversal.
+    // Optimization (6): parallelize by output rows (z).
     for lvl in 1..levels {
         let next_side = cur_side / 2;
         let need = (next_side * next_side) as usize;
 
-        // --- min: borrow prev + out without aliasing
-        {
-            let (prev, rest) = min_levels.split_at_mut(lvl);
-            let cur_min: &[i32] = &prev[lvl - 1];
-            let mn: &mut Vec<i32> = &mut rest[0];
-            mn.resize(need, 0);
+        let (min_prev, min_rest) = min_levels.split_at_mut(lvl);
+        let (max_prev, max_rest) = max_levels.split_at_mut(lvl);
 
-            for z in 0..next_side {
-                for x in 0..next_side {
-                    let i00 = ((2 * z) * cur_side + (2 * x)) as usize;
-                    let i10 = ((2 * z) * cur_side + (2 * x + 1)) as usize;
-                    let i01 = ((2 * z + 1) * cur_side + (2 * x)) as usize;
-                    let i11 = ((2 * z + 1) * cur_side + (2 * x + 1)) as usize;
+        let cur_min: &[i32] = &min_prev[lvl - 1];
+        let cur_max: &[i32] = &max_prev[lvl - 1];
 
-                    let o = (z * next_side + x) as usize;
+        let mn: &mut Vec<i32> = &mut min_rest[0];
+        let mx: &mut Vec<i32> = &mut max_rest[0];
+        mn.resize(need, 0);
+        mx.resize(need, 0);
+
+        let cur_side_us = cur_side as usize;
+        let next_side_us = next_side as usize;
+
+        mn.par_chunks_mut(next_side_us)
+            .zip(mx.par_chunks_mut(next_side_us))
+            .enumerate()
+            .for_each(|(z, (mn_row, mx_row))| {
+                let row0 = (2 * z) * cur_side_us;
+                let row1 = row0 + cur_side_us;
+
+                for x in 0..next_side_us {
+                    let col0 = 2 * x;
+                    let i00 = row0 + col0;
+                    let i10 = i00 + 1;
+                    let i01 = row1 + col0;
+                    let i11 = i01 + 1;
 
                     let a0 = cur_min[i00];
                     let a1 = cur_min[i10];
                     let a2 = cur_min[i01];
                     let a3 = cur_min[i11];
-
-                    mn[o] = a0.min(a1).min(a2).min(a3);
-                }
-            }
-        }
-
-        // --- max: borrow prev + out without aliasing
-        {
-            let (prev, rest) = max_levels.split_at_mut(lvl);
-            let cur_max: &[i32] = &prev[lvl - 1];
-            let mx: &mut Vec<i32> = &mut rest[0];
-            mx.resize(need, 0);
-
-            for z in 0..next_side {
-                for x in 0..next_side {
-                    let i00 = ((2 * z) * cur_side + (2 * x)) as usize;
-                    let i10 = ((2 * z) * cur_side + (2 * x + 1)) as usize;
-                    let i01 = ((2 * z + 1) * cur_side + (2 * x)) as usize;
-                    let i11 = ((2 * z + 1) * cur_side + (2 * x + 1)) as usize;
-
-                    let o = (z * next_side + x) as usize;
+                    mn_row[x] = a0.min(a1).min(a2).min(a3);
 
                     let b0 = cur_max[i00];
                     let b1 = cur_max[i10];
                     let b2 = cur_max[i01];
                     let b3 = cur_max[i11];
-
-                    mx[o] = b0.max(b1).max(b2).max(b3);
+                    mx_row[x] = b0.max(b1).max(b2).max(b3);
                 }
-            }
-        }
+            });
 
         cur_side = next_side;
     }
@@ -138,11 +132,12 @@ pub fn build_max_mip_inplace<'a>(
     }
 
     // lvl 0
-    levels[0].clear();
-    levels[0].extend_from_slice(base);
+    levels[0].resize(base.len(), 0);
+    levels[0].copy_from_slice(base);
 
     let mut cur_side = side;
 
+    // Optimization (6): parallelize by output rows (z).
     for lvl in 1..nlevels {
         let next_side = cur_side / 2;
         let need = (next_side * next_side) as usize;
@@ -152,17 +147,29 @@ pub fn build_max_mip_inplace<'a>(
         let out: &mut Vec<i32> = &mut rest[0];
         out.resize(need, 0);
 
-        for z in 0..next_side {
-            for x in 0..next_side {
-                let i00 = ((2 * z) * cur_side + (2 * x)) as usize;
-                let i10 = ((2 * z) * cur_side + (2 * x + 1)) as usize;
-                let i01 = ((2 * z + 1) * cur_side + (2 * x)) as usize;
-                let i11 = ((2 * z + 1) * cur_side + (2 * x + 1)) as usize;
+        let cur_side_us = cur_side as usize;
+        let next_side_us = next_side as usize;
 
-                let o = (z * next_side + x) as usize;
-                out[o] = cur[i00].max(cur[i10]).max(cur[i01]).max(cur[i11]);
-            }
-        }
+        out.par_chunks_mut(next_side_us)
+            .enumerate()
+            .for_each(|(z, out_row)| {
+                let row0 = (2 * z) * cur_side_us;
+                let row1 = row0 + cur_side_us;
+
+                for x in 0..next_side_us {
+                    let col0 = 2 * x;
+                    let i00 = row0 + col0;
+                    let i10 = i00 + 1;
+                    let i01 = row1 + col0;
+                    let i11 = i01 + 1;
+
+                    let a = cur[i00];
+                    let b = cur[i10];
+                    let c = cur[i01];
+                    let d = cur[i11];
+                    out_row[x] = a.max(b).max(c).max(d);
+                }
+            });
 
         cur_side = next_side;
     }

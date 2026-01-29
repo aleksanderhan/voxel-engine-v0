@@ -12,3 +12,4 @@ bytemuck = { version = "1.15", features = ["derive"] }
 noise = "0.9.0"
 crossbeam-channel = "0.5"
 rustc-hash = "2"
+rayon = "1"
