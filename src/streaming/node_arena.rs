@@ -68,11 +68,12 @@ impl NodeArena {
             return;
         }
 
-        // Insert sorted by start.
-        let mut idx = 0usize;
-        while idx < self.free.len() && self.free[idx].start < start {
-            idx += 1;
-        }
+        // Insert sorted by start (log n search).
+        let idx = self
+            .free
+            .binary_search_by_key(&start, |r| r.start)
+            .unwrap_or_else(|i| i);
+
         self.free.insert(idx, Range { start, len });
 
         // Fully coalesce with neighbors (both directions).

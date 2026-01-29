@@ -1,5 +1,7 @@
 // --- src/streaming/manager.rs ---
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+
 use std::mem::size_of;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -234,12 +236,12 @@ impl ChunkManager {
 
         Self {
             gen,
-            chunks: HashMap::new(),
+            chunks: HashMap::default(),
             build_queue: VecDeque::new(),
-            queued_set: std::collections::HashSet::new(),
+            queued_set: std::collections::HashSet::default(),
             last_center: None,
 
-            cancels: HashMap::new(),
+            cancels: HashMap::default(),
             tx_job,
             rx_done,
             in_flight: 0,
@@ -256,8 +258,8 @@ impl ChunkManager {
             grid_dims: [nx, ny, nz],
             chunk_grid: vec![INVALID_U32; grid_len],
 
-            cache: HashMap::new(),
-            cache_lru: VecDeque::new(),
+            cache: HashMap::default(),
+            cache_lru: VecDeque::default(),
             cache_stamp: 1,
             cache_bytes: 0,
         }
