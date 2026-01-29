@@ -2,31 +2,6 @@
 // --------------
 //
 // CPU-updated 2D clipmap height texture data (nested levels around camera).
-//
-// FP16 OPTIMIZATION:
-// - Each level stores CLIPMAP_RES * CLIPMAP_RES heights in *half float* (u16 bits).
-// - This halves upload bandwidth and reduces VRAM traffic.
-// - WGSL textureLoad still returns f32 when sampling R16Float.
-//
-// Strategy (ring clipmap / strip updates):
-// - Each level is a CLIPMAP_RES x CLIPMAP_RES height map (meters) stored as a TORUS.
-// - Level i has cell size = CLIPMAP_BASE_CELL_M * 2^i.
-// - We "snap" the *logical* origin (world cell coords) to cell boundaries for stability.
-// - When the origin changes by a small delta (dx,dz in cells), we DO NOT full refresh.
-//   Instead we:
-//     1) advance a per-level torus offset (texel origin) by (dx,dz)
-//     2) upload only the newly exposed rows/columns as strip patches
-// - Shader maps world->logical texel (0..res-1) then applies torus offset modulo res.
-//
-// Uniform packing (per level):
-// - We keep the clipmap uniform array as vec4<f32> per level.
-// - We store:
-//     x = origin_x_m
-//     y = origin_z_m
-//     z = cell_size_m
-//     w = packed offsets (u16 off_x | (u16 off_z << 16)) bitcast via f32 bits
-// - We KEEP inv_cell_size_m on CPU side for any legacy uses, but shader can compute 1/cell.
-//
 
 use glam::Vec3;
 
@@ -71,7 +46,7 @@ pub struct Clipmap {
     /// Toroidal storage offset per level (in texels).
     /// Mapping: storage = (logical + offset) mod res
     tex_offset: [(u16, u16); config::CLIPMAP_LEVELS_USIZE],
-    last_update_time_s: [f32; config::CLIPMAP_LEVELS_USIZE],
+    last_update_time_s_global: f32,
 }
 
 impl Clipmap {
@@ -79,7 +54,7 @@ impl Clipmap {
         Self {
             last_origin_cell: [(i32::MIN, i32::MIN); config::CLIPMAP_LEVELS_USIZE],
             tex_offset: [(0, 0); config::CLIPMAP_LEVELS_USIZE],
-            last_update_time_s: [f32::NEG_INFINITY; config::CLIPMAP_LEVELS_USIZE],
+            last_update_time_s_global: f32::NEG_INFINITY,
         }
     }
 
@@ -277,13 +252,6 @@ impl Clipmap {
         data
     }
 
-    /// Update clipmap data around camera.
-    ///
-    /// Returns:
-    /// - CPU params for GPU packing
-    /// - uploads:
-    ///     - full refresh on first touch or huge jump
-    ///     - otherwise strip patches (rows/cols)
     pub fn update(
         &mut self,
         world: &WorldGen,
@@ -299,7 +267,8 @@ impl Clipmap {
                 origin_x_m: 0.0,
                 origin_z_m: 0.0,
                 cell_size_m: 1.0,
-                off_x: 0, off_z: 0,
+                off_x: 0,
+                off_z: 0,
             }; config::CLIPMAP_LEVELS_USIZE],
         };
 
@@ -310,32 +279,58 @@ impl Clipmap {
 
         const EDGE_GUARD_TEXELS: i32 = 16; // tune: 8/16/24
 
+        // ---------------------------------------------------------------------
+        // Pass 1: compute desired origins + movement + force flags for ALL levels
+        // ---------------------------------------------------------------------
+        let mut cell_m_arr   = [0.0f32; config::CLIPMAP_LEVELS_USIZE];
+        let mut new_ox_c_arr = [0i32;   config::CLIPMAP_LEVELS_USIZE];
+        let mut new_oz_c_arr = [0i32;   config::CLIPMAP_LEVELS_USIZE];
+        let mut new_ox_m_arr = [0.0f32; config::CLIPMAP_LEVELS_USIZE];
+        let mut new_oz_m_arr = [0.0f32; config::CLIPMAP_LEVELS_USIZE];
+
+        let mut dx_arr    = [0i32; config::CLIPMAP_LEVELS_USIZE];
+        let mut dz_arr    = [0i32; config::CLIPMAP_LEVELS_USIZE];
+        let mut first_arr = [false; config::CLIPMAP_LEVELS_USIZE];
+        let mut moved_arr = [false; config::CLIPMAP_LEVELS_USIZE];
+        let mut force_arr = [false; config::CLIPMAP_LEVELS_USIZE];
+
+        let mut any_first = false;
+        let mut any_moved = false;
+        let mut any_force = false;
+
         for i in 0..config::CLIPMAP_LEVELS {
             let li = i as usize;
 
             let cell_m = Self::level_cell_size(i);
+            cell_m_arr[li] = cell_m;
 
-            // Where we would LIKE this level to be this frame
             let (new_ox_c, new_oz_c) = Self::snapped_origin_cell(cam_pos_m.x, cam_pos_m.z, cell_m);
             let (new_ox_m, new_oz_m) = Self::cell_to_origin_m(new_ox_c, new_oz_c, cell_m);
 
-            // What the texture currently represents (committed)
+            new_ox_c_arr[li] = new_ox_c;
+            new_oz_c_arr[li] = new_oz_c;
+            new_ox_m_arr[li] = new_ox_m;
+            new_oz_m_arr[li] = new_oz_m;
+
             let (old_ox_c, old_oz_c) = self.last_origin_cell[li];
             let first = old_ox_c == i32::MIN;
-
-            // Current committed torus offsets
-            let (mut off_x, mut off_z) = self.tex_offset[li];
+            first_arr[li] = first;
+            any_first |= first;
 
             let dx = if first { 0 } else { new_ox_c - old_ox_c };
             let dz = if first { 0 } else { new_oz_c - old_oz_c };
+            dx_arr[li] = dx;
+            dz_arr[li] = dz;
 
-            // Determine whether we must force an update to keep camera away from edges
+            let moved = first || dx != 0 || dz != 0;
+            moved_arr[li] = moved;
+            any_moved |= moved;
+
             let force_by_bounds = if first {
                 true
             } else {
                 let (old_ox_m, old_oz_m) = Self::cell_to_origin_m(old_ox_c, old_oz_c, cell_m);
 
-                // camera position in logical texel coords of the committed window
                 let cam_lx = ((cam_pos_m.x - old_ox_m) / cell_m).floor() as i32;
                 let cam_lz = ((cam_pos_m.z - old_oz_m) / cell_m).floor() as i32;
 
@@ -345,17 +340,46 @@ impl Clipmap {
                     || cam_lz >= (res_i - EDGE_GUARD_TEXELS)
             };
 
-            let moved = first || dx != 0 || dz != 0;
+            force_arr[li] = force_by_bounds;
+            any_force |= force_by_bounds;
+        }
 
-            let allow_by_time = first
-                || (time_s - self.last_update_time_s[li]) >= config::CLIPMAP_MIN_UPDATE_INTERVAL_S;
+        // ---------------------------------------------------------------------
+        // Shared cadence gate (Option B)
+        // ---------------------------------------------------------------------
+        let cadence_ok = any_first
+            || (time_s - self.last_update_time_s_global) >= config::CLIPMAP_MIN_UPDATE_INTERVAL_S;
 
-            // Soft throttle: if moved but camera is near edge, update anyway
-            let do_update = moved && (allow_by_time || force_by_bounds);
+        let do_frame_update = any_first || any_force || (cadence_ok && any_moved);
+
+        if do_frame_update {
+            self.last_update_time_s_global = time_s;
+        }
+
+        // ---------------------------------------------------------------------
+        // Pass 2: apply updates + build uploads, then emit committed params
+        // ---------------------------------------------------------------------
+        for i in 0..config::CLIPMAP_LEVELS {
+            let li = i as usize;
+
+            let cell_m = cell_m_arr[li];
+
+            let new_ox_c = new_ox_c_arr[li];
+            let new_oz_c = new_oz_c_arr[li];
+            let new_ox_m = new_ox_m_arr[li];
+            let new_oz_m = new_oz_m_arr[li];
+
+            let first = first_arr[li];
+            let dx = dx_arr[li];
+            let dz = dz_arr[li];
+            let moved = moved_arr[li];
+
+            // Current committed torus offsets (in texels)
+            let (mut off_x, mut off_z) = self.tex_offset[li];
+
+            let do_update = do_frame_update && moved;
 
             if do_update {
-                self.last_update_time_s[li] = time_s;
-
                 if first {
                     // Full refresh on first touch
                     self.last_origin_cell[li] = (new_ox_c, new_oz_c);
@@ -605,9 +629,9 @@ impl Clipmap {
                 }
             }
 
-            // Send the committed state (texture content <-> uniforms stay consistent)
+            // Send committed state (texture content <-> uniforms stay consistent)
             let (commit_ox_m, commit_oz_m) = if self.last_origin_cell[li].0 == i32::MIN {
-                (new_ox_m, new_oz_m) // should only happen pre-first
+                (new_ox_m, new_oz_m) // pre-first (should be rare)
             } else {
                 let (cx, cz) = self.last_origin_cell[li];
                 Self::cell_to_origin_m(cx, cz, cell_m)
@@ -620,7 +644,6 @@ impl Clipmap {
                 off_x: off_x as u32,
                 off_z: off_z as u32,
             };
-
         }
 
         (params, uploads)
@@ -630,6 +653,7 @@ impl Clipmap {
     pub fn invalidate_all(&mut self) {
         self.last_origin_cell = [(i32::MIN, i32::MIN); config::CLIPMAP_LEVELS_USIZE];
         self.tex_offset = [(0, 0); config::CLIPMAP_LEVELS_USIZE];
-        self.last_update_time_s = [f32::NEG_INFINITY; config::CLIPMAP_LEVELS_USIZE];
+        self.last_update_time_s_global = f32::NEG_INFINITY;
     }
+
 }

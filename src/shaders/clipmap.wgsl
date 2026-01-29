@@ -2,7 +2,6 @@
 // ------------------------
 //
 // UPDATED for toroidal (ring) clipmap storage.
-// level[i].w stores packed offsets (u16 off_x | (u16 off_z << 16)) via f32 bits.
 // We compute inv_cell = 1.0 / cell in shader (since CPU still keeps inv too).
 
 const CLIP_LEVELS_MAX : u32 = 16u;
@@ -101,18 +100,14 @@ fn clip_choose_level_hyst(xz: vec2<f32>, prev: u32) -> u32 {
   let guard: i32 = 2;
 
   var lvl = min(prev, n - 1u);
-
-  // If current level doesn't contain point (guarded), walk coarser until it does.
-  loop {
-    if (clip_level_contains(xz, lvl, guard) || lvl >= (n - 1u)) { break; }
-    lvl = lvl + 1u;
-  }
+  lvl = clip_ensure_contains(xz, lvl, guard);
 
   // Switch to coarser only when clearly outside current threshold
   loop {
     if (lvl >= (n - 1u)) { break; }
     if (d > clip_outer_out(lvl)) {
       lvl = lvl + 1u;
+      lvl = clip_ensure_contains(xz, lvl, guard); // IMPORTANT
       continue;
     }
     break;
@@ -124,6 +119,8 @@ fn clip_choose_level_hyst(xz: vec2<f32>, prev: u32) -> u32 {
     let fine = lvl - 1u;
     if (d <= clip_inner_in(fine) && clip_level_contains(xz, fine, guard)) {
       lvl = fine;
+      // fine is *finer*, but still make sure it contains:
+      lvl = clip_ensure_contains(xz, lvl, guard);
       continue;
     }
     break;
@@ -132,29 +129,6 @@ fn clip_choose_level_hyst(xz: vec2<f32>, prev: u32) -> u32 {
   return lvl;
 }
 
-
-fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
-  let res_i = max(i32(clip.res), 1);
-  let p = clip.level[level];
-  let origin = vec2<f32>(p.x, p.y);
-  let cell   = max(p.z, 1e-6);
-
-  let uv = (world_xz - origin) / cell;
-  let ix = i32(floor(uv.x));
-  let iz = i32(floor(uv.y));
-
-  // IMPORTANT: don't clamp to edge (that creates the mangling).
-  // If we're outside the committed window, return very low terrain.
-  if (ix < 0 || iz < 0 || ix >= res_i || iz >= res_i) {
-    return -BIG_F32;
-  }
-
-  let off = clip_offsets(level);
-  let sx = imod(ix + off.x, res_i);
-  let sz = imod(iz + off.y, res_i);
-
-  return textureLoad(clip_height, vec2<i32>(sx, sz), i32(level), 0).x;
-}
 
 fn clip_height_at(xz: vec2<f32>) -> f32 {
   let lvl = clip_choose_level_raw(xz);
@@ -165,15 +139,20 @@ fn clip_height_at(xz: vec2<f32>) -> f32 {
 fn clip_normal_at_level_2tap(world_xz: vec2<f32>, level: u32) -> vec3<f32> {
   let cell = clip.level[level].z;
 
-  let h  = clip_height_at_level(world_xz, level);
-  let hx = clip_height_at_level(world_xz + vec2<f32>(cell, 0.0), level);
-  let hz = clip_height_at_level(world_xz + vec2<f32>(0.0, cell), level);
+  let h0 = clip_height_at_level_ok(world_xz, level);
+  let hx = clip_height_at_level_ok(world_xz + vec2<f32>(cell, 0.0), level);
+  let hz = clip_height_at_level_ok(world_xz + vec2<f32>(0.0, cell), level);
 
-  let dhx = (hx - h) / max(cell, 1e-4);
-  let dhz = (hz - h) / max(cell, 1e-4);
+  if (!h0.ok || !hx.ok || !hz.ok) {
+    return vec3<f32>(0.0, 1.0, 0.0);
+  }
+
+  let dhx = (hx.h - h0.h) / max(cell, 1e-4);
+  let dhz = (hz.h - h0.h) / max(cell, 1e-4);
 
   return normalize(vec3<f32>(-dhx, 1.0, -dhz));
 }
+
 
 fn clip_normal_at(xz: vec2<f32>) -> vec3<f32> {
   let lvl = clip_choose_level_raw(xz);
@@ -212,6 +191,7 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
     // Monotonic LOD: prevent switching to a finer level mid-ray
     let cand = clip_choose_level_hyst(p.xz, lvl_prev);
     lvl = max(lvl_prev, cand);
+    lvl = clip_ensure_contains(p.xz, lvl, 2); 
     lvl_prev = lvl;
 
     h = clip_height_at_level(p.xz, lvl);
@@ -368,4 +348,96 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>) 
   let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis;
 
   return base * (ambient + direct) + 0.18 * spec_col;
+}
+
+fn clip_ensure_contains(xz: vec2<f32>, lvl_in: u32, guard: i32) -> u32 {
+  let n = min(clip.levels, CLIP_LEVELS_MAX);
+  var lvl = min(lvl_in, n - 1u);
+
+  loop {
+    if (clip_level_contains(xz, lvl, guard) || lvl >= (n - 1u)) { break; }
+    lvl = lvl + 1u;
+  }
+  return lvl;
+}
+
+struct HSample { h: f32, ok: bool };
+
+fn clip_height_at_level_ok(world_xz: vec2<f32>, level: u32) -> HSample {
+  let res_i = max(i32(clip.res), 1);
+  let p = clip.level[level];
+  let origin = vec2<f32>(p.x, p.y);
+  let cell   = max(p.z, 1e-6);
+
+  let uv = (world_xz - origin) / cell;
+  let ix = i32(floor(uv.x));
+  let iz = i32(floor(uv.y));
+
+  if (ix < 0 || iz < 0 || ix >= res_i || iz >= res_i) {
+    return HSample(0.0, false);
+  }
+
+  let off = clip_offsets(level);
+  let sx = imod(ix + off.x, res_i);
+  let sz = imod(iz + off.y, res_i);
+
+  let h = textureLoad(clip_height, vec2<i32>(sx, sz), i32(level), 0).x;
+  return HSample(h, true);
+}
+
+fn clip_height_texel(level: u32, ix: i32, iz: i32) -> f32 {
+  let res_i = max(i32(clip.res), 1);
+
+  // If outside committed window, treat as invalid
+  if (ix < 0 || iz < 0 || ix >= res_i || iz >= res_i) {
+    return -BIG_F32;
+  }
+
+  let off = clip_offsets(level);
+  let sx = imod(ix + off.x, res_i);
+  let sz = imod(iz + off.y, res_i);
+
+  return textureLoad(clip_height, vec2<i32>(sx, sz), i32(level), 0).x;
+}
+
+// Bilinear height sample. IMPORTANT: matches CPU building at (tx+0.5)*cell.
+// We shift by 0.5 so integer texels correspond to *sample centers*.
+fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
+  let res_i = max(i32(clip.res), 1);
+  let p = clip.level[level];
+  let origin = vec2<f32>(p.x, p.y);
+  let cell   = max(p.z, 1e-6);
+
+  // "uv" in texel units, where texel centers are at N+0.5
+  let uv = (world_xz - origin) / cell;
+
+  // Align so ix,iz index texel centers
+  let st = uv - vec2<f32>(0.5, 0.5);
+
+  let ix0 = i32(floor(st.x));
+  let iz0 = i32(floor(st.y));
+  let ix1 = ix0 + 1;
+  let iz1 = iz0 + 1;
+
+  // If the bilerp footprint goes out of range, mark invalid
+  if (ix0 < 0 || iz0 < 0 || ix1 >= res_i || iz1 >= res_i) {
+    return -BIG_F32;
+  }
+
+  let fx = fract(st.x);
+  let fz = fract(st.y);
+
+  let h00 = clip_height_texel(level, ix0, iz0);
+  let h10 = clip_height_texel(level, ix1, iz0);
+  let h01 = clip_height_texel(level, ix0, iz1);
+  let h11 = clip_height_texel(level, ix1, iz1);
+
+  // If any corner is invalid, fall back to a safe value
+  if (h00 <= -0.5 * BIG_F32 || h10 <= -0.5 * BIG_F32 || h01 <= -0.5 * BIG_F32 || h11 <= -0.5 * BIG_F32) {
+    return -BIG_F32;
+  }
+
+  let hx0 = mix(h00, h10, fx);
+  let hx1 = mix(h01, h11, fx);
+  return mix(hx0, hx1, fz);
 }
