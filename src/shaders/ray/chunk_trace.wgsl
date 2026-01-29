@@ -206,6 +206,7 @@ struct VoxTraceResult {
   t_exit  : f32,
 };
 
+// DDA = Digital Differential Analyzer (grid-stepping along the ray)
 fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
   // Fast out if no chunks
   if (cam.chunk_count == 0u) {
@@ -218,9 +219,11 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
   let go = cam.grid_origin_chunk;
   let gd = cam.grid_dims;
 
+  // Grid bounds in meters
   let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
   let grid_bmax = grid_bmin + vec3<f32>(f32(gd.x), f32(gd.y), f32(gd.z)) * chunk_size_m;
 
+  // Ray vs grid AABB
   let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
   var t_enter = max(rtg.x, 0.0);
   let t_exit  = rtg.y;
@@ -229,26 +232,48 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
     return VoxTraceResult(false, miss_hitgeom(), 0.0);
   }
 
+  // Nudge inside
   let nudge_p = PRIMARY_NUDGE_VOXEL_FRAC * voxel_size;
-
   let start_t = t_enter + nudge_p;
-  let p0 = ro + start_t * rd;
+  let p0      = ro + start_t * rd;
 
-  var c = chunk_coord_from_pos(p0, chunk_size_m);
-  var cx: i32 = c.x;
-  var cy: i32 = c.y;
-  var cz: i32 = c.z;
+  // World chunk coords at start
+  let c = chunk_coord_from_pos(p0, chunk_size_m);
 
+  // Local grid coords (0..dims-1) and running linear index
+  let nx: i32 = i32(gd.x);
+  let ny: i32 = i32(gd.y);
+  let nz: i32 = i32(gd.z);
+
+  var lcx: i32 = c.x - go.x;
+  var lcy: i32 = c.y - go.y;
+  var lcz: i32 = c.z - go.z;
+
+  // If start is outside (should be rare if AABB hit), treat as out-of-grid.
+  if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) {
+    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+  }
+
+  let stride_x: i32 = 1;
+  let stride_y: i32 = nx;
+  let stride_z: i32 = nx * ny;
+
+  var idx_i: i32 = (lcz * ny + lcy) * nx + lcx;
+
+  // DDA setup (in ray-param space, relative to p0)
   var t_local: f32 = 0.0;
+  let t_exit_local = max(t_exit - start_t, 0.0);
 
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
   let step_x: i32 = select(-1, 1, rd.x > 0.0);
   let step_y: i32 = select(-1, 1, rd.y > 0.0);
   let step_z: i32 = select(-1, 1, rd.z > 0.0);
 
-  let bx = select(f32(cx) * chunk_size_m, f32(cx + 1) * chunk_size_m, rd.x > 0.0);
-  let by = select(f32(cy) * chunk_size_m, f32(cy + 1) * chunk_size_m, rd.y > 0.0);
-  let bz = select(f32(cz) * chunk_size_m, f32(cz + 1) * chunk_size_m, rd.z > 0.0);
+  // Next chunk boundary in meters (world chunk coords from c)
+  let bx = select(f32(c.x) * chunk_size_m, f32(c.x + 1) * chunk_size_m, rd.x > 0.0);
+  let by = select(f32(c.y) * chunk_size_m, f32(c.y + 1) * chunk_size_m, rd.y > 0.0);
+  let bz = select(f32(c.z) * chunk_size_m, f32(c.z + 1) * chunk_size_m, rd.z > 0.0);
 
   var tMaxX: f32 = (bx - p0.x) * inv.x;
   var tMaxY: f32 = (by - p0.y) * inv.y;
@@ -262,25 +287,15 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
   if (abs(rd.y) < EPS_INV) { tMaxY = BIG_F32; }
   if (abs(rd.z) < EPS_INV) { tMaxZ = BIG_F32; }
 
+  // Linear-index step deltas
+  let didx_x: i32 = select(-stride_x, stride_x, rd.x > 0.0);
+  let didx_y: i32 = select(-stride_y, stride_y, rd.y > 0.0);
+  let didx_z: i32 = select(-stride_z, stride_z, rd.z > 0.0);
+
   var best = miss_hitgeom();
-  let t_exit_local = max(t_exit - start_t, 0.0);
 
+  // Conservative cap
   let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 1024u);
-
-  // ---- HOISTED: grid bounds for the DDA loop (was recomputed each step)
-  let ox: i32 = go.x;
-  let oy: i32 = go.y;
-  let oz: i32 = go.z;
-  let nx: i32 = i32(gd.x);
-  let ny: i32 = i32(gd.y);
-  let nz: i32 = i32(gd.z);
-  let gx0: i32 = ox;
-  let gy0: i32 = oy;
-  let gz0: i32 = oz;
-  let gx1: i32 = ox + nx;
-  let gy1: i32 = oy + ny;
-  let gz1: i32 = oz + nz;
-  // ---------------------------------------------------------------
 
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }
@@ -288,7 +303,8 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
     let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
     if (best.hit != 0u && (start_t + tNextLocal) >= best.t) { break; }
 
-    let slot = grid_lookup_slot(cx, cy, cz);
+    // Slot lookup via running linear index
+    let slot = chunk_grid[u32(idx_i)];
     if (slot != INVALID_U32 && slot < cam.chunk_count) {
       let ch = chunks[slot];
 
@@ -299,17 +315,29 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
       if (h.hit != 0u && h.t < best.t) { best = h; }
     }
 
+    // Advance DDA + update (lc*, idx_i)
     if (tMaxX < tMaxY) {
-      if (tMaxX < tMaxZ) { cx += step_x; t_local = tMaxX; tMaxX += tDeltaX; }
-      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
+      if (tMaxX < tMaxZ) {
+        lcx += step_x; idx_i += didx_x;
+        t_local = tMaxX; tMaxX += tDeltaX;
+      } else {
+        lcz += step_z; idx_i += didx_z;
+        t_local = tMaxZ; tMaxZ += tDeltaZ;
+      }
     } else {
-      if (tMaxY < tMaxZ) { cy += step_y; t_local = tMaxY; tMaxY += tDeltaY; }
-      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
+      if (tMaxY < tMaxZ) {
+        lcy += step_y; idx_i += didx_y;
+        t_local = tMaxY; tMaxY += tDeltaY;
+      } else {
+        lcz += step_z; idx_i += didx_z;
+        t_local = tMaxZ; tMaxZ += tDeltaZ;
+      }
     }
 
-    // bounds check (now uses hoisted constants)
-    if (cx < gx0 || cy < gy0 || cz < gz0 || cx >= gx1 || cy >= gy1 || cz >= gz1) { break; }
+    // Local bounds (no origin adds)
+    if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) { break; }
   }
 
   return VoxTraceResult(true, best, t_exit);
 }
+
