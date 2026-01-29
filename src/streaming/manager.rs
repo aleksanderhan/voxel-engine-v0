@@ -1,12 +1,15 @@
 // src/streaming/manager.rs
 // ------------------------
-// Editing-aware chunk streaming.
 //
-// Key fixes vs your current version:
-// 1) App edits must go through ChunkManager::apply_edits(), which updates per-chunk edit maps.
-// 2) Raycast must use *resident* nodes, not cache (cache can be evicted, causing misses).
+// IMPLEMENTS "1-5" IN ONE PASS:
 //
-// Abbreviations:
+// 1) Mutable per-chunk CPU tree (stable node IDs).
+// 2) Incremental edits update only affected paths (split/collapse).
+// 3) Re-pack CPU tree to compact GPU NodeGpu layout.
+// 4) Diff the packed arrays -> upload only dirty ranges.
+// 5) Keep per-chunk GPU slab capacity; reallocate slab if packed node count grows.
+//
+// Abbreviations (expanded first time used here):
 // - SVO = Sparse Voxel Octree
 // - LRU = Least Recently Used
 // - AABB = Axis-Aligned Bounding Box
@@ -31,6 +34,7 @@ use crate::{
 use super::NodeArena;
 
 const INVALID_U32: u32 = 0xFFFF_FFFF;
+const LEAF_U32: u32 = 0xFFFF_FFFF;
 
 // Vertical band dy in [-1..=2]
 const GRID_Y_MIN_DY: i32 = -1;
@@ -62,6 +66,431 @@ fn world_to_local(wx: i32, wy: i32, wz: i32, ck: ChunkKey) -> (i32, i32, i32) {
     (wx - ox, wy - oy, wz - oz)
 }
 
+const NONE_CPU: u32 = 0xFFFF_FFFF;
+
+#[derive(Clone, Copy, Debug)]
+struct CpuNode {
+    child: [u32; 8],
+    material: u32, // meaningful iff leaf
+}
+
+#[derive(Clone, Debug)]
+struct CpuArena {
+    nodes: Vec<CpuNode>,
+    free: Vec<u32>,
+}
+
+impl CpuArena {
+    fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self, n: CpuNode) -> u32 {
+        if let Some(id) = self.free.pop() {
+            self.nodes[id as usize] = n;
+            id
+        } else {
+            let id = self.nodes.len() as u32;
+            self.nodes.push(n);
+            id
+        }
+    }
+
+    fn get(&self, id: u32) -> &CpuNode {
+        &self.nodes[id as usize]
+    }
+
+    fn get_mut(&mut self, id: u32) -> &mut CpuNode {
+        &mut self.nodes[id as usize]
+    }
+
+    fn free_subtree(&mut self, id: u32) {
+        let node = self.nodes[id as usize];
+        for &c in &node.child {
+            if c != NONE_CPU {
+                self.free_subtree(c);
+            }
+        }
+        self.free.push(id);
+    }
+}
+
+#[inline(always)]
+fn is_leaf_cpu(n: &CpuNode) -> bool {
+    n.child.iter().all(|&c| c == NONE_CPU)
+}
+
+#[inline]
+fn popcount(x: u32) -> u32 {
+    x.count_ones()
+}
+
+#[inline]
+fn child_rank(mask: u32, ci: u32) -> u32 {
+    let bit = 1u32 << ci;
+    let lower = mask & (bit - 1u32);
+    popcount(lower)
+}
+
+fn cpu_from_packed(nodes: &[NodeGpu]) -> (CpuArena, u32) {
+    let mut arena = CpuArena::new();
+
+    fn build(arena: &mut CpuArena, packed: &[NodeGpu], idx: u32) -> u32 {
+        let n = packed[idx as usize];
+
+        if n.child_base == LEAF_U32 {
+            let leaf = CpuNode {
+                child: [NONE_CPU; 8],
+                material: n.material,
+            };
+            return arena.alloc(leaf);
+        }
+
+        let mut out = CpuNode {
+            child: [NONE_CPU; 8],
+            material: 0,
+        };
+
+        let mask = n.child_mask;
+        for ci in 0..8u32 {
+            if (mask & (1u32 << ci)) == 0 {
+                continue;
+            }
+            let koff = child_rank(mask, ci);
+            let kidx = n.child_base + koff;
+            let cid = build(arena, packed, kidx);
+            out.child[ci as usize] = cid;
+        }
+
+        arena.alloc(out)
+    }
+
+    if nodes.is_empty() {
+        // treat as all-air
+        let root = arena.alloc(CpuNode {
+            child: [NONE_CPU; 8],
+            material: crate::world::materials::AIR,
+        });
+        return (arena, root);
+    }
+
+    let root = build(&mut arena, nodes, 0);
+    (arena, root)
+}
+
+fn pack_cpu_to_gpu(arena: &CpuArena, root: u32) -> Vec<NodeGpu> {
+    fn is_empty_air_leaf(arena: &CpuArena, id: u32) -> bool {
+        let n = arena.get(id);
+        is_leaf_cpu(n) && n.material == crate::world::materials::AIR
+    }
+
+    fn emit(arena: &CpuArena, id: u32, out: &mut Vec<NodeGpu>) -> u32 {
+        let n = *arena.get(id);
+
+        if is_leaf_cpu(&n) {
+            out.push(NodeGpu {
+                child_base: LEAF_U32,
+                child_mask: 0,
+                material: n.material,
+                _pad: 0,
+            });
+            return (out.len() - 1) as u32;
+        }
+
+        let me = out.len() as u32;
+        out.push(NodeGpu {
+            child_base: 0,
+            child_mask: 0,
+            material: 0,
+            _pad: 0,
+        });
+
+        let mut mask: u32 = 0;
+        let base = out.len() as u32;
+
+        for ci in 0..8u32 {
+            let c = n.child[ci as usize];
+            if c == NONE_CPU {
+                continue;
+            }
+
+            // omit explicit AIR leaves to keep packed format compact
+            if is_empty_air_leaf(arena, c) {
+                continue;
+            }
+
+            mask |= 1u32 << ci;
+            let _ = emit(arena, c, out);
+        }
+
+        if mask == 0 {
+            out[me as usize] = NodeGpu {
+                child_base: LEAF_U32,
+                child_mask: 0,
+                material: crate::world::materials::AIR,
+                _pad: 0,
+            };
+            return me;
+        }
+
+        out[me as usize] = NodeGpu {
+            child_base: base,
+            child_mask: mask,
+            material: 0,
+            _pad: 0,
+        };
+
+        me
+    }
+
+    let mut out = Vec::with_capacity(1024);
+    let _ = emit(arena, root, &mut out);
+
+    if out.is_empty() {
+        out.push(NodeGpu {
+            child_base: LEAF_U32,
+            child_mask: 0,
+            material: crate::world::materials::AIR,
+            _pad: 0,
+        });
+    }
+    out
+}
+
+fn diff_ranges(old: &[NodeGpu], new: &[NodeGpu]) -> Vec<(u32, Arc<[NodeGpu]>)> {
+    let n = old.len().min(new.len());
+    let mut out = Vec::new();
+
+    let mut i = 0usize;
+    while i < n {
+        if old[i] == new[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < n && old[i] != new[i] {
+            i += 1;
+        }
+        out.push((start as u32, Arc::from(new[start..i].to_vec())));
+    }
+
+    if new.len() > old.len() {
+        let start = old.len() as u32;
+        out.push((start, Arc::from(new[old.len()..].to_vec())));
+    }
+
+    out
+}
+
+/// Incremental edit of a single voxel in a CPU tree.
+/// - `node_opt`: explicit node id (Some) or implicit AIR region (None).
+/// Returns new node_opt and whether changed.
+fn edit_cpu(
+    arena: &mut CpuArena,
+    node_opt: Option<u32>,
+    ox: i32,
+    oy: i32,
+    oz: i32,
+    size: i32,
+    tx: i32,
+    ty: i32,
+    tz: i32,
+    new_mat: u32,
+) -> (Option<u32>, bool) {
+    use crate::world::materials::AIR;
+
+    if tx < ox || ty < oy || tz < oz || tx >= ox + size || ty >= oy + size || tz >= oz + size {
+        return (node_opt, false);
+    }
+
+    if size == 1 {
+        let cur = match node_opt {
+            None => AIR,
+            Some(id) => arena.get(id).material,
+        };
+        if cur == new_mat {
+            return (node_opt, false);
+        }
+
+        if new_mat == AIR {
+            if let Some(id) = node_opt {
+                arena.free_subtree(id);
+            }
+            return (None, true);
+        }
+
+        if let Some(id) = node_opt {
+            *arena.get_mut(id) = CpuNode {
+                child: [NONE_CPU; 8],
+                material: new_mat,
+            };
+            return (Some(id), true);
+        }
+
+        let id = arena.alloc(CpuNode {
+            child: [NONE_CPU; 8],
+            material: new_mat,
+        });
+        return (Some(id), true);
+    }
+
+    // ensure explicit node
+    let id = match node_opt {
+        Some(id) => id,
+        None => arena.alloc(CpuNode {
+            child: [NONE_CPU; 8],
+            material: AIR,
+        }),
+    };
+
+    // split if leaf and we need to descend
+    if is_leaf_cpu(arena.get(id)) {
+        let mat = arena.get(id).material;
+        if mat == new_mat {
+            return (Some(id), false);
+        }
+
+        let old_mat = mat;
+        let mut new_internal = CpuNode {
+            child: [NONE_CPU; 8],
+            material: 0,
+        };
+
+        if old_mat != AIR {
+            for ci in 0..8usize {
+                let c = arena.alloc(CpuNode {
+                    child: [NONE_CPU; 8],
+                    material: old_mat,
+                });
+                new_internal.child[ci] = c;
+            }
+        }
+        *arena.get_mut(id) = new_internal;
+    }
+
+    let half = size / 2;
+
+    let cx = if tx >= ox + half { 1 } else { 0 };
+    let cy = if ty >= oy + half { 1 } else { 0 };
+    let cz = if tz >= oz + half { 1 } else { 0 };
+    let ci = (cx as u32) | ((cy as u32) << 1) | ((cz as u32) << 2);
+
+    let child_ox = ox + cx * half;
+    let child_oy = oy + cy * half;
+    let child_oz = oz + cz * half;
+
+    let child_opt = {
+        let n = arena.get(id);
+        let c = n.child[ci as usize];
+        if c == NONE_CPU {
+            None
+        } else {
+            Some(c)
+        }
+    };
+
+    let (new_child_opt, changed_child) = edit_cpu(
+        arena,
+        child_opt,
+        child_ox,
+        child_oy,
+        child_oz,
+        half,
+        tx,
+        ty,
+        tz,
+        new_mat,
+    );
+
+    if !changed_child {
+        return (Some(id), false);
+    }
+
+    // free old child subtree if we replaced it with implicit AIR
+    let old_child = {
+        let n = arena.get(id);
+        n.child[ci as usize]
+    };
+    if new_child_opt.is_none() && old_child != NONE_CPU {
+        arena.free_subtree(old_child);
+    }
+
+    // update child pointer
+    {
+        let n = arena.get_mut(id);
+        n.child[ci as usize] = new_child_opt.unwrap_or(NONE_CPU);
+    }
+
+    // attempt collapse: if all 8 children are leaves (or implicit AIR) and uniform material -> collapse
+    let mut all_leaf = true;
+    let mut uniform = true;
+    let mut uni_mat: u32 = AIR;
+    let mut first = true;
+
+    {
+        let n = arena.get(id);
+        for &c in &n.child {
+            let cm = if c == NONE_CPU {
+                AIR
+            } else {
+                let cn = arena.get(c);
+                if !is_leaf_cpu(cn) {
+                    all_leaf = false;
+                    uniform = false;
+                    break;
+                }
+                cn.material
+            };
+
+            if first {
+                uni_mat = cm;
+                first = false;
+            } else if cm != uni_mat {
+                uniform = false;
+            }
+        }
+    }
+
+    if all_leaf && uniform {
+        let children = {
+            let n = arena.get(id);
+            n.child
+        };
+        for &c in &children {
+            if c != NONE_CPU {
+                arena.free_subtree(c);
+            }
+        }
+
+        if uni_mat == AIR {
+            arena.free_subtree(id);
+            return (None, true);
+        }
+
+        *arena.get_mut(id) = CpuNode {
+            child: [NONE_CPU; 8],
+            material: uni_mat,
+        };
+        return (Some(id), true);
+    }
+
+    // if internal has no explicit children -> implicit AIR region
+    let no_children = {
+        let n = arena.get(id);
+        n.child.iter().all(|&c| c == NONE_CPU)
+    };
+    if no_children {
+        arena.free_subtree(id);
+        return (None, true);
+    }
+
+    (Some(id), true)
+}
+
 /// A single voxel edit in world-voxel coordinates.
 #[derive(Clone, Copy, Debug)]
 pub struct VoxelEdit {
@@ -85,11 +514,17 @@ enum ChunkState {
     Resident(Resident),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Resident {
     slot: u32,      // index into chunk_meta (dense)
     node_base: u32, // base index into global node arena
     node_count: u32,
+    node_cap: u32, // allocated slab length in NodeGpu elements
+
+    // authoritative CPU + packed representation for incremental edits / raycast
+    cpu: CpuArena,
+    cpu_root: u32,
+    packed: Arc<[NodeGpu]>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,12 +546,21 @@ struct BuildDone {
     nodes: Vec<NodeGpu>,
 }
 
+// -----------------------------
+// Upload: meta + node range writes
+// -----------------------------
+
+pub struct NodeWrite {
+    pub start: u32,            // start index relative to chunk.node_base
+    pub nodes: Arc<[NodeGpu]>, // range payload
+}
+
 pub struct ChunkUpload {
     pub slot: u32,
     pub meta: ChunkMetaGpu,
 
-    pub node_base: u32,
-    pub nodes: Arc<[NodeGpu]>,
+    pub node_base: u32, // absolute base in global node buffer
+    pub writes: Vec<NodeWrite>,
 }
 
 // -----------------------------
@@ -163,10 +607,10 @@ pub struct ChunkManager {
     in_flight: usize,
 
     // Dense slots for resident chunks
-    slot_to_key: Vec<ChunkKey>,        // slot -> key
-    resident_nodes: Vec<Arc<[NodeGpu]>>, // slot -> nodes (authoritative for raycast)
-    chunk_meta: Vec<ChunkMetaGpu>,     // slot -> meta
-    uploads: Vec<ChunkUpload>,         // pending GPU writes this frame
+    slot_to_key: Vec<ChunkKey>,          // slot -> key
+    resident_nodes: Vec<Arc<[NodeGpu]>>, // slot -> packed nodes (for raycast)
+    chunk_meta: Vec<ChunkMetaGpu>,       // slot -> meta
+    uploads: Vec<ChunkUpload>,           // pending GPU writes this frame
 
     // General “something changed” flag (kept for other systems).
     changed: bool,
@@ -210,7 +654,6 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
             while let Ok(job) = rx_job.recv() {
                 let k = job.key;
 
-                // If already cancelled before starting, still notify main thread.
                 if job.cancel.load(Ordering::Relaxed) {
                     let _ = tx_done.send(BuildDone {
                         key: k,
@@ -369,31 +812,55 @@ impl ChunkManager {
     }
 
     /// Apply a batch of voxel edits (world-voxel coords).
-    /// This marks affected chunks dirty so they get rebuilt and uploaded.
+    ///
+    /// Behavior:
+    /// - Always updates per-chunk edit override maps + stamps (so builds are correct).
+    /// - If a chunk is currently resident, applies the edit incrementally immediately:
+    ///   - update CPU tree
+    ///   - repack to GPU layout
+    ///   - diff ranges + upload
+    ///   - grow/realloc slab if needed
+    /// - If not resident, falls back to "invalidate + rebuild".
     pub fn apply_edits(&mut self, edits: &[VoxelEdit]) {
-        let mut touched: HashSet<ChunkKey> = HashSet::new();
+        // group edits per chunk (local coords)
+        let mut per_chunk: HashMap<ChunkKey, Vec<(i32, i32, i32, u32)>> = HashMap::new();
 
         for e in edits {
             let ck = world_to_chunk_key(e.x, e.y, e.z);
             let (lx, ly, lz) = world_to_local(e.x, e.y, e.z, ck);
 
-            // Ignore edits outside the chunk bounds (defensive).
             let cs = config::CHUNK_SIZE as i32;
             if (lx | ly | lz) < 0 || lx >= cs || ly >= cs || lz >= cs {
                 continue;
             }
 
+            // record override
             let entry = self.edits.entry(ck).or_insert_with(ChunkEdits::default);
             entry.stamp = entry.stamp.wrapping_add(1).max(1);
             entry.map.insert(pack_local_64(lx, ly, lz), e.material);
 
-            touched.insert(ck);
+            per_chunk.entry(ck).or_default().push((lx, ly, lz, e.material));
         }
 
-        // Any touched chunk: cancel in-flight, invalidate cache, and force rebuild.
-        for ck in touched {
-            self.invalidate_and_rebuild_chunk(ck);
+        if per_chunk.is_empty() {
+            return;
         }
+
+        for (ck, ops) in per_chunk {
+            match self.chunks.get(&ck) {
+                Some(ChunkState::Resident(_)) => {
+                    let ok = self.apply_edits_to_resident_chunk(ck, &ops);
+                    if !ok {
+                        self.invalidate_and_rebuild_chunk(ck);
+                    }
+                }
+                _ => {
+                    self.invalidate_and_rebuild_chunk(ck);
+                }
+            }
+        }
+
+        self.changed = true;
     }
 
     // -------------------------------------------------------------------------
@@ -412,7 +879,11 @@ impl ChunkManager {
         let ground_y_vox = world.ground_height(cam_vx, cam_vz);
         let ground_cy = ground_y_vox.div_euclid(config::CHUNK_SIZE as i32);
 
-        let center = ChunkKey { x: ccx, y: ground_cy, z: ccz };
+        let center = ChunkKey {
+            x: ccx,
+            y: ground_cy,
+            z: ccz,
+        };
 
         let desired = Self::desired_chunks(center, config::ACTIVE_RADIUS);
         let keep = Self::desired_chunks(center, config::KEEP_RADIUS);
@@ -477,7 +948,6 @@ impl ChunkManager {
                 continue;
             }
 
-            // If it became valid-cached since it was queued, don't rebuild.
             if self.cache_contains_valid(k) {
                 self.chunks.insert(k, ChunkState::Missing);
                 let _ = self.try_promote_from_cache(center, k);
@@ -492,7 +962,16 @@ impl ChunkManager {
 
                 let (edit_stamp, edit_map) = self.snapshot_chunk_edit_map(k);
 
-                if self.tx_job.send(BuildJob { key: k, cancel: cancel.clone(), edit_stamp, edit_map }).is_ok() {
+                if self
+                    .tx_job
+                    .send(BuildJob {
+                        key: k,
+                        cancel: cancel.clone(),
+                        edit_stamp,
+                        edit_map,
+                    })
+                    .is_ok()
+                {
                     self.in_flight += 1;
                 } else {
                     self.chunks.insert(k, ChunkState::Queued);
@@ -510,7 +989,6 @@ impl ChunkManager {
                 self.in_flight -= 1;
             }
 
-            // If cancelled (before start or mid-build), don't keep it Building.
             if done.canceled || done.cancel.load(Ordering::Relaxed) {
                 if self.chunks.get(&done.key).is_some() {
                     self.chunks.insert(done.key, ChunkState::Missing);
@@ -518,7 +996,6 @@ impl ChunkManager {
                 continue;
             }
 
-            // If finished but no longer in KEEP, drop it.
             if !keep_set.contains(&done.key) {
                 self.cancel_token(done.key).store(true, Ordering::Relaxed);
                 self.chunks.insert(done.key, ChunkState::Missing);
@@ -565,7 +1042,11 @@ impl ChunkManager {
         for dy in GRID_Y_MIN_DY..=(GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1) {
             for dz in -radius..=radius {
                 for dx in -radius..=radius {
-                    out.push(ChunkKey { x: center.x + dx, y: center.y + dy, z: center.z + dz });
+                    out.push(ChunkKey {
+                        x: center.x + dx,
+                        y: center.y + dy,
+                        z: center.z + dz,
+                    });
                 }
             }
         }
@@ -580,7 +1061,10 @@ impl ChunkManager {
         self.edits.get(&key).map(|e| e.stamp).unwrap_or(0)
     }
 
-    fn snapshot_chunk_edit_map(&self, key: ChunkKey) -> (u64, Option<crate::svo::builder::ChunkEditMap>) {
+    fn snapshot_chunk_edit_map(
+        &self,
+        key: ChunkKey,
+    ) -> (u64, Option<crate::svo::builder::ChunkEditMap>) {
         let Some(ed) = self.edits.get(&key) else {
             return (0, None);
         };
@@ -594,25 +1078,173 @@ impl ChunkManager {
         // Invalidate cache entry (edits mean old cached nodes are wrong).
         self.cache_remove(key);
 
-        // Cancel in-flight if queued/building.
         if matches!(self.chunks.get(&key), Some(ChunkState::Queued | ChunkState::Building)) {
             self.cancel_token(key).store(true, Ordering::Relaxed);
             self.queued_set.remove(&key);
             self.chunks.insert(key, ChunkState::Missing);
         }
 
-        // If resident, unload (frees node arena, updates slots, dirties grid).
         if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
             self.unload_chunk(key);
         }
 
-        // Re-queue immediately (high priority).
         self.chunks.insert(key, ChunkState::Queued);
         if self.queued_set.insert(key) {
             self.build_queue.push_front(key);
         }
 
         self.changed = true;
+    }
+
+    fn apply_edits_to_resident_chunk(
+        &mut self,
+        key: ChunkKey,
+        ops: &[(i32, i32, i32, u32)],
+    ) -> bool {
+        use crate::world::materials::AIR;
+
+        let cs = config::CHUNK_SIZE as i32;
+
+        // extract resident (move out, mutate, put back)
+        let state = self.chunks.remove(&key);
+        let Some(ChunkState::Resident(mut res)) = state else {
+            if let Some(st) = state {
+                self.chunks.insert(key, st);
+            }
+            return false;
+        };
+
+        let slot = res.slot as usize;
+        let mut changed = false;
+
+        for &(lx, ly, lz, mat) in ops {
+            // root is always tracked as explicit id; but edit_cpu can return None if whole chunk becomes implicit AIR
+            let (new_root_opt, did) = edit_cpu(
+                &mut res.cpu,
+                Some(res.cpu_root),
+                0,
+                0,
+                0,
+                cs,
+                lx,
+                ly,
+                lz,
+                mat,
+            );
+
+            if let Some(nr) = new_root_opt {
+                res.cpu_root = nr;
+            } else {
+                // keep root explicit for simplicity
+                res.cpu_root = res.cpu.alloc(CpuNode {
+                    child: [NONE_CPU; 8],
+                    material: AIR,
+                });
+            }
+
+            changed |= did;
+        }
+
+        if !changed {
+            self.chunks.insert(key, ChunkState::Resident(res));
+            return true;
+        }
+
+        // repack to GPU nodes
+        let new_nodes_vec = pack_cpu_to_gpu(&res.cpu, res.cpu_root);
+        let new_arc: Arc<[NodeGpu]> = Arc::from(new_nodes_vec.clone());
+        let needed = new_nodes_vec.len() as u32;
+
+        // slab growth
+        if needed > res.node_cap {
+            // allocate new slab (grow ~1.25x, at least needed)
+            let grown = ((res.node_cap as u64 * 5) / 4) as u32;
+            let new_cap = grown.max(needed).max(1);
+
+            let mut new_base = self.arena.alloc(new_cap);
+
+            if new_base.is_none() {
+                // bounded evictions (avoid evicting self)
+                for _ in 0..EVICT_ATTEMPTS {
+                    if let Some(evict_key) = self
+                        .slot_to_key
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|k| *k != key)
+                    {
+                        self.unload_chunk(evict_key);
+                    } else {
+                        break;
+                    }
+
+                    new_base = self.arena.alloc(new_cap);
+                    if new_base.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            let Some(new_base) = new_base else {
+                self.chunks.insert(key, ChunkState::Resident(res));
+                return false;
+            };
+
+            // free old slab and rebind
+            self.arena.free(res.node_base, res.node_cap);
+
+            res.node_base = new_base;
+            res.node_cap = new_cap;
+            res.node_count = needed;
+
+            self.chunk_meta[slot].node_base = res.node_base;
+            self.chunk_meta[slot].node_count = res.node_count;
+
+            // full upload for this chunk
+            self.uploads.push(ChunkUpload {
+                slot: res.slot,
+                meta: self.chunk_meta[slot],
+                node_base: res.node_base,
+                writes: vec![NodeWrite {
+                    start: 0,
+                    nodes: new_arc.clone(),
+                }],
+            });
+
+            self.resident_nodes[slot] = new_arc.clone();
+            res.packed = new_arc;
+
+            self.grid_dirty = true;
+            self.changed = true;
+
+            self.chunks.insert(key, ChunkState::Resident(res));
+            return true;
+        }
+
+        // diff ranges vs previous packed
+        let diffs = diff_ranges(&res.packed, &new_nodes_vec);
+
+        res.packed = new_arc.clone();
+        self.resident_nodes[slot] = new_arc.clone();
+
+        res.node_count = needed;
+        self.chunk_meta[slot].node_count = res.node_count;
+
+        let mut writes = Vec::with_capacity(diffs.len());
+        for (start, nodes) in diffs {
+            writes.push(NodeWrite { start, nodes });
+        }
+
+        self.uploads.push(ChunkUpload {
+            slot: res.slot,
+            meta: self.chunk_meta[slot],
+            node_base: res.node_base,
+            writes,
+        });
+
+        self.changed = true;
+        self.chunks.insert(key, ChunkState::Resident(res));
+        true
     }
 
     // -------------------------------------------------------------------------
@@ -637,7 +1269,15 @@ impl ChunkManager {
         self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
         let stamp = self.cache_stamp;
 
-        self.cache.insert(key, CachedChunk { nodes, bytes, stamp, edit_stamp });
+        self.cache.insert(
+            key,
+            CachedChunk {
+                nodes,
+                bytes,
+                stamp,
+                edit_stamp,
+            },
+        );
         self.cache_bytes = self.cache_bytes.saturating_add(bytes);
         self.cache_lru.push_back((key, stamp));
 
@@ -716,6 +1356,7 @@ impl ChunkManager {
             return false;
         }
 
+        // allocate exactly 'need' initially (node_cap = need)
         let mut node_base = self.arena.alloc(need);
         if node_base.is_none() {
             for _ in 0..EVICT_ATTEMPTS {
@@ -736,6 +1377,10 @@ impl ChunkManager {
 
         let slot = self.slot_to_key.len() as u32;
         self.slot_to_key.push(key);
+
+        // build CPU tree from packed nodes
+        let (cpu, cpu_root) = cpu_from_packed(&nodes);
+
         self.resident_nodes.push(nodes.clone());
 
         let origin_vox = [
@@ -754,12 +1399,25 @@ impl ChunkManager {
 
         self.chunk_meta.push(meta);
 
-        self.chunks.insert(
-            key,
-            ChunkState::Resident(Resident { slot, node_base, node_count: need }),
-        );
+        let res = Resident {
+            slot,
+            node_base,
+            node_count: need,
+            node_cap: need,
+            cpu,
+            cpu_root,
+            packed: nodes.clone(),
+        };
 
-        self.uploads.push(ChunkUpload { slot, meta, node_base, nodes });
+        self.chunks.insert(key, ChunkState::Resident(res));
+
+        // full upload for this chunk
+        self.uploads.push(ChunkUpload {
+            slot,
+            meta,
+            node_base,
+            writes: vec![NodeWrite { start: 0, nodes }],
+        });
 
         self.grid_dirty = true;
         self.changed = true;
@@ -804,9 +1462,12 @@ impl ChunkManager {
     fn unload_chunk(&mut self, key: ChunkKey) {
         let Some(state) = self.chunks.get(&key) else { return; };
 
-        match *state {
+        match state {
             ChunkState::Resident(res) => {
-                self.arena.free(res.node_base, res.node_count);
+                let res = res.clone();
+
+                // free GPU slab
+                self.arena.free(res.node_base, res.node_cap);
 
                 let dead_slot = res.slot as usize;
                 let last_slot = self.slot_to_key.len().saturating_sub(1);
@@ -821,18 +1482,19 @@ impl ChunkManager {
                     let moved_meta = self.chunk_meta[last_slot];
                     self.chunk_meta[dead_slot] = moved_meta;
 
+                    // update moved resident slot index
                     if let Some(st) = self.chunks.get_mut(&moved_key) {
                         if let ChunkState::Resident(mr) = st {
                             mr.slot = dead_slot as u32;
                         }
                     }
 
-                    // Schedule meta rewrite for moved slot (nodes empty => meta-only update on GPU).
+                    // meta-only upload for moved slot
                     self.uploads.push(ChunkUpload {
                         slot: dead_slot as u32,
                         meta: self.chunk_meta[dead_slot],
-                        node_base: 0,
-                        nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
+                        node_base: self.chunk_meta[dead_slot].node_base,
+                        writes: Vec::new(),
                     });
                 }
 

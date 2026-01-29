@@ -10,7 +10,10 @@ pub struct Hit {
     pub voxel: [i32; 3],
     pub normal: [i32; 3],
     pub material: u32,
+    pub leaf_min: [i32; 3],
+    pub leaf_size: i32,
 }
+
 
 #[inline]
 fn popcount(x: u32) -> u32 {
@@ -59,7 +62,7 @@ pub fn raycast_chunk_svo_vox(
     chunk_origin_vox: [i32; 3],
     ray_o_vox: Vec3,
     ray_d_vox: Vec3,
-) -> Option<(f32 /*t_vox*/, [i32; 3] /*voxel*/, [i32; 3] /*normal*/, u32 /*mat*/)> {
+) -> Option<(f32, [i32;3], [i32;3], u32, [i32;3], i32)> {
     let cs = config::CHUNK_SIZE as i32;
     let bmin = Vec3::new(chunk_origin_vox[0] as f32, chunk_origin_vox[1] as f32, chunk_origin_vox[2] as f32);
     let bmax = bmin + Vec3::splat(cs as f32);
@@ -73,10 +76,10 @@ pub fn raycast_chunk_svo_vox(
     let mut stack: Vec<(u32, Vec3, i32, f32, f32)> = Vec::with_capacity(64);
     stack.push((0, bmin, cs, t_entry, t_exit));
 
-    let mut best: Option<(f32, [i32; 3], [i32; 3], u32)> = None;
+    let mut best: Option<(f32, [i32; 3], [i32; 3], u32, [i32; 3], i32)> = None;
 
     while let Some((ni, nmin, size, te, tx)) = stack.pop() {
-        if let Some((bt, _, _, _)) = best {
+        if let Some((bt, _, _, _, _, _)) = best {
             if te >= bt {
                 continue;
             }
@@ -110,7 +113,9 @@ pub fn raycast_chunk_svo_vox(
             let vy = p.y.floor() as i32;
             let vz = p.z.floor() as i32;
 
-            best = Some((te, [vx, vy, vz], normal, mat));
+            let leaf_min = [nmin.x as i32, nmin.y as i32, nmin.z as i32];
+            let leaf_size = size;
+            best = Some((te, [vx, vy, vz], normal, mat, leaf_min, leaf_size));
             continue;
         }
 

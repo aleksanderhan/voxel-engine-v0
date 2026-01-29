@@ -203,21 +203,27 @@ impl App {
             let mut best: Option<crate::svo::raycast::Hit> = None;
 
             for (chunk_origin_vox, nodes) in self.chunks.resident_chunks_for_raycast() {
-                if let Some((t_vox, voxel, normal, mat)) =
+                if let Some((t_vox, voxel, normal, mat, leaf_min, leaf_size)) =
                     crate::svo::raycast::raycast_chunk_svo_vox(&nodes, chunk_origin_vox, ray_o_vox, ray_d_vox)
                 {
                     let t_m = t_vox * vs;
                     if t_m >= 0.0 && best.map_or(true, |h| t_m < h.t_m) {
-                        best = Some(crate::svo::raycast::Hit { t_m, voxel, normal, material: mat });
+                        best = Some(crate::svo::raycast::Hit {
+                            t_m,
+                            voxel,
+                            normal,
+                            material: mat,
+                            leaf_min,
+                            leaf_size,
+                        });
                     }
                 }
+
             }
 
             if let Some(hit) = best {
-                println!(
-                    "HIT t_m={} voxel={:?} normal={:?} mat={}",
-                    hit.t_m, hit.voxel, hit.normal, hit.material
-                );
+                println!("HIT voxel={:?} leaf_min={:?} leaf_size={}", hit.voxel, hit.leaf_min, hit.leaf_size);
+
                 let mut edits = Vec::with_capacity(1);
 
                 if dig {
@@ -230,18 +236,40 @@ impl App {
                 }
 
                 if place {
-                    let pv = [
-                        hit.voxel[0] + hit.normal[0],
-                        hit.voxel[1] + hit.normal[1],
-                        hit.voxel[2] + hit.normal[2],
-                    ];
-                    edits.push(VoxelEdit {
-                        x: pv[0],
-                        y: pv[1],
-                        z: pv[2],
-                        material: DIRT,
-                    });
+                    let s = hit.leaf_size;
+
+                    // base cube = the leaf you hit (aligned to leaf grid)
+                    let [bx, by, bz] = hit.leaf_min;
+
+                    // place cube adjacent to the face you clicked; step by *s* voxels
+                    let [nx, ny, nz] = hit.normal;
+
+                    // avoid accidental giant overwrite if normal is bogus
+                    if nx != 0 || ny != 0 || nz != 0 {
+                        let px0 = bx + nx * s;
+                        let py0 = by + ny * s;
+                        let pz0 = bz + nz * s;
+
+                        let mut edits = Vec::with_capacity((s * s * s) as usize);
+                        for z in pz0..pz0 + s {
+                            for y in py0..py0 + s {
+                                for x in px0..px0 + s {
+                                    edits.push(VoxelEdit { x, y, z, material: 2 });
+                                }
+                            }
+                        }
+
+                        println!(
+                            "APPLY edits len={} first={:?} last={:?}",
+                            edits.len(),
+                            edits.first(),
+                            edits.last()
+                        );
+
+                        self.chunks.apply_edits(&edits);
+                    }
                 }
+
 
                 if !edits.is_empty() {
                     println!("APPLY edits={:?}", edits);

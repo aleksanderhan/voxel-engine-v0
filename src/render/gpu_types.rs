@@ -1,14 +1,13 @@
 // src/render/gpu_types.rs
 // -----------------------
 //
-// Fix: ClipLevelParams now has `packed_offsets`, but we keep its existing
-// `inv_cell_size_m` field on CPU side.
-// GPU uniform uses vec4 per level with packed offsets in .w.
+// CHANGE:
+// - NodeGpu now derives PartialEq/Eq so we can diff packed node arrays and upload only dirty ranges.
 
 use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct NodeGpu {
     pub child_base: u32,
     pub child_mask: u32,

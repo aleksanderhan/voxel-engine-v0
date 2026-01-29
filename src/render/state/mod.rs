@@ -1,5 +1,10 @@
 // src/render/state/mod.rs
 // -----------------------
+//
+// CHANGE:
+// - ChunkUpload now contains a list of node write ranges (diff uploads).
+// - apply_chunk_uploads() writes only those ranges, and supports meta-only updates.
+
 mod bindgroups;
 mod buffers;
 mod layout;
@@ -238,23 +243,30 @@ impl Renderer {
         let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
 
         for u in uploads {
+            // meta update
             if u.slot < self.buffers.chunk_capacity {
                 let meta_off = (u.slot as u64) * meta_stride;
                 self.queue
                     .write_buffer(&self.buffers.chunk, meta_off, bytemuck::bytes_of(&u.meta));
             }
 
-            if !u.nodes.is_empty() {
-                let needed = u.nodes.len() as u32;
+            // node range updates
+            for w in u.writes {
+                if w.nodes.is_empty() {
+                    continue;
+                }
 
-                if u.node_base <= self.buffers.node_capacity
-                    && u.node_base + needed <= self.buffers.node_capacity
+                let abs_start = u.node_base + w.start;
+                let needed = w.nodes.len() as u32;
+
+                if abs_start <= self.buffers.node_capacity
+                    && abs_start + needed <= self.buffers.node_capacity
                 {
-                    let node_off = (u.node_base as u64) * node_stride;
+                    let node_off = (abs_start as u64) * node_stride;
                     self.queue.write_buffer(
                         &self.buffers.node,
                         node_off,
-                        bytemuck::cast_slice(u.nodes.as_ref()),
+                        bytemuck::cast_slice(w.nodes.as_ref()),
                     );
                 }
             }
@@ -308,10 +320,10 @@ impl Renderer {
             // group(0) must match layouts.scene now
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
 
-            // group(1) is still empty (or you can omit setting it)
+            // group(1) is empty placeholder
             cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
 
-            // group(2) is your composite textures
+            // group(2) composite textures
             cpass.set_bind_group(2, &self.bind_groups.composite[pong], &[]);
 
             let gx = (width + 7) / 8;
