@@ -2,19 +2,10 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
-import fnmatch
-
+from pathlib import Path
 
 DEFAULT_INCLUDE_EXTS = {".rs", ".wgsl"}
-
-
-def normalize_ext(ext: str) -> str:
-    ext = ext.strip()
-    if not ext:
-        return ext
-    return ext if ext.startswith(".") else f".{ext}"
 
 
 def to_posix_rel(path: Path, base: Path) -> str:
@@ -27,59 +18,165 @@ def comment_prefix_for(path: Path) -> str:
     return "//"
 
 
-def should_skip_path(
-    p: Path,
-    src_dir: Path,
-    exclude_dirnames: set[str],
-    exclude_path_globs: list[str],
-) -> bool:
-    # Skip if any parent directory name matches excluded dirnames
-    # (also skips the directory itself when p is a dir).
-    parts = p.relative_to(src_dir).parts
-    for part in parts[:-1] if p.is_file() else parts:
-        if part in exclude_dirnames:
-            return True
+def parse_csv_list(value: str) -> list[str]:
+    """
+    Parse comma-separated list entries.
 
-    # Skip if the relative posix path matches any excluded glob pattern.
-    # Note: patterns are matched against paths relative to src_dir, POSIX-style.
-    rel_posix = p.relative_to(src_dir).as_posix()
-    for pat in exclude_path_globs:
-        if fnmatch.fnmatch(rel_posix, pat):
-            return True
+    Entries may be:
+      - A directory name (no '/'): matches that directory name anywhere under --src
+        Example: "ray" matches ".../shaders/ray/..." and ".../ray/..."
+      - A nested relative path (contains '/'): matches that subtree path under --src
+        Example: "shaders/ray" matches only ".../<src>/shaders/ray/..."
+      - "." meaning the src root itself.
 
+    Backslashes are normalized to '/'.
+    Leading/trailing slashes are ignored.
+    """
+    if not value:
+        return []
+    items: list[str] = []
+    for part in value.split(","):
+        s = part.strip()
+        if not s:
+            continue
+        s = s.replace("\\", "/").strip("/")
+        items.append(s if s else ".")
+    return items
+
+
+def split_names_and_paths(items: list[str]) -> tuple[set[str], list[str]]:
+    """
+    Split items into:
+      - names: entries with no '/' and not '.', matched by directory basename anywhere
+      - paths: entries with '/' or '.', matched as relative subtree under --src
+    """
+    names: set[str] = set()
+    paths: list[str] = []
+    for it in items:
+        if it == "." or "/" in it:
+            paths.append(it)
+        else:
+            names.add(it)
+    return names, paths
+
+
+def rel_posix_dir_for(p: Path, src_dir: Path) -> str:
+    """
+    Returns the relative directory (POSIX) to use for subtree matching:
+      - if p is a dir: its relative posix path (or "." if root)
+      - if p is a file: its parent dir relative posix path (or "." if at root)
+    """
+    rel = p.relative_to(src_dir)
+    if p.is_dir():
+        s = rel.as_posix()
+        return s if s else "."
+    parent = rel.parent.as_posix()
+    return parent if parent else "."
+
+
+def is_under_any_path(rel_dir_posix: str, roots: list[str]) -> bool:
+    """
+    True if rel_dir_posix is exactly a root, or is inside it (root/...).
+    """
+    for r in roots:
+        if r == ".":
+            return True
+        if rel_dir_posix == r or rel_dir_posix.startswith(r + "/"):
+            return True
     return False
+
+
+def has_any_ancestor_named(p: Path, src_dir: Path, names: set[str]) -> bool:
+    """
+    True if any ancestor directory (under src_dir) has basename in `names`.
+    For files, checks parent directories. For directories, checks itself + parents.
+    """
+    if not names:
+        return False
+    rel_parts = p.relative_to(src_dir).parts
+    parts = rel_parts[:-1] if p.is_file() else rel_parts
+    return any(part in names for part in parts)
+
+
+def is_excluded(p: Path, src_dir: Path, exclude_names: set[str], exclude_paths: list[str]) -> bool:
+    """
+    Exclusion matches if:
+      - p is in/under any excluded relative path root, OR
+      - p has any ancestor directory whose basename is in exclude_names
+    """
+    rel_dir = rel_posix_dir_for(p, src_dir)
+    return is_under_any_path(rel_dir, exclude_paths) or has_any_ancestor_named(p, src_dir, exclude_names)
+
+
+def is_included(p: Path, src_dir: Path, include_names: set[str], include_paths: list[str]) -> bool:
+    """
+    Inclusion matches if:
+      - no include filter is provided: everything is included (subject to excludes), OR
+      - p is in/under any included relative path root, OR
+      - p has any ancestor directory whose basename is in include_names
+    """
+    if not include_names and not include_paths:
+        return True
+    rel_dir = rel_posix_dir_for(p, src_dir)
+    return is_under_any_path(rel_dir, include_paths) or has_any_ancestor_named(p, src_dir, include_names)
 
 
 def collect_files(
     src_dir: Path,
     include_exts: set[str],
-    exclude_dirnames: set[str],
-    exclude_path_globs: list[str],
+    include_names: set[str],
+    include_paths: list[str],
+    exclude_names: set[str],
+    exclude_paths: list[str],
 ) -> list[Path]:
-    files: list[Path] = []
+    import os
 
-    # Manual walk so we can prune excluded directories early.
-    for root, dirs, filenames in __import__("os").walk(src_dir):
-        root_path = Path(root)
+    files_set: set[Path] = set()
 
-        # Prune dirs in-place (prevents descending into them)
-        kept_dirs: list[str] = []
-        for d in dirs:
-            dp = root_path / d
-            if not should_skip_path(dp, src_dir, exclude_dirnames, exclude_path_globs):
-                kept_dirs.append(d)
-        dirs[:] = kept_dirs
+    # Walk roots optimization:
+    # - If include_paths is present and include_names is empty, we can walk only those subtrees.
+    # - If include_names is present (e.g. "ray"), we must walk all of src_dir to discover matches.
+    if include_paths and not include_names:
+        walk_roots: list[Path] = []
+        for d in include_paths:
+            root = src_dir if d == "." else (src_dir / Path(d))
+            root = root.resolve()
+            try:
+                root.relative_to(src_dir)
+            except ValueError:
+                raise ValueError(f"--include entry escapes --src: {d}")
+            if root.exists() and root.is_dir():
+                walk_roots.append(root)
+        if not walk_roots:
+            return []
+    else:
+        walk_roots = [src_dir]
 
-        # Collect files
-        for name in filenames:
-            fp = root_path / name
-            if fp.suffix in include_exts and not should_skip_path(
-                fp, src_dir, exclude_dirnames, exclude_path_globs
-            ):
-                files.append(fp)
+    for start in walk_roots:
+        for root, dirs, filenames in os.walk(start):
+            root_path = Path(root)
 
-    files.sort(key=lambda x: x.as_posix())
-    return files
+            # Prune excluded directories (prevents descending into them)
+            kept_dirs: list[str] = []
+            for d in dirs:
+                dp = root_path / d
+                # dp is under src_dir by construction of os.walk(start) where start is under src_dir
+                if not is_excluded(dp, src_dir, exclude_names, exclude_paths):
+                    kept_dirs.append(d)
+            dirs[:] = kept_dirs
+
+            # Collect matching files
+            for name in filenames:
+                fp = root_path / name
+                if fp.suffix not in include_exts:
+                    continue
+                if is_excluded(fp, src_dir, exclude_names, exclude_paths):
+                    continue
+                if not is_included(fp, src_dir, include_names, include_paths):
+                    continue
+                files_set.add(fp)
+
+    return sorted(files_set, key=lambda x: x.as_posix())
 
 
 def concatenate_sources(
@@ -87,8 +184,10 @@ def concatenate_sources(
     out_file: Path,
     *,
     include_exts: set[str],
-    exclude_dirnames: set[str],
-    exclude_path_globs: list[str],
+    include_names: set[str],
+    include_paths: list[str],
+    exclude_names: set[str],
+    exclude_paths: list[str],
     encoding: str = "utf-8",
 ) -> None:
     src_dir = src_dir.resolve()
@@ -100,8 +199,10 @@ def concatenate_sources(
     source_files = collect_files(
         src_dir,
         include_exts=include_exts,
-        exclude_dirnames=exclude_dirnames,
-        exclude_path_globs=exclude_path_globs,
+        include_names=include_names,
+        include_paths=include_paths,
+        exclude_names=exclude_names,
+        exclude_paths=exclude_paths,
     )
 
     # Avoid including the output file if it lives under src_dir
@@ -134,60 +235,47 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--src", default="src", help="Source directory to traverse (default: src).")
     parser.add_argument("--out", default="all_sources.txt", help="Output file path (default: all_sources.txt).")
-    parser.add_argument("--encoding", default="utf-8", help="Text encoding to use (default: utf-8).")
 
     parser.add_argument(
-        "--include-ext",
-        action="append",
-        default=[],
-        help="Extension to include (repeatable). If omitted, defaults to: .rs, .wgsl",
-    )
-    parser.add_argument(
-        "--exclude-ext",
-        action="append",
-        default=[],
-        help="Extension to exclude (repeatable). Example: --exclude-ext .wgsl",
-    )
-
-    parser.add_argument(
-        "--exclude-dir",
-        action="append",
-        default=[],
-        help="Directory name to skip anywhere under --src (repeatable). Example: --exclude-dir target",
-    )
-    parser.add_argument(
-        "--exclude-path",
-        action="append",
-        default=[],
+        "--include",
+        default="",
         help=(
-            "Glob pattern (relative to --src, POSIX style) to skip (repeatable). "
-            "Examples: --exclude-path 'tests/**' --exclude-path '**/generated/**'"
+            "Comma-separated directories to include. "
+            "Use a bare name (no '/') to match that directory name anywhere under --src. "
+            "Use a nested path (with '/') to match a specific subtree under --src. "
+            "If provided, ONLY included directories are considered (then --exclude still applies). "
+            "Examples: --include ray,shaders/wgsl"
+        ),
+    )
+    parser.add_argument(
+        "--exclude",
+        default="",
+        help=(
+            "Comma-separated directories to exclude. "
+            "Use a bare name (no '/') to match that directory name anywhere under --src. "
+            "Use a nested path (with '/') to match a specific subtree under --src. "
+            "Examples: --exclude target,tests/fixtures"
         ),
     )
 
     args = parser.parse_args(argv)
 
-    # Build include set
-    if args.include_ext:
-        include_exts = {normalize_ext(e) for e in args.include_ext if e.strip()}
-    else:
-        include_exts = set(DEFAULT_INCLUDE_EXTS)
+    include_items = parse_csv_list(args.include)
+    exclude_items = parse_csv_list(args.exclude)
 
-    # Apply excludes to include set
-    exclude_exts = {normalize_ext(e) for e in args.exclude_ext if e.strip()}
-    include_exts -= exclude_exts
-
-    exclude_dirnames = {d.strip() for d in args.exclude_dir if d.strip()}
-    exclude_path_globs = [p.strip() for p in args.exclude_path if p.strip()]
+    include_names, include_paths = split_names_and_paths(include_items)
+    exclude_names, exclude_paths = split_names_and_paths(exclude_items)
 
     try:
         concatenate_sources(
             Path(args.src),
             Path(args.out),
-            include_exts=include_exts,
-            exclude_dirnames=exclude_dirnames,
-            exclude_path_globs=exclude_path_globs,
-            encoding=args.encoding,
+            include_exts=set(DEFAULT_INCLUDE_EXTS),
+            include_names=include_names,
+            include_paths=include_paths,
+            exclude_names=exclude_names,
+            exclude_paths=exclude_paths,
+            encoding="utf-8",
         )
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)

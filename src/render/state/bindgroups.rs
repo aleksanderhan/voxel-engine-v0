@@ -124,7 +124,8 @@ fn make_composite_bg(
     color_view: &wgpu::TextureView,
     godray_view: &wgpu::TextureView,
     output_view: &wgpu::TextureView,
-    depth_view: &wgpu::TextureView, // NEW
+    depth_view: &wgpu::TextureView,
+    godray_sampler: &wgpu::Sampler,
     label: &str,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -135,6 +136,7 @@ fn make_composite_bg(
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(godray_view) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(output_view) },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(godray_sampler) },
         ],
     })
 }
@@ -211,6 +213,7 @@ pub fn create_bind_groups(
             &textures.godray[0].view,
             &textures.output.view,
             &textures.depth.view,
+            sampler,
             "composite_bg_read_a",
         ),
         make_composite_bg(
@@ -220,6 +223,7 @@ pub fn create_bind_groups(
             &textures.godray[1].view,
             &textures.output.view,
             &textures.depth.view,
+            sampler,
             "composite_bg_read_b",
         ),
     ];

@@ -31,6 +31,11 @@ fn trace_chunk_shadow_trans_interval(
 
     let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base);
 
+    // ---- NEW: compute slab once, reuse t_exit for stepping
+    let slab    = cube_slab_inv(ro, inv, q.bmin, q.size);
+    let t_leave = slab.t_exit;
+    // -----------------------------------------------------
+
     if (q.mat != MAT_AIR) {
       if (q.mat == MAT_LEAF) {
         if (VOLUME_DISPLACED_LEAVES) {
@@ -40,20 +45,17 @@ fn trace_chunk_shadow_trans_interval(
           let h2 = leaf_displaced_cube_hit(ro, rd, q.bmin, q.size, time_s, strength, tcur - nudge_s, t_exit);
           if (h2.hit) { trans *= LEAF_LIGHT_TRANSMIT; }
 
-          let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
           tcur = max(t_leave, tcur) + nudge_s;
           continue;
         }
 
         trans *= LEAF_LIGHT_TRANSMIT;
-        let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
         tcur = max(t_leave, tcur) + nudge_s;
         continue;
       }
 
       if (q.mat == MAT_GRASS) {
         trans *= GRASS_LIGHT_TRANSMIT;
-        let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
         tcur = max(t_leave, tcur) + nudge_s;
         continue;
       }
@@ -61,7 +63,6 @@ fn trace_chunk_shadow_trans_interval(
       return 0.0;
     }
 
-    let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
     tcur = max(t_leave, tcur) + nudge_s;
   }
 
@@ -124,6 +125,21 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   var trans = 1.0;
   let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 512u);
 
+  // ---- HOISTED: grid bounds for the DDA loop (was recomputed each step)
+  let ox: i32 = go.x;
+  let oy: i32 = go.y;
+  let oz: i32 = go.z;
+  let nx: i32 = i32(gd.x);
+  let ny: i32 = i32(gd.y);
+  let nz: i32 = i32(gd.z);
+  let gx0: i32 = ox;
+  let gy0: i32 = oy;
+  let gz0: i32 = oz;
+  let gx1: i32 = ox + nx;
+  let gy1: i32 = oy + ny;
+  let gz1: i32 = oz + nz;
+  // ---------------------------------------------------------------
+
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }
     if (trans < MIN_TRANS) { break; }
@@ -149,15 +165,8 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
       else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
     }
 
-    let ox = cam.grid_origin_chunk.x;
-    let oy = cam.grid_origin_chunk.y;
-    let oz = cam.grid_origin_chunk.z;
-
-    let nx = i32(cam.grid_dims.x);
-    let ny = i32(cam.grid_dims.y);
-    let nz = i32(cam.grid_dims.z);
-
-    if (cx < ox || cy < oy || cz < oz || cx >= ox + nx || cy >= oy + ny || cz >= oz + nz) { break; }
+    // bounds check (now uses hoisted constants)
+    if (cx < gx0 || cy < gy0 || cz < gz0 || cx >= gx1 || cy >= gy1 || cz >= gz1) { break; }
   }
 
   return trans;

@@ -172,3 +172,21 @@ fn compute_godray_quarter_pixel(
   let hist_w = clamp(0.28 + GODRAY_TS_LP_ALPHA * stable, 0.18, 0.94);
   return mix(cur, hist_clamped, hist_w);
 }
+
+fn godray_decompress(cur: vec3<f32>) -> vec3<f32> {
+  // must match quarter pass compression
+  let k = 0.25;
+  let one = vec3<f32>(1.0);
+  let denom = max(one - cur, vec3<f32>(1e-4));
+  return (k * cur) / denom;
+}
+
+// Sample godray quarter-res texture in normalized UV, hardware bilinear
+fn godray_sample_linear(
+  uv: vec2<f32>,
+  godray_tex: texture_2d<f32>,
+  godray_samp: sampler
+) -> vec3<f32> {
+  let c = textureSampleLevel(godray_tex, godray_samp, uv, 0.0).xyz;
+  return godray_decompress(c);
+}

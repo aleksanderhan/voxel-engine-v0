@@ -60,6 +60,11 @@ fn trace_chunk_hybrid_interval(
 
     let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base);
 
+    // ---- NEW: compute slab ONCE for this leaf, reuse for stepping/probing
+    let slab    = cube_slab_inv(ro, inv, q.bmin, q.size);
+    let t_leave = slab.t_exit;
+    // ---------------------------------------------------------------
+
     // AIR: probe grass slab just below when in blade layer
     if (q.mat == MAT_AIR) {
       let layer_h = GRASS_LAYER_HEIGHT_VOX * vs;
@@ -88,7 +93,8 @@ fn trace_chunk_hybrid_interval(
             f32(ch.origin.z + iz)
           );
 
-          let t_leave_air = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
+          // was: exit_time_from_cube_inv(...)
+          let t_leave_air = t_leave;
           let tmax_probe  = min(min(t_leave_air, t_exit), tcur + q.size + 2.0 * vs);
 
           let time_s   = cam.voxel_params.y;
@@ -109,7 +115,7 @@ fn trace_chunk_hybrid_interval(
         }
       }
 
-      let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
+      // was: exit_time_from_cube_inv(...)
       tcur = max(t_leave, tcur) + eps_step;
       continue;
     }
@@ -133,13 +139,13 @@ fn trace_chunk_hybrid_interval(
         return out;
       }
 
-      let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
+      // was: exit_time_from_cube_inv(...)
       tcur = max(t_leave, tcur) + eps_step;
       continue;
     }
 
-    // Solid: AABB face hit
-    let bh = aabb_hit_normal_inv(ro, rd, inv, q.bmin, q.size, t_enter, t_exit);
+    // Solid: AABB face hit (use slab we already computed)
+    let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
 
     if (bh.hit) {
       // If grass solid, try blades above the voxel under this hit (from above)
@@ -183,7 +189,7 @@ fn trace_chunk_hybrid_interval(
       return out;
     }
 
-    let t_leave = exit_time_from_cube_inv(ro, rd, inv, q.bmin, q.size);
+    // Miss: step using the already-computed slab exit
     tcur = max(t_leave, tcur) + eps_step;
   }
 
@@ -206,7 +212,7 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
     return VoxTraceResult(false, miss_hitgeom(), 0.0);
   }
 
-  let voxel_size = cam.voxel_params.x;
+  let voxel_size   = cam.voxel_params.x;
   let chunk_size_m = f32(cam.chunk_size) * voxel_size;
 
   let go = cam.grid_origin_chunk;
@@ -261,6 +267,21 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
 
   let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 1024u);
 
+  // ---- HOISTED: grid bounds for the DDA loop (was recomputed each step)
+  let ox: i32 = go.x;
+  let oy: i32 = go.y;
+  let oz: i32 = go.z;
+  let nx: i32 = i32(gd.x);
+  let ny: i32 = i32(gd.y);
+  let nz: i32 = i32(gd.z);
+  let gx0: i32 = ox;
+  let gy0: i32 = oy;
+  let gz0: i32 = oz;
+  let gx1: i32 = ox + nx;
+  let gy1: i32 = oy + ny;
+  let gz1: i32 = oz + nz;
+  // ---------------------------------------------------------------
+
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }
 
@@ -286,13 +307,8 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
       else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
     }
 
-    let ox = cam.grid_origin_chunk.x;
-    let oy = cam.grid_origin_chunk.y;
-    let oz = cam.grid_origin_chunk.z;
-    let nx = i32(cam.grid_dims.x);
-    let ny = i32(cam.grid_dims.y);
-    let nz = i32(cam.grid_dims.z);
-    if (cx < ox || cy < oy || cz < oz || cx >= ox + nx || cy >= oy + ny || cz >= oz + nz) { break; }
+    // bounds check (now uses hoisted constants)
+    if (cx < gx0 || cy < gy0 || cz < gz0 || cx >= gx1 || cy >= gy1 || cz >= gz1) { break; }
   }
 
   return VoxTraceResult(true, best, t_exit);

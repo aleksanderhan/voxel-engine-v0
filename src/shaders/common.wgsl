@@ -190,6 +190,20 @@ const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.16;
 const GRASS_VOXEL_TAPER           : f32 = 0.70;
 const GRASS_OVERHANG_VOX          : f32 = 0.20;
 
+// Grass level-of-detail (LOD) distances in meters-ish (assuming rd normalized).
+const GRASS_LOD_MID_START : f32 = 18.0;
+const GRASS_LOD_FAR_START : f32 = 45.0;
+
+// Mid/far quality knobs (tune freely)
+const GRASS_BLADE_COUNT_MID : u32 = 3u;
+const GRASS_BLADE_COUNT_FAR : u32 = 2u;
+
+const GRASS_SEGS_MID : u32 = 4u;
+const GRASS_SEGS_FAR : u32 = 3u;
+
+const GRASS_TRACE_STEPS_MID : u32 = 12u;
+const GRASS_TRACE_STEPS_FAR : u32 = 8u;
+
 //// --------------------------------------------------------------------------
 //// GPU structs (must match Rust layouts)
 //// --------------------------------------------------------------------------

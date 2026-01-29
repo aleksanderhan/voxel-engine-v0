@@ -14,6 +14,8 @@
 @group(2) @binding(1) var godray_tex : texture_2d<f32>;
 @group(2) @binding(2) var out_img    : texture_storage_2d<rgba16float, write>;
 @group(2) @binding(3) var depth_full : texture_2d<f32>;
+@group(2) @binding(4) var godray_samp: sampler;
+
 
 @compute @workgroup_size(8, 8, 1)
 fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -102,6 +104,6 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
   let px = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
 
-  let outc = composite_pixel(ip, px, color_tex, godray_tex, depth_full);
+  let outc = composite_pixel(ip, px, color_tex, godray_tex, godray_samp, depth_full);
   textureStore(out_img, ip, outc);
 }

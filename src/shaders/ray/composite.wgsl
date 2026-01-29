@@ -91,33 +91,61 @@ fn composite_pixel(
   px: vec2<f32>,
   color_tex: texture_2d<f32>,
   godray_tex: texture_2d<f32>,
+  godray_samp: sampler,
   depth_full: texture_2d<f32>
 ) -> vec4<f32> {
   let dims = textureDimensions(color_tex);
   let base = textureLoad(color_tex, ip, 0).xyz;
 
-  let g  = godray_sample_bilerp(px, godray_tex, depth_full);
-  let gx = godray_sample_bilerp(px + vec2<f32>( 1.0, 0.0), godray_tex, depth_full)
-         + godray_sample_bilerp(px + vec2<f32>(-1.0, 0.0), godray_tex, depth_full);
-  let gy = godray_sample_bilerp(px + vec2<f32>(0.0,  1.0), godray_tex, depth_full)
-         + godray_sample_bilerp(px + vec2<f32>(0.0, -1.0), godray_tex, depth_full);
-  let gd = godray_sample_bilerp(px + vec2<f32>( 1.0,  1.0), godray_tex, depth_full)
-         + godray_sample_bilerp(px + vec2<f32>(-1.0,  1.0), godray_tex, depth_full)
-         + godray_sample_bilerp(px + vec2<f32>( 1.0, -1.0), godray_tex, depth_full)
-         + godray_sample_bilerp(px + vec2<f32>(-1.0, -1.0), godray_tex, depth_full);
+  // Normalized UV in full-res space (works even if godray_tex is quarter-res)
+  let fd = vec2<f32>(f32(dims.x), f32(dims.y));
+  let uv = (px + vec2<f32>(0.5)) / fd;
 
-  let blur = (gx + gy + 0.7 * gd) / (4.0 + 0.7 * 4.0);
+  // Godray taps (5 total)
+  let du = vec2<f32>(1.0 / fd.x, 0.0);
+  let dv = vec2<f32>(0.0, 1.0 / fd.y);
 
-  var god_lin = max(g + COMPOSITE_SHARPEN * (g - blur), vec3<f32>(0.0));
+  let gC = godray_sample_linear(uv,        godray_tex, godray_samp);
+  let gE = godray_sample_linear(uv + du,   godray_tex, godray_samp);
+  let gW = godray_sample_linear(uv - du,   godray_tex, godray_samp);
+  let gN = godray_sample_linear(uv + dv,   godray_tex, godray_samp);
+  let gS = godray_sample_linear(uv - dv,   godray_tex, godray_samp);
+
+  // Depth edge weights (4 depth taps, cheap)
+  let d0 = textureLoad(depth_full, ip, 0).x;
+
+  let ipE = vec2<i32>(min(ip.x + 1, i32(dims.x) - 1), ip.y);
+  let ipW = vec2<i32>(max(ip.x - 1, 0),              ip.y);
+  let ipN = vec2<i32>(ip.x, min(ip.y + 1, i32(dims.y) - 1));
+  let ipS = vec2<i32>(ip.x, max(ip.y - 1, 0));
+
+  let dE = textureLoad(depth_full, ipE, 0).x;
+  let dW = textureLoad(depth_full, ipW, 0).x;
+  let dN = textureLoad(depth_full, ipN, 0).x;
+  let dS = textureLoad(depth_full, ipS, 0).x;
+
+  // Similar tol shape as before, but no exp
+  let tol = 0.02 + 0.06 * smoothstep(10.0, 80.0, d0);
+
+  let wE = 1.0 - smoothstep(0.0, tol, abs(dE - d0));
+  let wW = 1.0 - smoothstep(0.0, tol, abs(dW - d0));
+  let wN = 1.0 - smoothstep(0.0, tol, abs(dN - d0));
+  let wS = 1.0 - smoothstep(0.0, tol, abs(dS - d0));
+
+  let wsum = max(wE + wW + wN + wS, 1e-4);
+  let blur = (gE * wE + gW * wW + gN * wN + gS * wS) / wsum;
+
+  // Unsharp (keeps your look, but now cheap)
+  var god_lin = max(gC + COMPOSITE_SHARPEN * (gC - blur), vec3<f32>(0.0));
   god_lin = max(god_lin - vec3<f32>(GODRAY_BLACK_LEVEL), vec3<f32>(0.0));
   god_lin = god_lin / (god_lin + vec3<f32>(GODRAY_KNEE_COMPOSITE));
 
-  let d = textureLoad(depth_full, ip, 0).x;
-  let god_far = smoothstep(GODRAY_FADE_NEAR, GODRAY_FADE_FAR, d);
-
+  let god_far = smoothstep(GODRAY_FADE_NEAR, GODRAY_FADE_FAR, d0);
   let god_scale = GODRAY_COMPOSITE_SCALE * mix(1.0, 0.25, god_far);
+
   var hdr = max(base + god_scale * god_lin, vec3<f32>(0.0));
 
+  // --- rest of your bloom/tonemap code unchanged ---
   // Bloom (hue-preserving + distance-faded)
   let bloom_thresh = 1.4;
   let bloom_k      = 0.12;
@@ -149,7 +177,7 @@ fn composite_pixel(
   let l_hdr = max(dot(hdr, lum_w), 1e-6);
   let gray_hdr = vec3<f32>(l_hdr);
 
-  let t_sat = smoothstep(30.0, 100.0, d);
+  let t_sat = smoothstep(30.0, 100.0, d0);
 
   var sat_boost = 1.00 + 0.55 * t_sat;
 

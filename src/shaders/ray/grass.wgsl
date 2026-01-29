@@ -68,25 +68,42 @@ fn grass_bend_offset(root_m: vec3<f32>, t: f32, height01: f32, strength: f32) ->
   return vec3<f32>(tip.x, 0.15 * tip.y, tip.z);
 }
 
-fn grass_sdf(
+fn grass_sdf_lod(
   p_m: vec3<f32>,
   cell_bmin_m: vec3<f32>,
   cell_id_vox: vec3<f32>,
   time_s: f32,
-  strength: f32
+  strength: f32,
+  lod: u32
 ) -> f32 {
   let vs = cam.voxel_params.x;
 
   let top_y   = cell_bmin_m.y + vs;
   let layer_h = GRASS_LAYER_HEIGHT_VOX * vs;
 
+  // Quick vertical reject
   let y01 = (p_m.y - top_y) / max(layer_h, 1e-6);
   if (y01 < 0.0 || y01 > 1.0) { return BIG_F32; }
 
+  // Cheap horizontal reject (avoid SDF loops when outside slab footprint)
+  let over = GRASS_OVERHANG_VOX * vs;
+  if (p_m.x < cell_bmin_m.x - over || p_m.x > cell_bmin_m.x + vs + over ||
+      p_m.z < cell_bmin_m.z - over || p_m.z > cell_bmin_m.z + vs + over) {
+    return BIG_F32;
+  }
+
   let blade_len = layer_h * (0.65 + 0.35 * hash13(cell_id_vox + vec3<f32>(9.1, 3.7, 5.2)));
 
-  let segs_f = max(3.0, floor(GRASS_VOXEL_SEGS));
-  let segs   = u32(segs_f);
+  // Choose blade count + seg count by LOD
+  var blade_count: u32 = GRASS_BLADE_COUNT;
+  var segs: u32 = u32(max(3.0, floor(GRASS_VOXEL_SEGS)));
+  if (lod == 1u) {
+    blade_count = min(blade_count, GRASS_BLADE_COUNT_MID);
+    segs = min(segs, GRASS_SEGS_MID);
+  } else if (lod == 2u) {
+    blade_count = min(blade_count, GRASS_BLADE_COUNT_FAR);
+    segs = min(segs, GRASS_SEGS_FAR);
+  }
 
   let half_xz = GRASS_VOXEL_THICKNESS_VOX * vs;
   let seg_h   = blade_len / max(f32(segs), 1.0);
@@ -94,7 +111,7 @@ fn grass_sdf(
 
   var dmin = BIG_F32;
 
-  for (var i: u32 = 0u; i < GRASS_BLADE_COUNT; i = i + 1u) {
+  for (var i: u32 = 0u; i < blade_count; i = i + 1u) {
     let uv = grass_root_uv(cell_id_vox, i);
 
     let inset = 0.12;
@@ -128,29 +145,37 @@ fn grass_sdf(
   return dmin;
 }
 
-fn grass_sdf_normal(
+
+fn grass_sdf_normal_lod(
   p_m: vec3<f32>,
   cell_bmin_m: vec3<f32>,
   cell_id_vox: vec3<f32>,
   time_s: f32,
-  strength: f32
+  strength: f32,
+  lod: u32
 ) -> vec3<f32> {
+  // Mid/far: cheap approximation is good enough visually
+  if (lod != 0u) {
+    return vec3<f32>(0.0, 1.0, 0.0);
+  }
+
   let e = 0.02 * cam.voxel_params.x;
 
   let dx =
-    grass_sdf(p_m + vec3<f32>(e, 0.0, 0.0), cell_bmin_m, cell_id_vox, time_s, strength) -
-    grass_sdf(p_m - vec3<f32>(e, 0.0, 0.0), cell_bmin_m, cell_id_vox, time_s, strength);
+    grass_sdf_lod(p_m + vec3<f32>(e, 0.0, 0.0), cell_bmin_m, cell_id_vox, time_s, strength, lod) -
+    grass_sdf_lod(p_m - vec3<f32>(e, 0.0, 0.0), cell_bmin_m, cell_id_vox, time_s, strength, lod);
 
   let dy =
-    grass_sdf(p_m + vec3<f32>(0.0, e, 0.0), cell_bmin_m, cell_id_vox, time_s, strength) -
-    grass_sdf(p_m - vec3<f32>(0.0, e, 0.0), cell_bmin_m, cell_id_vox, time_s, strength);
+    grass_sdf_lod(p_m + vec3<f32>(0.0, e, 0.0), cell_bmin_m, cell_id_vox, time_s, strength, lod) -
+    grass_sdf_lod(p_m - vec3<f32>(0.0, e, 0.0), cell_bmin_m, cell_id_vox, time_s, strength, lod);
 
   let dz =
-    grass_sdf(p_m + vec3<f32>(0.0, 0.0, e), cell_bmin_m, cell_id_vox, time_s, strength) -
-    grass_sdf(p_m - vec3<f32>(0.0, 0.0, e), cell_bmin_m, cell_id_vox, time_s, strength);
+    grass_sdf_lod(p_m + vec3<f32>(0.0, 0.0, e), cell_bmin_m, cell_id_vox, time_s, strength, lod) -
+    grass_sdf_lod(p_m - vec3<f32>(0.0, 0.0, e), cell_bmin_m, cell_id_vox, time_s, strength, lod);
 
   return normalize(vec3<f32>(dx, dy, dz));
 }
+
 
 struct GrassHit {
   hit: bool,
@@ -158,7 +183,7 @@ struct GrassHit {
   n: vec3<f32>,
 };
 
-fn grass_layer_trace(
+fn grass_layer_trace_lod(
   ro: vec3<f32>,
   rd: vec3<f32>,
   t_start: f32,
@@ -166,20 +191,25 @@ fn grass_layer_trace(
   cell_bmin_m: vec3<f32>,
   cell_id_vox: vec3<f32>,
   time_s: f32,
-  strength: f32
+  strength: f32,
+  lod: u32
 ) -> GrassHit {
   let vs = cam.voxel_params.x;
   var t = t_start;
 
-  for (var i: u32 = 0u; i < GRASS_TRACE_STEPS; i = i + 1u) {
+  var steps: u32 = GRASS_TRACE_STEPS;
+  if (lod == 1u) { steps = GRASS_TRACE_STEPS_MID; }
+  if (lod == 2u) { steps = GRASS_TRACE_STEPS_FAR; }
+
+  for (var i: u32 = 0u; i < steps; i = i + 1u) {
     if (t > t_end) { break; }
 
     let p = ro + rd * t;
-    let d = grass_sdf(p, cell_bmin_m, cell_id_vox, time_s, strength);
+    let d = grass_sdf_lod(p, cell_bmin_m, cell_id_vox, time_s, strength, lod);
 
     let hit_eps = GRASS_HIT_EPS_VOX * vs;
     if (d < hit_eps) {
-      let n = grass_sdf_normal(p, cell_bmin_m, cell_id_vox, time_s, strength);
+      let n = grass_sdf_normal_lod(p, cell_bmin_m, cell_id_vox, time_s, strength, lod);
       return GrassHit(true, t, n);
     }
 
@@ -189,6 +219,7 @@ fn grass_layer_trace(
 
   return GrassHit(false, BIG_F32, vec3<f32>(0.0));
 }
+
 
 fn try_grass_slab_hit(
   ro: vec3<f32>,
@@ -229,5 +260,16 @@ fn try_grass_slab_hit(
     return GrassHit(false, BIG_F32, vec3<f32>(0.0));
   }
 
-  return grass_layer_trace(ro, rd, t0, t1, cell_bmin, cell_id_vox, time_s, strength);
+  // ---- NEW: pick LOD based on distance along the ray
+  let lod = grass_lod_from_t(t0);
+  // -----------------------------------------------
+
+  return grass_layer_trace_lod(ro, rd, t0, t1, cell_bmin, cell_id_vox, time_s, strength, lod);
+}
+
+fn grass_lod_from_t(t: f32) -> u32 {
+  // 0 = near, 1 = mid, 2 = far
+  if (t >= GRASS_LOD_FAR_START) { return 2u; }
+  if (t >= GRASS_LOD_MID_START) { return 1u; }
+  return 0u;
 }
