@@ -22,7 +22,7 @@ pub struct ChunkMetaGpu {
     pub origin: [i32; 4],
     pub node_base: u32,
     pub node_count: u32,
-    pub _pad0: u32,
+    pub macro_base: u32,
     pub _pad1: u32,
 }
 

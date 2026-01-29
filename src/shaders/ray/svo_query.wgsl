@@ -13,11 +13,39 @@ fn query_leaf_at(
   p_in: vec3<f32>,
   root_bmin: vec3<f32>,
   root_size: f32,
-  node_base: u32
+  node_base: u32,
+  macro_base: u32
 ) -> LeafQuery {
   var idx: u32 = node_base;
   var bmin: vec3<f32> = root_bmin;
   var size: f32 = root_size;
+
+  // ------------------------------------------------------------------------
+  // Macro occupancy early-out (8x8x8). If the macro cell is empty => MAT_AIR.
+  // ------------------------------------------------------------------------
+  if (macro_base != INVALID_U32) {
+    let cell = macro_cell_size(root_size);
+
+    // local position in chunk (meters)
+    let lp = p_in - root_bmin;
+
+    // macro coords 0..7
+    let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
+    let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
+    let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
+
+    let bit = macro_bit_index(mx, my, mz);
+
+    if (!macro_test(macro_base, bit)) {
+      let macro_bmin = root_bmin + vec3<f32>(
+        f32(mx) * cell,
+        f32(my) * cell,
+        f32(mz) * cell
+      );
+      return LeafQuery(macro_bmin, cell, MAT_AIR);
+    }
+  }
+
 
   let min_leaf: f32 = cam.voxel_params.x;
   var p = p_in;
@@ -64,10 +92,11 @@ fn query_leaf_at(
   return LeafQuery(bmin, size, MAT_AIR);
 }
 
-fn is_air(p: vec3<f32>, root_bmin: vec3<f32>, root_size: f32, node_base: u32) -> bool {
-  return query_leaf_at(p, root_bmin, root_size, node_base).mat == MAT_AIR;
+fn is_air(p: vec3<f32>, root_bmin: vec3<f32>, root_size: f32, node_base: u32, macro_base: u32) -> bool {
+  return query_leaf_at(p, root_bmin, root_size, node_base, macro_base).mat == MAT_AIR;
 }
 
-fn is_grass(p: vec3<f32>, root_bmin: vec3<f32>, root_size: f32, node_base: u32) -> bool {
-  return query_leaf_at(p, root_bmin, root_size, node_base).mat == MAT_GRASS;
+fn is_grass(p: vec3<f32>, root_bmin: vec3<f32>, root_size: f32, node_base: u32, macro_base: u32) -> bool {
+  return query_leaf_at(p, root_bmin, root_size, node_base, macro_base).mat == MAT_GRASS;
 }
+

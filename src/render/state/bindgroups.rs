@@ -57,6 +57,10 @@ fn make_primary_bg(
                 binding: 7,
                 resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
             },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: buffers.macro_occ.as_entire_binding(),
+            },
         ],
     })
 }
@@ -85,6 +89,10 @@ fn make_scene_bg(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: buffers.chunk_grid.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry { 
+                binding: 8, 
+                resource: buffers.macro_occ.as_entire_binding() 
             },
         ],
     })

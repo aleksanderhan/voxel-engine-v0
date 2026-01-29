@@ -236,34 +236,6 @@ impl Renderer {
         );
     }
 
-    pub fn apply_chunk_uploads(&self, uploads: Vec<ChunkUpload>) {
-        let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
-        let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
-
-        for u in uploads {
-            if u.slot < self.buffers.chunk_capacity {
-                let meta_off = (u.slot as u64) * meta_stride;
-                self.queue
-                    .write_buffer(&self.buffers.chunk, meta_off, bytemuck::bytes_of(&u.meta));
-            }
-
-            if !u.nodes.is_empty() {
-                let needed = u.nodes.len() as u32;
-
-                if u.node_base <= self.buffers.node_capacity
-                    && u.node_base + needed <= self.buffers.node_capacity
-                {
-                    let node_off = (u.node_base as u64) * node_stride;
-                    self.queue.write_buffer(
-                        &self.buffers.node,
-                        node_off,
-                        bytemuck::cast_slice(u.nodes.as_ref()),
-                    );
-                }
-            }
-        }
-    }
-
     pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -345,4 +317,37 @@ impl Renderer {
         rpass.set_bind_group(0, &self.bind_groups.blit, &[]);
         rpass.draw(0..3, 0..1);
     }
+
+    pub fn apply_chunk_uploads(&self, uploads: Vec<ChunkUpload>) {
+        let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
+        let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
+        let u32_stride  = std::mem::size_of::<u32>() as u64;
+
+        for u in uploads {
+            // meta
+            if u.slot < self.buffers.chunk_capacity {
+                let meta_off = (u.slot as u64) * meta_stride;
+                self.queue.write_buffer(&self.buffers.chunk, meta_off, bytemuck::bytes_of(&u.meta));
+            }
+
+            // nodes
+            if !u.nodes.is_empty() {
+                let needed = u.nodes.len() as u32;
+                if u.node_base + needed <= self.buffers.node_capacity {
+                    let node_off = (u.node_base as u64) * node_stride;
+                    self.queue.write_buffer(&self.buffers.node, node_off, bytemuck::cast_slice(u.nodes.as_ref()));
+                }
+            }
+
+            // NEW: macro occupancy
+            if !u.macro_words.is_empty() {
+                let needed = u.macro_words.len() as u32;
+                if u.meta.macro_base + needed <= self.buffers.macro_capacity_u32 {
+                    let off = (u.meta.macro_base as u64) * u32_stride;
+                    self.queue.write_buffer(&self.buffers.macro_occ, off, bytemuck::cast_slice(u.macro_words.as_ref()));
+                }
+            }
+        }
+    }
+
 }

@@ -15,6 +15,9 @@ use super::mips::{build_max_mip_inplace, build_minmax_mip_inplace, MaxMipView, M
 
 const LEAF: u32 = 0xFFFF_FFFF;
 
+const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
+
+
 #[inline]
 fn is_empty_leaf(n: &NodeGpu) -> bool {
     n.child_base == LEAF && n.material == AIR
@@ -154,9 +157,9 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     chunk_size: u32,
     cancel: &AtomicBool,
     scratch: &mut BuildScratch,
-) -> Vec<NodeGpu> {
+) -> (Vec<NodeGpu>, Vec<u32>) {
     if should_cancel(cancel) {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let chunk_ox = chunk_origin[0];
@@ -188,7 +191,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     scratch.ensure_height_cache(cache_w, cache_h);
     for z in 0..cache_h {
         if (z & 15) == 0 && should_cancel(cancel) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let wz = cache_z0 + z as i32;
         let row = z * cache_w;
@@ -228,7 +231,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     for lz in 0..cs_i {
         if (lz & 15) == 0 && should_cancel(cancel) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         for lx in 0..cs_i {
             let wx = chunk_ox + lx;
@@ -260,7 +263,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     for zm in zm0..=zm1 {
         if ((zm - zm0) & 3) == 0 && should_cancel(cancel) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         for xm in xm0..=xm1 {
@@ -320,7 +323,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     for ly in 0..cs_i {
         if (ly & 7) == 0 && should_cancel(cancel) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         let wy = chunk_oy + ly;
@@ -358,7 +361,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     for z in 1..=side {
         if (z & 7) == 0 && should_cancel(cancel) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         for y in 1..=side {
             let mut run: u32 = 0;
@@ -376,6 +379,36 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
             }
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Macro occupancy bitset (8x8x8 => 512 bits => 16 u32 words)
+    // -------------------------------------------------------------------------
+    let macro_dim: usize = 8;
+    debug_assert_eq!(side % macro_dim, 0);
+
+    let cell: usize = side / macro_dim;
+
+    let mut macro_words = vec![0u32; MACRO_WORDS_PER_CHUNK_USIZE];
+
+    for mz in 0..macro_dim {
+        if should_cancel(cancel) { return (Vec::new(), Vec::new()); }
+        for my in 0..macro_dim {
+            for mx in 0..macro_dim {
+                let x0 = mx * cell;
+                let y0 = my * cell;
+                let z0 = mz * cell;
+
+                let sum = prefix_sum_cube(&scratch.prefix, side, x0, y0, z0, cell);
+                if sum > 0 {
+                    let bit = mx + macro_dim * (my + macro_dim * mz); // 0..511
+                    let w = bit >> 5;
+                    let b = bit & 31;
+                    macro_words[w] |= 1u32 << b;
+                }
+            }
+        }
+    }
+
 
     fn build_node(
         nodes: &mut Vec<NodeGpu>,
@@ -498,9 +531,9 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     );
 
     if should_cancel(cancel) {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     nodes[0] = root;
-    nodes
+    (nodes, macro_words)
 }

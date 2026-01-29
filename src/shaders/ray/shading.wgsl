@@ -52,7 +52,8 @@ fn voxel_ao_local(
   n: vec3<f32>,
   root_bmin: vec3<f32>,
   root_size: f32,
-  node_base: u32
+  node_base: u32,
+  macro_base: u32
 ) -> f32 {
   let r = 0.75 * cam.voxel_params.x;
 
@@ -62,24 +63,24 @@ fn voxel_ao_local(
 
   var occ = 0.0;
 
-  let q0 = query_leaf_at(hp + t * r, root_bmin, root_size, node_base);
+  let q0 = query_leaf_at(hp + t * r, root_bmin, root_size, node_base, macro_base);
   occ += select(0.0, 1.0, q0.mat != MAT_AIR);
 
-  let q1 = query_leaf_at(hp - t * r, root_bmin, root_size, node_base);
+  let q1 = query_leaf_at(hp - t * r, root_bmin, root_size, node_base, macro_base);
   occ += select(0.0, 1.0, q1.mat != MAT_AIR);
 
-  let q2 = query_leaf_at(hp + b * r, root_bmin, root_size, node_base);
+  let q2 = query_leaf_at(hp + b * r, root_bmin, root_size, node_base, macro_base);
   occ += select(0.0, 1.0, q2.mat != MAT_AIR);
 
-  let q3 = query_leaf_at(hp - b * r, root_bmin, root_size, node_base);
+  let q3 = query_leaf_at(hp - b * r, root_bmin, root_size, node_base, macro_base);
   occ += select(0.0, 1.0, q3.mat != MAT_AIR);
 
   let h0 = normalize(n + 0.65 * t + 0.35 * b);
-  let q4 = query_leaf_at(hp + h0 * r, root_bmin, root_size, node_base);
+  let q4 = query_leaf_at(hp + h0 * r, root_bmin, root_size, node_base, macro_base);
   occ += select(0.0, 1.0, q4.mat != MAT_AIR);
 
   let h1 = normalize(n - 0.65 * t + 0.35 * b);
-  let q5 = query_leaf_at(hp + h1 * r, root_bmin, root_size, node_base);
+  let q5 = query_leaf_at(hp + h1 * r, root_bmin, root_size, node_base, macro_base);
   occ += select(0.0, 1.0, q5.mat != MAT_AIR);
 
   let occ_n = occ * (1.0 / 6.0);
@@ -130,7 +131,7 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>) -> ve
   let vis  = sun_transmittance(hp_shadow, SUN_DIR);
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
-  let ao = select(1.0, voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base), hg.hit != 0u);
+  let ao = select(1.0, voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base), hg.hit != 0u);
 
   let amb_col      = hemi_ambient(hg.n, sky_up);
   let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);

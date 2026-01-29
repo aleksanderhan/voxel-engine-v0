@@ -28,7 +28,7 @@ fn trace_chunk_shadow_trans_interval(
     let p  = ro + tcur * rd;
     let pq = p + rd * (1e-4 * cam.voxel_params.x);
 
-    let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base);
+    let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base, ch.macro_base);
 
     // slab once (for stepping)
     let slab    = cube_slab_inv(ro, inv, q.bmin, q.size);

@@ -15,11 +15,13 @@ struct HitGeom {
   n        : vec3<f32>,
   _pad3    : f32,
 
-  root_bmin : vec3<f32>,
-  root_size : f32,
-  node_base : u32,
-  _pad4     : vec3<u32>,
+  root_bmin  : vec3<f32>,
+  root_size  : f32,
+  node_base  : u32,
+  macro_base : u32,
+  _pad4      : vec2<u32>,
 };
+
 
 fn miss_hitgeom() -> HitGeom {
   var h : HitGeom;
@@ -30,6 +32,7 @@ fn miss_hitgeom() -> HitGeom {
   h.root_bmin = vec3<f32>(0.0);
   h.root_size = 0.0;
   h.node_base = 0u;
+  h.macro_base = INVALID_U32;
   return h;
 }
 
@@ -58,7 +61,7 @@ fn trace_chunk_hybrid_interval(
     let p  = ro + tcur * rd;
     let pq = p + rd * (1e-4 * vs);
 
-    let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base);
+    let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base, ch.macro_base);
 
     // ---- NEW: compute slab ONCE for this leaf, reuse for stepping/probing
     let slab    = cube_slab_inv(ro, inv, q.bmin, q.size);
@@ -86,7 +89,7 @@ fn trace_chunk_hybrid_interval(
       let y_top = cell_bmin.y + vs;
       if (p.y >= y_top - 1e-4 * vs && p.y <= y_top + layer_h + 1e-4 * vs) {
         let c = cell_bmin + vec3<f32>(0.5 * vs, 0.5 * vs, 0.5 * vs);
-        if (is_grass(c, root_bmin, root_size, ch.node_base)) {
+        if (is_grass(c, root_bmin, root_size, ch.node_base, ch.macro_base)) {
           let cell_id_vox = vec3<f32>(
             f32(ch.origin.x + ix),
             f32(ch.origin.y + iy),
@@ -110,6 +113,7 @@ fn trace_chunk_hybrid_interval(
             out.root_bmin = root_bmin;
             out.root_size = root_size;
             out.node_base = ch.node_base;
+            out.macro_base = ch.macro_base;
             return out;
           }
         }
@@ -136,6 +140,7 @@ fn trace_chunk_hybrid_interval(
         out.root_bmin = root_bmin;
         out.root_size = root_size;
         out.node_base = ch.node_base;
+        out.macro_base = ch.macro_base;
         return out;
       }
 
@@ -174,6 +179,7 @@ fn trace_chunk_hybrid_interval(
           out.root_bmin = root_bmin;
           out.root_size = root_size;
           out.node_base = ch.node_base;
+          out.macro_base = ch.macro_base;
           return out;
         }
       }
@@ -186,6 +192,7 @@ fn trace_chunk_hybrid_interval(
       out.root_bmin = root_bmin;
       out.root_size = root_size;
       out.node_base = ch.node_base;
+      out.macro_base = ch.macro_base;
       return out;
     }
 

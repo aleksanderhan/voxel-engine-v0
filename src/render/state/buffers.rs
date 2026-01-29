@@ -24,6 +24,9 @@ pub struct Buffers {
     pub node_capacity: u32,
     pub chunk_capacity: u32,
     pub grid_capacity: u32,
+
+    pub macro_occ: wgpu::Buffer,
+    pub macro_capacity_u32: u32,
 }
 
 fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
@@ -75,6 +78,17 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         (grid_capacity as u64) * (std::mem::size_of::<u32>() as u64),
     );
 
+    // ---- macro occupancy: 8^3 bits = 512 bits = 16 u32 words per chunk ----
+    const MACRO_WORDS_PER_CHUNK: u32 = 16;
+
+    let macro_capacity_u32 = chunk_capacity * MACRO_WORDS_PER_CHUNK;
+
+    let macro_occ = make_storage_buffer(
+        device,
+        "macro_occ_buf",
+        (macro_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
+    );
+
     Buffers {
         camera,
         overlay,
@@ -85,5 +99,7 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         node_capacity,
         chunk_capacity,
         grid_capacity,
+        macro_occ,
+        macro_capacity_u32,
     }
 }

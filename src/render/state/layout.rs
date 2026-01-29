@@ -101,11 +101,12 @@ fn bgl_storage_tex_wo(
 pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     let cs_vis = wgpu::ShaderStages::COMPUTE;
 
-    let scene_entries: [wgpu::BindGroupLayoutEntry; 4] = [
+    let scene_entries: [wgpu::BindGroupLayoutEntry; 5] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
         bgl_storage_ro(3, cs_vis),
+        bgl_storage_ro(8, cs_vis),
     ];
 
     let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -123,6 +124,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     // 5 depth storage
     // 6 clipmap uniform
     // 7 clipmap height texture array (R32Float)
+    // 8 macro_occ
     let mut primary_entries = Vec::with_capacity(8);
     primary_entries.extend_from_slice(&scene_entries);
 

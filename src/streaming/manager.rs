@@ -41,6 +41,11 @@ const GRID_Y_COUNT: u32 = 4;
 // How many eviction attempts to make when we can't fit a chunk's nodes contiguously.
 const EVICT_ATTEMPTS: usize = 8;
 
+// 8^3 bits = 512 bits = 16 u32
+const MACRO_WORDS_PER_CHUNK: u32 = 16;
+const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
+
+
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 struct ChunkKey {
     x: i32,
@@ -54,11 +59,12 @@ enum ChunkState {
     Resident(Resident),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Resident {
     slot: u32,      // index into chunk_meta (dense)
     node_base: u32, // base index into global node arena
     node_count: u32,
+    macro_words: Arc<[u32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +78,7 @@ struct BuildDone {
     cancel: Arc<AtomicBool>,
     canceled: bool,
     nodes: Vec<NodeGpu>,
+    macro_words: Vec<u32>,
 }
 
 pub struct ChunkUpload {
@@ -80,6 +87,8 @@ pub struct ChunkUpload {
 
     pub node_base: u32,
     pub nodes: Arc<[NodeGpu]>,
+
+    pub macro_words: Arc<[u32]>,
 }
 
 // -----------------------------
@@ -91,6 +100,7 @@ struct CachedChunk {
     nodes: Arc<[NodeGpu]>,
     bytes: usize,
     stamp: u64,
+    macro_words: Arc<[u32]>,
 }
 
 fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender<BuildDone>) {
@@ -115,6 +125,7 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                             cancel: job.cancel,
                             canceled: true,
                             nodes: Vec::new(),
+                            macro_words: Vec::new(),
                         })
                         .is_err()
                     {
@@ -130,7 +141,7 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                     0,
                 ];
 
-                let nodes = build_chunk_svo_sparse_cancelable_with_scratch(
+                let (nodes, macro_words) = build_chunk_svo_sparse_cancelable_with_scratch(
                     &gen,
                     [origin[0], origin[1], origin[2]],
                     config::CHUNK_SIZE,
@@ -138,10 +149,11 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                     &mut scratch,
                 );
 
+
                 // If we got cancelled mid-build, still notify the main thread,
                 // but drop nodes to save main-thread work + upload pressure.
                 let canceled = job.cancel.load(Ordering::Relaxed);
-                let nodes = if canceled { Vec::new() } else { nodes };
+                let (nodes, macro_words) = if canceled { (Vec::new(), Vec::new()) } else { (nodes, macro_words) };
 
                 if tx_done
                     .send(BuildDone {
@@ -149,6 +161,7 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                         cancel: job.cancel,
                         canceled,
                         nodes,
+                        macro_words,
                     })
                     .is_err()
                 {
@@ -540,7 +553,7 @@ impl ChunkManager {
             }
 
             // Still relevant: cache + try resident.
-            self.on_build_done(center, done.key, done.nodes);
+            self.on_build_done(center, done.key, done.nodes, done.macro_words);
         }
 
         // If the keep-grid origin would shift, the lookup mapping changes.
@@ -611,8 +624,10 @@ impl ChunkManager {
         }
     }
 
-    fn cache_put(&mut self, key: ChunkKey, nodes: Arc<[NodeGpu]>) {
-        let bytes = nodes.len() * size_of::<NodeGpu>();
+    fn cache_put(&mut self, key: ChunkKey, nodes: Arc<[NodeGpu]>, macro_words: Arc<[u32]>) {
+        let bytes =
+            nodes.len() * size_of::<NodeGpu>() +
+            macro_words.len() * size_of::<u32>();
 
         // If replacing an existing entry, subtract its bytes first.
         if let Some(old) = self.cache.remove(&key) {
@@ -628,6 +643,7 @@ impl ChunkManager {
                 nodes,
                 bytes,
                 stamp,
+                macro_words,
             },
         );
 
@@ -669,6 +685,7 @@ impl ChunkManager {
         center: ChunkKey,
         key: ChunkKey,
         nodes: Arc<[NodeGpu]>,
+        macro_words: Arc<[u32]>,
     ) -> bool {
         // If already resident, nothing to do.
         if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
@@ -679,6 +696,11 @@ impl ChunkManager {
 
         if need == 0 {
             // Missing = remove from map.
+            self.chunks.remove(&key);
+            return false;
+        }
+        if macro_words.len() != MACRO_WORDS_PER_CHUNK_USIZE {
+            // bad build result; drop it
             self.chunks.remove(&key);
             return false;
         }
@@ -707,6 +729,8 @@ impl ChunkManager {
         let slot = self.slot_to_key.len() as u32;
         self.slot_to_key.push(key);
 
+        let macro_base = slot * MACRO_WORDS_PER_CHUNK;
+
         let origin_vox = [
             key.x * config::CHUNK_SIZE as i32,
             key.y * config::CHUNK_SIZE as i32,
@@ -717,7 +741,7 @@ impl ChunkManager {
             origin: [origin_vox[0], origin_vox[1], origin_vox[2], 0],
             node_base,
             node_count: need,
-            _pad0: 0,
+            macro_base,
             _pad1: 0,
         };
 
@@ -730,6 +754,7 @@ impl ChunkManager {
                 slot,
                 node_base,
                 node_count: need,
+                macro_words: macro_words.clone(),
             }),
         );
 
@@ -739,6 +764,7 @@ impl ChunkManager {
             meta,
             node_base,
             nodes,
+            macro_words,
         });
 
         // Resident set changed => grid mapping may change.
@@ -749,17 +775,16 @@ impl ChunkManager {
     }
 
     fn try_promote_from_cache(&mut self, center: ChunkKey, key: ChunkKey) -> bool {
-        // Avoid cloning the whole CachedChunk; just clone the Arc.
-        let nodes = match self.cache.get(&key) {
-            Some(e) => e.nodes.clone(),
+        let (nodes, macro_words) = match self.cache.get(&key) {
+            Some(e) => (e.nodes.clone(), e.macro_words.clone()),
             None => return false,
         };
 
         self.cache_touch(key);
-        self.try_make_resident(center, key, nodes)
+        self.try_make_resident(center, key, nodes, macro_words)
     }
 
-    fn on_build_done(&mut self, center: ChunkKey, key: ChunkKey, nodes: Vec<NodeGpu>) {
+    fn on_build_done(&mut self, center: ChunkKey, key: ChunkKey, nodes: Vec<NodeGpu>, macro_words: Vec<u32>) {
         // If this chunk got cancelled while the result was in flight, drop it.
         if let Some(c) = self.cancels.get(&key) {
             if c.load(Ordering::Relaxed) {
@@ -770,9 +795,10 @@ impl ChunkManager {
 
         // Convert to Arc slice once (cheap clones thereafter).
         let nodes_arc: Arc<[NodeGpu]> = nodes.into();
+        let macro_arc: Arc<[u32]> = macro_words.into();
 
         // Cache it (so we never rebuild this chunk again unless evicted).
-        self.cache_put(key, nodes_arc.clone());
+        self.cache_put(key, nodes_arc.clone(), macro_arc.clone());
 
         // If already resident (should be rare), don't allocate/upload again.
         if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
@@ -780,7 +806,7 @@ impl ChunkManager {
         }
 
         // Try to allocate + upload now; if we can't fit, keep it cached and mark missing.
-        let ok = self.try_make_resident(center, key, nodes_arc);
+        let ok = self.try_make_resident(center, key, nodes_arc, macro_arc);
         if !ok {
             self.chunks.remove(&key);
         }
@@ -804,7 +830,8 @@ impl ChunkManager {
                     self.slot_to_key[dead_slot] = moved_key;
 
                     // Move meta.
-                    let moved_meta = self.chunk_meta[last_slot];
+                    let mut moved_meta = self.chunk_meta[last_slot];
+                    moved_meta.macro_base = (dead_slot as u32) * MACRO_WORDS_PER_CHUNK;
                     self.chunk_meta[dead_slot] = moved_meta;
 
                     // Update moved chunk's Resident.slot.
@@ -814,12 +841,20 @@ impl ChunkManager {
                         }
                     }
 
+                    let moved_macro = self
+                        .cache
+                        .get(&moved_key)
+                        .map(|e| e.macro_words.clone())
+                        .unwrap_or_else(|| Arc::<[u32]>::from(vec![0u32; MACRO_WORDS_PER_CHUNK_USIZE]));
+
+
                     // Schedule meta rewrite for moved slot (GPU needs updated slot meta).
                     self.uploads.push(ChunkUpload {
                         slot: dead_slot as u32,
                         meta: self.chunk_meta[dead_slot],
                         node_base: 0,
                         nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
+                        macro_words: moved_macro,
                     });
                 }
 

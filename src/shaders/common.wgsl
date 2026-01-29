@@ -239,7 +239,7 @@ struct ChunkMeta {
   origin     : vec4<i32>,
   node_base  : u32,
   node_count : u32,
-  _pad0      : u32,
+  macro_base : u32,
   _pad1      : u32,
 };
 
@@ -251,10 +251,31 @@ struct ChunkMeta {
 @group(0) @binding(1) var<storage, read> chunks     : array<ChunkMeta>;
 @group(0) @binding(2) var<storage, read> nodes      : array<Node>;
 @group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
+@group(0) @binding(8) var<storage, read> macro_occ : array<u32>;
 
 //// --------------------------------------------------------------------------
 //// Shared helpers
 //// --------------------------------------------------------------------------
+
+const MACRO_DIM : u32 = 8u;          // 8x8x8 macro cells per chunk
+const MACRO_WORDS_PER_CHUNK : u32 = 16u; // 512 bits / 32
+
+fn macro_cell_size(root_size: f32) -> f32 {
+  return root_size / f32(MACRO_DIM);
+}
+
+// bit index = mx + 8*(my + 8*mz) in [0..511]
+fn macro_bit_index(mx: u32, my: u32, mz: u32) -> u32 {
+  return mx + MACRO_DIM * (my + MACRO_DIM * mz);
+}
+
+fn macro_test(macro_base: u32, bit: u32) -> bool {
+  let w = bit >> 5u;
+  let b = bit & 31u;
+  let word = macro_occ[macro_base + w];
+  return (word & (1u << b)) != 0u;
+}
+
 
 fn safe_inv(x: f32) -> f32 {
   return select(1.0 / x, BIG_F32, abs(x) < EPS_INV);
