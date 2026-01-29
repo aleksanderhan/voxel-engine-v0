@@ -241,6 +241,134 @@ fn descend_leaf_sparse(
 // REAL rope traversal: AIR leaf => rope jump => use key to get neighbor cube
 // => descend starting from that neighbor node (NOT from root).
 // --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
+// Macro 3D DDA (digital differential analyzer) for macro occupancy stepping
+// --------------------------------------------------------------------------
+
+struct MacroDDA {
+  valid  : bool,
+  cell   : f32,
+
+  mx     : i32,
+  my     : i32,
+  mz     : i32,
+
+  stepX  : i32,
+  stepY  : i32,
+  stepZ  : i32,
+
+  tMaxX  : f32,
+  tMaxY  : f32,
+  tMaxZ  : f32,
+
+  tDeltaX: f32,
+  tDeltaY: f32,
+  tDeltaZ: f32,
+};
+
+fn macro_dda_init(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  inv: vec3<f32>,
+  tcur: f32,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  macro_base: u32
+) -> MacroDDA {
+  var m: MacroDDA;
+  m.valid = (macro_base != INVALID_U32);
+  if (!m.valid) {
+    m.cell = 0.0;
+    return m;
+  }
+
+  m.cell = macro_cell_size(root_size);
+
+  let p  = ro + rd * tcur;
+  let lp = p - root_bmin;
+
+  // current macro cell indices
+  let mx0 = i32(floor(lp.x / m.cell));
+  let my0 = i32(floor(lp.y / m.cell));
+  let mz0 = i32(floor(lp.z / m.cell));
+
+  // clamp into [0 .. MACRO_DIM-1]
+  let md = i32(MACRO_DIM) - 1;
+  m.mx = clamp(mx0, 0, md);
+  m.my = clamp(my0, 0, md);
+  m.mz = clamp(mz0, 0, md);
+
+  m.stepX = select(-1, 1, rd.x > 0.0);
+  m.stepY = select(-1, 1, rd.y > 0.0);
+  m.stepZ = select(-1, 1, rd.z > 0.0);
+
+  // next boundary plane index in macro grid space
+  let nx = m.mx + select(0, 1, m.stepX > 0);
+  let ny = m.my + select(0, 1, m.stepY > 0);
+  let nz = m.mz + select(0, 1, m.stepZ > 0);
+
+  // boundary positions in world space
+  let bx = root_bmin.x + f32(nx) * m.cell;
+  let by = root_bmin.y + f32(ny) * m.cell;
+  let bz = root_bmin.z + f32(nz) * m.cell;
+
+  // tMax values in ray-t space
+  m.tMaxX = select(BIG_F32, tcur + (bx - p.x) * inv.x, abs(rd.x) >= EPS_INV);
+  m.tMaxY = select(BIG_F32, tcur + (by - p.y) * inv.y, abs(rd.y) >= EPS_INV);
+  m.tMaxZ = select(BIG_F32, tcur + (bz - p.z) * inv.z, abs(rd.z) >= EPS_INV);
+
+  // tDelta: distance (in t) to cross one macro cell along each axis
+  m.tDeltaX = select(BIG_F32, m.cell * abs(inv.x), abs(rd.x) >= EPS_INV);
+  m.tDeltaY = select(BIG_F32, m.cell * abs(inv.y), abs(rd.y) >= EPS_INV);
+  m.tDeltaZ = select(BIG_F32, m.cell * abs(inv.z), abs(rd.z) >= EPS_INV);
+
+  return m;
+}
+
+fn macro_dda_exit_t(m: MacroDDA, t_exit: f32) -> f32 {
+  return min(t_exit, min(m.tMaxX, min(m.tMaxY, m.tMaxZ)));
+}
+
+fn macro_dda_step(m: ptr<function, MacroDDA>) {
+  // step to next macro cell along smallest tMax axis
+  if ((*m).tMaxX < (*m).tMaxY) {
+    if ((*m).tMaxX < (*m).tMaxZ) {
+      (*m).mx += (*m).stepX;
+      (*m).tMaxX += (*m).tDeltaX;
+    } else {
+      (*m).mz += (*m).stepZ;
+      (*m).tMaxZ += (*m).tDeltaZ;
+    }
+  } else {
+    if ((*m).tMaxY < (*m).tMaxZ) {
+      (*m).my += (*m).stepY;
+      (*m).tMaxY += (*m).tDeltaY;
+    } else {
+      (*m).mz += (*m).stepZ;
+      (*m).tMaxZ += (*m).tDeltaZ;
+    }
+  }
+
+  // if we stepped outside the macro grid, mark invalid so we stop using it
+  let md = i32(MACRO_DIM) - 1;
+  if ((*m).mx < 0 || (*m).my < 0 || (*m).mz < 0 ||
+      (*m).mx > md || (*m).my > md || (*m).mz > md) {
+    (*m).valid = false;
+  }
+}
+
+fn macro_dda_is_empty(m: MacroDDA, macro_base: u32) -> bool {
+  // m.valid must be true to call this
+  let mxu = u32(m.mx);
+  let myu = u32(m.my);
+  let mzu = u32(m.mz);
+  let bit = macro_bit_index(mxu, myu, mzu);
+  return !macro_test(macro_base, bit);
+}
+
+// --------------------------------------------------------------------------
+// Rewritten traversal (macro DDA + leaf/rope traversal)
+// --------------------------------------------------------------------------
 fn trace_chunk_rope_interval(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -248,9 +376,6 @@ fn trace_chunk_rope_interval(
   t_enter: f32,
   t_exit: f32
 ) -> HitGeom {
-  var have_macro: bool = false;
-  var macro_cell: MacroCell;
-
   let vs = cam.voxel_params.x;
 
   let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
@@ -272,56 +397,38 @@ fn trace_chunk_rope_interval(
   var have_leaf: bool = false;
   var leaf: LeafState;
 
-  // Current macro interval end in ray-t (only meaningful if macro data exists)
-  var t_macro_exit: f32 = t_exit;
+  // Macro DDA setup (valid==false if no macro data)
+  var m = macro_dda_init(ro, rd, inv, tcur, root_bmin, root_size, ch.macro_base);
 
-  let have_macro_data = (ch.macro_base != INVALID_U32);
-
-  // Coarse phase: advance by empty macro cells. Fine phase: traverse leaves/ropes,
-  // but treat macro boundaries as "events" (NOT as leaf exits).
   let MAX_ITERS: u32 = 4096u;
 
   for (var it: u32 = 0u; it < MAX_ITERS; it = it + 1u) {
     if (tcur > t_exit) { break; }
 
-    // ----------------------------------------------------------------------
-    // COARSE: macro cell update + empty jump
-    // ----------------------------------------------------------------------
-    if (have_macro_data) {
-      let pM  = ro + tcur * rd;
-      let pqM = pM + rd * (1e-4 * vs);
+    // ------------------------------------------------------------
+    // COARSE: macro empty jump using macro 3D DDA
+    // ------------------------------------------------------------
+    var t_macro_exit: f32 = t_exit;
 
-      if (!have_macro || !point_in_cube(pqM, macro_cell.bmin, macro_cell.size)) {
-        macro_cell = macro_cell_query(pqM, root_bmin, root_size, ch.macro_base);
-        have_macro = true;
+    if (m.valid) {
+      t_macro_exit = macro_dda_exit_t(m, t_exit);
 
-        let slabm = cube_slab_inv(ro, inv, macro_cell.bmin, macro_cell.size);
-        t_macro_exit = min(slabm.t_exit, t_exit);
-
-        // NOTE: do NOT invalidate leaf here; a leaf cube can straddle macro boundaries.
-        // (Invalidating leaf here is what creates macro-grid seams.)
-      }
-
-      if (macro_cell.is_empty) {
-        // Jump across the whole empty macro cell
+      if (macro_dda_is_empty(m, ch.macro_base)) {
+        // Jump across empty macro cell
         tcur = max(t_macro_exit, tcur) + eps_step;
-
-        // After a big jump, leaf cache is generally not useful.
         have_leaf = false;
+
+        if (tcur > t_exit) { break; }
+
+        // Advance macro DDA to next macro cell
+        macro_dda_step(&m);
         continue;
       }
-    } else {
-      // No macro data => treat whole interval as non-empty span
-      t_macro_exit = t_exit;
     }
 
-    // ----------------------------------------------------------------------
-    // FINE: ensure leaf contains point, then step by either:
-    //  - leaf exit (normal traversal), OR
-    //  - macro boundary event (refresh macro), whichever comes first.
-    //  Crucially, if macro boundary happens first, we DO NOT do rope traversal
-    //  because we did NOT exit the leaf.
-    // ----------------------------------------------------------------------
+    // ------------------------------------------------------------
+    // FINE: leaf traversal (rope traversal only on true leaf exit)
+    // ------------------------------------------------------------
     let p  = ro + tcur * rd;
     let pq = p + rd * (1e-4 * vs);
 
@@ -333,19 +440,26 @@ fn trace_chunk_rope_interval(
     let slab    = cube_slab_inv(ro, inv, leaf.bmin, leaf.size);
     let t_leave = slab.t_exit;
 
-    // Next "event": either we leave the leaf, or (if macro data exists) we hit macro boundary.
-    let t_event = select(t_leave, min(t_leave, t_macro_exit), have_macro_data);
+    // Macro boundary event happens before leaf exit => advance to macro boundary
+    // IMPORTANT: do not treat as leaf exit; do not do ropes.
+    if (m.valid && (t_macro_exit < t_leave)) {
+      tcur = max(t_macro_exit, tcur) + eps_step;
 
-    // ----------------------------------------------------------------------
-    // AIR path: grass probe only within [tcur, t_event], then:
-    //  - if event==macro boundary => advance to macro boundary and loop (no ropes)
-    //  - else event==leaf exit => do rope traversal as before
-    // ----------------------------------------------------------------------
+      if (tcur > t_exit) { break; }
+
+      macro_dda_step(&m);
+      // leaf can straddle macro boundaries; keep cache
+      continue;
+    }
+
+    // ------------------------------------------------------------
+    // AIR leaf path
+    // ------------------------------------------------------------
     if (leaf.mat == MAT_AIR) {
-      // AIR-side grass probe (bounded to event)
+      // Grass probe bounded to [tcur, t_leave] (macro boundary already handled above)
       if (leaf.size <= grass_probe_max_leaf) {
         let t0_probe = max(t_enter, tcur - eps_step);
-        let t1_probe = min(t_event, t_exit);
+        let t1_probe = min(t_leave, t_exit);
 
         if (t1_probe >= t0_probe) {
           let gh = probe_grass_columns_xz_dda(
@@ -374,14 +488,7 @@ fn trace_chunk_rope_interval(
         }
       }
 
-      // If we hit macro boundary before leaving the leaf, just advance to boundary and refresh macro.
-      if (have_macro_data && (t_macro_exit < t_leave)) {
-        tcur = max(t_macro_exit, tcur) + eps_step;
-        // leaf may still contain pq after boundary; keep cache
-        continue;
-      }
-
-      // Otherwise, we truly leave the leaf => rope traversal.
+      // True leaf exit => rope traversal
       let face = exit_face_from_slab(rd, slab);
 
       tcur = max(t_leave, tcur) + eps_step;
@@ -427,24 +534,16 @@ fn trace_chunk_rope_interval(
         continue;
       }
 
-      // Fallback: force re-descend from root next iter
+      // Fallback: re-descend from root next iter
       have_leaf = false;
       continue;
     }
 
-    // ----------------------------------------------------------------------
-    // Non-air: we must test for hits over the true leaf interval.
-    // But if macro boundary happens first AND we did not exit the leaf, we
-    // should just advance to macro boundary and loop (no ropes, no treating it as exit).
-    // ----------------------------------------------------------------------
-    if (have_macro_data && (t_macro_exit < t_leave)) {
-      // Still inside same leaf, just crossing macro boundary
-      tcur = max(t_macro_exit, tcur) + eps_step;
-      // keep leaf cache (leaf can straddle macro boundary)
-      continue;
-    }
+    // ------------------------------------------------------------
+    // Non-air leaf path (macro boundary already handled above)
+    // ------------------------------------------------------------
 
-    // LEAF material: displaced cube hit (true leaf interval)
+    // Displaced leaf material
     if (leaf.mat == MAT_LEAF) {
       let h2 = leaf_displaced_cube_hit(
         ro, rd,
@@ -472,10 +571,10 @@ fn trace_chunk_rope_interval(
       continue;
     }
 
-    // SOLID: face hit (true leaf interval)
+    // Solid hit
     let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
     if (bh.hit) {
-      // Optional grass-on-solid-face probe when the solid voxel is grass
+      // Optional grass-on-solid-face probe when solid voxel is grass
       if (leaf.mat == MAT_GRASS) {
         let hp = ro + bh.t * rd;
 
@@ -529,8 +628,6 @@ fn trace_chunk_rope_interval(
 
   return miss_hitgeom();
 }
-
-
 
 // --------------------------------------------------------------------------
 // Scene voxel tracing over streamed chunk grid (for main_primary)
@@ -826,3 +923,5 @@ fn probe_grass_columns_xz_dda(
 
   return GrassHit(false, BIG_F32, vec3<f32>(0.0));
 }
+
+
