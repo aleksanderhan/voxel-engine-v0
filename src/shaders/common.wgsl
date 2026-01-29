@@ -247,11 +247,11 @@ struct Camera {
 };
 
 struct ChunkMeta {
-  origin     : vec4<i32>,
-  node_base  : u32,
-  node_count : u32,
-  macro_base : u32,
-  _pad1      : u32,
+  origin       : vec4<i32>,
+  node_base    : u32,
+  node_count   : u32,
+  macro_base   : u32,
+  colinfo_base : u32,
 };
 
 //// --------------------------------------------------------------------------
@@ -264,6 +264,8 @@ struct ChunkMeta {
 @group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
 @group(0) @binding(8) var<storage, read> macro_occ : array<u32>;
 @group(0) @binding(9) var<storage, read> node_ropes: array<NodeRopes>;
+@group(0) @binding(10) var<storage, read> chunk_colinfo : array<u32>;
+
 
 //// --------------------------------------------------------------------------
 //// Shared helpers
@@ -385,6 +387,31 @@ fn chunk_coord_from_pos(p: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
   );
 }
 
+fn chunk_max_depth() -> u32 {
+  // chunk_size is power-of-two; log2 = 31 - clz
+  return 31u - countLeadingZeros(cam.chunk_size);
+}
+
+// ---- Column info (64x64) ----
+// 4096 columns, packed 2x u16 per u32 => 2048 u32 words per chunk.
+const CHUNK_COL_WORDS_PER_CHUNK : u32 = 2048u;
+
+fn col_idx_64(ix: u32, iz: u32) -> u32 {
+  return iz * 64u + ix; // 0..4095
+}
+
+// returns (y8, mat8). y8==255 => empty column.
+fn colinfo_load(ch: ChunkMeta, ix: u32, iz: u32) -> vec2<u32> {
+  let idx  = col_idx_64(ix, iz);
+  let word = chunk_colinfo[ch.colinfo_base + (idx >> 1u)];
+  let half = select(word & 0xFFFFu, (word >> 16u) & 0xFFFFu, (idx & 1u) != 0u);
+
+  let y8   = half & 0xFFu;
+  let mat8 = (half >> 8u) & 0xFFu;
+  return vec2<u32>(y8, mat8);
+}
+
+
 //// --------------------------------------------------------------------------
 //// Hash / noise helpers (shared)
 //// --------------------------------------------------------------------------
@@ -458,9 +485,4 @@ fn fbm(p: vec2<f32>) -> f32 {
     amp *= 0.5;
   }
   return sum;
-}
-
-fn chunk_max_depth() -> u32 {
-  // chunk_size is power-of-two; log2 = 31 - clz
-  return 31u - countLeadingZeros(cam.chunk_size);
 }

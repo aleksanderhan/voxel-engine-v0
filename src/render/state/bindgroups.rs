@@ -65,6 +65,10 @@ fn make_primary_bg(
                 binding: 9,
                 resource: buffers.node_ropes.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: buffers.colinfo.as_entire_binding(),
+            },
 
         ],
     })
@@ -102,6 +106,10 @@ fn make_scene_bg(
             wgpu::BindGroupEntry {
                 binding: 9,
                 resource: buffers.node_ropes.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: buffers.colinfo.as_entire_binding(),
             },
 
         ],

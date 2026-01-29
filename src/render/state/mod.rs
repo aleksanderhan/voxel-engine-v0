@@ -266,6 +266,20 @@ impl Renderer {
                     self.queue.write_buffer(&self.buffers.node_ropes, rope_off, bytemuck::cast_slice(u.ropes.as_ref()));
                 }
             }
+
+            // colinfo (64*64 columns packed => 2048 u32 per chunk)
+            if !u.colinfo_words.is_empty() {
+                let needed = u.colinfo_words.len() as u32;
+                if u.meta.colinfo_base + needed <= self.buffers.colinfo_capacity_u32 {
+                    let off = (u.meta.colinfo_base as u64) * u32_stride;
+                    self.queue.write_buffer(
+                        &self.buffers.colinfo,
+                        off,
+                        bytemuck::cast_slice(u.colinfo_words.as_ref()),
+                    );
+                }
+            }
+
         }
     }
 

@@ -31,6 +31,9 @@ pub struct Buffers {
     pub node_ropes: wgpu::Buffer,
     pub rope_capacity: u32, // in nodes
 
+    pub colinfo: wgpu::Buffer,
+    pub colinfo_capacity_u32: u32,
+
 }
 
 fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
@@ -84,9 +87,7 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
 
     // ---- macro occupancy: 8^3 bits = 512 bits = 16 u32 words per chunk ----
     const MACRO_WORDS_PER_CHUNK: u32 = 16;
-
     let macro_capacity_u32 = chunk_capacity * MACRO_WORDS_PER_CHUNK;
-
     let macro_occ = make_storage_buffer(
         device,
         "macro_occ_buf",
@@ -100,6 +101,14 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         (rope_capacity as u64) * (std::mem::size_of::<NodeRopesGpu>() as u64),
     );
 
+    // ---- column info: 64*64 columns packed => 2048 u32 per chunk ----
+    const COLINFO_WORDS_PER_CHUNK: u32 = 2048;
+    let colinfo_capacity_u32 = chunk_capacity * COLINFO_WORDS_PER_CHUNK;
+    let colinfo = make_storage_buffer(
+        device,
+        "chunk_colinfo_buf",
+        (colinfo_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
+    );
 
     Buffers {
         camera,
@@ -115,5 +124,7 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         macro_capacity_u32,
         node_ropes,
         rope_capacity,
+        colinfo,
+        colinfo_capacity_u32,
     }
 }

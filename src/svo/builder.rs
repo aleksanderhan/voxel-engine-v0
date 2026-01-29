@@ -305,9 +305,9 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     chunk_size: u32,
     cancel: &AtomicBool,
     scratch: &mut BuildScratch,
-) -> (Vec<NodeGpu>, Vec<u32>, Vec<NodeRopesGpu>) {
+) -> (Vec<NodeGpu>, Vec<u32>, Vec<NodeRopesGpu>, Vec<u32>) {
     if should_cancel(cancel) {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
 
     let chunk_ox = chunk_origin[0];
@@ -339,7 +339,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     scratch.ensure_height_cache(cache_w, cache_h);
     for z in 0..cache_h {
         if (z & 15) == 0 && should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
         let wz = cache_z0 + z as i32;
         let row = z * cache_w;
@@ -378,7 +378,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     for lz in 0..cs_i {
         if (lz & 15) == 0 && should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
         for lx in 0..cs_i {
             let wx = chunk_ox + lx;
@@ -410,7 +410,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     for zm in zm0..=zm1 {
         if ((zm - zm0) & 3) == 0 && should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
 
         for xm in xm0..=xm1 {
@@ -470,7 +470,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     for ly in 0..cs_i {
         if (ly & 7) == 0 && should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
 
         let wy = chunk_oy + ly;
@@ -497,6 +497,45 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     }
 
     // -------------------------------------------------------------------------
+    // Column top map (64x64): per (x,z), store top-most non-air voxel (y, mat)
+    // packed u16: (mat8<<8) | y8, y8=255 means empty column
+    // 2 entries per u32 => 2048 u32 words
+    // -------------------------------------------------------------------------
+    let side_u = cs_u as usize;
+    debug_assert_eq!(side_u, 64, "colinfo packing assumes chunk_size=64");
+
+    let mut colinfo_words = vec![0u32; 2048];
+
+    for lz in 0..64usize {
+        for lx in 0..64usize {
+            let mut y8: u32 = 255;
+            let mut mat8: u32 = 0;
+
+            // scan from top down
+            for ly in (0..64usize).rev() {
+                let m = scratch.material[idx3(64, lx, ly, lz)];
+                if m != AIR {
+                    y8 = ly as u32;
+                    mat8 = m & 0xFF;
+                    break;
+                }
+            }
+
+            let entry16: u32 = (y8 & 0xFF) | ((mat8 & 0xFF) << 8);
+
+            let idx = (lz * 64 + lx) as u32;      // 0..4095
+            let w = (idx >> 1) as usize;          // 0..2047
+            let hi = (idx & 1) != 0;
+
+            if !hi {
+                colinfo_words[w] = (colinfo_words[w] & 0xFFFF_0000) | entry16;
+            } else {
+                colinfo_words[w] = (colinfo_words[w] & 0x0000_FFFF) | (entry16 << 16);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Prefix sum over solid occupancy
     // -------------------------------------------------------------------------
     BuildScratch::ensure_prefix(&mut scratch.prefix, side);
@@ -504,7 +543,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     for z in 1..=side {
         if (z & 7) == 0 && should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
         for y in 1..=side {
             let mut run: u32 = 0;
@@ -535,7 +574,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     for mz in 0..macro_dim {
         if should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
         for my in 0..macro_dim {
             for mx in 0..macro_dim {
@@ -686,7 +725,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     );
 
     if should_cancel(cancel) {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
 
     nodes[0] = root;
@@ -694,5 +733,5 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     // Build ropes AFTER nodes are finalized.
     let ropes = build_ropes(&nodes);
 
-    (nodes, macro_words, ropes)
+    (nodes, macro_words, ropes, colinfo_words)
 }

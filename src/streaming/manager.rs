@@ -35,6 +35,11 @@ const EVICT_ATTEMPTS: usize = 8;
 const MACRO_WORDS_PER_CHUNK: u32 = 16;
 const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
 
+// 64x64 columns, packed 2x u16 per u32 => 2048 u32 per chunk
+const COLINFO_WORDS_PER_CHUNK: u32 = 2048;
+const COLINFO_WORDS_PER_CHUNK_USIZE: usize = 2048;
+
+
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 struct ChunkKey {
     x: i32,
@@ -68,6 +73,7 @@ struct BuildDone {
     nodes: Vec<NodeGpu>,
     macro_words: Vec<u32>,
     ropes: Vec<NodeRopesGpu>,
+    colinfo_words: Vec<u32>,
 }
 
 pub struct ChunkUpload {
@@ -80,6 +86,8 @@ pub struct ChunkUpload {
     pub macro_words: Arc<[u32]>,
 
     pub ropes: Arc<[NodeRopesGpu]>,
+
+    pub colinfo_words: Arc<[u32]>,
 }
 
 // -----------------------------
@@ -91,6 +99,7 @@ struct CachedChunk {
     nodes: Arc<[NodeGpu]>,
     ropes: Arc<[NodeRopesGpu]>,
     macro_words: Arc<[u32]>,
+    colinfo_words: Arc<[u32]>,
     bytes: usize,
     stamp: u64,
 }
@@ -115,6 +124,7 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                         nodes: Vec::new(),
                         macro_words: Vec::new(),
                         ropes: Vec::new(),
+                        colinfo_words: Vec::new()
                     });
                     continue;
                 }
@@ -126,7 +136,7 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                     0,
                 ];
 
-                let (nodes, macro_words, ropes) = build_chunk_svo_sparse_cancelable_with_scratch(
+                let (nodes, macro_words, ropes, colinfo_words) = build_chunk_svo_sparse_cancelable_with_scratch(
                     &gen,
                     [origin[0], origin[1], origin[2]],
                     config::CHUNK_SIZE,
@@ -148,6 +158,7 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                     nodes,
                     macro_words,
                     ropes,
+                    colinfo_words
                 });
             }
         });
@@ -443,7 +454,7 @@ impl ChunkManager {
                 continue;
             }
 
-            self.on_build_done(center, done.key, done.nodes, done.macro_words, done.ropes);
+            self.on_build_done(center, done.key, done.nodes, done.macro_words, done.ropes, done.colinfo_words);
         }
 
         if self.keep_origin_for(center) != self.grid_origin_chunk {
@@ -513,12 +524,8 @@ impl ChunkManager {
         nodes: Arc<[NodeGpu]>,
         macro_words: Arc<[u32]>,
         ropes: Arc<[NodeRopesGpu]>,
+        colinfo_words: Arc<[u32]>,
     ) {
-        let bytes =
-            nodes.len() * size_of::<NodeGpu>()
-            + ropes.len() * size_of::<NodeRopesGpu>()
-            + macro_words.len() * size_of::<u32>();
-
         if let Some(old) = self.cache.remove(&key) {
             self.cache_bytes = self.cache_bytes.saturating_sub(old.bytes);
         }
@@ -526,12 +533,19 @@ impl ChunkManager {
         self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
         let stamp = self.cache_stamp;
 
+        let bytes =
+            nodes.len() * size_of::<NodeGpu>()
+            + ropes.len() * size_of::<NodeRopesGpu>()
+            + macro_words.len() * size_of::<u32>()
+            + colinfo_words.len() * size_of::<u32>();
+
         self.cache.insert(
             key,
             CachedChunk {
                 nodes,
                 ropes,
                 macro_words,
+                colinfo_words,
                 bytes,
                 stamp,
             },
@@ -576,13 +590,13 @@ impl ChunkManager {
         nodes: Arc<[NodeGpu]>,
         macro_words: Arc<[u32]>,
         ropes: Arc<[NodeRopesGpu]>,
+        colinfo_words: Arc<[u32]>,
     ) -> bool {
         if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
             return true;
         }
-
+        
         let need = nodes.len() as u32;
-
         if need == 0 {
             self.chunks.remove(&key);
             return false;
@@ -592,6 +606,10 @@ impl ChunkManager {
             return false;
         }
         if ropes.len() != nodes.len() {
+            self.chunks.remove(&key);
+            return false;
+        }
+        if colinfo_words.len() != COLINFO_WORDS_PER_CHUNK_USIZE {
             self.chunks.remove(&key);
             return false;
         }
@@ -625,12 +643,14 @@ impl ChunkManager {
             key.z * config::CHUNK_SIZE as i32,
         ];
 
+        let colinfo_base = slot * COLINFO_WORDS_PER_CHUNK;
+
         let meta = ChunkMetaGpu {
             origin: [origin_vox[0], origin_vox[1], origin_vox[2], 0],
             node_base,
             node_count: need,
             macro_base,
-            _pad1: 0,
+            colinfo_base,
         };
 
         self.chunk_meta.push(meta);
@@ -651,6 +671,7 @@ impl ChunkManager {
             nodes,
             macro_words,
             ropes,
+            colinfo_words,
         });
 
         self.grid_dirty = true;
@@ -664,9 +685,13 @@ impl ChunkManager {
             Some(e) => (e.nodes.clone(), e.macro_words.clone(), e.ropes.clone()),
             None => return false,
         };
+        let (nodes, macro_words, ropes, colinfo_words) = match self.cache.get(&key) {
+            Some(e) => (e.nodes.clone(), e.macro_words.clone(), e.ropes.clone(), e.colinfo_words.clone()),
+            None => return false,
+        };
 
         self.cache_touch(key);
-        self.try_make_resident(center, key, nodes, macro_words, ropes)
+        self.try_make_resident(center, key, nodes, macro_words, ropes, colinfo_words)
     }
 
     fn on_build_done(
@@ -676,6 +701,7 @@ impl ChunkManager {
         nodes: Vec<NodeGpu>,
         macro_words: Vec<u32>,
         ropes: Vec<NodeRopesGpu>,
+        colinfo_words: Vec<u32>
     ) {
         if let Some(c) = self.cancels.get(&key) {
             if c.load(Ordering::Relaxed) {
@@ -687,14 +713,15 @@ impl ChunkManager {
         let nodes_arc: Arc<[NodeGpu]> = nodes.into();
         let macro_arc: Arc<[u32]> = macro_words.into();
         let ropes_arc: Arc<[NodeRopesGpu]> = ropes.into();
+        let colinfo_arc: Arc<[u32]> = colinfo_words.into();
 
-        self.cache_put(key, nodes_arc.clone(), macro_arc.clone(), ropes_arc.clone());
+        self.cache_put(key, nodes_arc.clone(), macro_arc.clone(), ropes_arc.clone(), colinfo_arc.clone());
 
         if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
             return;
         }
 
-        let ok = self.try_make_resident(center, key, nodes_arc, macro_arc, ropes_arc);
+        let ok = self.try_make_resident(center, key, nodes_arc, macro_arc, ropes_arc, colinfo_arc);
         if !ok {
             self.chunks.remove(&key);
         }
@@ -716,6 +743,7 @@ impl ChunkManager {
 
                     let mut moved_meta = self.chunk_meta[last_slot];
                     moved_meta.macro_base = (dead_slot as u32) * MACRO_WORDS_PER_CHUNK;
+                    moved_meta.colinfo_base = (dead_slot as u32) * COLINFO_WORDS_PER_CHUNK;
                     self.chunk_meta[dead_slot] = moved_meta;
 
                     if let Some(st) = self.chunks.get_mut(&moved_key) {
@@ -730,6 +758,12 @@ impl ChunkManager {
                         .map(|e| e.macro_words.clone())
                         .unwrap_or_else(|| Arc::<[u32]>::from(vec![0u32; MACRO_WORDS_PER_CHUNK_USIZE]));
 
+                    let moved_colinfo = self
+                        .cache
+                        .get(&moved_key)
+                        .map(|e| e.colinfo_words.clone())
+                        .unwrap_or_else(|| Arc::<[u32]>::from(vec![0u32; COLINFO_WORDS_PER_CHUNK_USIZE]));
+
                     // Meta rewrite for moved slot (nodes/ropes unchanged on GPU; only macro_base changes)
                     self.uploads.push(ChunkUpload {
                         slot: dead_slot as u32,
@@ -738,6 +772,7 @@ impl ChunkManager {
                         nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
                         macro_words: moved_macro,
                         ropes: Arc::<[NodeRopesGpu]>::from(Vec::<NodeRopesGpu>::new()),
+                        colinfo_words: moved_colinfo,
                     });
                 }
 

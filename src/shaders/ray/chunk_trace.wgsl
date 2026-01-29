@@ -219,7 +219,6 @@ fn descend_leaf_sparse(
 // REAL rope traversal: AIR leaf => rope jump => use key to get neighbor cube
 // => descend starting from that neighbor node (NOT from root).
 // --------------------------------------------------------------------------
-
 fn trace_chunk_rope_interval(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -230,14 +229,20 @@ fn trace_chunk_rope_interval(
   let vs = cam.voxel_params.x;
 
   let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
-  let root_bmin = root_bmin_vox * vs;
-  let root_size = f32(cam.chunk_size) * vs;
+  let root_bmin     = root_bmin_vox * vs;
+  let root_size     = f32(cam.chunk_size) * vs;
 
   let eps_step = 1e-4 * vs;
-  var tcur = max(t_enter, 0.0) + eps_step;
+  var tcur     = max(t_enter, 0.0) + eps_step;
 
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
-  let chunk_size_i = i32(cam.chunk_size);
+
+  // Only probe grass when we are in small-enough air leaves
+  let grass_probe_max_leaf = 2.0 * vs;
+
+  let origin_vox_i = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
+  let time_s       = cam.voxel_params.y;
+  let strength     = cam.voxel_params.z;
 
   var have_leaf: bool = false;
   var leaf: LeafState;
@@ -248,7 +253,9 @@ fn trace_chunk_rope_interval(
     let p  = ro + tcur * rd;
     let pq = p + rd * (1e-4 * vs);
 
+    // ----------------------------------------------------------------------
     // Macro empty => big AIR slab step
+    // ----------------------------------------------------------------------
     let m = macro_leaf_or_invalid(pq, root_bmin, root_size, ch.macro_base);
     if (m.size > 0.0) {
       let slabm = cube_slab_inv(ro, inv, m.bmin, m.size);
@@ -257,7 +264,9 @@ fn trace_chunk_rope_interval(
       continue;
     }
 
+    // ----------------------------------------------------------------------
     // Ensure leaf contains pq
+    // ----------------------------------------------------------------------
     if (!have_leaf || !point_in_cube(pq, leaf.bmin, leaf.size)) {
       leaf = descend_leaf_sparse(pq, ch.node_base, 0u, root_bmin, root_size);
       have_leaf = true;
@@ -266,13 +275,78 @@ fn trace_chunk_rope_interval(
     let slab    = cube_slab_inv(ro, inv, leaf.bmin, leaf.size);
     let t_leave = slab.t_exit;
 
-    // AIR: rope traversal if we have a backing node
+    // ----------------------------------------------------------------------
+    // AIR: optional air-side grass + rope traversal
+    // ----------------------------------------------------------------------
     if (leaf.mat == MAT_AIR) {
+      // ------------------------------------------------------------
+      // AIR-side grass (column map) — step across the AIR segment in xz
+      // ------------------------------------------------------------
+      if (leaf.size <= grass_probe_max_leaf) {
+        let t0_probe = max(t_enter, tcur - eps_step);
+        let t1_probe = min(t_leave, t_exit);
+
+        if (t1_probe >= t0_probe) {
+          // Decide how many samples based on projected travel in XZ
+          let p0 = ro + rd * t0_probe;
+          let p1 = ro + rd * t1_probe;
+
+          let dxz = vec2<f32>(p1.x - p0.x, p1.z - p0.z);
+          let dist_xz = length(dxz);
+
+          // about 1 sample per voxel in xz (clamped)
+          let n = clamp(u32(ceil(dist_xz / max(vs, 1e-6))), 1u, 16u);
+
+          for (var si: u32 = 0u; si < n; si = si + 1u) {
+            let a  = (f32(si) + 0.5) / f32(n);
+            let ts = mix(t0_probe, t1_probe, a);
+            let ps = ro + rd * ts;
+
+            let lp = ps - root_bmin;
+            let lx_u = clamp(u32(floor(lp.x / vs)), 0u, 63u);
+            let lz_u = clamp(u32(floor(lp.z / vs)), 0u, 63u);
+
+            let e16 = colinfo_entry_u16(ch.colinfo_base, lx_u, lz_u);
+            let ci  = colinfo_decode(e16);
+
+            if (ci.valid && ci.mat == MAT_GRASS) {
+              let wx: i32 = origin_vox_i.x + i32(lx_u);
+              let wy: i32 = origin_vox_i.y + i32(ci.y_vox);
+              let wz: i32 = origin_vox_i.z + i32(lz_u);
+
+              let bmin_m = vec3<f32>(f32(wx), f32(wy), f32(wz)) * vs;
+              let id_vox = vec3<f32>(f32(wx), f32(wy), f32(wz));
+
+              let gh = try_grass_slab_hit(
+                ro, rd,
+                t0_probe, t1_probe,
+                bmin_m, id_vox,
+                vs, time_s, strength
+              );
+
+              if (gh.hit) {
+                var outg = miss_hitgeom();
+                outg.hit = 1u;
+                outg.t   = gh.t;
+                outg.mat = MAT_GRASS;
+                outg.n   = gh.n;
+                outg.root_bmin  = root_bmin;
+                outg.root_size  = root_size;
+                outg.node_base  = ch.node_base;
+                outg.macro_base = ch.macro_base;
+                return outg;
+              }
+            }
+          }
+        }
+      }
+
+
+      // ---- Rope traversal for AIR
       let face = exit_face_from_slab(rd, slab);
       tcur = max(t_leave, tcur) + eps_step;
 
       if (!leaf.has_node) {
-        // missing-child AIR has no ropes; force re-descend next time
         have_leaf = false;
         continue;
       }
@@ -283,7 +357,6 @@ fn trace_chunk_rope_interval(
         continue;
       }
 
-      // Neighbor node cube from key, then descend starting from that node cube.
       let nk = node_at(ch.node_base, nidx).key;
       let c  = node_cube_from_key(root_bmin, root_size, nk);
 
@@ -292,21 +365,26 @@ fn trace_chunk_rope_interval(
       continue;
     }
 
+    // ----------------------------------------------------------------------
     // Leaves: displaced cube hit
+    // ----------------------------------------------------------------------
     if (leaf.mat == MAT_LEAF) {
-      let time_s   = cam.voxel_params.y;
-      let strength = cam.voxel_params.z;
+      let h2 = leaf_displaced_cube_hit(
+        ro, rd,
+        leaf.bmin, leaf.size,
+        time_s, strength,
+        t_enter, t_exit
+      );
 
-      let h2 = leaf_displaced_cube_hit(ro, rd, leaf.bmin, leaf.size, time_s, strength, t_enter, t_exit);
       if (h2.hit) {
         var out = miss_hitgeom();
         out.hit = 1u;
         out.t   = h2.t;
         out.mat = MAT_LEAF;
         out.n   = h2.n;
-        out.root_bmin = root_bmin;
-        out.root_size = root_size;
-        out.node_base = ch.node_base;
+        out.root_bmin  = root_bmin;
+        out.root_size  = root_size;
+        out.node_base  = ch.node_base;
         out.macro_base = ch.macro_base;
         return out;
       }
@@ -316,25 +394,31 @@ fn trace_chunk_rope_interval(
       continue;
     }
 
-    // Solid: face hit
+    // ----------------------------------------------------------------------
+    // Solid: face hit (+ optional grass-on-solid-face probe)
+    // ----------------------------------------------------------------------
     let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
     if (bh.hit) {
+      // Optional grass-on-solid-face probe when the solid voxel is grass
       if (leaf.mat == MAT_GRASS) {
-        let time_s   = cam.voxel_params.y;
-        let strength = cam.voxel_params.z;
-
         let hp = ro + bh.t * rd;
 
         let cell = pick_grass_cell_in_chunk(
           hp, rd,
           root_bmin,
-          vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z),
+          origin_vox_i,
           vs,
-          chunk_size_i
+          i32(cam.chunk_size)
         );
 
         let tmax_probe = min(bh.t, t_exit);
-        let gh = try_grass_slab_hit(ro, rd, t_enter, tmax_probe, cell.bmin_m, cell.id_vox, vs, time_s, strength);
+
+        let gh = try_grass_slab_hit(
+          ro, rd,
+          t_enter, tmax_probe,
+          cell.bmin_m, cell.id_vox,
+          vs, time_s, strength
+        );
 
         if (gh.hit) {
           var outg = miss_hitgeom();
@@ -342,9 +426,9 @@ fn trace_chunk_rope_interval(
           outg.t   = gh.t;
           outg.mat = MAT_GRASS;
           outg.n   = gh.n;
-          outg.root_bmin = root_bmin;
-          outg.root_size = root_size;
-          outg.node_base = ch.node_base;
+          outg.root_bmin  = root_bmin;
+          outg.root_size  = root_size;
+          outg.node_base  = ch.node_base;
           outg.macro_base = ch.macro_base;
           return outg;
         }
@@ -355,14 +439,16 @@ fn trace_chunk_rope_interval(
       out.t   = bh.t;
       out.mat = leaf.mat;
       out.n   = bh.n;
-      out.root_bmin = root_bmin;
-      out.root_size = root_size;
-      out.node_base = ch.node_base;
+      out.root_bmin  = root_bmin;
+      out.root_size  = root_size;
+      out.node_base  = ch.node_base;
       out.macro_base = ch.macro_base;
       return out;
     }
 
+    // ----------------------------------------------------------------------
     // Miss solid: step out
+    // ----------------------------------------------------------------------
     tcur = max(t_leave, tcur) + eps_step;
     have_leaf = false;
   }
@@ -506,4 +592,37 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
   }
 
   return VoxTraceResult(true, best, t_exit);
+}
+
+// --------------------------------------------------------------------------
+// Column-top map (64x64)
+// - Each (x,z) has a packed u16 entry: (mat8<<8) | y8
+// - y8=255 means empty column (all air)
+// - Two entries per u32 word => 2048 u32 words per chunk
+// --------------------------------------------------------------------------
+
+fn colinfo_entry_u16(colinfo_base: u32, lx: u32, lz: u32) -> u32 {
+  // idx in [0..4095]
+  let idx = lz * 64u + lx;
+  let w = idx >> 1u;          // 0..2047
+  let word = chunk_colinfo[colinfo_base + w];
+  if ((idx & 1u) == 0u) {
+    return word & 0xFFFFu;
+  }
+  return (word >> 16u) & 0xFFFFu;
+}
+
+struct ColInfo {
+  valid : bool,
+  y_vox : u32,   // 0..63
+  mat   : u32,   // 0..255 (we only care if == MAT_GRASS)
+};
+
+fn colinfo_decode(e16: u32) -> ColInfo {
+  let y8   = e16 & 0xFFu;
+  let mat8 = (e16 >> 8u) & 0xFFu;
+  if (y8 == 255u) {
+    return ColInfo(false, 0u, 0u);
+  }
+  return ColInfo(true, y8, mat8);
 }
