@@ -2,7 +2,6 @@
 //// --------------------------------------------------------------------------
 //// Sun transmittance (geometry-only + full with clouds)
 //// --------------------------------------------------------------------------
-
 fn trace_chunk_shadow_trans_interval(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -26,24 +25,38 @@ fn trace_chunk_shadow_trans_interval(
     if (tcur > t_exit) { break; }
     if (trans < MIN_TRANS) { break; }
 
-    let p = ro + tcur * rd;
+    let p  = ro + tcur * rd;
     let pq = p + rd * (1e-4 * cam.voxel_params.x);
 
     let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base);
 
-    // ---- NEW: compute slab once, reuse t_exit for stepping
+    // slab once (for stepping)
     let slab    = cube_slab_inv(ro, inv, q.bmin, q.size);
     let t_leave = slab.t_exit;
-    // -----------------------------------------------------
 
     if (q.mat != MAT_AIR) {
       if (q.mat == MAT_LEAF) {
         if (VOLUME_DISPLACED_LEAVES) {
-          let time_s   = cam.voxel_params.y;
-          let strength = cam.voxel_params.z;
+          // --- NEW: distance gate for displaced-leaf shadow test ---
+          // If far, skip expensive displaced intersection and just apply transmit.
+          let center = q.bmin + vec3<f32>(0.5 * q.size);
+          let d = length(center - cam.cam_pos.xyz);
 
-          let h2 = leaf_displaced_cube_hit(ro, rd, q.bmin, q.size, time_s, strength, tcur - nudge_s, t_exit);
-          if (h2.hit) { trans *= LEAF_LIGHT_TRANSMIT; }
+          if (d < LEAF_LOD_DISP_END) {
+            let time_s   = cam.voxel_params.y;
+            let strength = cam.voxel_params.z;
+
+            let h2 = leaf_displaced_cube_hit(
+              ro, rd,
+              q.bmin, q.size,
+              time_s, strength,
+              tcur - nudge_s, t_exit
+            );
+            if (h2.hit) { trans *= LEAF_LIGHT_TRANSMIT; }
+          } else {
+            trans *= LEAF_LIGHT_TRANSMIT;
+          }
+          // --------------------------------------------------------
 
           tcur = max(t_leave, tcur) + nudge_s;
           continue;
@@ -68,6 +81,7 @@ fn trace_chunk_shadow_trans_interval(
 
   return trans;
 }
+
 
 fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let voxel_size   = cam.voxel_params.x;

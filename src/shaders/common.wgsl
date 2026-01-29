@@ -155,6 +155,9 @@ const LEAF_VERTICAL_REDUCE : f32 = 0.15;
 const LEAF_OFFSET_AMP       : f32 = 0.75;
 const LEAF_OFFSET_MAX_FRAC  : f32 = 0.75;
 
+const LEAF_LOD_DISP_START : f32 = 25.0;
+const LEAF_LOD_DISP_END   : f32 = 70.0;
+
 const WIND_PHASE_OFF_1 : vec3<f32> = vec3<f32>(19.0, 7.0, 11.0);
 const TAU             : f32        = 6.28318530718;
 
