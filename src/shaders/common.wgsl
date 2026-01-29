@@ -176,7 +176,7 @@ const J3_SCALE : f32 = 4.19;
 
 const COMPOSITE_SHARPEN : f32 = 0.15;
 
-const POST_EXPOSURE : f32 = 0.10;
+const POST_EXPOSURE : f32 = 0.15;
 
 //// --------------------------------------------------------------------------
 //// Grass “hair” (procedural blades)

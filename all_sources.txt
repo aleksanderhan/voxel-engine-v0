@@ -1,0 +1,3203 @@
+// src/streaming/manager.rs
+// ------------------------
+// src/streaming/manager.rs
+// ------------------------
+// Chunk streaming + background SVO building + CPU cache.
+
+use std::collections::VecDeque;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+
+use std::mem::size_of;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use glam::{Vec2, Vec3};
+
+use crate::{
+    config,
+    render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu},
+    svo::{build_chunk_svo_sparse_cancelable_with_scratch, BuildScratch},
+    world::WorldGen,
+};
+
+use super::NodeArena;
+
+const INVALID_U32: u32 = 0xFFFF_FFFF;
+
+// Vertical band dy in [-1..=2]
+const GRID_Y_MIN_DY: i32 = -1;
+const GRID_Y_COUNT: u32 = 4;
+
+const EVICT_ATTEMPTS: usize = 8;
+
+// 8^3 bits = 512 bits = 16 u32
+const MACRO_WORDS_PER_CHUNK: u32 = 16;
+const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
+
+// 64x64 columns, packed 2x u16 per u32 => 2048 u32 per chunk
+const COLINFO_WORDS_PER_CHUNK: u32 = 2048;
+const COLINFO_WORDS_PER_CHUNK_USIZE: usize = 2048;
+
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+struct ChunkKey {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+enum ChunkState {
+    Queued,
+    Building,
+    Resident(Resident),
+}
+
+#[derive(Clone, Debug)]
+struct Resident {
+    slot: u32,
+    node_base: u32,
+    node_count: u32,
+}
+
+#[derive(Clone, Debug)]
+struct BuildJob {
+    key: ChunkKey,
+    cancel: Arc<AtomicBool>,
+}
+
+struct BuildDone {
+    key: ChunkKey,
+    cancel: Arc<AtomicBool>,
+    canceled: bool,
+    nodes: Vec<NodeGpu>,
+    macro_words: Vec<u32>,
+    ropes: Vec<NodeRopesGpu>,
+    colinfo_words: Vec<u32>,
+}
+
+pub struct ChunkUpload {
+    pub slot: u32,
+    pub meta: ChunkMetaGpu,
+
+    pub node_base: u32,
+    pub nodes: Arc<[NodeGpu]>,
+
+    pub macro_words: Arc<[u32]>,
+
+    pub ropes: Arc<[NodeRopesGpu]>,
+
+    pub colinfo_words: Arc<[u32]>,
+}
+
+// -----------------------------
+// CPU cache (budgeted, LRU-ish)
+// -----------------------------
+
+#[derive(Clone)]
+struct CachedChunk {
+    nodes: Arc<[NodeGpu]>,
+    ropes: Arc<[NodeRopesGpu]>,
+    macro_words: Arc<[u32]>,
+    colinfo_words: Arc<[u32]>,
+    bytes: usize,
+    stamp: u64,
+}
+
+fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender<BuildDone>) {
+    for _ in 0..config::WORKER_THREADS {
+        let gen = gen.clone();
+        let rx_job = rx_job.clone();
+        let tx_done = tx_done.clone();
+
+        std::thread::spawn(move || {
+            let mut scratch = BuildScratch::new();
+
+            while let Ok(job) = rx_job.recv() {
+                let k = job.key;
+
+                if job.cancel.load(Ordering::Relaxed) {
+                    let _ = tx_done.send(BuildDone {
+                        key: k,
+                        cancel: job.cancel,
+                        canceled: true,
+                        nodes: Vec::new(),
+                        macro_words: Vec::new(),
+                        ropes: Vec::new(),
+                        colinfo_words: Vec::new()
+                    });
+                    continue;
+                }
+
+                let origin = [
+                    k.x * config::CHUNK_SIZE as i32,
+                    k.y * config::CHUNK_SIZE as i32,
+                    k.z * config::CHUNK_SIZE as i32,
+                    0,
+                ];
+
+                let (nodes, macro_words, ropes, colinfo_words) = build_chunk_svo_sparse_cancelable_with_scratch(
+                    &gen,
+                    [origin[0], origin[1], origin[2]],
+                    config::CHUNK_SIZE,
+                    job.cancel.as_ref(),
+                    &mut scratch,
+                );
+
+                let canceled = job.cancel.load(Ordering::Relaxed);
+                let (nodes, macro_words, ropes) = if canceled {
+                    (Vec::new(), Vec::new(), Vec::new())
+                } else {
+                    (nodes, macro_words, ropes)
+                };
+
+                let _ = tx_done.send(BuildDone {
+                    key: k,
+                    cancel: job.cancel,
+                    canceled,
+                    nodes,
+                    macro_words,
+                    ropes,
+                    colinfo_words
+                });
+            }
+        });
+    }
+}
+
+fn sort_queue_near_first(queue: &mut VecDeque<ChunkKey>, center: ChunkKey, cam_fwd: Vec3) {
+    let mut v: Vec<ChunkKey> = queue.drain(..).collect();
+
+    let mut f = Vec2::new(cam_fwd.x, cam_fwd.z);
+    if f.length_squared() > 1e-6 {
+        f = f.normalize();
+    } else {
+        f = Vec2::ZERO;
+    }
+
+    v.sort_by(|a, b| {
+        let sa = chunk_priority_score(*a, center, f);
+        let sb = chunk_priority_score(*b, center, f);
+        sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    queue.extend(v);
+}
+
+fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
+    let dx = (k.x - c.x) as f32;
+    let dz = (k.z - c.z) as f32;
+    let dy = (k.y - c.y) as f32;
+
+    let base = dx.abs() + dz.abs() + 2.0 * dy.abs();
+    let dir = dx * fwd_xz.x + dz * fwd_xz.y;
+
+    let front_bonus = 0.75;
+    let behind_penalty = 0.25;
+
+    let bias = if dir >= 0.0 {
+        -front_bonus * dir
+    } else {
+        -behind_penalty * dir
+    };
+
+    base + bias
+}
+
+pub struct ChunkManager {
+    chunks: HashMap<ChunkKey, ChunkState>,
+    build_queue: VecDeque<ChunkKey>,
+    queued_set: HashSet<ChunkKey>,
+    last_center: Option<ChunkKey>,
+
+    cancels: HashMap<ChunkKey, Arc<AtomicBool>>,
+
+    tx_job: Sender<BuildJob>,
+    rx_done: Receiver<BuildDone>,
+    in_flight: usize,
+
+    slot_to_key: Vec<ChunkKey>,
+    chunk_meta: Vec<ChunkMetaGpu>,
+    uploads: Vec<ChunkUpload>,
+
+    changed: bool,
+    grid_dirty: bool,
+
+    arena: NodeArena,
+
+    grid_origin_chunk: [i32; 3],
+    grid_dims: [u32; 3],
+    chunk_grid: Vec<u32>,
+
+    cache: HashMap<ChunkKey, CachedChunk>,
+    cache_lru: VecDeque<(ChunkKey, u64)>,
+    cache_stamp: u64,
+    cache_bytes: usize,
+
+    active_offsets: Vec<(i32, i32, i32)>,
+    to_unload: Vec<ChunkKey>,
+}
+
+impl ChunkManager {
+    pub fn new(gen: Arc<WorldGen>) -> Self {
+        let (tx_job, rx_job) = unbounded::<BuildJob>();
+        let (tx_done, rx_done) = unbounded::<BuildDone>();
+        spawn_workers(gen.clone(), rx_job, tx_done);
+
+        let node_capacity = (config::NODE_BUDGET_BYTES / size_of::<NodeGpu>()) as u32;
+
+        let nx = (2 * config::KEEP_RADIUS + 1) as u32;
+        let nz = nx;
+        let ny = GRID_Y_COUNT;
+        let grid_len = (nx * ny * nz) as usize;
+
+        let active_offsets = Self::build_offsets(config::ACTIVE_RADIUS);
+
+        Self {
+            chunks: HashMap::default(),
+            build_queue: VecDeque::new(),
+            queued_set: HashSet::default(),
+            last_center: None,
+
+            cancels: HashMap::default(),
+            tx_job,
+            rx_done,
+            in_flight: 0,
+
+            slot_to_key: Vec::new(),
+            chunk_meta: Vec::new(),
+            uploads: Vec::new(),
+
+            changed: false,
+            grid_dirty: true,
+
+            arena: NodeArena::new(node_capacity),
+
+            grid_origin_chunk: [0, 0, 0],
+            grid_dims: [nx, ny, nz],
+            chunk_grid: vec![INVALID_U32; grid_len],
+
+            cache: HashMap::default(),
+            cache_lru: VecDeque::default(),
+            cache_stamp: 1,
+            cache_bytes: 0,
+
+            active_offsets,
+            to_unload: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn build_offsets(radius: i32) -> Vec<(i32, i32, i32)> {
+        let mut v = Vec::new();
+        v.reserve(
+            (GRID_Y_COUNT as usize)
+                * ((2 * radius + 1) as usize)
+                * ((2 * radius + 1) as usize),
+        );
+
+        for dy in GRID_Y_MIN_DY..=(GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1) {
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    v.push((dx, dy, dz));
+                }
+            }
+        }
+        v
+    }
+
+    #[inline(always)]
+    fn y_band_min() -> i32 {
+        GRID_Y_MIN_DY
+    }
+
+    #[inline(always)]
+    fn y_band_max() -> i32 {
+        GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1
+    }
+
+    #[inline(always)]
+    fn in_keep(center: ChunkKey, k: ChunkKey) -> bool {
+        let dx = k.x - center.x;
+        let dz = k.z - center.z;
+        let dy = k.y - center.y;
+
+        dx >= -config::KEEP_RADIUS
+            && dx <= config::KEEP_RADIUS
+            && dz >= -config::KEEP_RADIUS
+            && dz <= config::KEEP_RADIUS
+            && dy >= Self::y_band_min()
+            && dy <= Self::y_band_max()
+    }
+
+    pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
+        self.uploads.clear();
+
+        let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
+        let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
+
+        let ccx = cam_vx.div_euclid(config::CHUNK_SIZE as i32);
+        let ccz = cam_vz.div_euclid(config::CHUNK_SIZE as i32);
+
+        let ground_y_vox = world.ground_height(cam_vx, cam_vz);
+        let ground_cy = ground_y_vox.div_euclid(config::CHUNK_SIZE as i32);
+
+        let center = ChunkKey { x: ccx, y: ground_cy, z: ccz };
+
+        // ACTIVE
+        let n_active = self.active_offsets.len();
+        for i in 0..n_active {
+            let (dx, dy, dz) = self.active_offsets[i];
+            let k = ChunkKey {
+                x: center.x + dx,
+                y: center.y + dy,
+                z: center.z + dz,
+            };
+
+            match self.chunks.get(&k) {
+                Some(ChunkState::Resident(_)) | Some(ChunkState::Queued) | Some(ChunkState::Building) => {}
+                None => {
+                    if self.cache.get(&k).is_some() {
+                        let _ = self.try_promote_from_cache(center, k);
+                        continue;
+                    }
+
+                    let c = self.cancel_token(k);
+                    c.store(false, Ordering::Relaxed);
+
+                    self.chunks.insert(k, ChunkState::Queued);
+
+                    if self.queued_set.insert(k) {
+                        self.build_queue.push_back(k);
+                    }
+                }
+            }
+        }
+
+        // Unload outside KEEP
+        self.to_unload.clear();
+        for &k in self.chunks.keys() {
+            if !Self::in_keep(center, k) {
+                self.to_unload.push(k);
+            }
+        }
+
+        let mut unload_list = std::mem::take(&mut self.to_unload);
+        for k in unload_list.drain(..) {
+            self.unload_chunk(k);
+        }
+        self.to_unload = unload_list;
+
+        let center_changed = self.last_center.map_or(true, |c| c != center);
+        if center_changed {
+            self.last_center = Some(center);
+
+            self.build_queue.retain(|k| {
+                Self::in_keep(center, *k) && matches!(self.chunks.get(k), Some(ChunkState::Queued))
+            });
+
+            self.queued_set.clear();
+            self.queued_set.extend(self.build_queue.iter().copied());
+
+            sort_queue_near_first(&mut self.build_queue, center, cam_fwd);
+        }
+
+        // Dispatch builds
+        while self.in_flight < config::MAX_IN_FLIGHT {
+            let Some(k) = self.build_queue.pop_front() else { break; };
+            self.queued_set.remove(&k);
+
+            if !Self::in_keep(center, k) {
+                self.cancel_token(k).store(true, Ordering::Relaxed);
+                self.chunks.remove(&k);
+                continue;
+            }
+
+            if self.cache.get(&k).is_some() {
+                self.chunks.remove(&k);
+                let _ = self.try_promote_from_cache(center, k);
+                continue;
+            }
+
+            if matches!(self.chunks.get(&k), Some(ChunkState::Queued)) {
+                self.chunks.insert(k, ChunkState::Building);
+
+                let cancel = self.cancel_token(k);
+                cancel.store(false, Ordering::Relaxed);
+
+                if self.tx_job.send(BuildJob { key: k, cancel: cancel.clone() }).is_ok() {
+                    self.in_flight += 1;
+                } else {
+                    self.chunks.insert(k, ChunkState::Queued);
+                    if self.queued_set.insert(k) {
+                        self.build_queue.push_back(k);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Harvest done builds
+        while let Ok(done) = self.rx_done.try_recv() {
+            if self.in_flight > 0 {
+                self.in_flight -= 1;
+            }
+
+            if done.canceled || done.cancel.load(Ordering::Relaxed) {
+                self.chunks.remove(&done.key);
+                continue;
+            }
+
+            if !Self::in_keep(center, done.key) {
+                self.cancel_token(done.key).store(true, Ordering::Relaxed);
+                self.chunks.remove(&done.key);
+                continue;
+            }
+
+            self.on_build_done(center, done.key, done.nodes, done.macro_words, done.ropes, done.colinfo_words);
+        }
+
+        if self.keep_origin_for(center) != self.grid_origin_chunk {
+            self.grid_dirty = true;
+        }
+
+        let grid_changed = self.grid_dirty;
+        if self.grid_dirty {
+            self.rebuild_grid(center);
+            self.grid_dirty = false;
+        }
+
+        grid_changed
+    }
+
+    fn cancel_token(&mut self, key: ChunkKey) -> Arc<AtomicBool> {
+        self.cancels
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    fn evict_one_farthest(&mut self, center: ChunkKey, protect: ChunkKey) -> bool {
+        if self.slot_to_key.is_empty() {
+            return false;
+        }
+
+        let mut best: Option<(f32, ChunkKey)> = None;
+        for &k in &self.slot_to_key {
+            if k == protect {
+                continue;
+            }
+            let dx = (k.x - center.x) as f32;
+            let dz = (k.z - center.z) as f32;
+            let dy = (k.y - center.y) as f32;
+
+            let d = dx * dx + dz * dz + 4.0 * dy * dy;
+
+            if best.map_or(true, |(bd, _)| d > bd) {
+                best = Some((d, k));
+            }
+        }
+
+        if let Some((_, k)) = best {
+            self.unload_chunk(k);
+            return true;
+        }
+
+        false
+    }
+
+    // ----------------
+    // Cache helpers
+    // ----------------
+
+    fn cache_touch(&mut self, key: ChunkKey) {
+        if let Some(e) = self.cache.get_mut(&key) {
+            self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
+            e.stamp = self.cache_stamp;
+            self.cache_lru.push_back((key, e.stamp));
+        }
+    }
+
+    fn cache_put(
+        &mut self,
+        key: ChunkKey,
+        nodes: Arc<[NodeGpu]>,
+        macro_words: Arc<[u32]>,
+        ropes: Arc<[NodeRopesGpu]>,
+        colinfo_words: Arc<[u32]>,
+    ) {
+        if let Some(old) = self.cache.remove(&key) {
+            self.cache_bytes = self.cache_bytes.saturating_sub(old.bytes);
+        }
+
+        self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
+        let stamp = self.cache_stamp;
+
+        let bytes =
+            nodes.len() * size_of::<NodeGpu>()
+            + ropes.len() * size_of::<NodeRopesGpu>()
+            + macro_words.len() * size_of::<u32>()
+            + colinfo_words.len() * size_of::<u32>();
+
+        self.cache.insert(
+            key,
+            CachedChunk {
+                nodes,
+                ropes,
+                macro_words,
+                colinfo_words,
+                bytes,
+                stamp,
+            },
+        );
+
+        self.cache_bytes = self.cache_bytes.saturating_add(bytes);
+        self.cache_lru.push_back((key, stamp));
+
+        self.evict_cache_as_needed();
+    }
+
+    fn evict_cache_as_needed(&mut self) {
+        let budget = config::CHUNK_CACHE_BUDGET_BYTES;
+
+        while self.cache_bytes > budget {
+            let Some((k, stamp)) = self.cache_lru.pop_front() else { break; };
+
+            let should_evict = self
+                .cache
+                .get(&k)
+                .map(|e| e.stamp == stamp)
+                .unwrap_or(false);
+
+            if !should_evict {
+                continue;
+            }
+
+            if let Some(ev) = self.cache.remove(&k) {
+                self.cache_bytes = self.cache_bytes.saturating_sub(ev.bytes);
+            }
+        }
+    }
+
+    // -------------------------------
+    // Resident creation / promotion
+    // -------------------------------
+
+    fn try_make_resident(
+        &mut self,
+        center: ChunkKey,
+        key: ChunkKey,
+        nodes: Arc<[NodeGpu]>,
+        macro_words: Arc<[u32]>,
+        ropes: Arc<[NodeRopesGpu]>,
+        colinfo_words: Arc<[u32]>,
+    ) -> bool {
+        if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
+            return true;
+        }
+        
+        let need = nodes.len() as u32;
+        if need == 0 {
+            self.chunks.remove(&key);
+            return false;
+        }
+        if macro_words.len() != MACRO_WORDS_PER_CHUNK_USIZE {
+            self.chunks.remove(&key);
+            return false;
+        }
+        if ropes.len() != nodes.len() {
+            self.chunks.remove(&key);
+            return false;
+        }
+        if colinfo_words.len() != COLINFO_WORDS_PER_CHUNK_USIZE {
+            self.chunks.remove(&key);
+            return false;
+        }
+
+        let mut node_base = self.arena.alloc(need);
+        if node_base.is_none() {
+            for _ in 0..EVICT_ATTEMPTS {
+                if !self.evict_one_farthest(center, key) {
+                    break;
+                }
+                node_base = self.arena.alloc(need);
+                if node_base.is_some() {
+                    break;
+                }
+            }
+        }
+
+        let Some(node_base) = node_base else {
+            self.chunks.remove(&key);
+            return false;
+        };
+
+        let slot = self.slot_to_key.len() as u32;
+        self.slot_to_key.push(key);
+
+        let macro_base = slot * MACRO_WORDS_PER_CHUNK;
+
+        let origin_vox = [
+            key.x * config::CHUNK_SIZE as i32,
+            key.y * config::CHUNK_SIZE as i32,
+            key.z * config::CHUNK_SIZE as i32,
+        ];
+
+        let colinfo_base = slot * COLINFO_WORDS_PER_CHUNK;
+
+        let meta = ChunkMetaGpu {
+            origin: [origin_vox[0], origin_vox[1], origin_vox[2], 0],
+            node_base,
+            node_count: need,
+            macro_base,
+            colinfo_base,
+        };
+
+        self.chunk_meta.push(meta);
+
+        self.chunks.insert(
+            key,
+            ChunkState::Resident(Resident {
+                slot,
+                node_base,
+                node_count: need,
+            }),
+        );
+
+        self.uploads.push(ChunkUpload {
+            slot,
+            meta,
+            node_base,
+            nodes,
+            macro_words,
+            ropes,
+            colinfo_words,
+        });
+
+        self.grid_dirty = true;
+        self.changed = true;
+
+        true
+    }
+
+    fn try_promote_from_cache(&mut self, center: ChunkKey, key: ChunkKey) -> bool {
+        let (nodes, macro_words, ropes) = match self.cache.get(&key) {
+            Some(e) => (e.nodes.clone(), e.macro_words.clone(), e.ropes.clone()),
+            None => return false,
+        };
+        let (nodes, macro_words, ropes, colinfo_words) = match self.cache.get(&key) {
+            Some(e) => (e.nodes.clone(), e.macro_words.clone(), e.ropes.clone(), e.colinfo_words.clone()),
+            None => return false,
+        };
+
+        self.cache_touch(key);
+        self.try_make_resident(center, key, nodes, macro_words, ropes, colinfo_words)
+    }
+
+    fn on_build_done(
+        &mut self,
+        center: ChunkKey,
+        key: ChunkKey,
+        nodes: Vec<NodeGpu>,
+        macro_words: Vec<u32>,
+        ropes: Vec<NodeRopesGpu>,
+        colinfo_words: Vec<u32>
+    ) {
+        if let Some(c) = self.cancels.get(&key) {
+            if c.load(Ordering::Relaxed) {
+                self.chunks.remove(&key);
+                return;
+            }
+        }
+
+        let nodes_arc: Arc<[NodeGpu]> = nodes.into();
+        let macro_arc: Arc<[u32]> = macro_words.into();
+        let ropes_arc: Arc<[NodeRopesGpu]> = ropes.into();
+        let colinfo_arc: Arc<[u32]> = colinfo_words.into();
+
+        self.cache_put(key, nodes_arc.clone(), macro_arc.clone(), ropes_arc.clone(), colinfo_arc.clone());
+
+        if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
+            return;
+        }
+
+        let ok = self.try_make_resident(center, key, nodes_arc, macro_arc, ropes_arc, colinfo_arc);
+        if !ok {
+            self.chunks.remove(&key);
+        }
+    }
+
+    fn unload_chunk(&mut self, key: ChunkKey) {
+        let Some(state) = self.chunks.remove(&key) else { return; };
+
+        match state {
+            ChunkState::Resident(res) => {
+                self.arena.free(res.node_base, res.node_count);
+
+                let dead_slot = res.slot as usize;
+                let last_slot = self.slot_to_key.len().saturating_sub(1);
+
+                if dead_slot != last_slot {
+                    let moved_key = self.slot_to_key[last_slot];
+                    self.slot_to_key[dead_slot] = moved_key;
+
+                    let mut moved_meta = self.chunk_meta[last_slot];
+                    moved_meta.macro_base = (dead_slot as u32) * MACRO_WORDS_PER_CHUNK;
+                    moved_meta.colinfo_base = (dead_slot as u32) * COLINFO_WORDS_PER_CHUNK;
+                    self.chunk_meta[dead_slot] = moved_meta;
+
+                    if let Some(st) = self.chunks.get_mut(&moved_key) {
+                        if let ChunkState::Resident(mr) = st {
+                            mr.slot = dead_slot as u32;
+                        }
+                    }
+
+                    let moved_macro = self
+                        .cache
+                        .get(&moved_key)
+                        .map(|e| e.macro_words.clone())
+                        .unwrap_or_else(|| Arc::<[u32]>::from(vec![0u32; MACRO_WORDS_PER_CHUNK_USIZE]));
+
+                    let moved_colinfo = self
+                        .cache
+                        .get(&moved_key)
+                        .map(|e| e.colinfo_words.clone())
+                        .unwrap_or_else(|| Arc::<[u32]>::from(vec![0u32; COLINFO_WORDS_PER_CHUNK_USIZE]));
+
+                    // Meta rewrite for moved slot (nodes/ropes unchanged on GPU; only macro_base changes)
+                    self.uploads.push(ChunkUpload {
+                        slot: dead_slot as u32,
+                        meta: self.chunk_meta[dead_slot],
+                        node_base: 0,
+                        nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
+                        macro_words: moved_macro,
+                        ropes: Arc::<[NodeRopesGpu]>::from(Vec::<NodeRopesGpu>::new()),
+                        colinfo_words: moved_colinfo,
+                    });
+                }
+
+                self.slot_to_key.pop();
+                self.chunk_meta.pop();
+
+                self.grid_dirty = true;
+                self.changed = true;
+            }
+
+            ChunkState::Queued | ChunkState::Building => {
+                self.cancel_token(key).store(true, Ordering::Relaxed);
+                self.queued_set.remove(&key);
+
+                self.grid_dirty = true;
+                self.changed = true;
+            }
+        }
+    }
+
+    #[inline]
+    fn keep_origin_for(&self, center: ChunkKey) -> [i32; 3] {
+        let ox = center.x - config::KEEP_RADIUS;
+        let oz = center.z - config::KEEP_RADIUS;
+        let oy = center.y + GRID_Y_MIN_DY;
+        [ox, oy, oz]
+    }
+
+    fn rebuild_grid(&mut self, center: ChunkKey) {
+        let nx = (2 * config::KEEP_RADIUS + 1) as u32;
+        let nz = nx;
+        let ny = GRID_Y_COUNT;
+
+        self.grid_dims = [nx, ny, nz];
+        self.grid_origin_chunk = self.keep_origin_for(center);
+
+        let needed = (nx * ny * nz) as usize;
+        if self.chunk_grid.len() != needed {
+            self.chunk_grid.resize(needed, INVALID_U32);
+        }
+        self.chunk_grid.fill(INVALID_U32);
+
+        for (slot, &k) in self.slot_to_key.iter().enumerate() {
+            if let Some(idx) = self.grid_index_for_chunk(k) {
+                self.chunk_grid[idx] = slot as u32;
+            }
+        }
+    }
+
+    #[inline]
+    fn grid_index_for_chunk(&self, k: ChunkKey) -> Option<usize> {
+        let [ox, oy, oz] = self.grid_origin_chunk;
+        let [nx, ny, nz] = self.grid_dims;
+
+        let ix = k.x - ox;
+        let iy = k.y - oy;
+        let iz = k.z - oz;
+
+        if ix < 0 || iy < 0 || iz < 0 {
+            return None;
+        }
+
+        let ix = ix as u32;
+        let iy = iy as u32;
+        let iz = iz as u32;
+
+        if ix >= nx || iy >= ny || iz >= nz {
+            return None;
+        }
+
+        let idx = (iz * ny * nx) + (iy * nx) + ix;
+        Some(idx as usize)
+    }
+
+    // -------------------------------------------------------------------------
+    // Public API
+    // -------------------------------------------------------------------------
+
+    pub fn chunk_count(&self) -> u32 {
+        self.slot_to_key.len() as u32
+    }
+
+    pub fn grid_origin(&self) -> [i32; 3] {
+        self.grid_origin_chunk
+    }
+
+    pub fn grid_dims(&self) -> [u32; 3] {
+        self.grid_dims
+    }
+
+    pub fn chunk_grid(&self) -> &[u32] {
+        &self.chunk_grid
+    }
+
+    pub fn take_uploads(&mut self) -> Vec<ChunkUpload> {
+        std::mem::take(&mut self.uploads)
+    }
+}
+
+// src/streaming/mod.rs
+// --------------------
+// src/streaming/mod.rs
+// --------------------
+// Chunk streaming + node arena + uploads.
+
+pub mod manager;
+pub mod node_arena;
+
+pub use manager::{ChunkManager, ChunkUpload};
+pub use node_arena::NodeArena;
+
+// src/streaming/node_arena.rs
+// ---------------------------
+// src/streaming/node_arena.rs
+//
+// Very simple free-list arena for node ranges (in units of NodeGpu elements).
+// Improvements:
+// - free() now fully coalesces adjacent ranges (fixes long-run fragmentation).
+// - alloc() uses best-fit (smallest range that fits) to reduce fragmentation further.
+
+#[derive(Clone, Copy, Debug)]
+struct Range {
+    start: u32,
+    len: u32,
+}
+
+pub struct NodeArena {
+    free: Vec<Range>, // kept sorted by start
+}
+
+impl NodeArena {
+    pub fn new(capacity: u32) -> Self {
+        Self {
+            free: vec![Range {
+                start: 0,
+                len: capacity,
+            }],
+        }
+    }
+
+    /// Allocate a contiguous range of `len` elements.
+    /// Returns the start index in the arena, or None if no free range fits.
+    pub fn alloc(&mut self, len: u32) -> Option<u32> {
+        if len == 0 {
+            return Some(0);
+        }
+
+        // Best-fit: choose the smallest free range that still fits.
+        let mut best_i: Option<usize> = None;
+        let mut best_len: u32 = u32::MAX;
+
+        for (i, r) in self.free.iter().enumerate() {
+            if r.len >= len && r.len < best_len {
+                best_len = r.len;
+                best_i = Some(i);
+                if r.len == len {
+                    break; // perfect fit
+                }
+            }
+        }
+
+        let i = best_i?;
+        let r = self.free[i];
+        let start = r.start;
+
+        if r.len == len {
+            self.free.remove(i);
+        } else {
+            self.free[i] = Range {
+                start: r.start + len,
+                len: r.len - len,
+            };
+        }
+
+        Some(start)
+    }
+
+    /// Free a previously allocated range.
+    pub fn free(&mut self, start: u32, len: u32) {
+        if len == 0 {
+            return;
+        }
+
+        // Insert sorted by start (log n search).
+        let idx = self
+            .free
+            .binary_search_by_key(&start, |r| r.start)
+            .unwrap_or_else(|i| i);
+
+        self.free.insert(idx, Range { start, len });
+
+        // Fully coalesce with neighbors (both directions).
+        self.coalesce_at(idx);
+    }
+
+    fn coalesce_at(&mut self, mut i: usize) {
+        // Merge backward as long as possible.
+        while i > 0 {
+            let a = self.free[i - 1];
+            let b = self.free[i];
+            if a.start + a.len == b.start {
+                self.free[i - 1] = Range {
+                    start: a.start,
+                    len: a.len + b.len,
+                };
+                self.free.remove(i);
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // Merge forward as long as possible.
+        while i + 1 < self.free.len() {
+            let a = self.free[i];
+            let b = self.free[i + 1];
+            if a.start + a.len == b.start {
+                self.free[i] = Range {
+                    start: a.start,
+                    len: a.len + b.len,
+                };
+                self.free.remove(i + 1);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+// src/svo/builder.rs
+// ------------------
+// src/svo/builder.rs
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::{
+    config,
+    render::gpu_types::{NodeGpu, NodeRopesGpu},
+    world::{
+        materials::{AIR, DIRT, GRASS, STONE, WOOD},
+        WorldGen,
+    },
+};
+
+use super::mips::{build_max_mip_inplace, build_minmax_mip_inplace, MaxMipView, MinMaxMipView};
+
+const LEAF: u32 = 0xFFFF_FFFF;
+const INVALID_U32: u32 = 0xFFFF_FFFF;
+
+// 8^3 bits = 512 bits = 16 u32
+const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
+
+#[inline]
+fn should_cancel(cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Relaxed)
+}
+
+/// Pack (x,y,z,level) into NodeGpu.key.
+/// - chunk_size = 64 => max coord at finest level is 63, fits 6 bits each.
+/// - level: 0=root(size 64), 6=voxel(size 1)
+#[inline]
+fn pack_key(chunk_size: u32, ox: i32, oy: i32, oz: i32, size: i32) -> u32 {
+    let cs = chunk_size;
+    debug_assert!(cs.is_power_of_two());
+    let size_u = size as u32;
+    debug_assert!(size_u.is_power_of_two());
+
+    let lvl = cs.trailing_zeros() - size_u.trailing_zeros(); // 0..=log2(cs)
+    let cx = (ox as u32) / size_u;
+    let cy = (oy as u32) / size_u;
+    let cz = (oz as u32) / size_u;
+
+    (cx & 63)
+        | ((cy & 63) << 6)
+        | ((cz & 63) << 12)
+        | ((lvl & 7) << 18)
+}
+
+#[inline]
+fn idx2(side: usize, x: usize, z: usize) -> usize {
+    z * side + x
+}
+
+#[inline]
+fn idx3(side: usize, x: usize, y: usize, z: usize) -> usize {
+    (y * side * side) + (z * side) + x
+}
+
+#[inline]
+fn pidx(dim: usize, x: usize, y: usize, z: usize) -> usize {
+    (z * dim * dim) + (y * dim) + x
+}
+
+#[inline]
+fn prefix_sum_cube(prefix: &[u32], side: usize, x0: usize, y0: usize, z0: usize, size: usize) -> u32 {
+    let dim = side + 1;
+    let x1 = x0 + size;
+    let y1 = y0 + size;
+    let z1 = z0 + size;
+
+    let a = prefix[pidx(dim, x1, y1, z1)] as i64;
+    let b = prefix[pidx(dim, x0, y1, z1)] as i64;
+    let c = prefix[pidx(dim, x1, y0, z1)] as i64;
+    let d = prefix[pidx(dim, x1, y1, z0)] as i64;
+    let e = prefix[pidx(dim, x0, y0, z1)] as i64;
+    let f = prefix[pidx(dim, x0, y1, z0)] as i64;
+    let g = prefix[pidx(dim, x1, y0, z0)] as i64;
+    let h = prefix[pidx(dim, x0, y0, z0)] as i64;
+
+    let s = a - b - c - d + e + f + g - h;
+    debug_assert!(s >= 0);
+    s as u32
+}
+
+/// Reusable scratch buffers for chunk building (reduces allocations & improves locality).
+pub struct BuildScratch {
+    // 2D (side*side)
+    ground: Vec<i32>,
+    tree_top: Vec<i32>,
+
+    // height cache
+    height_cache: Vec<i32>,
+    height_cache_w: usize,
+    height_cache_h: usize,
+
+    // 3D (side^3)
+    material: Vec<u32>,
+    prefix: Vec<u32>,
+
+    // mip storage
+    ground_min_levels: Vec<Vec<i32>>,
+    ground_max_levels: Vec<Vec<i32>>,
+    tree_levels: Vec<Vec<i32>>,
+}
+
+impl BuildScratch {
+    pub fn new() -> Self {
+        Self {
+            ground: Vec::new(),
+            tree_top: Vec::new(),
+            height_cache: Vec::new(),
+            height_cache_w: 0,
+            height_cache_h: 0,
+            material: Vec::new(),
+            prefix: Vec::new(),
+            ground_min_levels: Vec::new(),
+            ground_max_levels: Vec::new(),
+            tree_levels: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn ensure_height_cache(&mut self, w: usize, h: usize) {
+        let need = w * h;
+        if self.height_cache.len() != need {
+            self.height_cache.resize(need, 0);
+        } else {
+            self.height_cache.fill(0);
+        }
+        self.height_cache_w = w;
+        self.height_cache_h = h;
+    }
+
+    #[inline]
+    fn ensure_2d(v: &mut Vec<i32>, side: usize, fill: i32) {
+        let need = side * side;
+        if v.len() != need {
+            v.resize(need, fill);
+        } else {
+            v.fill(fill);
+        }
+    }
+
+    #[inline]
+    fn ensure_3d_u32(v: &mut Vec<u32>, side: usize, fill: u32) {
+        let need = side * side * side;
+        if v.len() != need {
+            v.resize(need, fill);
+        } else {
+            v.fill(fill);
+        }
+    }
+
+    #[inline]
+    fn ensure_prefix(v: &mut Vec<u32>, side: usize) {
+        let dim = side + 1;
+        let need = dim * dim * dim;
+        if v.len() != need {
+            v.resize(need, 0);
+        } else {
+            v.fill(0);
+        }
+    }
+}
+
+// -----------------------------
+// Rope building (CPU)
+// -----------------------------
+
+#[inline]
+fn is_leaf(n: &NodeGpu) -> bool {
+    n.child_base == LEAF
+}
+
+#[inline]
+fn ropes_invalid() -> NodeRopesGpu {
+    NodeRopesGpu {
+        px: INVALID_U32,
+        nx: INVALID_U32,
+        py: INVALID_U32,
+        ny: INVALID_U32,
+        pz: INVALID_U32,
+        nz: INVALID_U32,
+        _pad0: 0,
+        _pad1: 0,
+    }
+}
+
+#[inline]
+fn child_idx(nodes: &[NodeGpu], parent_idx: u32, ci: u32) -> u32 {
+    let p = &nodes[parent_idx as usize];
+    debug_assert!(!is_leaf(p));
+    // We enforce internal nodes to have all 8 children => child_mask should be 0xFF.
+    debug_assert_eq!(p.child_mask, 0xFF);
+    p.child_base + ci
+}
+
+#[inline]
+fn descend_one(nodes: &[NodeGpu], nei: u32, hx: u32, hy: u32, hz: u32) -> u32 {
+    if nei == INVALID_U32 {
+        return INVALID_U32;
+    }
+    let n = &nodes[nei as usize];
+    if is_leaf(n) {
+        return nei;
+    }
+    let ci = hx | (hy << 1) | (hz << 2);
+    child_idx(nodes, nei, ci)
+}
+
+fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
+    if is_leaf(&nodes[idx as usize]) {
+        return;
+    }
+
+    let base = nodes[idx as usize].child_base;
+
+    // Parent ropes already filled in ropes[idx]
+    let pr = ropes[idx as usize];
+
+    for ci in 0u32..8u32 {
+        let hx = ci & 1;
+        let hy = (ci >> 1) & 1;
+        let hz = (ci >> 2) & 1;
+
+        let self_child = base + ci;
+
+        // Sibling links inside the same parent
+        let sib_x = ci ^ 1;
+        let sib_y = ci ^ 2;
+        let sib_z = ci ^ 4;
+
+        // +X / -X
+        let px = if hx == 0 {
+            base + sib_x
+        } else {
+            // across parent's +X, we enter neighbor on its -X side => hx=0
+            descend_one(nodes, pr.px, 0, hy, hz)
+        };
+
+        let nx = if hx == 1 {
+            base + sib_x
+        } else {
+            // across parent's -X, we enter neighbor on its +X side => hx=1
+            descend_one(nodes, pr.nx, 1, hy, hz)
+        };
+
+        // +Y / -Y
+        let py = if hy == 0 {
+            base + sib_y
+        } else {
+            descend_one(nodes, pr.py, hx, 0, hz) // enter on -Y => hy=0
+        };
+
+        let ny = if hy == 1 {
+            base + sib_y
+        } else {
+            descend_one(nodes, pr.ny, hx, 1, hz) // enter on +Y => hy=1
+        };
+
+        // +Z / -Z
+        let pz = if hz == 0 {
+            base + sib_z
+        } else {
+            descend_one(nodes, pr.pz, hx, hy, 0) // enter on -Z => hz=0
+        };
+
+        let nz = if hz == 1 {
+            base + sib_z
+        } else {
+            descend_one(nodes, pr.nz, hx, hy, 1) // enter on +Z => hz=1
+        };
+
+        ropes[self_child as usize] = NodeRopesGpu {
+            px,
+            nx,
+            py,
+            ny,
+            pz,
+            nz,
+            _pad0: 0,
+            _pad1: 0,
+        };
+    }
+
+    // Recurse
+    for ci in 0u32..8u32 {
+        build_ropes_rec(nodes, ropes, base + ci);
+    }
+}
+
+fn build_ropes(nodes: &[NodeGpu]) -> Vec<NodeRopesGpu> {
+    let mut ropes = vec![ropes_invalid(); nodes.len()];
+    // Root external ropes are invalid => stay INVALID_U32.
+    build_ropes_rec(nodes, &mut ropes, 0);
+    ropes
+}
+
+// -----------------------------------------------------------------------------
+// Cancelable build with reusable scratch (fast path).
+// NOW RETURNS: (nodes, macro_words, ropes)
+// -----------------------------------------------------------------------------
+pub fn build_chunk_svo_sparse_cancelable_with_scratch(
+    gen: &WorldGen,
+    chunk_origin: [i32; 3],
+    chunk_size: u32,
+    cancel: &AtomicBool,
+    scratch: &mut BuildScratch,
+) -> (Vec<NodeGpu>, Vec<u32>, Vec<NodeRopesGpu>, Vec<u32>) {
+    if should_cancel(cancel) {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
+
+    let chunk_ox = chunk_origin[0];
+    let chunk_oy = chunk_origin[1];
+    let chunk_oz = chunk_origin[2];
+
+    let cs_u = chunk_size;
+    let cs_i = chunk_size as i32;
+    debug_assert!(cs_u.is_power_of_two());
+
+    let side = cs_u as usize;
+    let vpm: i32 = config::VOXELS_PER_METER as i32;
+    debug_assert!(vpm > 0);
+
+    // -------------------------------------------------------------------------
+    // Height cache
+    // -------------------------------------------------------------------------
+    let margin_m: i32 = 6;
+    let margin: i32 = margin_m * vpm + (vpm - 1);
+
+    let cache_x0 = chunk_ox - margin;
+    let cache_z0 = chunk_oz - margin;
+    let cache_x1 = chunk_ox + cs_i + margin; // inclusive
+    let cache_z1 = chunk_oz + cs_i + margin; // inclusive
+
+    let cache_w = (cache_x1 - cache_x0 + 1) as usize;
+    let cache_h = (cache_z1 - cache_z0 + 1) as usize;
+
+    scratch.ensure_height_cache(cache_w, cache_h);
+    for z in 0..cache_h {
+        if (z & 15) == 0 && should_cancel(cancel) {
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+        let wz = cache_z0 + z as i32;
+        let row = z * cache_w;
+        for x in 0..cache_w {
+            let wx = cache_x0 + x as i32;
+            scratch.height_cache[row + x] = gen.ground_height(wx, wz);
+        }
+    }
+
+    let height_at = |wx: i32, wz: i32| -> i32 {
+        if wx < cache_x0 || wx > cache_x1 || wz < cache_z0 || wz > cache_z1 {
+            gen.ground_height(wx, wz)
+        } else {
+            let ix = (wx - cache_x0) as usize;
+            let iz = (wz - cache_z0) as usize;
+            scratch.height_cache[iz * scratch.height_cache_w + ix]
+        }
+    };
+
+    // -------------------------------------------------------------------------
+    // Tree cache/mask
+    // -------------------------------------------------------------------------
+    let (_tree_cache_unused, tree_mask) = gen.build_tree_cache_with_mask(
+        chunk_ox,
+        chunk_oy,
+        chunk_oz,
+        cs_i,
+        &height_at,
+        cancel,
+    );
+
+    // -------------------------------------------------------------------------
+    // 2D maps (ground)
+    // -------------------------------------------------------------------------
+    BuildScratch::ensure_2d(&mut scratch.ground, side, 0);
+
+    for lz in 0..cs_i {
+        if (lz & 15) == 0 && should_cancel(cancel) {
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+        for lx in 0..cs_i {
+            let wx = chunk_ox + lx;
+            let wz = chunk_oz + lz;
+            let g = height_at(wx, wz);
+
+            let i = idx2(side, lx as usize, lz as usize);
+            scratch.ground[i] = g;
+        }
+    }
+
+    let ground_mip: MinMaxMipView<'_> = build_minmax_mip_inplace(
+        &scratch.ground,
+        cs_u,
+        &mut scratch.ground_min_levels,
+        &mut scratch.ground_max_levels,
+    );
+
+    // -------------------------------------------------------------------------
+    // Tree top stamp (2D)
+    // -------------------------------------------------------------------------
+    BuildScratch::ensure_2d(&mut scratch.tree_top, side, -1);
+
+    let pad_m = 4;
+    let xm0 = (chunk_ox.div_euclid(vpm)) - pad_m;
+    let xm1 = ((chunk_ox + cs_i).div_euclid(vpm)) + pad_m;
+    let zm0 = (chunk_oz.div_euclid(vpm)) - pad_m;
+    let zm1 = ((chunk_oz + cs_i).div_euclid(vpm)) + pad_m;
+
+    for zm in zm0..=zm1 {
+        if ((zm - zm0) & 3) == 0 && should_cancel(cancel) {
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+
+        for xm in xm0..=xm1 {
+            let Some((trunk_h_vox, crown_r_vox)) = gen.tree_instance_at_meter(xm, zm) else {
+                continue;
+            };
+
+            let tx = xm * vpm;
+            let tz = zm * vpm;
+
+            let g = height_at(tx, tz);
+            let trunk_base = g + vpm;
+            let trunk_top = trunk_base + trunk_h_vox;
+
+            let canopy_h_vox = 5 * vpm;
+            let top_y = trunk_top + canopy_h_vox + 2 * vpm;
+
+            let r = crown_r_vox + 2 * vpm;
+
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    if dx * dx + dz * dz > r * r {
+                        continue;
+                    }
+
+                    let wx = tx + dx;
+                    let wz = tz + dz;
+
+                    let lx = wx - chunk_ox;
+                    let lz = wz - chunk_oz;
+                    if lx >= 0 && lx < cs_i && lz >= 0 && lz < cs_i {
+                        let i = idx2(side, lx as usize, lz as usize);
+                        scratch.tree_top[i] = scratch.tree_top[i].max(top_y);
+                    }
+                }
+            }
+
+            // ensure trunk column included
+            let lx = tx - chunk_ox;
+            let lz = tz - chunk_oz;
+            if lx >= 0 && lx < cs_i && lz >= 0 && lz < cs_i {
+                let i = idx2(side, lx as usize, lz as usize);
+                scratch.tree_top[i] = scratch.tree_top[i].max(trunk_top);
+            }
+        }
+    }
+
+    let tree_mip: MaxMipView<'_> =
+        build_max_mip_inplace(&scratch.tree_top, cs_u, &mut scratch.tree_levels);
+
+    // -------------------------------------------------------------------------
+    // Precompute per-voxel material
+    // -------------------------------------------------------------------------
+    BuildScratch::ensure_3d_u32(&mut scratch.material, side, AIR);
+
+    let dirt_depth = 3 * vpm;
+
+    for ly in 0..cs_i {
+        if (ly & 7) == 0 && should_cancel(cancel) {
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+
+        let wy = chunk_oy + ly;
+
+        for lz in 0..cs_i {
+            for lx in 0..cs_i {
+                let col = idx2(side, lx as usize, lz as usize);
+                let g = scratch.ground[col];
+
+                let m: u32 = if wy < g {
+                    if wy >= g - dirt_depth { DIRT } else { STONE }
+                } else if wy == g {
+                    let tm = tree_mask.material_local(lx as usize, ly as usize, lz as usize);
+                    if tm == WOOD { WOOD } else { GRASS }
+                } else {
+                    let tm = tree_mask.material_local(lx as usize, ly as usize, lz as usize);
+                    if tm != AIR { tm } else { AIR }
+                };
+
+                let i3 = idx3(side, lx as usize, ly as usize, lz as usize);
+                scratch.material[i3] = m;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Column top map (64x64): per (x,z), store top-most non-air voxel (y, mat)
+    // packed u16: (mat8<<8) | y8, y8=255 means empty column
+    // 2 entries per u32 => 2048 u32 words
+    // -------------------------------------------------------------------------
+    let side_u = cs_u as usize;
+    debug_assert_eq!(side_u, 64, "colinfo packing assumes chunk_size=64");
+
+    let mut colinfo_words = vec![0u32; 2048];
+
+    for lz in 0..64usize {
+        for lx in 0..64usize {
+            let mut y8: u32 = 255;
+            let mut mat8: u32 = 0;
+
+            // scan from top down
+            for ly in (0..64usize).rev() {
+                let m = scratch.material[idx3(64, lx, ly, lz)];
+                if m != AIR {
+                    y8 = ly as u32;
+                    mat8 = m & 0xFF;
+                    break;
+                }
+            }
+
+            let entry16: u32 = (y8 & 0xFF) | ((mat8 & 0xFF) << 8);
+
+            let idx = (lz * 64 + lx) as u32;      // 0..4095
+            let w = (idx >> 1) as usize;          // 0..2047
+            let hi = (idx & 1) != 0;
+
+            if !hi {
+                colinfo_words[w] = (colinfo_words[w] & 0xFFFF_0000) | entry16;
+            } else {
+                colinfo_words[w] = (colinfo_words[w] & 0x0000_FFFF) | (entry16 << 16);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Prefix sum over solid occupancy
+    // -------------------------------------------------------------------------
+    BuildScratch::ensure_prefix(&mut scratch.prefix, side);
+    let dim = side + 1;
+
+    for z in 1..=side {
+        if (z & 7) == 0 && should_cancel(cancel) {
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+        for y in 1..=side {
+            let mut run: u32 = 0;
+            for x in 1..=side {
+                let v = (scratch.material[idx3(side, x - 1, y - 1, z - 1)] != AIR) as u32;
+                run += v;
+
+                let a = scratch.prefix[pidx(dim, x, y, z - 1)] as i64;
+                let b = scratch.prefix[pidx(dim, x, y - 1, z)] as i64;
+                let c = scratch.prefix[pidx(dim, x, y - 1, z - 1)] as i64;
+
+                let p = a + b - c + (run as i64);
+                debug_assert!(p >= 0);
+                scratch.prefix[pidx(dim, x, y, z)] = p as u32;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Macro occupancy bitset (8x8x8 => 512 bits => 16 u32 words)
+    // -------------------------------------------------------------------------
+    let macro_dim: usize = 8;
+    debug_assert_eq!(side % macro_dim, 0);
+
+    let cell: usize = side / macro_dim;
+
+    let mut macro_words = vec![0u32; MACRO_WORDS_PER_CHUNK_USIZE];
+
+    for mz in 0..macro_dim {
+        if should_cancel(cancel) {
+            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+        for my in 0..macro_dim {
+            for mx in 0..macro_dim {
+                let x0 = mx * cell;
+                let y0 = my * cell;
+                let z0 = mz * cell;
+
+                let sum = prefix_sum_cube(&scratch.prefix, side, x0, y0, z0, cell);
+                if sum > 0 {
+                    let bit = mx + macro_dim * (my + macro_dim * mz); // 0..511
+                    let w = bit >> 5;
+                    let b = bit & 31;
+                    macro_words[w] |= 1u32 << b;
+                }
+            }
+        }
+    }
+
+    fn make_leaf(chunk_size: u32, ox: i32, oy: i32, oz: i32, size: i32, mat: u32) -> NodeGpu {
+        NodeGpu {
+            child_base: LEAF,
+            child_mask: 0,
+            material: mat,
+            key: pack_key(chunk_size, ox, oy, oz, size),
+        }
+    }
+
+    fn build_node(
+        nodes: &mut Vec<NodeGpu>,
+        chunk_size: u32,
+        ox: i32,
+        oy: i32,
+        oz: i32,
+        size: i32,
+        chunk_oy: i32,
+        material: &[u32],
+        prefix: &[u32],
+        side: usize,
+        ground_mip: &MinMaxMipView<'_>,
+        tree_mip: &MaxMipView<'_>,
+        dirt_depth: i32,
+        cancel: &AtomicBool,
+    ) -> NodeGpu {
+        if should_cancel(cancel) {
+            return make_leaf(chunk_size, ox, oy, oz, size, AIR);
+        }
+
+        let size_u = size as u32;
+
+        let (gmin, gmax) = ground_mip.query(ox, oz, size_u);
+        let tmax = tree_mip.query_max(ox, oz, size_u);
+
+        let y0 = chunk_oy + oy;
+        let y1 = y0 + size - 1;
+
+        // above everything
+        let top_solid = gmax.max(tmax);
+        if y0 > top_solid {
+            return make_leaf(chunk_size, ox, oy, oz, size, AIR);
+        }
+
+        // deep solid stone
+        if y1 < gmin - dirt_depth {
+            return make_leaf(chunk_size, ox, oy, oz, size, STONE);
+        }
+
+        // empty check via prefix
+        let sx = ox as usize;
+        let sy = oy as usize;
+        let sz = oz as usize;
+        let s = size as usize;
+
+        let sum = prefix_sum_cube(prefix, side, sx, sy, sz, s);
+        if sum == 0 {
+            return make_leaf(chunk_size, ox, oy, oz, size, AIR);
+        }
+
+        if size == 1 {
+            let m = material[idx3(side, sx, sy, sz)];
+            return make_leaf(chunk_size, ox, oy, oz, size, m);
+        }
+
+        // Mixed node => build all 8 children (INCLUDING AIR LEAVES).
+        // This is the critical invariant needed for rope correctness.
+        let half = size / 2;
+        let mut child_roots: [NodeGpu; 8] = [make_leaf(chunk_size, 0, 0, 0, 1, AIR); 8];
+
+        for ci in 0..8 {
+            if (ci & 3) == 0 && should_cancel(cancel) {
+                return make_leaf(chunk_size, ox, oy, oz, size, AIR);
+            }
+
+            let dx = if (ci & 1) != 0 { half } else { 0 };
+            let dy = if (ci & 2) != 0 { half } else { 0 };
+            let dz = if (ci & 4) != 0 { half } else { 0 };
+
+            child_roots[ci] = build_node(
+                nodes,
+                chunk_size,
+                ox + dx,
+                oy + dy,
+                oz + dz,
+                half,
+                chunk_oy,
+                material,
+                prefix,
+                side,
+                ground_mip,
+                tree_mip,
+                dirt_depth,
+                cancel,
+            );
+        }
+
+        let base = nodes.len() as u32;
+
+        // Push ALL 8 children in ci order.
+        for ci in 0..8 {
+            nodes.push(child_roots[ci]);
+        }
+
+        NodeGpu {
+            child_base: base,
+            child_mask: 0xFF, // all 8 children exist
+            material: 0,
+            key: pack_key(chunk_size, ox, oy, oz, size),
+        }
+    }
+
+    // Root must be at index 0 for GPU.
+    let mut nodes = vec![make_leaf(cs_u, 0, 0, 0, cs_i, AIR)];
+
+    let root = build_node(
+        &mut nodes,
+        cs_u,
+        0,
+        0,
+        0,
+        cs_i,
+        chunk_oy,
+        &scratch.material,
+        &scratch.prefix,
+        side,
+        &ground_mip,
+        &tree_mip,
+        dirt_depth,
+        cancel,
+    );
+
+    if should_cancel(cancel) {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
+
+    nodes[0] = root;
+
+    // Build ropes AFTER nodes are finalized.
+    let ropes = build_ropes(&nodes);
+
+    (nodes, macro_words, ropes, colinfo_words)
+}
+
+// src/svo/mips.rs
+// ---------------
+// src/svo/mips.rs
+
+use rayon::prelude::*;
+
+pub struct MinMaxMipView<'a> {
+    pub root_side: u32,
+    pub min_levels: &'a [Vec<i32>],
+    pub max_levels: &'a [Vec<i32>],
+}
+
+pub fn build_minmax_mip_inplace<'a>(
+    base: &[i32],
+    side: u32,
+    min_levels: &'a mut Vec<Vec<i32>>,
+    max_levels: &'a mut Vec<Vec<i32>>,
+) -> MinMaxMipView<'a> {
+    debug_assert!(side.is_power_of_two());
+    debug_assert_eq!(base.len(), (side * side) as usize);
+
+    let levels = side.trailing_zeros() as usize + 1;
+
+    if min_levels.len() != levels {
+        min_levels.resize_with(levels, Vec::new);
+    }
+    if max_levels.len() != levels {
+        max_levels.resize_with(levels, Vec::new);
+    }
+
+    // lvl 0
+    min_levels[0].resize(base.len(), 0);
+    min_levels[0].copy_from_slice(base);
+
+    max_levels[0].resize(base.len(), 0);
+    max_levels[0].copy_from_slice(base);
+
+    let mut cur_side = side;
+
+    // Optimization (2): compute min+max for each level in one traversal.
+    // Optimization (6): parallelize by output rows (z).
+    for lvl in 1..levels {
+        let next_side = cur_side / 2;
+        let need = (next_side * next_side) as usize;
+
+        let (min_prev, min_rest) = min_levels.split_at_mut(lvl);
+        let (max_prev, max_rest) = max_levels.split_at_mut(lvl);
+
+        let cur_min: &[i32] = &min_prev[lvl - 1];
+        let cur_max: &[i32] = &max_prev[lvl - 1];
+
+        let mn: &mut Vec<i32> = &mut min_rest[0];
+        let mx: &mut Vec<i32> = &mut max_rest[0];
+        mn.resize(need, 0);
+        mx.resize(need, 0);
+
+        let cur_side_us = cur_side as usize;
+        let next_side_us = next_side as usize;
+
+        mn.par_chunks_mut(next_side_us)
+            .zip(mx.par_chunks_mut(next_side_us))
+            .enumerate()
+            .for_each(|(z, (mn_row, mx_row))| {
+                let row0 = (2 * z) * cur_side_us;
+                let row1 = row0 + cur_side_us;
+
+                for x in 0..next_side_us {
+                    let col0 = 2 * x;
+                    let i00 = row0 + col0;
+                    let i10 = i00 + 1;
+                    let i01 = row1 + col0;
+                    let i11 = i01 + 1;
+
+                    let a0 = cur_min[i00];
+                    let a1 = cur_min[i10];
+                    let a2 = cur_min[i01];
+                    let a3 = cur_min[i11];
+                    mn_row[x] = a0.min(a1).min(a2).min(a3);
+
+                    let b0 = cur_max[i00];
+                    let b1 = cur_max[i10];
+                    let b2 = cur_max[i01];
+                    let b3 = cur_max[i11];
+                    mx_row[x] = b0.max(b1).max(b2).max(b3);
+                }
+            });
+
+        cur_side = next_side;
+    }
+
+    MinMaxMipView {
+        root_side: side,
+        min_levels: &min_levels[..],
+        max_levels: &max_levels[..],
+    }
+}
+
+impl<'a> MinMaxMipView<'a> {
+    #[inline]
+    pub fn query(&self, x0: i32, z0: i32, size: u32) -> (i32, i32) {
+        debug_assert!(size.is_power_of_two());
+        debug_assert!(size <= self.root_side);
+        debug_assert!(x0 >= 0 && z0 >= 0);
+
+        let level = size.trailing_zeros() as usize;
+        debug_assert!(level < self.min_levels.len());
+
+        let side = self.root_side >> level;
+        let x = (x0 as u32) / size;
+        let z = (z0 as u32) / size;
+        let idx = (z * side + x) as usize;
+
+        (self.min_levels[level][idx], self.max_levels[level][idx])
+    }
+}
+
+pub struct MaxMipView<'a> {
+    pub root_side: u32,
+    pub levels: &'a [Vec<i32>],
+}
+
+pub fn build_max_mip_inplace<'a>(
+    base: &[i32],
+    side: u32,
+    levels: &'a mut Vec<Vec<i32>>,
+) -> MaxMipView<'a> {
+    debug_assert!(side.is_power_of_two());
+    debug_assert_eq!(base.len(), (side * side) as usize);
+
+    let nlevels = side.trailing_zeros() as usize + 1;
+
+    if levels.len() != nlevels {
+        levels.resize_with(nlevels, Vec::new);
+    }
+
+    // lvl 0
+    levels[0].resize(base.len(), 0);
+    levels[0].copy_from_slice(base);
+
+    let mut cur_side = side;
+
+    // Optimization (6): parallelize by output rows (z).
+    for lvl in 1..nlevels {
+        let next_side = cur_side / 2;
+        let need = (next_side * next_side) as usize;
+
+        let (prev, rest) = levels.split_at_mut(lvl);
+        let cur: &[i32] = &prev[lvl - 1];
+        let out: &mut Vec<i32> = &mut rest[0];
+        out.resize(need, 0);
+
+        let cur_side_us = cur_side as usize;
+        let next_side_us = next_side as usize;
+
+        out.par_chunks_mut(next_side_us)
+            .enumerate()
+            .for_each(|(z, out_row)| {
+                let row0 = (2 * z) * cur_side_us;
+                let row1 = row0 + cur_side_us;
+
+                for x in 0..next_side_us {
+                    let col0 = 2 * x;
+                    let i00 = row0 + col0;
+                    let i10 = i00 + 1;
+                    let i01 = row1 + col0;
+                    let i11 = i01 + 1;
+
+                    let a = cur[i00];
+                    let b = cur[i10];
+                    let c = cur[i01];
+                    let d = cur[i11];
+                    out_row[x] = a.max(b).max(c).max(d);
+                }
+            });
+
+        cur_side = next_side;
+    }
+
+    MaxMipView {
+        root_side: side,
+        levels: &levels[..],
+    }
+}
+
+impl<'a> MaxMipView<'a> {
+    #[inline]
+    pub fn query_max(&self, x0: i32, z0: i32, size: u32) -> i32 {
+        debug_assert!(size.is_power_of_two());
+        debug_assert!(size <= self.root_side);
+        debug_assert!(x0 >= 0 && z0 >= 0);
+
+        let level = size.trailing_zeros() as usize;
+        debug_assert!(level < self.levels.len());
+
+        let side = self.root_side >> level;
+        let x = (x0 as u32) / size;
+        let z = (z0 as u32) / size;
+        let idx = (z * side + x) as usize;
+
+        self.levels[level][idx]
+    }
+}
+
+// src/svo/mod.rs
+// --------------
+// src/svo/mod.rs
+pub mod builder;
+pub mod mips;
+
+pub use builder::{
+    BuildScratch,
+    build_chunk_svo_sparse_cancelable_with_scratch,
+};
+
+// src/world/generator.rs
+// ----------------------
+// src/world/generator.rs
+
+use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
+
+use crate::config;
+
+#[derive(Clone)]
+pub struct WorldGen {
+    pub seed: u32,
+    height: Fbm<Perlin>,
+    detail: Fbm<Perlin>,
+}
+
+impl WorldGen {
+    pub fn new(seed: u32) -> Self {
+        let height = Fbm::<Perlin>::new(seed).set_octaves(7).set_frequency(0.010);
+        let detail = Fbm::<Perlin>::new(seed ^ 0xA5A5_A5A5).set_octaves(3).set_frequency(0.02);
+
+        Self { seed, height, detail }
+    }
+
+    pub fn ground_height(&self, x_vox: i32, z_vox: i32) -> i32 {
+        let xm = x_vox as f64 * config::VOXEL_SIZE_M_F64;
+        let zm = z_vox as f64 * config::VOXEL_SIZE_M_F64;
+
+        let h0 = self.height.get([xm, zm]) as f32;
+        let h1 = self.detail.get([xm, zm]) as f32;
+
+        let base_m = 10.0;
+        let amp_m = 18.0;
+        let hills_m = h0 * amp_m + h1 * 3.0;
+
+        let voxels_per_meter = (1.0 / config::VOXEL_SIZE_M_F64) as f32;
+        ((base_m + hills_m) * voxels_per_meter).round() as i32
+    }
+}
+
+// src/world/hash.rs
+// -----------------
+// src/world/hash.rs
+#[inline]
+pub fn hash_u32(mut v: u32) -> u32 {
+    v ^= v >> 16;
+    v = v.wrapping_mul(0x7feb_352d);
+    v ^= v >> 15;
+    v = v.wrapping_mul(0x846c_a68b);
+    v ^= v >> 16;
+    v
+}
+
+#[inline]
+pub fn hash2(seed: u32, x: i32, z: i32) -> u32 {
+    let a = (x as u32).wrapping_mul(0x9e37_79b1);
+    let b = (z as u32).wrapping_mul(0x85eb_ca6b);
+    hash_u32(seed ^ a ^ b)
+}
+
+#[inline]
+pub fn hash3(seed: u32, x: i32, y: i32, z: i32) -> u32 {
+    let a = (x as u32).wrapping_mul(0x9e37_79b1);
+    let b = (y as u32).wrapping_mul(0x85eb_ca6b);
+    let c = (z as u32).wrapping_mul(0xc2b2_ae35);
+    hash_u32(seed ^ a ^ b ^ c)
+}
+
+#[inline]
+pub fn u01(v: u32) -> f32 {
+    (v as f32) * (1.0 / 4294967296.0)
+}
+
+// src/world/materials.rs
+// ----------------------
+// src/world/materials.rs
+pub const AIR: u32 = 0;
+pub const GRASS: u32 = 1;
+pub const DIRT: u32 = 2;
+pub const STONE: u32 = 3;
+pub const WOOD: u32 = 4;
+pub const LEAF: u32 = 5;
+
+// src/world/mod.rs
+// ----------------
+// src/world/mod.rs
+pub mod generator;
+pub mod materials;
+pub mod hash;
+pub mod trees;
+
+pub use generator::WorldGen;
+
+// src/world/trees.rs
+// ------------------
+// src/world/trees.rs
+use crate::config;
+
+use super::{
+    generator::WorldGen,
+    hash::{hash2, hash3, hash_u32, u01},
+    materials::{AIR, LEAF, WOOD},
+};
+
+// ================================================================================================
+// TREE TUNING KNOBS
+// ================================================================================================
+// Conventions
+// - vpm = voxels per meter (VOXELS_PER_METER)
+// - Fast probability via bitmask:
+//      (hash & mask) == 0  => true with probability 1/(mask+1)
+//
+// Notes:
+// - AABB = axis-aligned bounding box
+// - BFS = breadth-first search
+// - SVO = Sparse Voxel Octree
+// ================================================================================================
+
+// Tree density: 1 tree per N meter-cells (lower => more trees)
+const TREE_CELL_MOD: u32 = 256;
+
+// ----------------------------------------
+// Primary branches (depth=0)
+// ----------------------------------------
+
+// Fewer primaries, but less “spike crown”
+const PRIMARY_MIN: usize = 6;
+const PRIMARY_MAX: usize = 14;
+const PRIMARY_MAX_CLAMP: usize = 18;
+
+// Start height along trunk (% of trunk height)
+// IMPORTANT: allow starts right near the top so the trunk doesn't look “pruned”
+const PRIMARY_START_Y_LO_FRAC: i32 = 28;
+const PRIMARY_START_Y_HI_FRAC: i32 = 99; // was 92
+const PRIMARY_START_JITTER_FRAC: f32 = 0.10;
+
+// Shape
+const PRIMARY_ANG_JITTER: f32 = 1.05; // more irregular azimuth (less radial symmetry)
+
+// SHORTER primaries (big lever for “branches too long”)
+const PRIMARY_LEN_M_MIN: f32 = 1.40;
+const PRIMARY_LEN_M_RAND: f32 = 2.20;
+
+// More vertical variation + less spear-like
+const PRIMARY_PITCH_BASE: f32 = 0.10;
+const PRIMARY_PITCH_H_SCALE: f32 = 0.18;
+const PRIMARY_PITCH_QUAD_BASE: f32 = 0.44;
+const PRIMARY_PITCH_QUAD_H_SCALE: f32 = 0.22;
+
+const PRIMARY_R0_M_MIN: f32 = 0.13;
+const PRIMARY_R0_M_RAND: f32 = 0.22;
+const PRIMARY_R1_SCALE_MIN: f32 = 0.28;
+const PRIMARY_R1_SCALE_RAND: f32 = 0.22;
+
+// More curvature so branches feel “grown”, not extruded
+const PRIMARY_BEND_M_MIN: f32 = 1.05;
+const PRIMARY_BEND_M_RAND: f32 = 1.85;
+const PRIMARY_C1_T: f32 = 0.28;
+const PRIMARY_C2_T: f32 = 0.72;
+const PRIMARY_C1_BEND_SCALE: f32 = 1.10;
+const PRIMARY_C2_BEND_SCALE: f32 = 0.85;
+const PRIMARY_C1_Y_BEND_SCALE: f32 = 0.44;
+const PRIMARY_C2_Y_BEND_SCALE: f32 = 0.34;
+
+// ----------------------------------------
+// Recursion / complexity
+// ----------------------------------------
+
+const MAX_BRANCH_DEPTH: u8 = 4;
+const BRANCH_CAP: usize = 520;
+
+// How many child candidates per parent depth: min + uniform(0..rand)
+// Index = parent.depth clamped to 0..3
+const CHILD_COUNT_MIN: [usize; 4] = [3, 3, 2, 1];
+const CHILD_COUNT_RAND: [usize; 4] = [3, 3, 3, 3];
+
+// Aggressive thinning (keeps overall sparse structure)
+// Keep child only if (sj & mask) == 0
+const CHILD_SPAWN_THIN_MASK: [u32; 4] = [
+    3,  // depth=0: keep ~1/4
+    7,  // depth=1: keep ~1/8
+    15, // depth=2: keep ~1/16
+    31, // depth>=3: keep ~1/32
+];
+
+// Spawn position along parent
+const CHILD_SPAWN_T_MIN: f32 = 0.32;
+const CHILD_SPAWN_T_RAND: f32 = 0.58;
+
+// SHORTER children
+const CHILD_LEN_M_MIN: f32 = 0.35;
+const CHILD_LEN_M_RAND: f32 = 1.05;
+const CHILD_LEN_M_FLOOR: f32 = 0.28;
+
+// Clamp children harder vs parent length
+const CHILD_MAXLEN_A: f32 = 0.48;
+const CHILD_MAXLEN_B: f32 = 0.18;
+
+// Direction shaping
+const CHILD_FAN_AMP_BASE: f32 = 0.95;
+const CHILD_FAN_AMP_DEPTH: f32 = 0.38;
+
+const CHILD_UP_BASE: f32 = 0.10;
+const CHILD_UP_DEPTH: f32 = 0.10;
+const CHILD_UP_RAND: f32 = 0.28;
+
+// Radius shrink factor by child depth (depth=1..)
+const CHILD_SHRINK: [f32; 4] = [0.58, 0.52, 0.46, 0.40];
+
+const CHILD_R0_MIN_VOX: f32 = 0.70;
+const CHILD_R1_MIN_VOX: f32 = 0.50;
+const CHILD_R1_SCALE_BASE: f32 = 0.34;
+const CHILD_R1_SCALE_RAND: f32 = 0.16;
+
+// Curvature
+const CHILD_BEND_M_MIN: f32 = 0.45;
+const CHILD_BEND_M_RAND: f32 = 1.25;
+const CHILD_C1_T: f32 = 0.28;
+const CHILD_C2_T: f32 = 0.72;
+const CHILD_C1_BEND_SCALE: f32 = 1.05;
+const CHILD_C2_BEND_SCALE: f32 = 0.78;
+const CHILD_C1_Y_BEND_SCALE: f32 = 0.34;
+const CHILD_C2_Y_BEND_SCALE: f32 = 0.26;
+
+// ----------------------------------------
+// Branch rasterization
+// ----------------------------------------
+
+const BRANCH_STEPS_MIN: i32 = 8;
+const BRANCH_STEPS_MAX: i32 = 30;
+const BRANCH_STEPS_BASE: f32 = 10.0;
+const BRANCH_STEPS_LEN_DIV_M: f32 = 0.30;
+
+// ----------------------------------------
+// Leaves
+// ----------------------------------------
+
+const LEAF_ALWAYS_TIP_FOR_ALL_BRANCHES: bool = true;
+const LEAF_RARE_SKIP_MASK: u32 = 16383;
+
+// Canopy extent along branches: more sleeves, distributed earlier
+const LEAF_SLEEVE_N: [usize; 5] = [3, 3, 4, 4, 5];
+const LEAF_SLEEVE_T_MIN: f32 = 0.14;
+const LEAF_SLEEVE_T_RAND: f32 = 0.78;
+
+// Disable extra offset tip tuft (tends to create little dense “buttons”)
+const LEAF_OFFSET_TIP_MASK: u32 = 0;
+
+// Bigger offsets = wider canopy without adding branches
+const LEAF_OFFSET_M_XZ: f32 = 0.95;
+const LEAF_OFFSET_M_Y: f32 = 0.46;
+
+const LEAF_SLEEVE_OFFSET_M_XZ: f32 = 0.62;
+const LEAF_SLEEVE_OFFSET_M_Y: f32 = 0.34;
+
+// Big tufts (canopy size)
+const TUFT_R_BASE: [f32; 5] = [0.42, 0.50, 0.60, 0.66, 0.72];
+const TUFT_R_RAND: [f32; 5] = [0.30, 0.36, 0.52, 0.60, 0.66];
+
+// Sparse/airy fill
+const LEAF_SPHERE_Y_SCALE: f32 = 1.16;
+const LEAF_SHELL_THRESH: f32 = 0.90;
+
+// TIP: visible but airy
+const TIP_GUARANTEED_GATE_MASK: u32 = 1;           // keep ~1/2 candidates
+const TIP_GUARANTEED_INTERIOR_KEEP_MASK: u32 = 31; // keep 1/32 interior
+const TIP_GUARANTEED_SHELL_DROP_MASK: u32 = 3;     // drop 1/4 near shell
+
+// SLEEVE: very sparse
+const TUFT_SPARSE_GATE_MASK: u32 = 15;             // keep ~1/16 candidates
+const TUFT_SPARSE_INTERIOR_KEEP_MASK: u32 = 255;   // keep 1/256 interior
+const TUFT_SPARSE_SHELL_DROP_MASK: u32 = 3;        // drop 1/4 near shell
+
+// Trunk wobble (meters)
+const TRUNK_WOBBLE_M_MAX: f32 = 0.25;
+
+// ----------------------------------------
+// Crown at trunk tip (prevents "pruned top")
+// ----------------------------------------
+
+const TOP_CROWN_ENABLE: bool = true;
+const TOP_CROWN_RING_TUFTS: usize = 6;
+const TOP_CROWN_R_SCALE: f32 = 1.65;
+const TOP_CROWN_RING_RAD_SCALE: f32 = 0.85;
+const TOP_CROWN_LIFT_M: f32 = 0.45;
+
+// ================================================================================================
+
+/// Procedural tree instance (voxel units for positions/sizes).
+#[derive(Clone, Copy)]
+struct Tree {
+    tx: i32,
+    tz: i32,
+    base_y: i32,   // touches ground
+    trunk_h: i32,  // voxels
+    crown_r: i32,  // voxels (horizontal extent)
+    trunk_r0: f32, // voxels radius at base
+    trunk_r1: f32, // voxels radius near top
+    seed: u32,
+}
+
+/// A single curved branch segment (cubic bezier), plus metadata for recursion.
+#[derive(Clone, Copy)]
+struct Branch {
+    ax: f32,
+    ay: f32,
+    az: f32,
+    c1x: f32,
+    c1y: f32,
+    c1z: f32,
+    c2x: f32,
+    c2y: f32,
+    c2z: f32,
+    bx: f32,
+    by: f32,
+    bz: f32,
+    r0: f32,
+    r1: f32,
+    len: f32,
+    depth: u8,
+    seed: u32,
+}
+
+/// Per-chunk cache of trees that can affect material queries.
+pub struct TreeCache {
+    trees: Vec<Tree>,
+}
+
+/// Chunk-local voxel mask for trees (fast O(1) queries in the chunk build).
+/// mask codes: 0 = none, 1 = wood, 2 = leaf
+pub struct TreeMaskCache {
+    pub origin: [i32; 3], // chunk origin in world-voxel coords
+    pub size: i32,        // chunk side in voxels
+    mask: Vec<u8>,
+    stride_z: usize,
+    stride_y: usize,
+}
+
+#[inline(always)]
+fn idx3_strided(stride_z: usize, stride_y: usize, x: i32, y: i32, z: i32) -> usize {
+    (y as usize) * stride_y + (z as usize) * stride_z + (x as usize)
+}
+
+impl TreeMaskCache {
+    #[inline(always)]
+    pub fn material_local(&self, lx: usize, ly: usize, lz: usize) -> u32 {
+        // caller guarantees in-bounds
+        let i = ly * self.stride_y + lz * self.stride_z + lx;
+        match unsafe { *self.mask.get_unchecked(i) } {
+            1 => WOOD,
+            2 => LEAF,
+            _ => AIR,
+        }
+    }
+
+    #[inline(always)]
+    fn write_leaf(&mut self, lx: i32, ly: i32, lz: i32) {
+        if (lx | ly | lz) < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
+            return;
+        }
+        let i = idx3_strided(self.stride_z, self.stride_y, lx, ly, lz);
+        if self.mask[i] != 1 {
+            self.mask[i] = 2;
+        }
+    }
+
+    #[inline(always)]
+    fn write_wood(&mut self, lx: i32, ly: i32, lz: i32) {
+        if (lx | ly | lz) < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
+            return;
+        }
+        let i = idx3_strided(self.stride_z, self.stride_y, lx, ly, lz);
+        self.mask[i] = 1;
+    }
+}
+
+impl WorldGen {
+    // -------------------------------------------------------------------------
+    // Small math helpers
+    // -------------------------------------------------------------------------
+
+    #[inline(always)]
+    fn lerp(a: f32, b: f32, t: f32) -> f32 {
+        a + (b - a) * t
+    }
+
+    #[inline(always)]
+    fn s11(n: u32) -> f32 {
+        (u01(n) - 0.5) * 2.0
+    }
+
+    #[inline(always)]
+    fn bezier3(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+        let u = 1.0 - t;
+        u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+    }
+
+    #[inline(always)]
+    fn bezier3_tangent(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+        let u = 1.0 - t;
+        3.0 * u * u * (b - a) + 6.0 * u * t * (c - b) + 3.0 * t * t * (d - c)
+    }
+
+    #[inline(always)]
+    fn bez_point(b: &Branch, t: f32) -> (f32, f32, f32) {
+        (
+            Self::bezier3(b.ax, b.c1x, b.c2x, b.bx, t),
+            Self::bezier3(b.ay, b.c1y, b.c2y, b.by, t),
+            Self::bezier3(b.az, b.c1z, b.c2z, b.bz, t),
+        )
+    }
+
+    #[inline(always)]
+    fn bez_tangent(b: &Branch, t: f32) -> (f32, f32, f32) {
+        (
+            Self::bezier3_tangent(b.ax, b.c1x, b.c2x, b.bx, t),
+            Self::bezier3_tangent(b.ay, b.c1y, b.c2y, b.by, t),
+            Self::bezier3_tangent(b.az, b.c1z, b.c2z, b.bz, t),
+        )
+    }
+
+    #[inline(always)]
+    fn norm3(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+        let inv = 1.0 / (x * x + y * y + z * z).sqrt().max(1e-6);
+        (x * inv, y * inv, z * inv)
+    }
+
+    #[inline(always)]
+    fn cross3(ax: f32, ay: f32, az: f32, bx: f32, by: f32, bz: f32) -> (f32, f32, f32) {
+        (ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx)
+    }
+
+    /// Orthonormal basis around direction `w` (unit). Returns (u, v, w).
+    #[inline(always)]
+    fn basis_from_w(
+        w: (f32, f32, f32),
+    ) -> ((f32, f32, f32), (f32, f32, f32), (f32, f32, f32)) {
+        let (wx, wy, wz) = w;
+        let (hx, hy, hz) = if wy.abs() < 0.95 {
+            (0.0, 1.0, 0.0)
+        } else {
+            (1.0, 0.0, 0.0)
+        };
+        let (ux, uy, uz) = Self::cross3(hx, hy, hz, wx, wy, wz);
+        let (ux, uy, uz) = Self::norm3(ux, uy, uz);
+        let (vx, vy, vz) = Self::cross3(wx, wy, wz, ux, uy, uz);
+        ((ux, uy, uz), (vx, vy, vz), (wx, wy, wz))
+    }
+
+    // -------------------------------------------------------------------------
+    // Knob helpers (compact)
+    // -------------------------------------------------------------------------
+
+    #[inline(always)]
+    fn idx4(d: u8) -> usize {
+        (d as usize).min(3)
+    }
+    #[inline(always)]
+    fn idx5(d: u8) -> usize {
+        (d as usize).min(4)
+    }
+
+    #[inline(always)]
+    fn child_count_for_depth(depth: u8, base: u32) -> usize {
+        let i = Self::idx4(depth);
+        CHILD_COUNT_MIN[i] + (base % (CHILD_COUNT_RAND[i] as u32 + 1)) as usize
+    }
+
+    #[inline(always)]
+    fn spawn_thin_mask(depth: u8) -> u32 {
+        CHILD_SPAWN_THIN_MASK[Self::idx4(depth)]
+    }
+
+    #[inline(always)]
+    fn shrink_for_child_depth(depth: u8) -> f32 {
+        // child depth starts at 1, so map 1->0, 2->1, 3->2, 4+->3
+        let i = ((depth as usize).saturating_sub(1)).min(3);
+        CHILD_SHRINK[i]
+    }
+
+    #[inline(always)]
+    fn sleeve_n(depth: u8) -> usize {
+        LEAF_SLEEVE_N[Self::idx5(depth)]
+    }
+
+    #[inline(always)]
+    fn tuft_r_m(depth: u8, seed: u32) -> f32 {
+        let i = Self::idx5(depth);
+        TUFT_R_BASE[i] + TUFT_R_RAND[i] * u01(hash_u32(seed))
+    }
+
+    // -------------------------------------------------------------------------
+    // Tree placement + params
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn tree_at_meter_cell(
+        &self,
+        xm: i32,
+        zm: i32,
+    ) -> Option<(u32 /*seed*/, i32 /*trunk_h_vox*/, i32 /*crown_r_vox*/)> {
+        let r = hash2(self.seed, xm, zm);
+        if (r % TREE_CELL_MOD) != 0 {
+            return None;
+        }
+
+        let trunk_h_m = 5 + (hash_u32(r) % 6) as i32; // 5..10m
+        let crown_r_m = 3 + (hash_u32(r ^ 0xBEEF) % 4) as i32; // 3..6m
+        let vpm = config::VOXELS_PER_METER;
+
+        Some((r, trunk_h_m * vpm, crown_r_m * vpm))
+    }
+
+    #[inline]
+    fn tree_params_at_trunk(&self, tx: i32, tz: i32, ground: i32) -> Option<Tree> {
+        let xm = tx.div_euclid(config::VOXELS_PER_METER);
+        let zm = tz.div_euclid(config::VOXELS_PER_METER);
+        let (seed, trunk_h, crown_r) = self.tree_at_meter_cell(xm, zm)?;
+
+        let vpm = config::VOXELS_PER_METER as f32;
+
+        // trunk radii (voxels): base ~0.45..0.75m, top ~0.18..0.30m
+        let r0 = 0.45 * vpm + u01(hash_u32(seed ^ 0x1111)) * (0.30 * vpm);
+        let r1 = 0.18 * vpm + u01(hash_u32(seed ^ 0x2222)) * (0.12 * vpm);
+
+        Some(Tree {
+            tx,
+            tz,
+            base_y: ground,
+            trunk_h,
+            crown_r,
+            trunk_r0: r0.max(1.0),
+            trunk_r1: r1.max(1.0),
+            seed,
+        })
+    }
+
+    /// Build a per-chunk tree cache. Call once per chunk build.
+    pub fn build_tree_cache<F: Fn(i32, i32) -> i32>(
+        &self,
+        chunk_ox: i32,
+        chunk_oz: i32,
+        chunk_size: i32,
+        height_at: &F,
+    ) -> TreeCache {
+        let vpm = config::VOXELS_PER_METER;
+
+        // Extra slack because canopy tufts can extend beyond crown_r
+        let pad_m = 10;
+
+        let xm0 = chunk_ox.div_euclid(vpm) - pad_m;
+        let xm1 = (chunk_ox + chunk_size).div_euclid(vpm) + pad_m;
+        let zm0 = chunk_oz.div_euclid(vpm) - pad_m;
+        let zm1 = (chunk_oz + chunk_size).div_euclid(vpm) + pad_m;
+
+        let mut trees = Vec::new();
+
+        for zm in zm0..=zm1 {
+            for xm in xm0..=xm1 {
+                if self.tree_at_meter_cell(xm, zm).is_none() {
+                    continue;
+                }
+
+                let tx = xm * vpm;
+                let tz = zm * vpm;
+                let ground = height_at(tx, tz);
+
+                let Some(t) = self.tree_params_at_trunk(tx, tz, ground) else {
+                    continue;
+                };
+
+                // Conservative XZ AABB reject vs chunk footprint
+                let r = t.crown_r + 5 * vpm; // extra slack for large tufts
+                let x0 = t.tx - r;
+                let x1 = t.tx + r;
+                let z0 = t.tz - r;
+                let z1 = t.tz + r;
+
+                let cx0 = chunk_ox;
+                let cx1 = chunk_ox + chunk_size;
+                let cz0 = chunk_oz;
+                let cz1 = chunk_oz + chunk_size;
+
+                if x1 < cx0 || x0 > cx1 || z1 < cz0 || z0 > cz1 {
+                    continue;
+                }
+
+                trees.push(t);
+            }
+        }
+
+        TreeCache { trees }
+    }
+
+    /// Build a tree cache + chunk-local voxel mask (fast O(1) tree material queries).
+    pub fn build_tree_cache_with_mask<F: Fn(i32, i32) -> i32>(
+        &self,
+        chunk_ox: i32,
+        chunk_oy: i32,
+        chunk_oz: i32,
+        chunk_size: i32,
+        height_at: &F,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> (TreeCache, TreeMaskCache) {
+        let cache = self.build_tree_cache(chunk_ox, chunk_oz, chunk_size, height_at);
+
+        let side = chunk_size.max(1) as i32;
+        let side_u = side as usize;
+
+        let mask = vec![0u8; side_u * side_u * side_u];
+
+        let mut out = TreeMaskCache {
+            origin: [chunk_ox, chunk_oy, chunk_oz],
+            size: side,
+            mask,
+            stride_z: side_u,
+            stride_y: side_u * side_u,
+        };
+
+        for t in &cache.trees {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            self.raster_tree_into_mask(t, &mut out);
+        }
+
+        (cache, out)
+    }
+
+    // -------------------------------------------------------------------------
+    // Geometry helpers
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn trunk_radius_at(tree: &Tree, y: i32) -> f32 {
+        let t = ((y - tree.base_y) as f32 / (tree.trunk_h as f32)).clamp(0.0, 1.0);
+        tree.trunk_r0 + (tree.trunk_r1 - tree.trunk_r0) * t
+    }
+
+    #[inline]
+    fn trunk_wobble(&self, tree: &Tree, y: i32) -> (f32, f32) {
+        let t = ((y - tree.base_y) as f32 / (tree.trunk_h as f32)).clamp(0.0, 1.0);
+
+        let a = u01(hash_u32(tree.seed ^ 0xA001 ^ (y as u32).wrapping_mul(97)));
+        let b = u01(hash_u32(tree.seed ^ 0xA002 ^ (y as u32).wrapping_mul(193)));
+
+        let amp = TRUNK_WOBBLE_M_MAX * (config::VOXELS_PER_METER as f32) * t;
+        ((a - 0.5) * 2.0 * amp, (b - 0.5) * 2.0 * amp)
+    }
+
+    // -------------------------------------------------------------------------
+    // Primary layout
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn primary_count(&self, tree: &Tree) -> usize {
+        let r = hash_u32(tree.seed ^ 0xBABA_1234);
+        let span = (PRIMARY_MAX - PRIMARY_MIN + 1) as u32;
+        let mut n = PRIMARY_MIN + (r % span) as usize;
+
+        // tiny bias extremes sometimes
+        if (r & 31) == 0 {
+            n = PRIMARY_MIN;
+        } else if (r & 63) == 1 {
+            n = PRIMARY_MAX;
+        }
+        n.min(PRIMARY_MAX_CLAMP)
+    }
+
+    fn primary_starts(&self, tree: &Tree, count: usize) -> [i32; 32] {
+        let mut out = [tree.base_y; 32];
+
+        let y_lo = tree.base_y + (tree.trunk_h * PRIMARY_START_Y_LO_FRAC) / 100;
+        let y_hi = tree.base_y + (tree.trunk_h * PRIMARY_START_Y_HI_FRAC) / 100;
+
+        for i in 0..count.min(32) {
+            let t = if count <= 1 {
+                0.5
+            } else {
+                (i as f32) / ((count - 1) as f32)
+            };
+            let y_base = (Self::lerp(y_lo as f32, y_hi as f32, t)) as i32;
+
+            let r = hash_u32(tree.seed ^ 0xC0DE_0001 ^ (i as u32).wrapping_mul(0x9E37_79B9));
+            let jitter =
+                (Self::s11(r ^ 0x1111) * PRIMARY_START_JITTER_FRAC * (tree.trunk_h as f32)) as i32;
+            out[i] = (y_base + jitter).clamp(y_lo, y_hi);
+        }
+
+        // insertion sort ascending
+        for i in 1..count.min(32) {
+            let mut j = i;
+            while j > 0 && out[j - 1] > out[j] {
+                out.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+
+        out
+    }
+
+    // -------------------------------------------------------------------------
+    // Branch generation
+    // -------------------------------------------------------------------------
+
+    fn child_branches_from_parent(&self, parent: &Branch, tree_seed: u32, out: &mut Vec<Branch>) {
+        if parent.depth >= MAX_BRANCH_DEPTH {
+            return;
+        }
+
+        let vpm = config::VOXELS_PER_METER as f32;
+        let base = hash_u32(parent.seed ^ 0xCC11_0000);
+
+        let child_count = Self::child_count_for_depth(parent.depth, base);
+
+        for j in 0..child_count {
+            let sj = hash_u32(base ^ (j as u32).wrapping_mul(0x9E37_79B9));
+
+            if (sj & Self::spawn_thin_mask(parent.depth)) != 0 {
+                continue;
+            }
+
+            let t = (CHILD_SPAWN_T_MIN + CHILD_SPAWN_T_RAND * u01(sj ^ 0x1111)).clamp(0.0, 1.0);
+
+            let (ax, ay, az) = Self::bez_point(parent, t);
+            let (tx, ty, tz) = Self::bez_tangent(parent, t);
+            let w = Self::norm3(tx, ty, tz);
+            let (u, v, w) = Self::basis_from_w(w);
+
+            let phi = u01(sj ^ 0xFACE_B00C) * std::f32::consts::TAU;
+            let (cs, sn) = (phi.cos(), phi.sin());
+            let sideways = (u.0 * cs + v.0 * sn, u.1 * cs + v.1 * sn, u.2 * cs + v.2 * sn);
+
+            let depth = parent.depth + 1;
+
+            let max_from_parent = parent.len * (CHILD_MAXLEN_A - CHILD_MAXLEN_B * (depth as f32));
+            let mut len =
+                (CHILD_LEN_M_MIN * vpm + u01(sj ^ 0x2222) * (CHILD_LEN_M_RAND * vpm)).min(
+                    max_from_parent,
+                );
+            len = len.max(CHILD_LEN_M_FLOOR * vpm);
+
+            let fan_amp = CHILD_FAN_AMP_BASE + CHILD_FAN_AMP_DEPTH * (depth as f32);
+            let fan = Self::s11(sj ^ 0x3333) * fan_amp;
+
+            let up = 1.65 * (CHILD_UP_BASE + CHILD_UP_DEPTH * (depth as f32))
+                + 1.25 * (CHILD_UP_RAND * u01(sj ^ 0x4444));
+
+            let dirx = (w.0 + sideways.0 * fan).clamp(-2.0, 2.0);
+            let diry = (w.1 + sideways.1 * fan + up).clamp(0.15, 3.0);
+            let dirz = (w.2 + sideways.2 * fan).clamp(-2.0, 2.0);
+            let (dirx, diry, dirz) = Self::norm3(dirx, diry, dirz);
+
+            let pr = parent.r0 + (parent.r1 - parent.r0) * t;
+
+            let shrink = Self::shrink_for_child_depth(depth);
+            let r0 = (pr * shrink).max(CHILD_R0_MIN_VOX);
+            let r1 =
+                (r0 * (CHILD_R1_SCALE_BASE + CHILD_R1_SCALE_RAND * u01(sj ^ 0x5555))).max(
+                    CHILD_R1_MIN_VOX,
+                );
+
+            let bx = ax + dirx * len;
+            let by = ay + diry * len;
+            let bz = az + dirz * len;
+
+            let bend = (CHILD_BEND_M_MIN * vpm) + (CHILD_BEND_M_RAND * vpm) * u01(sj ^ 0x6666);
+
+            let k1 = Self::s11(sj ^ 0x7777);
+            let k2 = Self::s11(sj ^ 0x8888);
+            let u1 = Self::s11(sj ^ 0x9999);
+            let u2 = Self::s11(sj ^ 0xAAAA);
+
+            let c1x = ax + dirx * (CHILD_C1_T * len)
+                + sideways.0 * (bend * CHILD_C1_BEND_SCALE * k1);
+            let c1y = ay + diry * (CHILD_C1_T * len) + (bend * CHILD_C1_Y_BEND_SCALE * u1.abs());
+            let c1z = az + dirz * (CHILD_C1_T * len)
+                + sideways.2 * (bend * CHILD_C1_BEND_SCALE * k1);
+
+            let c2x = ax + dirx * (CHILD_C2_T * len)
+                + sideways.0 * (bend * CHILD_C2_BEND_SCALE * k2);
+            let c2y = ay + diry * (CHILD_C2_T * len) + (bend * CHILD_C2_Y_BEND_SCALE * u2.abs());
+            let c2z = az + dirz * (CHILD_C2_T * len)
+                + sideways.2 * (bend * CHILD_C2_BEND_SCALE * k2);
+
+            out.push(Branch {
+                ax,
+                ay,
+                az,
+                c1x,
+                c1y,
+                c1z,
+                c2x,
+                c2y,
+                c2z,
+                bx,
+                by,
+                bz,
+                r0,
+                r1,
+                len,
+                depth,
+                seed: hash_u32(tree_seed ^ sj ^ 0xBEEF_1234),
+            });
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Rasterization into chunk-local mask
+    // -------------------------------------------------------------------------
+
+    fn raster_tree_into_mask(&self, tree: &Tree, out: &mut TreeMaskCache) {
+        let side = out.size;
+
+        // --- trunk ---
+        let top_y = tree.base_y + tree.trunk_h;
+        let y0 = tree.base_y.max(out.origin[1]);
+        let y1 = top_y.min(out.origin[1] + side - 1);
+
+        for wy in y0..=y1 {
+            let (wx, wz) = self.trunk_wobble(tree, wy);
+            let cx = tree.tx as f32 + wx;
+            let cz = tree.tz as f32 + wz;
+            let rr = Self::trunk_radius_at(tree, wy).max(1.0);
+            let r = rr.ceil() as i32;
+            let rr2 = rr * rr;
+
+            let minx = (cx.floor() as i32 - r).max(out.origin[0]);
+            let maxx = (cx.ceil() as i32 + r).min(out.origin[0] + side - 1);
+            let minz = (cz.floor() as i32 - r).max(out.origin[2]);
+            let maxz = (cz.ceil() as i32 + r).min(out.origin[2] + side - 1);
+
+            for x in minx..=maxx {
+                let dx = (x as f32) - cx;
+                let dx2 = dx * dx;
+                for z in minz..=maxz {
+                    let dz = (z as f32) - cz;
+                    if dx2 + dz * dz <= rr2 {
+                        out.write_wood(x - out.origin[0], wy - out.origin[1], z - out.origin[2]);
+                    }
+                }
+            }
+        }
+
+        // --- top crown (leaf cluster at trunk tip) ---
+        if TOP_CROWN_ENABLE {
+            let vpm_f = config::VOXELS_PER_METER as f32;
+
+            let tip_y = tree.base_y + tree.trunk_h;
+            let (twx, twz) = self.trunk_wobble(tree, tip_y);
+
+            let cx = tree.tx as f32 + twx;
+            let cy = tip_y as f32 + TOP_CROWN_LIFT_M * vpm_f;
+            let cz = tree.tz as f32 + twz;
+
+            let crown_r =
+                Self::tuft_r_m(0, tree.seed ^ 0xC0A7_0001) * vpm_f * TOP_CROWN_R_SCALE;
+
+            // center tuft (tip profile)
+            self.raster_sphere_leaf_tuft_with_masks(
+                out,
+                cx,
+                cy,
+                cz,
+                crown_r,
+                tree.seed ^ 0xC0A7_CE17,
+                TIP_GUARANTEED_GATE_MASK,
+                TIP_GUARANTEED_INTERIOR_KEEP_MASK,
+                TIP_GUARANTEED_SHELL_DROP_MASK,
+            );
+
+            // ring tufts (sleeve profile) for a crown silhouette
+            let ring_r = crown_r * TOP_CROWN_RING_RAD_SCALE;
+            for i in 0..TOP_CROWN_RING_TUFTS {
+                let rr = hash_u32(tree.seed ^ 0xC0A7_1E99 ^ (i as u32).wrapping_mul(0x9E37_79B9));
+                let ang = u01(rr ^ 0xA1) * std::f32::consts::TAU;
+
+                let ox = ang.cos() * ring_r;
+                let oz = ang.sin() * ring_r;
+                let oy = Self::s11(rr ^ 0xB2) * (0.18 * vpm_f);
+
+                self.raster_sphere_leaf_tuft_with_masks(
+                    out,
+                    cx + ox,
+                    cy + oy,
+                    cz + oz,
+                    crown_r * (0.70 + 0.15 * u01(rr ^ 0xC3)),
+                    tree.seed ^ rr ^ 0xC0A7_7AF7,
+                    TUFT_SPARSE_GATE_MASK,
+                    TUFT_SPARSE_INTERIOR_KEEP_MASK,
+                    TUFT_SPARSE_SHELL_DROP_MASK,
+                );
+            }
+        }
+
+        // --- branches ---
+        let vpm_f = config::VOXELS_PER_METER as f32;
+
+        let primary_count = self.primary_count(tree);
+        let starts = self.primary_starts(tree, primary_count);
+        let ang0 = u01(hash_u32(tree.seed ^ 0xA0A0_0001)) * std::f32::consts::TAU;
+
+        let mut branches: Vec<Branch> = Vec::with_capacity(BRANCH_CAP.min(1024));
+
+        // primary branches
+        for i in 0..primary_count.min(32) {
+            let sy = starts[i];
+            let br_seed = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
+
+            let ang_j = Self::s11(hash_u32(br_seed ^ 0xABCD_0001)) * PRIMARY_ANG_JITTER;
+            let ang =
+                ang0 + (i as f32) * (std::f32::consts::TAU / (primary_count as f32)) + ang_j;
+
+            let dirx = ang.cos();
+            let dirz = ang.sin();
+
+            let len = (PRIMARY_LEN_M_MIN * vpm_f)
+                + u01(hash_u32(br_seed ^ 0x1111)) * (PRIMARY_LEN_M_RAND * vpm_f);
+
+            let h = ((sy - tree.base_y) as f32 / (tree.trunk_h as f32)).clamp(0.0, 1.0);
+            let p = u01(hash_u32(br_seed ^ 0x2222));
+            let pitch = (PRIMARY_PITCH_BASE + PRIMARY_PITCH_H_SCALE * h)
+                + (p * p) * (PRIMARY_PITCH_QUAD_BASE + PRIMARY_PITCH_QUAD_H_SCALE * h);
+
+            let br0 = (PRIMARY_R0_M_MIN * vpm_f)
+                + u01(hash_u32(br_seed ^ 0x3333)) * (PRIMARY_R0_M_RAND * vpm_f);
+            let br1 = br0
+                * (PRIMARY_R1_SCALE_MIN + PRIMARY_R1_SCALE_RAND * u01(hash_u32(br_seed ^ 0x3334)));
+
+            let (twx, twz) = self.trunk_wobble(tree, sy);
+            let ax = tree.tx as f32 + twx;
+            let ay = sy as f32;
+            let az = tree.tz as f32 + twz;
+
+            let bx = ax + dirx * len;
+            let by = ay + pitch * len;
+            let bz = az + dirz * len;
+
+            let bend = (PRIMARY_BEND_M_MIN * vpm_f)
+                + (PRIMARY_BEND_M_RAND * vpm_f) * u01(hash_u32(br_seed ^ 0x9000));
+            let k1 = Self::s11(hash_u32(br_seed ^ 0x9001));
+            let k2 = Self::s11(hash_u32(br_seed ^ 0x9002));
+            let u1 = Self::s11(hash_u32(br_seed ^ 0x9003));
+            let u2 = Self::s11(hash_u32(br_seed ^ 0x9004));
+
+            let perpx = -dirz;
+            let perpz = dirx;
+
+            let c1x = ax + dirx * (PRIMARY_C1_T * len)
+                + perpx * (bend * (PRIMARY_C1_BEND_SCALE * k1));
+            let c1z = az + dirz * (PRIMARY_C1_T * len)
+                + perpz * (bend * (PRIMARY_C1_BEND_SCALE * k1));
+            let c1y = ay + (pitch * len) * PRIMARY_C1_T + (PRIMARY_C1_Y_BEND_SCALE * bend * u1);
+
+            let c2x = ax + dirx * (PRIMARY_C2_T * len)
+                + perpx * (bend * (PRIMARY_C2_BEND_SCALE * k2));
+            let c2z = az + dirz * (PRIMARY_C2_T * len)
+                + perpz * (bend * (PRIMARY_C2_BEND_SCALE * k2));
+            let c2y = ay + (pitch * len) * PRIMARY_C2_T + (PRIMARY_C2_Y_BEND_SCALE * bend * u2);
+
+            branches.push(Branch {
+                ax,
+                ay,
+                az,
+                c1x,
+                c1y,
+                c1z,
+                c2x,
+                c2y,
+                c2z,
+                bx,
+                by,
+                bz,
+                r0: br0.max(1.0),
+                r1: br1.max(0.80),
+                len,
+                depth: 0,
+                seed: hash_u32(tree.seed ^ br_seed ^ 0x1A2B_3C4D),
+            });
+        }
+
+        // BFS recursion (generate)
+        let mut k = 0usize;
+        while k < branches.len() && branches.len() < BRANCH_CAP {
+            let b = branches[k];
+            self.child_branches_from_parent(&b, tree.seed, &mut branches);
+            k += 1;
+        }
+
+        // wood raster
+        for b in &branches {
+            let len_m = b.len / vpm_f;
+            let steps = (BRANCH_STEPS_BASE + (len_m / BRANCH_STEPS_LEN_DIV_M)).round() as i32;
+            let steps = steps.clamp(BRANCH_STEPS_MIN, BRANCH_STEPS_MAX);
+            self.raster_bezier_wood(out, b, steps);
+        }
+
+        // leaves raster
+        for b in &branches {
+            if (hash_u32(b.seed ^ 0x1357_2468) & LEAF_RARE_SKIP_MASK) == 0 {
+                continue;
+            }
+
+            let tuft_r = Self::tuft_r_m(b.depth, b.seed ^ 0x4440) * vpm_f;
+
+            // tip tuft
+            if LEAF_ALWAYS_TIP_FOR_ALL_BRANCHES {
+                self.raster_sphere_leaf_tuft_with_masks(
+                    out,
+                    b.bx,
+                    b.by,
+                    b.bz,
+                    tuft_r,
+                    b.seed ^ 0x1EE7_1EAF,
+                    TIP_GUARANTEED_GATE_MASK,
+                    TIP_GUARANTEED_INTERIOR_KEEP_MASK,
+                    TIP_GUARANTEED_SHELL_DROP_MASK,
+                );
+            }
+
+            // sleeve tufts along branch
+            let sleeve_n = Self::sleeve_n(b.depth);
+            for si in 0..sleeve_n {
+                let rr = hash_u32(b.seed ^ 0x9000_1000 ^ (si as u32).wrapping_mul(0x9E37_79B9));
+                let t = LEAF_SLEEVE_T_MIN + LEAF_SLEEVE_T_RAND * u01(rr ^ 0x0101);
+                let (mx, my, mz) = Self::bez_point(b, t);
+
+                let ox = Self::s11(rr ^ 0x0202) * (LEAF_SLEEVE_OFFSET_M_XZ * vpm_f);
+                let oy = u01(rr ^ 0x0303) * (LEAF_SLEEVE_OFFSET_M_Y * vpm_f);
+                let oz = Self::s11(rr ^ 0x0404) * (LEAF_SLEEVE_OFFSET_M_XZ * vpm_f);
+
+                self.raster_sphere_leaf_tuft_with_masks(
+                    out,
+                    mx + ox,
+                    my + oy,
+                    mz + oz,
+                    tuft_r * (0.55 + 0.10 * (si as f32)),
+                    b.seed ^ rr ^ 0x2AA2_2AA2,
+                    TUFT_SPARSE_GATE_MASK,
+                    TUFT_SPARSE_INTERIOR_KEEP_MASK,
+                    TUFT_SPARSE_SHELL_DROP_MASK,
+                );
+            }
+
+            // extra offset tip tuft (disabled by LEAF_OFFSET_TIP_MASK=0)
+            let h = hash_u32(b.seed ^ 0xABC0_0001);
+            if (h & LEAF_OFFSET_TIP_MASK) != 0 {
+                let rr = hash_u32(b.seed ^ 0xABC0_0002);
+                let ox = Self::s11(rr ^ 0xABC1) * (LEAF_OFFSET_M_XZ * vpm_f);
+                let oy = u01(rr ^ 0xABC2) * (LEAF_OFFSET_M_Y * vpm_f);
+                let oz = Self::s11(rr ^ 0xABC3) * (LEAF_OFFSET_M_XZ * vpm_f);
+
+                self.raster_sphere_leaf_tuft_with_masks(
+                    out,
+                    b.bx + ox,
+                    b.by + oy,
+                    b.bz + oz,
+                    tuft_r * 0.75,
+                    b.seed ^ 0x600D_600D,
+                    TUFT_SPARSE_GATE_MASK,
+                    TUFT_SPARSE_INTERIOR_KEEP_MASK,
+                    TUFT_SPARSE_SHELL_DROP_MASK,
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Wood rasterization
+    // -------------------------------------------------------------------------
+
+    fn raster_bezier_wood(&self, out: &mut TreeMaskCache, b: &Branch, steps: i32) {
+        let steps = steps.max(2);
+        let inv = 1.0 / (steps as f32);
+
+        let mut px = b.ax;
+        let mut py = b.ay;
+        let mut pz = b.az;
+
+        for i in 1..=steps {
+            let t = (i as f32) * inv;
+
+            let qx = Self::bezier3(b.ax, b.c1x, b.c2x, b.bx, t);
+            let qy = Self::bezier3(b.ay, b.c1y, b.c2y, b.by, t);
+            let qz = Self::bezier3(b.az, b.c1z, b.c2z, b.bz, t);
+
+            let rr0 = b.r0 + (b.r1 - b.r0) * (((i - 1) as f32) * inv);
+            let rr1 = b.r0 + (b.r1 - b.r0) * t;
+
+            Self::raster_segment_wood_capsule_stamps(out, px, py, pz, qx, qy, qz, rr0, rr1);
+
+            px = qx;
+            py = qy;
+            pz = qz;
+        }
+    }
+
+    fn raster_segment_wood_capsule_stamps(
+        out: &mut TreeMaskCache,
+        ax: f32, ay: f32, az: f32,
+        bx: f32, by: f32, bz: f32,
+        r0: f32, r1: f32,
+    ) {
+        let vx = bx - ax;
+        let vy = by - ay;
+        let vz = bz - az;
+
+        let len2 = vx*vx + vy*vy + vz*vz;
+        if len2 <= 1e-8 {
+            Self::stamp_sphere_wood(out, ax, ay, az, r0.max(r1));
+            return;
+        }
+        let len = len2.sqrt();
+
+        // Step size in voxels. 0.75 tends to be safe (no holes) but not too expensive.
+        let step = (0.75_f32).max(0.40_f32 * r0.max(r1)); // tune
+        let n = (len / step).ceil() as i32;
+
+        let inv_n = 1.0 / (n as f32);
+
+        for i in 0..=n {
+            let t = (i as f32) * inv_n;
+            let cx = ax + vx * t;
+            let cy = ay + vy * t;
+            let cz = az + vz * t;
+
+            let r = r0 + (r1 - r0) * t;
+            Self::stamp_sphere_wood(out, cx, cy, cz, r);
+        }
+    }
+
+    fn stamp_sphere_wood(out: &mut TreeMaskCache, cx: f32, cy: f32, cz: f32, r: f32) {
+        let rr = r.max(1.0);
+        let ir = rr.ceil() as i32;
+        let r2 = rr * rr;
+
+        let minx = (cx.floor() as i32 - ir).max(out.origin[0]);
+        let maxx = (cx.ceil()  as i32 + ir).min(out.origin[0] + out.size - 1);
+        let miny = (cy.floor() as i32 - ir).max(out.origin[1]);
+        let maxy = (cy.ceil()  as i32 + ir).min(out.origin[1] + out.size - 1);
+
+        for y in miny..=maxy {
+            let dy = (y as f32) - cy;
+            let dy2 = dy*dy;
+            for x in minx..=maxx {
+                let dx = (x as f32) - cx;
+                let dxy2 = dx*dx + dy2;
+                if dxy2 > r2 { continue; }
+
+                let zext = (r2 - dxy2).sqrt();
+                let minz = ((cz - zext).floor() as i32).max(out.origin[2]);
+                let maxz = ((cz + zext).ceil()  as i32).min(out.origin[2] + out.size - 1);
+
+                let lx = (x - out.origin[0]) as i32;
+                let ly = (y - out.origin[1]) as i32;
+                for z in minz..=maxz {
+                    out.write_wood(lx, ly, z - out.origin[2]);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Leaf rasterization
+    // -------------------------------------------------------------------------
+
+    fn raster_sphere_leaf_tuft_with_masks(
+        &self,
+        out: &mut TreeMaskCache,
+        cx: f32,
+        cy: f32,
+        cz: f32,
+        r: f32,
+        seed: u32,
+        gate_mask: u32,
+        interior_keep_mask: u32,
+        shell_drop_mask: u32,
+    ) {
+        let rr = r.max(1.0);
+        let ir = rr.ceil() as i32;
+
+        let minx = (cx.floor() as i32 - ir).max(out.origin[0]);
+        let maxx = (cx.ceil() as i32 + ir).min(out.origin[0] + out.size - 1);
+        let miny = (cy.floor() as i32 - ir).max(out.origin[1]);
+        let maxy = (cy.ceil() as i32 + ir).min(out.origin[1] + out.size - 1);
+        let minz = (cz.floor() as i32 - ir).max(out.origin[2]);
+        let maxz = (cz.ceil() as i32 + ir).min(out.origin[2] + out.size - 1);
+
+        let r2 = rr * rr;
+
+        for y in miny..=maxy {
+            let py = y as f32;
+            let dy = (py - cy) * LEAF_SPHERE_Y_SCALE;
+            let dy2 = dy * dy;
+
+            for x in minx..=maxx {
+                let px = x as f32;
+                let dx = px - cx;
+                let dx2 = dx * dx;
+
+                for z in minz..=maxz {
+                    let pz = z as f32;
+                    let dz = pz - cz;
+                    let d2 = dx2 + dy2 + dz * dz;
+                    if d2 > r2 {
+                        continue;
+                    }
+
+                    // gate AFTER sphere test
+                    if (hash3(seed ^ 0xA11C_E5ED, x, y, z) & gate_mask) != 0 {
+                        continue;
+                    }
+
+                    // only now do sqrt + interior/shell hashing
+                    let shell2 = (LEAF_SHELL_THRESH * rr) * (LEAF_SHELL_THRESH * rr);
+                    if d2 < shell2 {
+                        let n = hash3(seed ^ 0xCAFE_BABE, x, y, z);
+                        if (n & interior_keep_mask) != 0 {
+                            continue;
+                        }
+                    } else {
+                        let n = hash3(seed ^ 0xD00D_F00D, x, y, z);
+                        if (n & shell_drop_mask) == 0 {
+                            continue;
+                        }
+                    }
+
+                    out.write_leaf(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // SVO bounds helper
+    // -------------------------------------------------------------------------
+
+    /// Used by the SVO builder to stamp conservative tree-top bounds.
+    pub fn tree_instance_at_meter(&self, xm: i32, zm: i32) -> Option<(i32, i32)> {
+        let (_seed, trunk_h_vox, crown_r_vox) = self.tree_at_meter_cell(xm, zm)?;
+        Some((trunk_h_vox, crown_r_vox))
+    }
+}
+

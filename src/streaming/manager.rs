@@ -236,6 +236,9 @@ pub struct ChunkManager {
 
     active_offsets: Vec<(i32, i32, i32)>,
     to_unload: Vec<ChunkKey>,
+
+    slot_macro: Vec<Arc<[u32]>>,
+    slot_colinfo: Vec<Arc<[u32]>>,
 }
 
 impl ChunkManager {
@@ -284,6 +287,9 @@ impl ChunkManager {
 
             active_offsets,
             to_unload: Vec::new(),
+
+            slot_macro: Vec::new(),
+            slot_colinfo: Vec::new(),
         }
     }
 
@@ -317,17 +323,27 @@ impl ChunkManager {
     }
 
     #[inline(always)]
-    fn in_keep(center: ChunkKey, k: ChunkKey) -> bool {
+    fn in_keep(world: &WorldGen, center: ChunkKey, k: ChunkKey) -> bool {
         let dx = k.x - center.x;
         let dz = k.z - center.z;
-        let dy = k.y - center.y;
 
-        dx >= -config::KEEP_RADIUS
-            && dx <= config::KEEP_RADIUS
-            && dz >= -config::KEEP_RADIUS
-            && dz <= config::KEEP_RADIUS
-            && dy >= Self::y_band_min()
-            && dy <= Self::y_band_max()
+        if dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS {
+            return false;
+        }
+        if dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS {
+            return false;
+        }
+
+        // Compute ground chunk-Y for THIS column (k.x,k.z), not the camera column.
+        let cs = config::CHUNK_SIZE as i32;
+        let half = cs / 2;
+        let wx = k.x * cs + half;
+        let wz = k.z * cs + half;
+        let ground_y_vox = world.ground_height(wx, wz);
+        let ground_cy = ground_y_vox.div_euclid(cs);
+
+        let dy = k.y - ground_cy;
+        dy >= Self::y_band_min() && dy <= Self::y_band_max()
     }
 
     pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
@@ -348,11 +364,25 @@ impl ChunkManager {
         let n_active = self.active_offsets.len();
         for i in 0..n_active {
             let (dx, dy, dz) = self.active_offsets[i];
+
+            let cs = config::CHUNK_SIZE as i32;
+            let half = cs / 2;
+
+            let x = center.x + dx;
+            let z = center.z + dz;
+
+            // ground chunk-Y for THIS (x,z) column
+            let wx = x * cs + half;
+            let wz = z * cs + half;
+            let ground_y_vox = world.ground_height(wx, wz);
+            let ground_cy = ground_y_vox.div_euclid(cs);
+
             let k = ChunkKey {
-                x: center.x + dx,
-                y: center.y + dy,
-                z: center.z + dz,
+                x,
+                y: ground_cy + dy, // dy is still your vertical band offset
+                z,
             };
+
 
             match self.chunks.get(&k) {
                 Some(ChunkState::Resident(_)) | Some(ChunkState::Queued) | Some(ChunkState::Building) => {}
@@ -377,10 +407,11 @@ impl ChunkManager {
         // Unload outside KEEP
         self.to_unload.clear();
         for &k in self.chunks.keys() {
-            if !Self::in_keep(center, k) {
+            if !Self::in_keep(world.as_ref(), center, k) {
                 self.to_unload.push(k);
             }
         }
+
 
         let mut unload_list = std::mem::take(&mut self.to_unload);
         for k in unload_list.drain(..) {
@@ -393,7 +424,7 @@ impl ChunkManager {
             self.last_center = Some(center);
 
             self.build_queue.retain(|k| {
-                Self::in_keep(center, *k) && matches!(self.chunks.get(k), Some(ChunkState::Queued))
+                Self::in_keep(world.as_ref(), center, *k) && matches!(self.chunks.get(k), Some(ChunkState::Queued))
             });
 
             self.queued_set.clear();
@@ -407,7 +438,7 @@ impl ChunkManager {
             let Some(k) = self.build_queue.pop_front() else { break; };
             self.queued_set.remove(&k);
 
-            if !Self::in_keep(center, k) {
+            if !Self::in_keep(world.as_ref(), center, k) {
                 self.cancel_token(k).store(true, Ordering::Relaxed);
                 self.chunks.remove(&k);
                 continue;
@@ -448,7 +479,7 @@ impl ChunkManager {
                 continue;
             }
 
-            if !Self::in_keep(center, done.key) {
+            if !Self::in_keep(world.as_ref(), center, done.key) {
                 self.cancel_token(done.key).store(true, Ordering::Relaxed);
                 self.chunks.remove(&done.key);
                 continue;
@@ -635,6 +666,9 @@ impl ChunkManager {
         let slot = self.slot_to_key.len() as u32;
         self.slot_to_key.push(key);
 
+        self.slot_macro.push(macro_words.clone());
+        self.slot_colinfo.push(colinfo_words.clone());
+
         let macro_base = slot * MACRO_WORDS_PER_CHUNK;
 
         let origin_vox = [
@@ -746,6 +780,9 @@ impl ChunkManager {
                     moved_meta.colinfo_base = (dead_slot as u32) * COLINFO_WORDS_PER_CHUNK;
                     self.chunk_meta[dead_slot] = moved_meta;
 
+                    self.slot_macro.swap(dead_slot, last_slot);
+                    self.slot_colinfo.swap(dead_slot, last_slot);
+
                     if let Some(st) = self.chunks.get_mut(&moved_key) {
                         if let ChunkState::Resident(mr) = st {
                             mr.slot = dead_slot as u32;
@@ -770,14 +807,17 @@ impl ChunkManager {
                         meta: self.chunk_meta[dead_slot],
                         node_base: 0,
                         nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
-                        macro_words: moved_macro,
+                        macro_words: self.slot_macro[dead_slot].clone(),
                         ropes: Arc::<[NodeRopesGpu]>::from(Vec::<NodeRopesGpu>::new()),
-                        colinfo_words: moved_colinfo,
+                        colinfo_words: self.slot_colinfo[dead_slot].clone(),
                     });
+
                 }
 
                 self.slot_to_key.pop();
                 self.chunk_meta.pop();
+                self.slot_macro.pop();
+                self.slot_colinfo.pop();
 
                 self.grid_dirty = true;
                 self.changed = true;
