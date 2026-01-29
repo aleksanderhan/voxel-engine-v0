@@ -1,1253 +1,3024 @@
-// src/render/state/bindgroups.rs
-// ------------------------------
-// src/render/state/bindgroups.rs
+// src/streaming/manager.rs
+// ------------------------
+// src/streaming/manager.rs
+// ------------------------
+// Chunk streaming + background SVO building + CPU cache.
 //
-// Bind group creation.
+// New behavior:
+// - Chunks are built once, then stored in a CPU cache (budgeted, LRU-ish).
+// - When chunks come back into range, we "promote" from cache: allocate GPU node arena
+//   range + upload nodes/meta, without rebuilding on worker threads.
 
-use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::mem::size_of;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
-pub struct BindGroups {
-    pub primary: wgpu::BindGroup,
-    pub scene: wgpu::BindGroup,
-    pub godray: [wgpu::BindGroup; 2],
-    pub composite: [wgpu::BindGroup; 2],
-    pub empty: wgpu::BindGroup,
-    pub blit: wgpu::BindGroup,
-}
-
-fn make_primary_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    buffers: &Buffers,
-    textures: &TextureSet,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("primary_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffers.camera.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buffers.chunk.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: buffers.node.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: buffers.chunk_grid.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&textures.color.view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: wgpu::BindingResource::TextureView(&textures.depth.view),
-            },
-            // Clipmap params uniform
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: buffers.clipmap.as_entire_binding(),
-            },
-            // Clipmap height texture array
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
-            },
-        ],
-    })
-}
-
-fn make_scene_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    buffers: &Buffers,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("scene_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffers.camera.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buffers.chunk.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: buffers.node.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: buffers.chunk_grid.as_entire_binding(),
-            },
-        ],
-    })
-}
-
-fn make_godray_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    depth_view: &wgpu::TextureView,
-    hist_view: &wgpu::TextureView,
-    out_view: &wgpu::TextureView,
-    label: &str,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(depth_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(hist_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(out_view),
-            },
-        ],
-    })
-}
-
-fn make_composite_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    color_view: &wgpu::TextureView,
-    godray_view: &wgpu::TextureView,
-    output_view: &wgpu::TextureView,
-    depth_view: &wgpu::TextureView, // NEW
-    label: &str,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(color_view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(godray_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(output_view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
-        ],
-    })
-}
-
-
-
-fn make_blit_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    output_view: &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-    overlay_buf: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("blit_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(output_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: overlay_buf.as_entire_binding(),
-            },
-        ],
-    })
-}
-
-pub fn create_bind_groups(
-    device: &wgpu::Device,
-    layouts: &Layouts,
-    buffers: &Buffers,
-    textures: &TextureSet,
-    sampler: &wgpu::Sampler,
-) -> BindGroups {
-    let primary = make_primary_bg(device, &layouts.primary, buffers, textures);
-    let scene = make_scene_bg(device, &layouts.scene, buffers);
-
-    let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("empty_bg"),
-        layout: &layouts.empty,
-        entries: &[],
-    });
-
-    let godray = [
-        make_godray_bg(
-            device,
-            &layouts.godray,
-            &textures.depth.view,
-            &textures.godray[0].view,
-            &textures.godray[1].view,
-            "godray_bg_a_to_b",
-        ),
-        make_godray_bg(
-            device,
-            &layouts.godray,
-            &textures.depth.view,
-            &textures.godray[1].view,
-            &textures.godray[0].view,
-            "godray_bg_b_to_a",
-        ),
-    ];
-
-    let composite = [
-        make_composite_bg(
-            device,
-            &layouts.composite,
-            &textures.color.view,
-            &textures.godray[0].view,
-            &textures.output.view,
-            &textures.depth.view,
-            "composite_bg_read_a",
-        ),
-        make_composite_bg(
-            device,
-            &layouts.composite,
-            &textures.color.view,
-            &textures.godray[1].view,
-            &textures.output.view,
-            &textures.depth.view,
-            "composite_bg_read_b",
-        ),
-    ];
-
-    let blit = make_blit_bg(
-        device,
-        &layouts.blit,
-        &textures.output.view,
-        sampler,
-        &buffers.overlay,
-    );
-
-    BindGroups {
-        primary,
-        scene,
-        godray,
-        composite,
-        empty,
-        blit,
-    }
-}
-
-// src/render/state/buffers.rs
-// ---------------------------
-// src/render/state/buffers.rs
-//
-// Persistent GPU buffers and capacities.
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use glam::{Vec2, Vec3};
 
 use crate::{
     config,
-    render::gpu_types::{ChunkMetaGpu, ClipmapGpu, NodeGpu},
+    render::gpu_types::{ChunkMetaGpu, NodeGpu},
+    svo::{build_chunk_svo_sparse_cancelable_with_scratch, BuildScratch},
+    world::WorldGen,
 };
 
-pub struct Buffers {
-    // --- Uniforms ---
-    pub camera: wgpu::Buffer,
-    pub overlay: wgpu::Buffer,
+use super::NodeArena;
 
-    /// Clipmap params (primary compute pass only).
-    pub clipmap: wgpu::Buffer,
+const INVALID_U32: u32 = 0xFFFF_FFFF;
 
-    // --- Storage buffers ---
-    pub node: wgpu::Buffer,
-    pub chunk: wgpu::Buffer,
-    pub chunk_grid: wgpu::Buffer,
+// Vertical band dy in [-1..=2]
+const GRID_Y_MIN_DY: i32 = -1;
+const GRID_Y_COUNT: u32 = 4;
 
-    // --- Capacities ---
-    pub node_capacity: u32,
-    pub chunk_capacity: u32,
-    pub grid_capacity: u32,
+// How many eviction attempts to make when we can't fit a chunk's nodes contiguously.
+const EVICT_ATTEMPTS: usize = 8;
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+struct ChunkKey {
+    x: i32,
+    y: i32,
+    z: i32,
 }
 
-fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: std::mem::size_of::<T>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
+enum ChunkState {
+    Missing,
+    Queued,
+    Building,
+    Resident(Resident),
 }
 
-fn make_storage_buffer(device: &wgpu::Device, label: &str, size_bytes: u64) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: size_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
+#[derive(Clone, Copy, Debug)]
+struct Resident {
+    slot: u32,      // index into chunk_meta (dense)
+    node_base: u32, // base index into global node arena
+    node_count: u32,
 }
 
-pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
-    let camera = make_uniform_buffer::<crate::render::gpu_types::CameraGpu>(device, "camera_buf");
-    let overlay = make_uniform_buffer::<crate::render::gpu_types::OverlayGpu>(device, "overlay_buf");
-
-    let clipmap = make_uniform_buffer::<ClipmapGpu>(device, "clipmap_buf");
-
-    let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
-
-    let node = make_storage_buffer(
-        device,
-        "svo_nodes_arena",
-        (node_capacity as u64) * (std::mem::size_of::<NodeGpu>() as u64),
-    );
-
-    let chunk_capacity =
-        (2 * config::KEEP_RADIUS + 1) as u32 * 4u32 * (2 * config::KEEP_RADIUS + 1) as u32;
-
-    let chunk = make_storage_buffer(
-        device,
-        "chunk_meta_persistent",
-        (chunk_capacity as u64) * (std::mem::size_of::<ChunkMetaGpu>() as u64),
-    );
-
-    let grid_capacity = chunk_capacity;
-
-    let chunk_grid = make_storage_buffer(
-        device,
-        "chunk_grid_buf",
-        (grid_capacity as u64) * (std::mem::size_of::<u32>() as u64),
-    );
-
-    Buffers {
-        camera,
-        overlay,
-        clipmap,
-        node,
-        chunk,
-        chunk_grid,
-        node_capacity,
-        chunk_capacity,
-        grid_capacity,
-    }
+#[derive(Clone, Debug)]
+struct BuildJob {
+    key: ChunkKey,
+    cancel: Arc<AtomicBool>,
 }
 
-// src/render/state/layout.rs
-// --------------------------
-// src/render/state/layout.rs
-//
-// Bind group layouts and small helpers.
-
-pub struct Layouts {
-    pub primary: wgpu::BindGroupLayout,
-    pub scene: wgpu::BindGroupLayout,
-    pub godray: wgpu::BindGroupLayout,
-    pub composite: wgpu::BindGroupLayout,
-    pub empty: wgpu::BindGroupLayout,
-    pub blit: wgpu::BindGroupLayout,
+struct BuildDone {
+    key: ChunkKey,
+    cancel: Arc<AtomicBool>,
+    canceled: bool,
+    nodes: Vec<NodeGpu>,
 }
 
-fn bgl_sampler(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-        count: None,
-    }
+pub struct ChunkUpload {
+    pub slot: u32,
+    pub meta: ChunkMetaGpu,
+
+    pub node_base: u32,
+    pub nodes: Arc<[NodeGpu]>,
 }
 
+// -----------------------------
+// CPU cache (budgeted, LRU-ish)
+// -----------------------------
 
-fn bgl_uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
+#[derive(Clone)]
+struct CachedChunk {
+    nodes: Arc<[NodeGpu]>,
+    bytes: usize,
+    stamp: u64,
 }
 
-fn bgl_storage_ro(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
+fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender<BuildDone>) {
+    for _ in 0..config::WORKER_THREADS {
+        let gen = gen.clone();
+        let rx_job = rx_job.clone();
+        let tx_done = tx_done.clone();
 
-fn bgl_tex_sample_2d(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    sample_type: wgpu::TextureSampleType,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Texture {
-            sample_type,
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
+        std::thread::spawn(move || {
+            // One reusable scratch per worker thread: removes most per-chunk allocations.
+            let mut scratch = BuildScratch::new();
 
-fn bgl_tex_sample_2d_array(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    sample_type: wgpu::TextureSampleType,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Texture {
-            sample_type,
-            view_dimension: wgpu::TextureViewDimension::D2Array,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
+            while let Ok(job) = rx_job.recv() {
+                let k = job.key;
 
-fn bgl_storage_tex_wo(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    format: wgpu::TextureFormat,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::StorageTexture {
-            access: wgpu::StorageTextureAccess::WriteOnly,
-            format,
-            view_dimension: wgpu::TextureViewDimension::D2,
-        },
-        count: None,
-    }
-}
+                // If we were already cancelled before starting, still notify the main thread
+                // so it can decrement `in_flight`.
+                if job.cancel.load(Ordering::Relaxed) {
+                    if tx_done
+                        .send(BuildDone {
+                            key: k,
+                            cancel: job.cancel,
+                            canceled: true,
+                            nodes: Vec::new(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
 
-pub fn create_layouts(device: &wgpu::Device) -> Layouts {
-    let cs_vis = wgpu::ShaderStages::COMPUTE;
+                let origin = [
+                    k.x * config::CHUNK_SIZE as i32,
+                    k.y * config::CHUNK_SIZE as i32,
+                    k.z * config::CHUNK_SIZE as i32,
+                ];
 
-    let scene_entries: [wgpu::BindGroupLayoutEntry; 4] = [
-        bgl_uniform(0, cs_vis),
-        bgl_storage_ro(1, cs_vis),
-        bgl_storage_ro(2, cs_vis),
-        bgl_storage_ro(3, cs_vis),
-    ];
+                let nodes = build_chunk_svo_sparse_cancelable_with_scratch(
+                    &gen,
+                    origin,
+                    config::CHUNK_SIZE,
+                    job.cancel.as_ref(),
+                    &mut scratch,
+                );
 
-    let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("scene_bgl"),
-        entries: &scene_entries,
-    });
+                // If we got cancelled mid-build, still notify the main thread,
+                // but drop nodes to save main-thread work + upload pressure.
+                let canceled = job.cancel.load(Ordering::Relaxed);
+                let nodes = if canceled { Vec::new() } else { nodes };
 
-    // PRIMARY: add clipmap uniform + clipmap height texture array
-    // bindings:
-    // 0 camera
-    // 1 chunks
-    // 2 nodes
-    // 3 chunk_grid
-    // 4 color storage
-    // 5 depth storage
-    // 6 clipmap uniform
-    // 7 clipmap height texture array (R32Float)
-    let mut primary_entries = Vec::with_capacity(8);
-    primary_entries.extend_from_slice(&scene_entries);
-
-    primary_entries.push(bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba16Float));
-    primary_entries.push(bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float));
-
-    primary_entries.push(bgl_uniform(6, cs_vis));
-    primary_entries.push(bgl_tex_sample_2d_array(
-        7,
-        cs_vis,
-        wgpu::TextureSampleType::Float { filterable: false },
-    ));
-
-    let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("primary_bgl"),
-        entries: &primary_entries,
-    });
-
-    let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("godray_bgl"),
-        entries: &[
-            bgl_tex_sample_2d(
-                0,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            bgl_tex_sample_2d(
-                1,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
-        ],
-    });
-
-    let composite = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("composite_bgl"),
-        entries: &[
-            bgl_tex_sample_2d(
-                0,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            bgl_tex_sample_2d(
-                1,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
-
-            // NEW: full-res depth for depth-aware upsample
-            bgl_tex_sample_2d(
-                3,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-        ],
-    });
-
-    let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("empty_bgl"),
-        entries: &[],
-    });
-
-    let blit = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("blit_bgl"),
-        entries: &[
-            bgl_tex_sample_2d(
-                0,
-                wgpu::ShaderStages::FRAGMENT,
-                wgpu::TextureSampleType::Float { filterable: true },
-            ),
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            bgl_uniform(2, wgpu::ShaderStages::FRAGMENT),
-        ],
-    });
-
-    Layouts {
-        primary,
-        scene,
-        godray,
-        composite,
-        empty,
-        blit,
-    }
-}
-
-// src/render/state/mod.rs
-// -----------------------
-// src/render/state/mod.rs
-// -----------------------
-mod bindgroups;
-mod buffers;
-mod layout;
-mod pipelines;
-pub mod textures;
-
-use crate::{
-    config,
-    render::gpu_types::{CameraGpu, ClipmapGpu, OverlayGpu},
-    streaming::ChunkUpload,
-};
-
-use bindgroups::{create_bind_groups, BindGroups};
-use buffers::{create_persistent_buffers, Buffers};
-use layout::{create_layouts, Layouts};
-use pipelines::{create_pipelines, Pipelines};
-use textures::{create_textures, quarter_dim, TextureSet};
-
-pub struct Renderer {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-
-    sampler: wgpu::Sampler,
-
-    layouts: Layouts,
-    pipelines: Pipelines,
-    buffers: Buffers,
-    textures: TextureSet,
-    bind_groups: BindGroups,
-
-    ping: usize,
-}
-
-impl Renderer {
-    pub async fn new(
-        adapter: &wgpu::Adapter,
-        surface_format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) -> Self {
-        let adapter_limits = adapter.limits();
-        let required_limits = wgpu::Limits {
-            max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
-            max_buffer_size: adapter_limits.max_buffer_size,
-            ..wgpu::Limits::default()
-        };
-
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-
-        let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ray_cs"),
-            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::ray_cs_wgsl().into()),
+                if tx_done
+                    .send(BuildDone {
+                        key: k,
+                        cancel: job.cancel,
+                        canceled,
+                        nodes,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
         });
+    }
+}
 
-        let fs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit"),
-            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::blit_wgsl().into()),
-        });
+fn sort_queue_near_first(queue: &mut VecDeque<ChunkKey>, center: ChunkKey, cam_fwd: Vec3) {
+    let mut v: Vec<ChunkKey> = queue.drain(..).collect();
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("nearest_sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
+    // Horizontal forward (XZ) for “look direction”.
+    let mut f = Vec2::new(cam_fwd.x, cam_fwd.z);
+    if f.length_squared() > 1e-6 {
+        f = f.normalize();
+    } else {
+        // If forward is degenerate, just treat as no directional bias.
+        f = Vec2::ZERO;
+    }
 
-        let layouts = create_layouts(&device);
-        let buffers = create_persistent_buffers(&device);
+    v.sort_by(|a, b| {
+        let sa = chunk_priority_score(*a, center, f);
+        let sb = chunk_priority_score(*b, center, f);
+        sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-        let textures = create_textures(&device, width, height);
+    queue.extend(v);
+}
 
-        let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
+fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
+    let dx = (k.x - c.x) as f32;
+    let dz = (k.z - c.z) as f32;
+    let dy = (k.y - c.y) as f32;
 
-        let bind_groups = create_bind_groups(&device, &layouts, &buffers, &textures, &sampler);
+    // Lower score = higher priority.
+    // Base distance (prefer close). Penalize vertical moves more.
+    let base = dx.abs() + dz.abs() + 2.0 * dy.abs();
+
+    // Directional bias: chunks in front (positive dot) get a lower score.
+    // 1) compute signed "forward distance"
+    let dir = dx * fwd_xz.x + dz * fwd_xz.y; // dot(delta_xz, fwd)
+
+    // 2) tune weights
+    let front_bonus = 0.75;   // bigger => prefer in-front more
+    let behind_penalty = 0.25; // bigger => deprioritize behind more
+
+    let bias = if dir >= 0.0 {
+        -front_bonus * dir
+    } else {
+        -behind_penalty * dir // dir is negative, so this increases score
+    };
+
+    base + bias
+}
+
+
+pub struct ChunkManager {
+    gen: Arc<WorldGen>,
+
+    chunks: HashMap<ChunkKey, ChunkState>,
+    build_queue: VecDeque<ChunkKey>,
+
+    // Deduplicate queued keys (prevents unbounded queue growth).
+    queued_set: HashSet<ChunkKey>,
+
+    // Only sort/purge when center chunk changes.
+    last_center: Option<ChunkKey>,
+
+    // Per-chunk cancel tokens
+    cancels: HashMap<ChunkKey, Arc<AtomicBool>>,
+
+    tx_job: Sender<BuildJob>,
+    rx_done: Receiver<BuildDone>,
+    in_flight: usize,
+
+    // Dense slots for resident chunks
+    slot_to_key: Vec<ChunkKey>,    // slot -> key
+    chunk_meta: Vec<ChunkMetaGpu>, // slot -> meta
+    uploads: Vec<ChunkUpload>,     // pending GPU writes this frame
+
+    // General “something changed” flag (kept for other systems).
+    changed: bool,
+
+    // Grid dirty flag:
+    // - true when the GPU lookup grid needs rebuilding (origin shift or resident slot mapping changed)
+    // - update() returns this so the renderer can skip `write_chunk_grid()` on most frames.
+    grid_dirty: bool,
+
+    // Node arena (in units of NodeGpu elements)
+    arena: NodeArena,
+
+    // Chunk grid for GPU lookup: maps grid cell -> resident slot index (or INVALID_U32).
+    grid_origin_chunk: [i32; 3],
+    grid_dims: [u32; 3],
+    chunk_grid: Vec<u32>,
+
+    // ----------------
+    // CPU chunk cache
+    // ----------------
+    cache: HashMap<ChunkKey, CachedChunk>,
+    cache_lru: VecDeque<(ChunkKey, u64)>, // (key, stamp) entries; duplicates are allowed
+    cache_stamp: u64,
+    cache_bytes: usize,
+}
+
+impl ChunkManager {
+    pub fn new(gen: Arc<WorldGen>) -> Self {
+        let (tx_job, rx_job) = unbounded::<BuildJob>();
+        let (tx_done, rx_done) = unbounded::<BuildDone>();
+        spawn_workers(gen.clone(), rx_job, tx_done);
+
+        // Arena capacity in NodeGpu elements.
+        let node_capacity = (config::NODE_BUDGET_BYTES / size_of::<NodeGpu>()) as u32;
+
+        // Grid size (KEEP box).
+        let nx = (2 * config::KEEP_RADIUS + 1) as u32;
+        let nz = nx;
+        let ny = GRID_Y_COUNT;
+        let grid_len = (nx * ny * nz) as usize;
 
         Self {
-            device,
-            queue,
-            sampler,
-            layouts,
-            pipelines,
-            buffers,
-            textures,
-            bind_groups,
-            ping: 0,
+            gen,
+            chunks: HashMap::new(),
+            build_queue: VecDeque::new(),
+            queued_set: HashSet::new(),
+            last_center: None,
+
+            cancels: HashMap::new(),
+            tx_job,
+            rx_done,
+            in_flight: 0,
+
+            slot_to_key: Vec::new(),
+            chunk_meta: Vec::new(),
+            uploads: Vec::new(),
+            changed: false,
+
+            grid_dirty: true, // first update should build + upload the grid
+            arena: NodeArena::new(node_capacity),
+
+            grid_origin_chunk: [0, 0, 0],
+            grid_dims: [nx, ny, nz],
+            chunk_grid: vec![INVALID_U32; grid_len],
+
+            cache: HashMap::new(),
+            cache_lru: VecDeque::new(),
+            cache_stamp: 1,
+            cache_bytes: 0,
         }
     }
-
-    pub fn device(&self) -> &wgpu::Device {
-        &self.device
-    }
-
-    pub fn queue(&self) -> &wgpu::Queue {
-        &self.queue
-    }
-
-    pub fn resize_output(&mut self, width: u32, height: u32) {
-        self.textures = create_textures(&self.device, width, height);
-        self.bind_groups = create_bind_groups(
-            &self.device,
-            &self.layouts,
-            &self.buffers,
-            &self.textures,
-            &self.sampler,
-        );
-
-        self.ping = 0;
-    }
-
-    pub fn write_chunk_grid(&self, grid: &[u32]) {
-        let n = grid.len().min(self.buffers.grid_capacity as usize);
-        self.queue.write_buffer(
-            &self.buffers.chunk_grid,
-            0,
-            bytemuck::cast_slice(&grid[..n]),
-        );
-    }
-
-    pub fn write_camera(&self, cam: &CameraGpu) {
-        self.queue
-            .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
-    }
-
-    pub fn write_overlay(&self, ov: &OverlayGpu) {
-        self.queue
-            .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
-    }
-
-    pub fn write_clipmap(&self, clip: &ClipmapGpu) {
-        self.queue
-            .write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
-    }
-
-    /// FP16 clipmap patch upload into a sub-rectangle of a level.
-    ///
-    /// `data_f16` is w*h u16 values (IEEE half bits), row-major for the patch.
-    ///
-    /// IMPORTANT: WebGPU requires `bytes_per_row` to be a multiple of 256 bytes.
-    /// For narrow strips (especially columns), we pad each row on the CPU when needed.
-    pub fn write_clipmap_patch(&self, level: u32, x: u32, y: u32, w: u32, h: u32, data_f16: &[u16]) {
-        let res = config::CLIPMAP_RES;
-        if level >= config::CLIPMAP_LEVELS {
-            return;
-        }
-        if w == 0 || h == 0 {
-            return;
-        }
-        if x + w > res || y + h > res {
-            return;
-        }
-
-        let expected = (w as usize) * (h as usize);
-        if data_f16.len() != expected {
-            return;
-        }
-
-        // Source row pitch (tightly packed)
-        let row_bytes = (w * 2) as usize; // R16Float => 2 bytes per texel
-
-        // WebGPU alignment requirement
-        let align = 256usize;
-        let padded_row_bytes = ((row_bytes + align - 1) / align) * align;
-
-        let bytes: Vec<u8>;
-        let bytes_ref: &[u8];
-
-        if padded_row_bytes == row_bytes {
-            bytes_ref = bytemuck::cast_slice(data_f16);
-        } else {
-            // Pad each row up to padded_row_bytes
-            bytes = {
-                let mut out = vec![0u8; padded_row_bytes * (h as usize)];
-                let src: &[u8] = bytemuck::cast_slice(data_f16);
-
-                for row in 0..(h as usize) {
-                    let src_off = row * row_bytes;
-                    let dst_off = row * padded_row_bytes;
-                    out[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
-                }
-                out
-            };
-            bytes_ref = &bytes;
-        }
-
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.textures.clip_height.tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: level },
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytes_ref,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(padded_row_bytes as u32),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-
-    /// Convenience full-level upload (kept for compatibility / debugging).
-    pub fn write_clipmap_level(&self, level: u32, data_f16: &[u16]) {
-        let res = config::CLIPMAP_RES as usize;
-        let expected = res * res;
-        if data_f16.len() != expected {
-            return;
-        }
-        self.write_clipmap_patch(
-            level,
-            0,
-            0,
-            config::CLIPMAP_RES,
-            config::CLIPMAP_RES,
-            data_f16,
-        );
-    }
-
-    pub fn apply_chunk_uploads(&self, uploads: Vec<ChunkUpload>) {
-        let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
-        let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
-
-        for u in uploads {
-            if u.slot < self.buffers.chunk_capacity {
-                let meta_off = (u.slot as u64) * meta_stride;
-                self.queue
-                    .write_buffer(&self.buffers.chunk, meta_off, bytemuck::bytes_of(&u.meta));
-            }
-
-            if !u.nodes.is_empty() {
-                let needed = u.nodes.len() as u32;
-
-                if u.node_base <= self.buffers.node_capacity
-                    && u.node_base + needed <= self.buffers.node_capacity
-                {
-                    let node_off = (u.node_base as u64) * node_stride;
-                    self.queue.write_buffer(
-                        &self.buffers.node,
-                        node_off,
-                        bytemuck::cast_slice(u.nodes.as_ref()),
-                    );
-                }
-            }
-        }
-    }
-
-    pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("primary_pass"),
-                timestamp_writes: None,
-            });
-
-            cpass.set_pipeline(&self.pipelines.primary);
-            cpass.set_bind_group(0, &self.bind_groups.primary, &[]);
-
-            let gx = (width + 7) / 8;
-            let gy = (height + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
-        }
-
-        let ping = self.ping;
-        let pong = 1 - ping;
-
-        {
-            let qw = quarter_dim(width);
-            let qh = quarter_dim(height);
-
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("godray_pass"),
-                timestamp_writes: None,
-            });
-
-            cpass.set_pipeline(&self.pipelines.godray);
-            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-            cpass.set_bind_group(1, &self.bind_groups.godray[ping], &[]);
-
-            let gx = (qw + 7) / 8;
-            let gy = (qh + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
-        }
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("composite_pass"),
-                timestamp_writes: None,
-            });
-
-            cpass.set_pipeline(&self.pipelines.composite);
-
-            // group(0) must match layouts.scene now
-            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-
-            // group(1) is still empty (or you can omit setting it)
-            cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
-
-            // group(2) is your composite textures
-            cpass.set_bind_group(2, &self.bind_groups.composite[pong], &[]);
-
-            let gx = (width + 7) / 8;
-            let gy = (height + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
-        }
-
-        self.ping = pong;
-    }
-
-    pub fn encode_blit(&self, encoder: &mut wgpu::CommandEncoder, frame_view: &wgpu::TextureView) {
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("blit_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: frame_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
-        rpass.set_pipeline(&self.pipelines.blit);
-        rpass.set_bind_group(0, &self.bind_groups.blit, &[]);
-        rpass.draw(0..3, 0..1);
-    }
-}
-
-// src/render/state/pipelines.rs
-// -----------------------------
-// src/render/state/pipelines.rs
-//
-// Pipeline creation.
-// This is intentionally isolated so the renderer logic (per-frame encoding) isn't
-// buried under wgpu setup boilerplate.
-//
-// Terminology:
-// - BindGroupLayout (BGL): describes what resources exist at @group/@binding.
-// - PipelineLayout (PL): ordered list of BGLs for group(0), group(1), ...
-// - Pipeline: compiled/validated shader entry point + fixed state + pipeline layout.
-//
-// Rule of thumb:
-// The order of BGLs in `bind_group_layouts` must match the group indices used in WGSL.
-// If a shader references @group(2), then the pipeline layout must include entries
-// for group(0) and group(1) as well (even if they're "empty" placeholders).
-
-use super::layout::Layouts;
-
-pub struct Pipelines {
-    /// Compute pipeline for the primary full-resolution pass (writes color/depth).
-    pub primary: wgpu::ComputePipeline,
-
-    /// Compute pipeline for the quarter-resolution godray pass (ping-pong temporal).
-    pub godray: wgpu::ComputePipeline,
-
-    /// Compute pipeline for the full-resolution composite pass (writes final output).
-    pub composite: wgpu::ComputePipeline,
-
-    /// Render pipeline for the final blit to the swapchain (fullscreen triangle).
-    pub blit: wgpu::RenderPipeline,
-}
-
-/// Helper to build a compute pipeline with a specific entry point and bind group layout list.
-///
-/// `bgls` order defines the pipeline layout's group indices:
-/// - bgls[0] => group(0)
-/// - bgls[1] => group(1)
-/// - ...
-fn make_compute_pipeline(
-    device: &wgpu::Device,
-    label: &str,
-    module: &wgpu::ShaderModule,
-    entry: &str,
-    bgls: &[&wgpu::BindGroupLayout],
-) -> wgpu::ComputePipeline {
-    // Create a pipeline layout named "{label}_pl" that fixes the bind group schema.
-    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(&format!("{label}_pl")),
-        bind_group_layouts: bgls,
-        // No push constants used by these shaders.
-        push_constant_ranges: &[],
-    });
-
-    // Create the compute pipeline referencing the WGSL entry point.
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(label),
-        layout: Some(&pl),
-        module,
-        entry_point: entry,
-        compilation_options: Default::default(),
-    })
-}
-
-/// Create all pipelines (compute + blit).
-///
-/// Inputs:
-/// - `cs_module`: WGSL module containing compute entry points.
-/// - `fs_module`: WGSL module containing vertex/fragment entry points for blit.
-/// - `surface_format`: swapchain format used for the final render target.
-pub fn create_pipelines(
-    device: &wgpu::Device,
-    layouts: &Layouts,
-    cs_module: &wgpu::ShaderModule,
-    fs_module: &wgpu::ShaderModule,
-    surface_format: wgpu::TextureFormat,
-) -> Pipelines {
-    // -------------------------------------------------------------------------
-    // Compute pipelines
-    // -------------------------------------------------------------------------
-
-    // Primary pass:
-    // Uses group(0) = layouts.primary, which includes:
-    // - camera + scene buffers
-    // - storage outputs for color/depth
-    let primary = make_compute_pipeline(
-        device,
-        "primary_pipeline",
-        cs_module,
-        "main_primary",
-        &[&layouts.primary],
-    );
-
-    // Godray pass:
-    // Uses:
-    //   group(0) = layouts.scene  (camera + scene buffers only)
-    //   group(1) = layouts.godray (depth sample + history sample + out storage)
-    let godray = make_compute_pipeline(
-        device,
-        "godray_pipeline",
-        cs_module,
-        "main_godray",
-        &[&layouts.scene, &layouts.godray],
-    );
-
-    // Composite pass:
-    // Shader reads from @group(2) (color + godray + output storage).
-    // wgpu requires the pipeline layout to include group(0) and group(1) slots too,
-    // so we provide empty placeholder layouts for those indices.
-    let composite = make_compute_pipeline(
-        device,
-        "composite_pipeline",
-        cs_module,
-        "main_composite",
-        // group(0)=scene (cam + buffers), group(1)=empty, group(2)=composite textures
-        &[&layouts.scene, &layouts.empty, &layouts.composite],
-    );
 
     // -------------------------------------------------------------------------
-    // Render pipeline: blit
+    // Public API
+    // -------------------------------------------------------------------------
+
+    pub fn chunk_count(&self) -> u32 {
+        self.slot_to_key.len() as u32
+    }
+
+    pub fn grid_origin(&self) -> [i32; 3] {
+        self.grid_origin_chunk
+    }
+
+    pub fn grid_dims(&self) -> [u32; 3] {
+        self.grid_dims
+    }
+
+    pub fn chunk_grid(&self) -> &[u32] {
+        &self.chunk_grid
+    }
+
+    pub fn take_uploads(&mut self) -> Vec<ChunkUpload> {
+        std::mem::take(&mut self.uploads)
+    }
+
+    // -------------------------------------------------------------------------
+    // Streaming update
     // -------------------------------------------------------------------------
     //
-    // Full-screen triangle approach:
-    // - No vertex buffers.
-    // - Vertex shader generates positions from vertex_index.
-    // - Fragment shader samples the renderer output texture.
+    // Returns:
+    // - true  if the chunk_grid mapping changed (origin shift and/or resident slot mapping changed)
+    // - false if chunk_grid is identical to last frame (safe to skip GPU upload)
 
-    // Pipeline layout for blit uses a single bind group: group(0) = layouts.blit.
-    let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("blit_pl"),
-        bind_group_layouts: &[&layouts.blit],
-        push_constant_ranges: &[],
-    });
+    pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
+        self.uploads.clear();
 
-    // Render pipeline state:
-    // - Targets the swapchain format.
-    // - Uses REPLACE blending (overwrite framebuffer).
-    // - Default primitive/multisample state is fine for a simple fullscreen draw.
-    let blit = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("blit_pipeline"),
-        layout: Some(&blit_pl),
-        vertex: wgpu::VertexState {
-            module: fs_module,
-            entry_point: "vs_main",
-            // No vertex buffers; vertices are synthesized in the vertex shader.
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: fs_module,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                // Overwrite swapchain pixel with sampled color.
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        // Default triangle list, CCW front face, etc. (fullscreen triangle doesn't care much).
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-    });
+        // Center chunk (ground-anchored).
+        let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
+        let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
 
-    Pipelines {
-        primary,
-        godray,
-        composite,
-        blit,
+        let ccx = cam_vx.div_euclid(config::CHUNK_SIZE as i32);
+        let ccz = cam_vz.div_euclid(config::CHUNK_SIZE as i32);
+
+        let ground_y_vox = world.ground_height(cam_vx, cam_vz);
+        let ground_cy = ground_y_vox.div_euclid(config::CHUNK_SIZE as i32);
+
+        let center = ChunkKey {
+            x: ccx,
+            y: ground_cy,
+            z: ccz,
+        };
+
+        // Desired vs keep sets.
+        let desired = Self::desired_chunks(center, config::ACTIVE_RADIUS);
+        let keep = Self::desired_chunks(center, config::KEEP_RADIUS);
+        let keep_set: HashSet<ChunkKey> = keep.iter().copied().collect();
+
+        // Promote cached desired chunks immediately (no rebuild).
+        // For missing desired chunks that are not cached, queue a build.
+        for k in &desired {
+            match self.chunks.get(k) {
+                Some(ChunkState::Resident(_)) | Some(ChunkState::Queued) | Some(ChunkState::Building) => {
+                    // Already handled / in progress.
+                }
+                None | Some(ChunkState::Missing) => {
+                    // Cache hit: try promote from cache (alloc arena + upload), DO NOT queue build.
+                    if self.cache.contains_key(k) {
+                        let _ = self.try_promote_from_cache(center, *k);
+                        continue;
+                    }
+
+                    // Cache miss: queue build.
+                    let c = self.cancel_token(*k);
+                    c.store(false, Ordering::Relaxed);
+
+                    self.chunks.insert(*k, ChunkState::Queued);
+
+                    // Dedupe queue entries.
+                    if self.queued_set.insert(*k) {
+                        self.build_queue.push_back(*k);
+                    }
+                }
+            }
+        }
+
+        // Unload outside keep (also cancel queued/building).
+        {
+            let keys_snapshot: Vec<ChunkKey> = self.chunks.keys().copied().collect();
+            for k in keys_snapshot {
+                if !keep_set.contains(&k) {
+                    self.unload_chunk(k);
+                }
+            }
+        }
+
+        // Only purge + sort when the center chunk changes.
+        let center_changed = self.last_center.map_or(true, |c| c != center);
+        if center_changed {
+            self.last_center = Some(center);
+
+            // Purge stale keys aggressively: keep only keys that are still queued and still in KEEP.
+            self.build_queue.retain(|k| {
+                keep_set.contains(k) && matches!(self.chunks.get(k), Some(ChunkState::Queued))
+            });
+
+            // Rebuild queued_set from the queue so it matches reality.
+            self.queued_set.clear();
+            self.queued_set.extend(self.build_queue.iter().copied());
+
+            // Sort once per center change.
+            sort_queue_near_first(&mut self.build_queue, center, cam_fwd);
+        }
+
+        // Dispatch builds (only for cache misses).
+        while self.in_flight < config::MAX_IN_FLIGHT {
+            let Some(k) = self.build_queue.pop_front() else { break; };
+
+            // Popped => no longer queued.
+            self.queued_set.remove(&k);
+
+            if !keep_set.contains(&k) {
+                // Cancel if it was pending.
+                self.cancel_token(k).store(true, Ordering::Relaxed);
+                self.chunks.insert(k, ChunkState::Missing);
+                continue;
+            }
+
+            // If it became cached since it was queued (rare, but possible if you later add disk caching),
+            // don't rebuild it.
+            if self.cache.contains_key(&k) {
+                self.chunks.insert(k, ChunkState::Missing);
+                let _ = self.try_promote_from_cache(center, k);
+                continue;
+            }
+
+            if matches!(self.chunks.get(&k), Some(ChunkState::Queued)) {
+                self.chunks.insert(k, ChunkState::Building);
+
+                let cancel = self.cancel_token(k);
+                cancel.store(false, Ordering::Relaxed);
+
+                if self
+                    .tx_job
+                    .send(BuildJob {
+                        key: k,
+                        cancel: cancel.clone(),
+                    })
+                    .is_ok()
+                {
+                    self.in_flight += 1;
+                } else {
+                    // Channel closed; keep it queued.
+                    self.chunks.insert(k, ChunkState::Queued);
+
+                    // Put it back (dedup-safe).
+                    if self.queued_set.insert(k) {
+                        self.build_queue.push_back(k);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Harvest done builds.
+        while let Ok(done) = self.rx_done.try_recv() {
+            if self.in_flight > 0 {
+                self.in_flight -= 1;
+            }
+
+            // If the job was canceled (either before start or mid-build),
+            // the chunk MUST NOT stay in Building forever.
+            if done.canceled || done.cancel.load(Ordering::Relaxed) {
+                if self.chunks.get(&done.key).is_some() {
+                    self.chunks.insert(done.key, ChunkState::Missing);
+                }
+                continue;
+            }
+
+            // If it finished but is no longer in KEEP, drop it and mark Missing.
+            if !keep_set.contains(&done.key) {
+                self.cancel_token(done.key).store(true, Ordering::Relaxed);
+                self.chunks.insert(done.key, ChunkState::Missing);
+                continue;
+            }
+
+            // Still relevant: cache + try resident.
+            self.on_build_done(center, done.key, done.nodes);
+        }
+
+        // If the keep-grid origin would shift, the lookup mapping changes.
+        if self.keep_origin_for(center) != self.grid_origin_chunk {
+            self.grid_dirty = true;
+        }
+
+        // Rebuild grid mapping for current KEEP region only when needed.
+        let grid_changed = self.grid_dirty;
+        if self.grid_dirty {
+            self.rebuild_grid(center);
+            self.grid_dirty = false;
+        }
+
+        grid_changed
+    }
+
+    // -------------------------------------------------------------------------
+    // Internals
+    // -------------------------------------------------------------------------
+
+    fn cancel_token(&mut self, key: ChunkKey) -> Arc<AtomicBool> {
+        self.cancels
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    fn desired_chunks(center: ChunkKey, radius: i32) -> Vec<ChunkKey> {
+        let mut out = Vec::new();
+        for dy in GRID_Y_MIN_DY..=(GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1) {
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    out.push(ChunkKey {
+                        x: center.x + dx,
+                        y: center.y + dy,
+                        z: center.z + dz,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn evict_one_farthest(&mut self, center: ChunkKey, protect: ChunkKey) -> bool {
+        if self.slot_to_key.is_empty() {
+            return false;
+        }
+
+        let mut best: Option<(f32, ChunkKey)> = None;
+        for &k in &self.slot_to_key {
+            if k == protect {
+                continue;
+            }
+            let dx = (k.x - center.x) as f32;
+            let dz = (k.z - center.z) as f32;
+            let dy = (k.y - center.y) as f32;
+
+            // Weighted distance (favor keeping vertical neighbors).
+            let d = dx * dx + dz * dz + 4.0 * dy * dy;
+
+            if best.map_or(true, |(bd, _)| d > bd) {
+                best = Some((d, k));
+            }
+        }
+
+        if let Some((_, k)) = best {
+            self.unload_chunk(k);
+            return true;
+        }
+
+        false
+    }
+
+    // ----------------
+    // Cache helpers
+    // ----------------
+
+    fn cache_touch(&mut self, key: ChunkKey) {
+        if let Some(e) = self.cache.get_mut(&key) {
+            self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
+            e.stamp = self.cache_stamp;
+            self.cache_lru.push_back((key, e.stamp));
+        }
+    }
+
+    fn cache_put(&mut self, key: ChunkKey, nodes: Arc<[NodeGpu]>) {
+        let bytes = nodes.len() * size_of::<NodeGpu>();
+
+        // If replacing an existing entry, subtract its bytes first.
+        if let Some(old) = self.cache.remove(&key) {
+            self.cache_bytes = self.cache_bytes.saturating_sub(old.bytes);
+        }
+
+        self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
+        let stamp = self.cache_stamp;
+
+        self.cache.insert(
+            key,
+            CachedChunk {
+                nodes,
+                bytes,
+                stamp,
+            },
+        );
+
+        self.cache_bytes = self.cache_bytes.saturating_add(bytes);
+        self.cache_lru.push_back((key, stamp));
+
+        self.evict_cache_as_needed();
+    }
+
+    fn evict_cache_as_needed(&mut self) {
+        let budget = config::CHUNK_CACHE_BUDGET_BYTES;
+
+        while self.cache_bytes > budget {
+            let Some((k, stamp)) = self.cache_lru.pop_front() else { break; };
+
+            // Only evict if this LRU record matches the current entry stamp.
+            let should_evict = self
+                .cache
+                .get(&k)
+                .map(|e| e.stamp == stamp)
+                .unwrap_or(false);
+
+            if !should_evict {
+                continue;
+            }
+
+            if let Some(ev) = self.cache.remove(&k) {
+                self.cache_bytes = self.cache_bytes.saturating_sub(ev.bytes);
+            }
+        }
+    }
+
+    // -------------------------------
+    // Resident creation / promotion
+    // -------------------------------
+
+    fn try_make_resident(
+        &mut self,
+        center: ChunkKey,
+        key: ChunkKey,
+        nodes: Arc<[NodeGpu]>,
+    ) -> bool {
+        // If already resident, nothing to do.
+        if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
+            return true;
+        }
+
+        let need = nodes.len() as u32;
+
+        // If we have nothing (shouldn't happen for non-air chunks, but be safe).
+        if need == 0 {
+            self.chunks.insert(key, ChunkState::Missing);
+            return false;
+        }
+
+        // Try allocate; if fails, evict farthest chunks and retry a few times.
+        let mut node_base = self.arena.alloc(need);
+        if node_base.is_none() {
+            for _ in 0..EVICT_ATTEMPTS {
+                if !self.evict_one_farthest(center, key) {
+                    break;
+                }
+                node_base = self.arena.alloc(need);
+                if node_base.is_some() {
+                    break;
+                }
+            }
+        }
+
+        let Some(node_base) = node_base else {
+            // Can't fit right now; keep cache so we can promote later.
+            self.chunks.insert(key, ChunkState::Missing);
+            return false;
+        };
+
+        // Allocate slot (dense).
+        let slot = self.slot_to_key.len() as u32;
+        self.slot_to_key.push(key);
+
+        let origin_vox = [
+            key.x * config::CHUNK_SIZE as i32,
+            key.y * config::CHUNK_SIZE as i32,
+            key.z * config::CHUNK_SIZE as i32,
+        ];
+
+        let meta = ChunkMetaGpu {
+            origin: [origin_vox[0], origin_vox[1], origin_vox[2], 0],
+            node_base,
+            node_count: need,
+            _pad0: 0,
+            _pad1: 0,
+        };
+
+        self.chunk_meta.push(meta);
+
+        // Mark resident.
+        self.chunks.insert(
+            key,
+            ChunkState::Resident(Resident {
+                slot,
+                node_base,
+                node_count: need,
+            }),
+        );
+
+        // Schedule GPU upload (nodes + meta).
+        self.uploads.push(ChunkUpload {
+            slot,
+            meta,
+            node_base,
+            nodes,
+        });
+
+        // Resident set changed => grid mapping may change.
+        self.grid_dirty = true;
+        self.changed = true;
+
+        true
+    }
+
+    fn try_promote_from_cache(&mut self, center: ChunkKey, key: ChunkKey) -> bool {
+        let Some(entry) = self.cache.get(&key).cloned() else {
+            return false;
+        };
+
+        // Touch LRU.
+        self.cache_touch(key);
+
+        // Try to make resident from cached nodes.
+        self.try_make_resident(center, key, entry.nodes)
+    }
+
+    fn on_build_done(&mut self, center: ChunkKey, key: ChunkKey, nodes: Vec<NodeGpu>) {
+        // If this chunk got cancelled while the result was in flight, drop it.
+        if let Some(c) = self.cancels.get(&key) {
+            if c.load(Ordering::Relaxed) {
+                self.chunks.insert(key, ChunkState::Missing);
+                return;
+            }
+        }
+
+        // Convert to Arc slice once (cheap clones thereafter).
+        let nodes_arc: Arc<[NodeGpu]> = nodes.into();
+
+        // Cache it (so we never rebuild this chunk again unless evicted).
+        self.cache_put(key, nodes_arc.clone());
+
+        // If already resident (should be rare), don't allocate/upload again.
+        if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
+            return;
+        }
+
+        // Try to allocate + upload now; if we can't fit, keep it cached and mark missing.
+        let ok = self.try_make_resident(center, key, nodes_arc);
+        if !ok {
+            self.chunks.insert(key, ChunkState::Missing);
+        }
+    }
+
+    fn unload_chunk(&mut self, key: ChunkKey) {
+        let Some(state) = self.chunks.get(&key) else { return; };
+
+        match *state {
+            ChunkState::Resident(res) => {
+                // Free node arena range.
+                self.arena.free(res.node_base, res.node_count);
+
+                // Remove slot densely by swap-remove.
+                let dead_slot = res.slot as usize;
+                let last_slot = self.slot_to_key.len().saturating_sub(1);
+
+                if dead_slot != last_slot {
+                    let moved_key = self.slot_to_key[last_slot];
+                    self.slot_to_key[dead_slot] = moved_key;
+
+                    // Move meta.
+                    let moved_meta = self.chunk_meta[last_slot];
+                    self.chunk_meta[dead_slot] = moved_meta;
+
+                    // Update moved chunk's Resident.slot.
+                    if let Some(state) = self.chunks.get_mut(&moved_key) {
+                        if let ChunkState::Resident(mr) = state {
+                            mr.slot = dead_slot as u32;
+                        }
+                    }
+
+                    // Schedule meta rewrite for moved slot (GPU needs updated slot meta).
+                    self.uploads.push(ChunkUpload {
+                        slot: dead_slot as u32,
+                        meta: self.chunk_meta[dead_slot],
+                        node_base: 0,
+                        nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
+                    });
+                }
+
+                self.slot_to_key.pop();
+                self.chunk_meta.pop();
+
+                self.chunks.insert(key, ChunkState::Missing);
+
+                // Slot mapping changed => grid mapping changed.
+                self.grid_dirty = true;
+                self.changed = true;
+            }
+
+            ChunkState::Queued | ChunkState::Building => {
+                // Cancel work in-flight.
+                self.cancel_token(key).store(true, Ordering::Relaxed);
+
+                // If it was queued, prevent duplicate re-adds.
+                self.queued_set.remove(&key);
+
+                self.chunks.insert(key, ChunkState::Missing);
+
+                // Conservative dirty.
+                self.grid_dirty = true;
+                self.changed = true;
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Compute the KEEP-grid origin for a given center (helper so we can detect origin shifts).
+    #[inline]
+    fn keep_origin_for(&self, center: ChunkKey) -> [i32; 3] {
+        let ox = center.x - config::KEEP_RADIUS;
+        let oz = center.z - config::KEEP_RADIUS;
+        let oy = center.y + GRID_Y_MIN_DY;
+        [ox, oy, oz]
+    }
+
+    /// Rebuild the chunk_grid mapping for the current KEEP volume.
+    ///
+    /// This is intentionally called only when `grid_dirty` is set, because it is O(ncells + nchunks)
+    /// and it forces a full GPU upload if you do it every frame.
+    fn rebuild_grid(&mut self, center: ChunkKey) {
+        let nx = (2 * config::KEEP_RADIUS + 1) as u32;
+        let nz = nx;
+        let ny = GRID_Y_COUNT;
+
+        self.grid_dims = [nx, ny, nz];
+        self.grid_origin_chunk = self.keep_origin_for(center);
+
+        let needed = (nx * ny * nz) as usize;
+        if self.chunk_grid.len() != needed {
+            self.chunk_grid.resize(needed, INVALID_U32);
+        }
+        self.chunk_grid.fill(INVALID_U32);
+
+        // Fill grid from resident chunks (slot -> key).
+        for (slot, &k) in self.slot_to_key.iter().enumerate() {
+            if let Some(idx) = self.grid_index_for_chunk(k) {
+                self.chunk_grid[idx] = slot as u32;
+            }
+        }
+    }
+
+    #[inline]
+    fn grid_index_for_chunk(&self, k: ChunkKey) -> Option<usize> {
+        let [ox, oy, oz] = self.grid_origin_chunk;
+        let [nx, ny, nz] = self.grid_dims;
+
+        let ix = k.x - ox;
+        let iy = k.y - oy;
+        let iz = k.z - oz;
+
+        if ix < 0 || iy < 0 || iz < 0 {
+            return None;
+        }
+
+        let ix = ix as u32;
+        let iy = iy as u32;
+        let iz = iz as u32;
+
+        if ix >= nx || iy >= ny || iz >= nz {
+            return None;
+        }
+
+        let idx = (iz * ny * nx) + (iy * nx) + ix;
+        Some(idx as usize)
     }
 }
 
-// src/render/state/textures.rs
-// ----------------------------
-// src/render/state/textures.rs
-// ----------------------------
+// src/streaming/mod.rs
+// --------------------
+// src/streaming/mod.rs
+// --------------------
+// Chunk streaming + node arena + uploads.
+
+pub mod manager;
+pub mod node_arena;
+
+pub use manager::{ChunkManager, ChunkUpload};
+pub use node_arena::NodeArena;
+
+// src/streaming/node_arena.rs
+// ---------------------------
+// src/streaming/node_arena.rs
+//
+// Very simple free-list arena for node ranges (in units of NodeGpu elements).
+// Improvements:
+// - free() now fully coalesces adjacent ranges (fixes long-run fragmentation).
+// - alloc() uses best-fit (smallest range that fits) to reduce fragmentation further.
+
+#[derive(Clone, Copy, Debug)]
+struct Range {
+    start: u32,
+    len: u32,
+}
+
+pub struct NodeArena {
+    free: Vec<Range>, // kept sorted by start
+}
+
+impl NodeArena {
+    pub fn new(capacity: u32) -> Self {
+        Self {
+            free: vec![Range {
+                start: 0,
+                len: capacity,
+            }],
+        }
+    }
+
+    /// Allocate a contiguous range of `len` elements.
+    /// Returns the start index in the arena, or None if no free range fits.
+    pub fn alloc(&mut self, len: u32) -> Option<u32> {
+        if len == 0 {
+            return Some(0);
+        }
+
+        // Best-fit: choose the smallest free range that still fits.
+        let mut best_i: Option<usize> = None;
+        let mut best_len: u32 = u32::MAX;
+
+        for (i, r) in self.free.iter().enumerate() {
+            if r.len >= len && r.len < best_len {
+                best_len = r.len;
+                best_i = Some(i);
+                if r.len == len {
+                    break; // perfect fit
+                }
+            }
+        }
+
+        let i = best_i?;
+        let r = self.free[i];
+        let start = r.start;
+
+        if r.len == len {
+            self.free.remove(i);
+        } else {
+            self.free[i] = Range {
+                start: r.start + len,
+                len: r.len - len,
+            };
+        }
+
+        Some(start)
+    }
+
+    /// Free a previously allocated range.
+    pub fn free(&mut self, start: u32, len: u32) {
+        if len == 0 {
+            return;
+        }
+
+        // Insert sorted by start.
+        let mut idx = 0usize;
+        while idx < self.free.len() && self.free[idx].start < start {
+            idx += 1;
+        }
+        self.free.insert(idx, Range { start, len });
+
+        // Fully coalesce with neighbors (both directions).
+        self.coalesce_at(idx);
+    }
+
+    fn coalesce_at(&mut self, mut i: usize) {
+        // Merge backward as long as possible.
+        while i > 0 {
+            let a = self.free[i - 1];
+            let b = self.free[i];
+            if a.start + a.len == b.start {
+                self.free[i - 1] = Range {
+                    start: a.start,
+                    len: a.len + b.len,
+                };
+                self.free.remove(i);
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // Merge forward as long as possible.
+        while i + 1 < self.free.len() {
+            let a = self.free[i];
+            let b = self.free[i + 1];
+            if a.start + a.len == b.start {
+                self.free[i] = Range {
+                    start: a.start,
+                    len: a.len + b.len,
+                };
+                self.free.remove(i + 1);
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Optional: quick stats for debugging.
+    pub fn free_range_count(&self) -> usize {
+        self.free.len()
+    }
+
+    pub fn largest_free_range(&self) -> u32 {
+        self.free.iter().map(|r| r.len).max().unwrap_or(0)
+    }
+
+    pub fn total_free(&self) -> u32 {
+        self.free.iter().map(|r| r.len).sum()
+    }
+}
+
+// src/svo/builder.rs
+// ------------------
+// src/svo/builder.rs
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     config,
-    render::resources::{create_output_texture, OutputTex},
+    render::NodeGpu,
+    world::{
+        materials::{AIR, DIRT, GRASS, STONE, WOOD},
+        WorldGen,
+    },
 };
 
-pub struct Tex2D {
-    pub view: wgpu::TextureView,
+use super::mips::{build_max_mip_inplace, build_minmax_mip_inplace, MaxMipView, MinMaxMipView};
+
+const LEAF: u32 = 0xFFFF_FFFF;
+
+#[inline]
+fn is_empty_leaf(n: &NodeGpu) -> bool {
+    n.child_base == LEAF && n.material == AIR
 }
 
-pub struct Tex2DArray {
-    pub tex: wgpu::Texture,
-    pub view: wgpu::TextureView,
+#[inline]
+fn should_cancel(cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Relaxed)
 }
 
-pub struct TextureSet {
-    pub output: OutputTex,
-    pub color: Tex2D,
-    pub depth: Tex2D,
-    pub godray: [Tex2D; 2],
+/// Reusable scratch buffers for chunk building (reduces allocations & improves locality).
+pub struct BuildScratch {
+    // 2D (side*side)
+    ground: Vec<i32>,
+    tree_top: Vec<i32>,
 
-    pub clip_height: Tex2DArray,
+    // --- add this ---
+    height_cache: Vec<i32>,
+    height_cache_w: usize,
+    height_cache_h: usize,
+
+    // 3D (side^3)
+    material: Vec<u32>,
+    prefix: Vec<u32>,
+
+    // mip storage
+    ground_min_levels: Vec<Vec<i32>>,
+    ground_max_levels: Vec<Vec<i32>>,
+    tree_levels: Vec<Vec<i32>>,
 }
 
-pub fn quarter_dim(x: u32) -> u32 {
-    (x + 3) / 4
+
+impl BuildScratch {
+    pub fn new() -> Self {
+        Self {
+            ground: Vec::new(),
+            tree_top: Vec::new(),
+
+            height_cache: Vec::new(),
+            height_cache_w: 0,
+            height_cache_h: 0,
+
+            material: Vec::new(),
+            prefix: Vec::new(),
+            ground_min_levels: Vec::new(),
+            ground_max_levels: Vec::new(),
+            tree_levels: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn ensure_height_cache(&mut self, w: usize, h: usize) {
+        let need = w * h;
+        if self.height_cache.len() != need {
+            self.height_cache.resize(need, 0);
+        } else {
+            self.height_cache.fill(0);
+        }
+        self.height_cache_w = w;
+        self.height_cache_h = h;
+    }
+
+
+    #[inline]
+    fn ensure_2d(v: &mut Vec<i32>, side: usize, fill: i32) {
+        let need = side * side;
+        if v.len() != need {
+            v.resize(need, fill);
+        } else {
+            v.fill(fill);
+        }
+    }
+
+    #[inline]
+    fn ensure_3d_u32(v: &mut Vec<u32>, side: usize, fill: u32) {
+        let need = side * side * side;
+        if v.len() != need {
+            v.resize(need, fill);
+        } else {
+            v.fill(fill);
+        }
+    }
+
+    #[inline]
+    fn ensure_prefix(v: &mut Vec<u32>, side: usize) {
+        let dim = side + 1;
+        let need = dim * dim * dim;
+        if v.len() != need {
+            v.resize(need, 0);
+        } else {
+            v.fill(0);
+        }
+    }
 }
 
-fn make_tex2d(
-    device: &wgpu::Device,
-    label: &str,
-    w: u32,
-    h: u32,
-    format: wgpu::TextureFormat,
-    usage: wgpu::TextureUsages,
-) -> Tex2D {
-    let w = w.max(1);
-    let h = h.max(1);
-
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage,
-        view_formats: &[],
-    });
-
-    let view = tex.create_view(&Default::default());
-    Tex2D { view }
+#[inline]
+fn idx2(side: usize, x: usize, z: usize) -> usize {
+    z * side + x
 }
 
-fn make_tex2d_array(
-    device: &wgpu::Device,
-    label: &str,
-    w: u32,
-    h: u32,
-    layers: u32,
-    format: wgpu::TextureFormat,
-    usage: wgpu::TextureUsages,
-) -> Tex2DArray {
-    let w = w.max(1);
-    let h = h.max(1);
-    let layers = layers.max(1);
-
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: layers,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage,
-        view_formats: &[],
-    });
-
-    let view = tex.create_view(&wgpu::TextureViewDescriptor {
-        label: Some(&format!("{label}_view")),
-        format: Some(format),
-        dimension: Some(wgpu::TextureViewDimension::D2Array),
-        aspect: wgpu::TextureAspect::All,
-        base_mip_level: 0,
-        mip_level_count: Some(1),
-        base_array_layer: 0,
-        array_layer_count: Some(layers),
-    });
-
-    Tex2DArray { tex, view }
+#[inline]
+fn idx3(side: usize, x: usize, y: usize, z: usize) -> usize {
+    (y * side * side) + (z * side) + x
 }
 
-pub fn create_textures(device: &wgpu::Device, width: u32, height: u32) -> TextureSet {
-    let width = width.max(1);
-    let height = height.max(1);
+#[inline]
+fn pidx(dim: usize, x: usize, y: usize, z: usize) -> usize {
+    (z * dim * dim) + (y * dim) + x
+}
 
-    let rw_tex_usage =
-        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
+#[inline]
+fn prefix_sum_cube(prefix: &[u32], side: usize, x0: usize, y0: usize, z0: usize, size: usize) -> u32 {
+    let dim = side + 1;
+    let x1 = x0 + size;
+    let y1 = y0 + size;
+    let z1 = z0 + size;
 
-    let output = create_output_texture(device, width, height);
+    let a = prefix[pidx(dim, x1, y1, z1)] as i64;
+    let b = prefix[pidx(dim, x0, y1, z1)] as i64;
+    let c = prefix[pidx(dim, x1, y0, z1)] as i64;
+    let d = prefix[pidx(dim, x1, y1, z0)] as i64;
+    let e = prefix[pidx(dim, x0, y0, z1)] as i64;
+    let f = prefix[pidx(dim, x0, y1, z0)] as i64;
+    let g = prefix[pidx(dim, x1, y0, z0)] as i64;
+    let h = prefix[pidx(dim, x0, y0, z0)] as i64;
 
-    let color = make_tex2d(
-        device,
-        "color_tex",
-        width,
-        height,
-        wgpu::TextureFormat::Rgba16Float,
-        rw_tex_usage,
+    let s = a - b - c - d + e + f + g - h;
+    debug_assert!(s >= 0);
+    s as u32
+}
+
+/// Cancelable build with reusable scratch (fast path).
+pub fn build_chunk_svo_sparse_cancelable_with_scratch(
+    gen: &WorldGen,
+    chunk_origin: [i32; 3],
+    chunk_size: u32,
+    cancel: &AtomicBool,
+    scratch: &mut BuildScratch,
+) -> Vec<NodeGpu> {
+    if should_cancel(cancel) {
+        return Vec::new();
+    }
+
+    let chunk_ox = chunk_origin[0];
+    let chunk_oy = chunk_origin[1];
+    let chunk_oz = chunk_origin[2];
+
+    let cs_u = chunk_size;
+    let cs_i = chunk_size as i32;
+    debug_assert!(cs_u.is_power_of_two());
+
+    let side = cs_u as usize;
+    let vpm: i32 = config::VOXELS_PER_METER as i32;
+    debug_assert!(vpm > 0);
+
+    // -------------------------------------------------------------------------
+    // Height cache (local array)
+    // -------------------------------------------------------------------------
+    let margin_m: i32 = 6;
+    let margin: i32 = margin_m * vpm + (vpm - 1);
+
+    let cache_x0 = chunk_ox - margin;
+    let cache_z0 = chunk_oz - margin;
+    let cache_x1 = chunk_ox + cs_i + margin; // inclusive
+    let cache_z1 = chunk_oz + cs_i + margin; // inclusive
+
+    let cache_w = (cache_x1 - cache_x0 + 1) as usize;
+    let cache_h = (cache_z1 - cache_z0 + 1) as usize;
+
+    scratch.ensure_height_cache(cache_w, cache_h);
+    for z in 0..cache_h {
+        if (z & 15) == 0 && should_cancel(cancel) {
+            return Vec::new();
+        }
+        let wz = cache_z0 + z as i32;
+        let row = z * cache_w;
+        for x in 0..cache_w {
+            let wx = cache_x0 + x as i32;
+            scratch.height_cache[row + x] = gen.ground_height(wx, wz);
+        }
+    }
+
+    let height_at = |wx: i32, wz: i32| -> i32 {
+        if wx < cache_x0 || wx > cache_x1 || wz < cache_z0 || wz > cache_z1 {
+            gen.ground_height(wx, wz)
+        } else {
+            let ix = (wx - cache_x0) as usize;
+            let iz = (wz - cache_z0) as usize;
+            scratch.height_cache[iz * scratch.height_cache_w + ix]
+        }
+    };
+
+
+    // -------------------------------------------------------------------------
+    // Tree cache/mask (fast O(1) material lookup)
+    // -------------------------------------------------------------------------
+    let (_tree_cache_unused, tree_mask) = gen.build_tree_cache_with_mask(
+        chunk_ox,
+        chunk_oy,
+        chunk_oz,
+        cs_i,
+        &height_at,
+        cancel,
     );
 
-    let depth = make_tex2d(
-        device,
-        "depth_tex",
-        width,
-        height,
-        wgpu::TextureFormat::R32Float,
-        rw_tex_usage,
+    // -------------------------------------------------------------------------
+    // 2D maps (ground)
+    // -------------------------------------------------------------------------
+    BuildScratch::ensure_2d(&mut scratch.ground, side, 0);
+
+    for lz in 0..cs_i {
+        if (lz & 15) == 0 && should_cancel(cancel) {
+            return Vec::new();
+        }
+        for lx in 0..cs_i {
+            let wx = chunk_ox + lx;
+            let wz = chunk_oz + lz;
+            let g = height_at(wx, wz);
+
+            let i = idx2(side, lx as usize, lz as usize);
+            scratch.ground[i] = g;
+        }
+    }
+
+    let ground_mip: MinMaxMipView<'_> = build_minmax_mip_inplace(
+        &scratch.ground,
+        cs_u,
+        &mut scratch.ground_min_levels,
+        &mut scratch.ground_max_levels,
     );
 
-    let qw = quarter_dim(width);
-    let qh = quarter_dim(height);
+    // -------------------------------------------------------------------------
+    // Tree top stamp (2D) for fast “above everything” pruning
+    // -------------------------------------------------------------------------
+    BuildScratch::ensure_2d(&mut scratch.tree_top, side, -1);
 
-    let godray = [
-        make_tex2d(
-            device,
-            "godray_a",
-            qw,
-            qh,
-            wgpu::TextureFormat::Rgba16Float,
-            rw_tex_usage,
-        ),
-        make_tex2d(
-            device,
-            "godray_b",
-            qw,
-            qh,
-            wgpu::TextureFormat::Rgba16Float,
-            rw_tex_usage,
-        ),
-    ];
+    let pad_m = 4;
+    let xm0 = (chunk_ox.div_euclid(vpm)) - pad_m;
+    let xm1 = ((chunk_ox + cs_i).div_euclid(vpm)) + pad_m;
+    let zm0 = (chunk_oz.div_euclid(vpm)) - pad_m;
+    let zm1 = ((chunk_oz + cs_i).div_euclid(vpm)) + pad_m;
 
-    // FP16 clipmap height: R16Float (half bandwidth vs R32Float)
-    let clip_height = make_tex2d_array(
-        device,
-        "clip_height",
-        config::CLIPMAP_RES,
-        config::CLIPMAP_RES,
-        config::CLIPMAP_LEVELS,
-        wgpu::TextureFormat::R16Float,
-        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+    for zm in zm0..=zm1 {
+        if ((zm - zm0) & 3) == 0 && should_cancel(cancel) {
+            return Vec::new();
+        }
+
+        for xm in xm0..=xm1 {
+            let Some((trunk_h_vox, crown_r_vox)) = gen.tree_instance_at_meter(xm, zm) else {
+                continue;
+            };
+
+            let tx = xm * vpm;
+            let tz = zm * vpm;
+
+            let g = height_at(tx, tz);
+            let trunk_base = g + vpm;
+            let trunk_top = trunk_base + trunk_h_vox;
+
+            let canopy_h_vox = 5 * vpm;
+            let top_y = trunk_top + canopy_h_vox + 2 * vpm;
+
+            let r = crown_r_vox + 2 * vpm;
+
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    if dx * dx + dz * dz > r * r {
+                        continue;
+                    }
+
+                    let wx = tx + dx;
+                    let wz = tz + dz;
+
+                    let lx = wx - chunk_ox;
+                    let lz = wz - chunk_oz;
+                    if lx >= 0 && lx < cs_i && lz >= 0 && lz < cs_i {
+                        let i = idx2(side, lx as usize, lz as usize);
+                        scratch.tree_top[i] = scratch.tree_top[i].max(top_y);
+                    }
+                }
+            }
+
+            // ensure trunk column included
+            let lx = tx - chunk_ox;
+            let lz = tz - chunk_oz;
+            if lx >= 0 && lx < cs_i && lz >= 0 && lz < cs_i {
+                let i = idx2(side, lx as usize, lz as usize);
+                scratch.tree_top[i] = scratch.tree_top[i].max(trunk_top);
+            }
+        }
+    }
+
+    let tree_mip: MaxMipView<'_> =
+        build_max_mip_inplace(&scratch.tree_top, cs_u, &mut scratch.tree_levels);
+
+    // -------------------------------------------------------------------------
+    // Precompute per-voxel material + occupancy (terrain + trees only)
+    // -------------------------------------------------------------------------
+    BuildScratch::ensure_3d_u32(&mut scratch.material, side, AIR);
+
+    let dirt_depth = 3 * vpm;
+
+    for ly in 0..cs_i {
+        if (ly & 7) == 0 && should_cancel(cancel) {
+            return Vec::new();
+        }
+
+        let wy = chunk_oy + ly;
+
+        for lz in 0..cs_i {
+            for lx in 0..cs_i {
+                let wx = chunk_ox + lx;
+                let wz = chunk_oz + lz;
+
+                let col = idx2(side, lx as usize, lz as usize);
+                let g = scratch.ground[col];
+
+                // base terrain + trees (FAST)
+                let m: u32 = if wy < g {
+                    if wy >= g - dirt_depth { DIRT } else { STONE }
+                } else if wy == g {
+                    let tm = tree_mask.material_fast(wx, wy, wz);
+                    if tm == WOOD { WOOD } else { GRASS }
+                } else {
+                    let tm = tree_mask.material_fast(wx, wy, wz);
+                    if tm != AIR { tm } else { AIR }
+                };
+
+                let i3 = idx3(side, lx as usize, ly as usize, lz as usize);
+                scratch.material[i3] = m;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Prefix sum over solid occupancy
+    // -------------------------------------------------------------------------
+    BuildScratch::ensure_prefix(&mut scratch.prefix, side);
+    let dim = side + 1;
+
+    for z in 1..=side {
+        if (z & 7) == 0 && should_cancel(cancel) {
+            return Vec::new();
+        }
+        for y in 1..=side {
+            let mut run: u32 = 0;
+            for x in 1..=side {
+                let v = (scratch.material[idx3(side, x - 1, y - 1, z - 1)] != AIR) as u32;
+                run += v;
+
+                let a = scratch.prefix[pidx(dim, x, y, z - 1)] as i64;
+                let b = scratch.prefix[pidx(dim, x, y - 1, z)] as i64;
+                let c = scratch.prefix[pidx(dim, x, y - 1, z - 1)] as i64;
+
+                let p = a + b - c + (run as i64);
+                debug_assert!(p >= 0);
+                scratch.prefix[pidx(dim, x, y, z)] = p as u32;
+            }
+        }
+    }
+
+    fn build_node(
+        nodes: &mut Vec<NodeGpu>,
+        ox: i32,
+        oy: i32,
+        oz: i32,
+        size: i32,
+        chunk_oy: i32,
+        material: &[u32],
+        prefix: &[u32],
+        side: usize,
+        ground_mip: &MinMaxMipView<'_>,
+        tree_mip: &MaxMipView<'_>,
+        dirt_depth: i32,
+        cancel: &AtomicBool,
+    ) -> NodeGpu {
+        if should_cancel(cancel) {
+            return NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 };
+        }
+
+        let size_u = size as u32;
+
+        let (gmin, gmax) = ground_mip.query(ox, oz, size_u);
+        let tmax = tree_mip.query_max(ox, oz, size_u);
+
+        let y0 = chunk_oy + oy;
+        let y1 = y0 + size - 1;
+
+        // above everything (ground or tree top)
+        let top_solid = gmax.max(tmax);
+        if y0 > top_solid {
+            return NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 };
+        }
+
+        // deep solid stone (below dirt band everywhere in this node footprint)
+        if y1 < gmin - dirt_depth {
+            return NodeGpu { child_base: LEAF, child_mask: 0, material: STONE, _pad: 0 };
+        }
+
+        // empty check via prefix
+        let sx = ox as usize;
+        let sy = oy as usize;
+        let sz = oz as usize;
+        let s = size as usize;
+
+        let sum = prefix_sum_cube(prefix, side, sx, sy, sz, s);
+        if sum == 0 {
+            return NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 };
+        }
+
+        if size == 1 {
+            let m = material[idx3(side, sx, sy, sz)];
+            return NodeGpu { child_base: LEAF, child_mask: 0, material: m, _pad: 0 };
+        }
+
+        let half = size / 2;
+        let mut child_roots: [NodeGpu; 8] =
+            [NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 }; 8];
+
+        for ci in 0..8 {
+            if (ci & 3) == 0 && should_cancel(cancel) {
+                return NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 };
+            }
+
+            let dx = if (ci & 1) != 0 { half } else { 0 };
+            let dy = if (ci & 2) != 0 { half } else { 0 };
+            let dz = if (ci & 4) != 0 { half } else { 0 };
+
+            child_roots[ci] = build_node(
+                nodes,
+                ox + dx,
+                oy + dy,
+                oz + dz,
+                half,
+                chunk_oy,
+                material,
+                prefix,
+                side,
+                ground_mip,
+                tree_mip,
+                dirt_depth,
+                cancel,
+            );
+        }
+
+        let base = nodes.len() as u32;
+        let mut mask: u32 = 0;
+
+        for ci in 0..8 {
+            if !is_empty_leaf(&child_roots[ci]) {
+                mask |= 1u32 << ci;
+                nodes.push(child_roots[ci]);
+            }
+        }
+
+        if mask == 0 {
+            return NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 };
+        }
+
+        NodeGpu { child_base: base, child_mask: mask, material: 0, _pad: 0 }
+    }
+
+    // Root must be at index 0 for GPU.
+    let mut nodes = vec![NodeGpu { child_base: LEAF, child_mask: 0, material: AIR, _pad: 0 }];
+
+    let root = build_node(
+        &mut nodes,
+        0,
+        0,
+        0,
+        cs_i,
+        chunk_oy,
+        &scratch.material,
+        &scratch.prefix,
+        side,
+        &ground_mip,
+        &tree_mip,
+        dirt_depth,
+        cancel,
     );
 
-    TextureSet {
-        output,
-        color,
-        depth,
-        godray,
-        clip_height,
+    if should_cancel(cancel) {
+        return Vec::new();
+    }
+
+    nodes[0] = root;
+    nodes
+}
+
+// src/svo/mips.rs
+// ---------------
+// src/svo/mips.rs
+
+pub struct MinMaxMipView<'a> {
+    pub root_side: u32,
+    pub min_levels: &'a [Vec<i32>],
+    pub max_levels: &'a [Vec<i32>],
+}
+
+pub fn build_minmax_mip_inplace<'a>(
+    base: &[i32],
+    side: u32,
+    min_levels: &'a mut Vec<Vec<i32>>,
+    max_levels: &'a mut Vec<Vec<i32>>,
+) -> MinMaxMipView<'a> {
+    debug_assert!(side.is_power_of_two());
+    debug_assert_eq!(base.len(), (side * side) as usize);
+
+    let levels = side.trailing_zeros() as usize + 1;
+
+    if min_levels.len() != levels {
+        min_levels.resize_with(levels, Vec::new);
+    }
+    if max_levels.len() != levels {
+        max_levels.resize_with(levels, Vec::new);
+    }
+
+    // lvl 0
+    min_levels[0].clear();
+    min_levels[0].extend_from_slice(base);
+
+    max_levels[0].clear();
+    max_levels[0].extend_from_slice(base);
+
+    let mut cur_side = side;
+
+    for lvl in 1..levels {
+        let next_side = cur_side / 2;
+        let need = (next_side * next_side) as usize;
+
+        // --- min: borrow prev + out without aliasing
+        {
+            let (prev, rest) = min_levels.split_at_mut(lvl);
+            let cur_min: &[i32] = &prev[lvl - 1];
+            let mn: &mut Vec<i32> = &mut rest[0];
+            mn.resize(need, 0);
+
+            for z in 0..next_side {
+                for x in 0..next_side {
+                    let i00 = ((2 * z) * cur_side + (2 * x)) as usize;
+                    let i10 = ((2 * z) * cur_side + (2 * x + 1)) as usize;
+                    let i01 = ((2 * z + 1) * cur_side + (2 * x)) as usize;
+                    let i11 = ((2 * z + 1) * cur_side + (2 * x + 1)) as usize;
+
+                    let o = (z * next_side + x) as usize;
+
+                    let a0 = cur_min[i00];
+                    let a1 = cur_min[i10];
+                    let a2 = cur_min[i01];
+                    let a3 = cur_min[i11];
+
+                    mn[o] = a0.min(a1).min(a2).min(a3);
+                }
+            }
+        }
+
+        // --- max: borrow prev + out without aliasing
+        {
+            let (prev, rest) = max_levels.split_at_mut(lvl);
+            let cur_max: &[i32] = &prev[lvl - 1];
+            let mx: &mut Vec<i32> = &mut rest[0];
+            mx.resize(need, 0);
+
+            for z in 0..next_side {
+                for x in 0..next_side {
+                    let i00 = ((2 * z) * cur_side + (2 * x)) as usize;
+                    let i10 = ((2 * z) * cur_side + (2 * x + 1)) as usize;
+                    let i01 = ((2 * z + 1) * cur_side + (2 * x)) as usize;
+                    let i11 = ((2 * z + 1) * cur_side + (2 * x + 1)) as usize;
+
+                    let o = (z * next_side + x) as usize;
+
+                    let b0 = cur_max[i00];
+                    let b1 = cur_max[i10];
+                    let b2 = cur_max[i01];
+                    let b3 = cur_max[i11];
+
+                    mx[o] = b0.max(b1).max(b2).max(b3);
+                }
+            }
+        }
+
+        cur_side = next_side;
+    }
+
+    MinMaxMipView {
+        root_side: side,
+        min_levels: &min_levels[..],
+        max_levels: &max_levels[..],
+    }
+}
+
+impl<'a> MinMaxMipView<'a> {
+    #[inline]
+    pub fn query(&self, x0: i32, z0: i32, size: u32) -> (i32, i32) {
+        debug_assert!(size.is_power_of_two());
+        debug_assert!(size <= self.root_side);
+        debug_assert!(x0 >= 0 && z0 >= 0);
+
+        let level = size.trailing_zeros() as usize;
+        debug_assert!(level < self.min_levels.len());
+
+        let side = self.root_side >> level;
+        let x = (x0 as u32) / size;
+        let z = (z0 as u32) / size;
+        let idx = (z * side + x) as usize;
+
+        (self.min_levels[level][idx], self.max_levels[level][idx])
+    }
+}
+
+pub struct MaxMipView<'a> {
+    pub root_side: u32,
+    pub levels: &'a [Vec<i32>],
+}
+
+pub fn build_max_mip_inplace<'a>(
+    base: &[i32],
+    side: u32,
+    levels: &'a mut Vec<Vec<i32>>,
+) -> MaxMipView<'a> {
+    debug_assert!(side.is_power_of_two());
+    debug_assert_eq!(base.len(), (side * side) as usize);
+
+    let nlevels = side.trailing_zeros() as usize + 1;
+
+    if levels.len() != nlevels {
+        levels.resize_with(nlevels, Vec::new);
+    }
+
+    // lvl 0
+    levels[0].clear();
+    levels[0].extend_from_slice(base);
+
+    let mut cur_side = side;
+
+    for lvl in 1..nlevels {
+        let next_side = cur_side / 2;
+        let need = (next_side * next_side) as usize;
+
+        let (prev, rest) = levels.split_at_mut(lvl);
+        let cur: &[i32] = &prev[lvl - 1];
+        let out: &mut Vec<i32> = &mut rest[0];
+        out.resize(need, 0);
+
+        for z in 0..next_side {
+            for x in 0..next_side {
+                let i00 = ((2 * z) * cur_side + (2 * x)) as usize;
+                let i10 = ((2 * z) * cur_side + (2 * x + 1)) as usize;
+                let i01 = ((2 * z + 1) * cur_side + (2 * x)) as usize;
+                let i11 = ((2 * z + 1) * cur_side + (2 * x + 1)) as usize;
+
+                let o = (z * next_side + x) as usize;
+                out[o] = cur[i00].max(cur[i10]).max(cur[i01]).max(cur[i11]);
+            }
+        }
+
+        cur_side = next_side;
+    }
+
+    MaxMipView {
+        root_side: side,
+        levels: &levels[..],
+    }
+}
+
+impl<'a> MaxMipView<'a> {
+    #[inline]
+    pub fn query_max(&self, x0: i32, z0: i32, size: u32) -> i32 {
+        debug_assert!(size.is_power_of_two());
+        debug_assert!(size <= self.root_side);
+        debug_assert!(x0 >= 0 && z0 >= 0);
+
+        let level = size.trailing_zeros() as usize;
+        debug_assert!(level < self.levels.len());
+
+        let side = self.root_side >> level;
+        let x = (x0 as u32) / size;
+        let z = (z0 as u32) / size;
+        let idx = (z * side + x) as usize;
+
+        self.levels[level][idx]
+    }
+}
+
+// src/svo/mod.rs
+// --------------
+// src/svo/mod.rs
+pub mod builder;
+pub mod mips;
+
+pub use builder::{
+    BuildScratch,
+    build_chunk_svo_sparse_cancelable_with_scratch,
+};
+
+// src/world/generator.rs
+// ----------------------
+// src/world/generator.rs
+
+use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
+
+use crate::config;
+
+#[derive(Clone)]
+pub struct WorldGen {
+    pub seed: u32,
+    height: Fbm<Perlin>,
+    detail: Fbm<Perlin>,
+}
+
+impl WorldGen {
+    pub fn new(seed: u32) -> Self {
+        let height = Fbm::<Perlin>::new(seed).set_octaves(7).set_frequency(0.010);
+        let detail = Fbm::<Perlin>::new(seed ^ 0xA5A5_A5A5).set_octaves(3).set_frequency(0.02);
+
+        Self { seed, height, detail }
+    }
+
+    pub fn ground_height(&self, x_vox: i32, z_vox: i32) -> i32 {
+        let xm = x_vox as f64 * config::VOXEL_SIZE_M_F64;
+        let zm = z_vox as f64 * config::VOXEL_SIZE_M_F64;
+
+        let h0 = self.height.get([xm, zm]) as f32;
+        let h1 = self.detail.get([xm, zm]) as f32;
+
+        let base_m = 10.0;
+        let amp_m = 18.0;
+        let hills_m = h0 * amp_m + h1 * 3.0;
+
+        let voxels_per_meter = (1.0 / config::VOXEL_SIZE_M_F64) as f32;
+        ((base_m + hills_m) * voxels_per_meter).round() as i32
+    }
+}
+
+// src/world/hash.rs
+// -----------------
+// src/world/hash.rs
+#[inline]
+pub fn hash_u32(mut v: u32) -> u32 {
+    v ^= v >> 16;
+    v = v.wrapping_mul(0x7feb_352d);
+    v ^= v >> 15;
+    v = v.wrapping_mul(0x846c_a68b);
+    v ^= v >> 16;
+    v
+}
+
+#[inline]
+pub fn hash2(seed: u32, x: i32, z: i32) -> u32 {
+    let a = (x as u32).wrapping_mul(0x9e37_79b1);
+    let b = (z as u32).wrapping_mul(0x85eb_ca6b);
+    hash_u32(seed ^ a ^ b)
+}
+
+#[inline]
+pub fn hash3(seed: u32, x: i32, y: i32, z: i32) -> u32 {
+    let a = (x as u32).wrapping_mul(0x9e37_79b1);
+    let b = (y as u32).wrapping_mul(0x85eb_ca6b);
+    let c = (z as u32).wrapping_mul(0xc2b2_ae35);
+    hash_u32(seed ^ a ^ b ^ c)
+}
+
+#[inline]
+pub fn u01(v: u32) -> f32 {
+    (v as f32) * (1.0 / 4294967296.0)
+}
+
+// src/world/materials.rs
+// ----------------------
+// src/world/materials.rs
+pub const AIR: u32 = 0;
+pub const GRASS: u32 = 1;
+pub const DIRT: u32 = 2;
+pub const STONE: u32 = 3;
+pub const WOOD: u32 = 4;
+pub const LEAF: u32 = 5;
+
+// src/world/mod.rs
+// ----------------
+// src/world/mod.rs
+pub mod generator;
+pub mod materials;
+pub mod hash;
+pub mod trees;
+
+pub use generator::WorldGen;
+
+// src/world/trees.rs
+// ------------------
+// src/world/trees.rs
+use crate::config;
+
+use super::{
+    generator::WorldGen,
+    hash::{hash2, hash3, hash_u32, u01},
+    materials::{AIR, LEAF, WOOD},
+};
+
+// ================================================================================================
+// TREE TUNING KNOBS
+// ================================================================================================
+// Conventions
+// - vpm = voxels per meter (VOXELS_PER_METER)
+// - Fast probability via bitmask:
+//      (hash & mask) == 0  => true with probability 1/(mask+1)
+//
+// Notes:
+// - AABB = axis-aligned bounding box
+// - BFS = breadth-first search
+// - SVO = Sparse Voxel Octree
+// ================================================================================================
+
+// Tree density: 1 tree per N meter-cells (lower => more trees)
+const TREE_CELL_MOD: u32 = 256;
+
+// ----------------------------------------
+// Primary branches (depth=0)
+// ----------------------------------------
+
+// Fewer primaries, but less “spike crown”
+const PRIMARY_MIN: usize = 6;
+const PRIMARY_MAX: usize = 14;
+const PRIMARY_MAX_CLAMP: usize = 18;
+
+// Start height along trunk (% of trunk height)
+// IMPORTANT: allow starts right near the top so the trunk doesn't look “pruned”
+const PRIMARY_START_Y_LO_FRAC: i32 = 28;
+const PRIMARY_START_Y_HI_FRAC: i32 = 99; // was 92
+const PRIMARY_START_JITTER_FRAC: f32 = 0.10;
+
+// Shape
+const PRIMARY_ANG_JITTER: f32 = 1.05; // more irregular azimuth (less radial symmetry)
+
+// SHORTER primaries (big lever for “branches too long”)
+const PRIMARY_LEN_M_MIN: f32 = 1.40;
+const PRIMARY_LEN_M_RAND: f32 = 2.20;
+
+// More vertical variation + less spear-like
+const PRIMARY_PITCH_BASE: f32 = 0.10;
+const PRIMARY_PITCH_H_SCALE: f32 = 0.18;
+const PRIMARY_PITCH_QUAD_BASE: f32 = 0.44;
+const PRIMARY_PITCH_QUAD_H_SCALE: f32 = 0.22;
+
+const PRIMARY_R0_M_MIN: f32 = 0.13;
+const PRIMARY_R0_M_RAND: f32 = 0.22;
+const PRIMARY_R1_SCALE_MIN: f32 = 0.28;
+const PRIMARY_R1_SCALE_RAND: f32 = 0.22;
+
+// More curvature so branches feel “grown”, not extruded
+const PRIMARY_BEND_M_MIN: f32 = 1.05;
+const PRIMARY_BEND_M_RAND: f32 = 1.85;
+const PRIMARY_C1_T: f32 = 0.28;
+const PRIMARY_C2_T: f32 = 0.72;
+const PRIMARY_C1_BEND_SCALE: f32 = 1.10;
+const PRIMARY_C2_BEND_SCALE: f32 = 0.85;
+const PRIMARY_C1_Y_BEND_SCALE: f32 = 0.44;
+const PRIMARY_C2_Y_BEND_SCALE: f32 = 0.34;
+
+// ----------------------------------------
+// Recursion / complexity
+// ----------------------------------------
+
+const MAX_BRANCH_DEPTH: u8 = 4;
+const BRANCH_CAP: usize = 520;
+
+// How many child candidates per parent depth: min + uniform(0..rand)
+// Index = parent.depth clamped to 0..3
+const CHILD_COUNT_MIN: [usize; 4] = [3, 3, 2, 1];
+const CHILD_COUNT_RAND: [usize; 4] = [3, 3, 3, 3];
+
+// Aggressive thinning (keeps overall sparse structure)
+// Keep child only if (sj & mask) == 0
+const CHILD_SPAWN_THIN_MASK: [u32; 4] = [
+    3,  // depth=0: keep ~1/4
+    7,  // depth=1: keep ~1/8
+    15, // depth=2: keep ~1/16
+    31, // depth>=3: keep ~1/32
+];
+
+// Spawn position along parent
+const CHILD_SPAWN_T_MIN: f32 = 0.32;
+const CHILD_SPAWN_T_RAND: f32 = 0.58;
+
+// SHORTER children
+const CHILD_LEN_M_MIN: f32 = 0.35;
+const CHILD_LEN_M_RAND: f32 = 1.05;
+const CHILD_LEN_M_FLOOR: f32 = 0.28;
+
+// Clamp children harder vs parent length
+const CHILD_MAXLEN_A: f32 = 0.48;
+const CHILD_MAXLEN_B: f32 = 0.18;
+
+// Direction shaping
+const CHILD_FAN_AMP_BASE: f32 = 0.95;
+const CHILD_FAN_AMP_DEPTH: f32 = 0.38;
+
+const CHILD_UP_BASE: f32 = 0.10;
+const CHILD_UP_DEPTH: f32 = 0.10;
+const CHILD_UP_RAND: f32 = 0.28;
+
+// Radius shrink factor by child depth (depth=1..)
+const CHILD_SHRINK: [f32; 4] = [0.58, 0.52, 0.46, 0.40];
+
+const CHILD_R0_MIN_VOX: f32 = 0.70;
+const CHILD_R1_MIN_VOX: f32 = 0.50;
+const CHILD_R1_SCALE_BASE: f32 = 0.34;
+const CHILD_R1_SCALE_RAND: f32 = 0.16;
+
+// Curvature
+const CHILD_BEND_M_MIN: f32 = 0.45;
+const CHILD_BEND_M_RAND: f32 = 1.25;
+const CHILD_C1_T: f32 = 0.28;
+const CHILD_C2_T: f32 = 0.72;
+const CHILD_C1_BEND_SCALE: f32 = 1.05;
+const CHILD_C2_BEND_SCALE: f32 = 0.78;
+const CHILD_C1_Y_BEND_SCALE: f32 = 0.34;
+const CHILD_C2_Y_BEND_SCALE: f32 = 0.26;
+
+// ----------------------------------------
+// Branch rasterization
+// ----------------------------------------
+
+const BRANCH_STEPS_MIN: i32 = 8;
+const BRANCH_STEPS_MAX: i32 = 30;
+const BRANCH_STEPS_BASE: f32 = 10.0;
+const BRANCH_STEPS_LEN_DIV_M: f32 = 0.30;
+const BRANCH_RADIUS_MIN_VOX: f32 = 0.55;
+
+// ----------------------------------------
+// Leaves
+// ----------------------------------------
+
+const LEAF_ALWAYS_TIP_FOR_ALL_BRANCHES: bool = true;
+const LEAF_RARE_SKIP_MASK: u32 = 16383;
+
+// Canopy extent along branches: more sleeves, distributed earlier
+const LEAF_SLEEVE_N: [usize; 5] = [3, 3, 4, 4, 5];
+const LEAF_SLEEVE_T_MIN: f32 = 0.14;
+const LEAF_SLEEVE_T_RAND: f32 = 0.78;
+
+// Disable extra offset tip tuft (tends to create little dense “buttons”)
+const LEAF_OFFSET_TIP_MASK: u32 = 0;
+
+// Bigger offsets = wider canopy without adding branches
+const LEAF_OFFSET_M_XZ: f32 = 0.95;
+const LEAF_OFFSET_M_Y: f32 = 0.46;
+
+const LEAF_SLEEVE_OFFSET_M_XZ: f32 = 0.62;
+const LEAF_SLEEVE_OFFSET_M_Y: f32 = 0.34;
+
+// Big tufts (canopy size)
+const TUFT_R_BASE: [f32; 5] = [0.42, 0.50, 0.60, 0.66, 0.72];
+const TUFT_R_RAND: [f32; 5] = [0.30, 0.36, 0.52, 0.60, 0.66];
+
+// Sparse/airy fill
+const LEAF_SPHERE_Y_SCALE: f32 = 1.16;
+const LEAF_SHELL_THRESH: f32 = 0.90;
+
+// TIP: visible but airy
+const TIP_GUARANTEED_GATE_MASK: u32 = 1;           // keep ~1/2 candidates
+const TIP_GUARANTEED_INTERIOR_KEEP_MASK: u32 = 31; // keep 1/32 interior
+const TIP_GUARANTEED_SHELL_DROP_MASK: u32 = 3;     // drop 1/4 near shell
+
+// SLEEVE: very sparse
+const TUFT_SPARSE_GATE_MASK: u32 = 15;             // keep ~1/16 candidates
+const TUFT_SPARSE_INTERIOR_KEEP_MASK: u32 = 255;   // keep 1/256 interior
+const TUFT_SPARSE_SHELL_DROP_MASK: u32 = 3;        // drop 1/4 near shell
+
+// Trunk wobble (meters)
+const TRUNK_WOBBLE_M_MAX: f32 = 0.25;
+
+// ----------------------------------------
+// Crown at trunk tip (prevents "pruned top")
+// ----------------------------------------
+
+const TOP_CROWN_ENABLE: bool = true;
+const TOP_CROWN_RING_TUFTS: usize = 6;
+const TOP_CROWN_R_SCALE: f32 = 1.65;
+const TOP_CROWN_RING_RAD_SCALE: f32 = 0.85;
+const TOP_CROWN_LIFT_M: f32 = 0.45;
+
+// ================================================================================================
+
+/// Procedural tree instance (voxel units for positions/sizes).
+#[derive(Clone, Copy)]
+struct Tree {
+    tx: i32,
+    tz: i32,
+    base_y: i32,   // touches ground
+    trunk_h: i32,  // voxels
+    crown_r: i32,  // voxels (horizontal extent)
+    canopy_h: i32, // conservative bounds / variety
+    trunk_r0: f32, // voxels radius at base
+    trunk_r1: f32, // voxels radius near top
+    seed: u32,
+}
+
+/// A single curved branch segment (cubic bezier), plus metadata for recursion.
+#[derive(Clone, Copy)]
+struct Branch {
+    ax: f32,
+    ay: f32,
+    az: f32,
+    c1x: f32,
+    c1y: f32,
+    c1z: f32,
+    c2x: f32,
+    c2y: f32,
+    c2z: f32,
+    bx: f32,
+    by: f32,
+    bz: f32,
+    r0: f32,
+    r1: f32,
+    len: f32,
+    depth: u8,
+    seed: u32,
+}
+
+/// Per-chunk cache of trees that can affect material queries.
+pub struct TreeCache {
+    trees: Vec<Tree>,
+}
+
+/// Chunk-local voxel mask for trees (fast O(1) queries in the chunk build).
+/// mask codes: 0 = none, 1 = wood, 2 = leaf
+pub struct TreeMaskCache {
+    pub origin: [i32; 3], // chunk origin in world-voxel coords
+    pub size: i32,        // chunk side in voxels
+    mask: Vec<u8>,
+    stride_z: usize,
+    stride_y: usize,
+}
+
+#[inline(always)]
+fn idx3_strided(stride_z: usize, stride_y: usize, x: i32, y: i32, z: i32) -> usize {
+    (y as usize) * stride_y + (z as usize) * stride_z + (x as usize)
+}
+
+impl TreeMaskCache {
+    #[inline(always)]
+    pub fn contains_point_fast(&self, x: i32, y: i32, z: i32) -> u8 {
+        let lx = x - self.origin[0];
+        let ly = y - self.origin[1];
+        let lz = z - self.origin[2];
+        if (lx | ly | lz) < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
+            return 0;
+        }
+        self.mask[idx3_strided(self.stride_z, self.stride_y, lx, ly, lz)]
+    }
+
+    #[inline(always)]
+    pub fn material_fast(&self, x: i32, y: i32, z: i32) -> u32 {
+        match self.contains_point_fast(x, y, z) {
+            1 => WOOD,
+            2 => LEAF,
+            _ => AIR,
+        }
+    }
+
+    #[inline(always)]
+    fn write_leaf(&mut self, lx: i32, ly: i32, lz: i32) {
+        if (lx | ly | lz) < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
+            return;
+        }
+        let i = idx3_strided(self.stride_z, self.stride_y, lx, ly, lz);
+        if self.mask[i] != 1 {
+            self.mask[i] = 2;
+        }
+    }
+
+    #[inline(always)]
+    fn write_wood(&mut self, lx: i32, ly: i32, lz: i32) {
+        if (lx | ly | lz) < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
+            return;
+        }
+        let i = idx3_strided(self.stride_z, self.stride_y, lx, ly, lz);
+        self.mask[i] = 1;
+    }
+}
+
+impl WorldGen {
+    // -------------------------------------------------------------------------
+    // Small math helpers
+    // -------------------------------------------------------------------------
+
+    #[inline(always)]
+    fn lerp(a: f32, b: f32, t: f32) -> f32 {
+        a + (b - a) * t
+    }
+
+    #[inline(always)]
+    fn s11(n: u32) -> f32 {
+        (u01(n) - 0.5) * 2.0
+    }
+
+    #[inline(always)]
+    fn bezier3(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+        let u = 1.0 - t;
+        u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d
+    }
+
+    #[inline(always)]
+    fn bezier3_tangent(a: f32, b: f32, c: f32, d: f32, t: f32) -> f32 {
+        let u = 1.0 - t;
+        3.0 * u * u * (b - a) + 6.0 * u * t * (c - b) + 3.0 * t * t * (d - c)
+    }
+
+    #[inline(always)]
+    fn bez_point(b: &Branch, t: f32) -> (f32, f32, f32) {
+        (
+            Self::bezier3(b.ax, b.c1x, b.c2x, b.bx, t),
+            Self::bezier3(b.ay, b.c1y, b.c2y, b.by, t),
+            Self::bezier3(b.az, b.c1z, b.c2z, b.bz, t),
+        )
+    }
+
+    #[inline(always)]
+    fn bez_tangent(b: &Branch, t: f32) -> (f32, f32, f32) {
+        (
+            Self::bezier3_tangent(b.ax, b.c1x, b.c2x, b.bx, t),
+            Self::bezier3_tangent(b.ay, b.c1y, b.c2y, b.by, t),
+            Self::bezier3_tangent(b.az, b.c1z, b.c2z, b.bz, t),
+        )
+    }
+
+    #[inline(always)]
+    fn norm3(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
+        let inv = 1.0 / (x * x + y * y + z * z).sqrt().max(1e-6);
+        (x * inv, y * inv, z * inv)
+    }
+
+    #[inline(always)]
+    fn cross3(ax: f32, ay: f32, az: f32, bx: f32, by: f32, bz: f32) -> (f32, f32, f32) {
+        (ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx)
+    }
+
+    /// Orthonormal basis around direction `w` (unit). Returns (u, v, w).
+    #[inline(always)]
+    fn basis_from_w(
+        w: (f32, f32, f32),
+    ) -> ((f32, f32, f32), (f32, f32, f32), (f32, f32, f32)) {
+        let (wx, wy, wz) = w;
+        let (hx, hy, hz) = if wy.abs() < 0.95 {
+            (0.0, 1.0, 0.0)
+        } else {
+            (1.0, 0.0, 0.0)
+        };
+        let (ux, uy, uz) = Self::cross3(hx, hy, hz, wx, wy, wz);
+        let (ux, uy, uz) = Self::norm3(ux, uy, uz);
+        let (vx, vy, vz) = Self::cross3(wx, wy, wz, ux, uy, uz);
+        ((ux, uy, uz), (vx, vy, vz), (wx, wy, wz))
+    }
+
+    // -------------------------------------------------------------------------
+    // Knob helpers (compact)
+    // -------------------------------------------------------------------------
+
+    #[inline(always)]
+    fn idx4(d: u8) -> usize {
+        (d as usize).min(3)
+    }
+    #[inline(always)]
+    fn idx5(d: u8) -> usize {
+        (d as usize).min(4)
+    }
+
+    #[inline(always)]
+    fn child_count_for_depth(depth: u8, base: u32) -> usize {
+        let i = Self::idx4(depth);
+        CHILD_COUNT_MIN[i] + (base % (CHILD_COUNT_RAND[i] as u32 + 1)) as usize
+    }
+
+    #[inline(always)]
+    fn spawn_thin_mask(depth: u8) -> u32 {
+        CHILD_SPAWN_THIN_MASK[Self::idx4(depth)]
+    }
+
+    #[inline(always)]
+    fn shrink_for_child_depth(depth: u8) -> f32 {
+        // child depth starts at 1, so map 1->0, 2->1, 3->2, 4+->3
+        let i = ((depth as usize).saturating_sub(1)).min(3);
+        CHILD_SHRINK[i]
+    }
+
+    #[inline(always)]
+    fn sleeve_n(depth: u8) -> usize {
+        LEAF_SLEEVE_N[Self::idx5(depth)]
+    }
+
+    #[inline(always)]
+    fn tuft_r_m(depth: u8, seed: u32) -> f32 {
+        let i = Self::idx5(depth);
+        TUFT_R_BASE[i] + TUFT_R_RAND[i] * u01(hash_u32(seed))
+    }
+
+    // -------------------------------------------------------------------------
+    // Tree placement + params
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn tree_at_meter_cell(
+        &self,
+        xm: i32,
+        zm: i32,
+    ) -> Option<(u32 /*seed*/, i32 /*trunk_h_vox*/, i32 /*crown_r_vox*/)> {
+        let r = hash2(self.seed, xm, zm);
+        if (r % TREE_CELL_MOD) != 0 {
+            return None;
+        }
+
+        let trunk_h_m = 5 + (hash_u32(r) % 6) as i32; // 5..10m
+        let crown_r_m = 3 + (hash_u32(r ^ 0xBEEF) % 4) as i32; // 3..6m
+        let vpm = config::VOXELS_PER_METER;
+
+        Some((r, trunk_h_m * vpm, crown_r_m * vpm))
+    }
+
+    #[inline]
+    fn tree_params_at_trunk(&self, tx: i32, tz: i32, ground: i32) -> Option<Tree> {
+        let xm = tx.div_euclid(config::VOXELS_PER_METER);
+        let zm = tz.div_euclid(config::VOXELS_PER_METER);
+        let (seed, trunk_h, crown_r) = self.tree_at_meter_cell(xm, zm)?;
+
+        let vpm = config::VOXELS_PER_METER as f32;
+
+        // trunk radii (voxels): base ~0.45..0.75m, top ~0.18..0.30m
+        let r0 = 0.45 * vpm + u01(hash_u32(seed ^ 0x1111)) * (0.30 * vpm);
+        let r1 = 0.18 * vpm + u01(hash_u32(seed ^ 0x2222)) * (0.12 * vpm);
+
+        // kept for conservative bounds / variety
+        let canopy_h =
+            ((2.5 * vpm) + u01(hash_u32(seed ^ 0x3333)) * (2.0 * vpm)).round() as i32;
+
+        Some(Tree {
+            tx,
+            tz,
+            base_y: ground,
+            trunk_h,
+            crown_r,
+            canopy_h,
+            trunk_r0: r0.max(1.0),
+            trunk_r1: r1.max(1.0),
+            seed,
+        })
+    }
+
+    /// Build a per-chunk tree cache. Call once per chunk build.
+    pub fn build_tree_cache<F: Fn(i32, i32) -> i32>(
+        &self,
+        chunk_ox: i32,
+        chunk_oz: i32,
+        chunk_size: i32,
+        height_at: &F,
+    ) -> TreeCache {
+        let vpm = config::VOXELS_PER_METER;
+
+        // Extra slack because canopy tufts can extend beyond crown_r
+        let pad_m = 10;
+
+        let xm0 = chunk_ox.div_euclid(vpm) - pad_m;
+        let xm1 = (chunk_ox + chunk_size).div_euclid(vpm) + pad_m;
+        let zm0 = chunk_oz.div_euclid(vpm) - pad_m;
+        let zm1 = (chunk_oz + chunk_size).div_euclid(vpm) + pad_m;
+
+        let mut trees = Vec::new();
+
+        for zm in zm0..=zm1 {
+            for xm in xm0..=xm1 {
+                if self.tree_at_meter_cell(xm, zm).is_none() {
+                    continue;
+                }
+
+                let tx = xm * vpm;
+                let tz = zm * vpm;
+                let ground = height_at(tx, tz);
+
+                let Some(t) = self.tree_params_at_trunk(tx, tz, ground) else {
+                    continue;
+                };
+
+                // Conservative XZ AABB reject vs chunk footprint
+                let r = t.crown_r + 5 * vpm; // extra slack for large tufts
+                let x0 = t.tx - r;
+                let x1 = t.tx + r;
+                let z0 = t.tz - r;
+                let z1 = t.tz + r;
+
+                let cx0 = chunk_ox;
+                let cx1 = chunk_ox + chunk_size;
+                let cz0 = chunk_oz;
+                let cz1 = chunk_oz + chunk_size;
+
+                if x1 < cx0 || x0 > cx1 || z1 < cz0 || z0 > cz1 {
+                    continue;
+                }
+
+                trees.push(t);
+            }
+        }
+
+        TreeCache { trees }
+    }
+
+    /// Build a tree cache + chunk-local voxel mask (fast O(1) tree material queries).
+    pub fn build_tree_cache_with_mask<F: Fn(i32, i32) -> i32>(
+        &self,
+        chunk_ox: i32,
+        chunk_oy: i32,
+        chunk_oz: i32,
+        chunk_size: i32,
+        height_at: &F,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> (TreeCache, TreeMaskCache) {
+        let cache = self.build_tree_cache(chunk_ox, chunk_oz, chunk_size, height_at);
+
+        let side = chunk_size.max(1) as i32;
+        let side_u = side as usize;
+
+        let mask = vec![0u8; side_u * side_u * side_u];
+
+        let mut out = TreeMaskCache {
+            origin: [chunk_ox, chunk_oy, chunk_oz],
+            size: side,
+            mask,
+            stride_z: side_u,
+            stride_y: side_u * side_u,
+        };
+
+        for t in &cache.trees {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            self.raster_tree_into_mask(t, &mut out);
+        }
+
+        (cache, out)
+    }
+
+    // -------------------------------------------------------------------------
+    // Geometry helpers
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn trunk_radius_at(tree: &Tree, y: i32) -> f32 {
+        let t = ((y - tree.base_y) as f32 / (tree.trunk_h as f32)).clamp(0.0, 1.0);
+        tree.trunk_r0 + (tree.trunk_r1 - tree.trunk_r0) * t
+    }
+
+    #[inline]
+    fn trunk_wobble(&self, tree: &Tree, y: i32) -> (f32, f32) {
+        let t = ((y - tree.base_y) as f32 / (tree.trunk_h as f32)).clamp(0.0, 1.0);
+
+        let a = u01(hash_u32(tree.seed ^ 0xA001 ^ (y as u32).wrapping_mul(97)));
+        let b = u01(hash_u32(tree.seed ^ 0xA002 ^ (y as u32).wrapping_mul(193)));
+
+        let amp = TRUNK_WOBBLE_M_MAX * (config::VOXELS_PER_METER as f32) * t;
+        ((a - 0.5) * 2.0 * amp, (b - 0.5) * 2.0 * amp)
+    }
+
+    #[inline]
+    fn dist2_point_segment(
+        px: f32,
+        py: f32,
+        pz: f32,
+        ax: f32,
+        ay: f32,
+        az: f32,
+        bx: f32,
+        by: f32,
+        bz: f32,
+    ) -> (f32 /*d2*/, f32 /*t*/) {
+        let abx = bx - ax;
+        let aby = by - ay;
+        let abz = bz - az;
+
+        let apx = px - ax;
+        let apy = py - ay;
+        let apz = pz - az;
+
+        let ab2 = abx * abx + aby * aby + abz * abz;
+        if ab2 <= 1e-8 {
+            return (apx * apx + apy * apy + apz * apz, 0.0);
+        }
+
+        let t = ((apx * abx + apy * aby + apz * abz) / ab2).clamp(0.0, 1.0);
+        let cx = ax + t * abx;
+        let cy = ay + t * aby;
+        let cz = az + t * abz;
+
+        let dx = px - cx;
+        let dy = py - cy;
+        let dz = pz - cz;
+
+        (dx * dx + dy * dy + dz * dz, t)
+    }
+
+    // -------------------------------------------------------------------------
+    // Primary layout
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn primary_count(&self, tree: &Tree) -> usize {
+        let r = hash_u32(tree.seed ^ 0xBABA_1234);
+        let span = (PRIMARY_MAX - PRIMARY_MIN + 1) as u32;
+        let mut n = PRIMARY_MIN + (r % span) as usize;
+
+        // tiny bias extremes sometimes
+        if (r & 31) == 0 {
+            n = PRIMARY_MIN;
+        } else if (r & 63) == 1 {
+            n = PRIMARY_MAX;
+        }
+        n.min(PRIMARY_MAX_CLAMP)
+    }
+
+    fn primary_starts(&self, tree: &Tree, count: usize) -> [i32; 32] {
+        let mut out = [tree.base_y; 32];
+
+        let y_lo = tree.base_y + (tree.trunk_h * PRIMARY_START_Y_LO_FRAC) / 100;
+        let y_hi = tree.base_y + (tree.trunk_h * PRIMARY_START_Y_HI_FRAC) / 100;
+
+        for i in 0..count.min(32) {
+            let t = if count <= 1 {
+                0.5
+            } else {
+                (i as f32) / ((count - 1) as f32)
+            };
+            let y_base = (Self::lerp(y_lo as f32, y_hi as f32, t)) as i32;
+
+            let r = hash_u32(tree.seed ^ 0xC0DE_0001 ^ (i as u32).wrapping_mul(0x9E37_79B9));
+            let jitter =
+                (Self::s11(r ^ 0x1111) * PRIMARY_START_JITTER_FRAC * (tree.trunk_h as f32)) as i32;
+            out[i] = (y_base + jitter).clamp(y_lo, y_hi);
+        }
+
+        // insertion sort ascending
+        for i in 1..count.min(32) {
+            let mut j = i;
+            while j > 0 && out[j - 1] > out[j] {
+                out.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+
+        out
+    }
+
+    // -------------------------------------------------------------------------
+    // Branch generation
+    // -------------------------------------------------------------------------
+
+    fn child_branches_from_parent(&self, parent: &Branch, tree_seed: u32, out: &mut Vec<Branch>) {
+        if parent.depth >= MAX_BRANCH_DEPTH {
+            return;
+        }
+
+        let vpm = config::VOXELS_PER_METER as f32;
+        let base = hash_u32(parent.seed ^ 0xCC11_0000);
+
+        let child_count = Self::child_count_for_depth(parent.depth, base);
+
+        for j in 0..child_count {
+            let sj = hash_u32(base ^ (j as u32).wrapping_mul(0x9E37_79B9));
+
+            if (sj & Self::spawn_thin_mask(parent.depth)) != 0 {
+                continue;
+            }
+
+            let t = (CHILD_SPAWN_T_MIN + CHILD_SPAWN_T_RAND * u01(sj ^ 0x1111)).clamp(0.0, 1.0);
+
+            let (ax, ay, az) = Self::bez_point(parent, t);
+            let (tx, ty, tz) = Self::bez_tangent(parent, t);
+            let w = Self::norm3(tx, ty, tz);
+            let (u, v, w) = Self::basis_from_w(w);
+
+            let phi = u01(sj ^ 0xFACE_B00C) * std::f32::consts::TAU;
+            let (cs, sn) = (phi.cos(), phi.sin());
+            let sideways = (u.0 * cs + v.0 * sn, u.1 * cs + v.1 * sn, u.2 * cs + v.2 * sn);
+
+            let depth = parent.depth + 1;
+
+            let max_from_parent = parent.len * (CHILD_MAXLEN_A - CHILD_MAXLEN_B * (depth as f32));
+            let mut len =
+                (CHILD_LEN_M_MIN * vpm + u01(sj ^ 0x2222) * (CHILD_LEN_M_RAND * vpm)).min(
+                    max_from_parent,
+                );
+            len = len.max(CHILD_LEN_M_FLOOR * vpm);
+
+            let fan_amp = CHILD_FAN_AMP_BASE + CHILD_FAN_AMP_DEPTH * (depth as f32);
+            let fan = Self::s11(sj ^ 0x3333) * fan_amp;
+
+            let up = 1.65 * (CHILD_UP_BASE + CHILD_UP_DEPTH * (depth as f32))
+                + 1.25 * (CHILD_UP_RAND * u01(sj ^ 0x4444));
+
+            let dirx = (w.0 + sideways.0 * fan).clamp(-2.0, 2.0);
+            let diry = (w.1 + sideways.1 * fan + up).clamp(0.15, 3.0);
+            let dirz = (w.2 + sideways.2 * fan).clamp(-2.0, 2.0);
+            let (dirx, diry, dirz) = Self::norm3(dirx, diry, dirz);
+
+            let pr = parent.r0 + (parent.r1 - parent.r0) * t;
+
+            let shrink = Self::shrink_for_child_depth(depth);
+            let r0 = (pr * shrink).max(CHILD_R0_MIN_VOX);
+            let r1 =
+                (r0 * (CHILD_R1_SCALE_BASE + CHILD_R1_SCALE_RAND * u01(sj ^ 0x5555))).max(
+                    CHILD_R1_MIN_VOX,
+                );
+
+            let bx = ax + dirx * len;
+            let by = ay + diry * len;
+            let bz = az + dirz * len;
+
+            let bend = (CHILD_BEND_M_MIN * vpm) + (CHILD_BEND_M_RAND * vpm) * u01(sj ^ 0x6666);
+
+            let k1 = Self::s11(sj ^ 0x7777);
+            let k2 = Self::s11(sj ^ 0x8888);
+            let u1 = Self::s11(sj ^ 0x9999);
+            let u2 = Self::s11(sj ^ 0xAAAA);
+
+            let c1x = ax + dirx * (CHILD_C1_T * len)
+                + sideways.0 * (bend * CHILD_C1_BEND_SCALE * k1);
+            let c1y = ay + diry * (CHILD_C1_T * len) + (bend * CHILD_C1_Y_BEND_SCALE * u1.abs());
+            let c1z = az + dirz * (CHILD_C1_T * len)
+                + sideways.2 * (bend * CHILD_C1_BEND_SCALE * k1);
+
+            let c2x = ax + dirx * (CHILD_C2_T * len)
+                + sideways.0 * (bend * CHILD_C2_BEND_SCALE * k2);
+            let c2y = ay + diry * (CHILD_C2_T * len) + (bend * CHILD_C2_Y_BEND_SCALE * u2.abs());
+            let c2z = az + dirz * (CHILD_C2_T * len)
+                + sideways.2 * (bend * CHILD_C2_BEND_SCALE * k2);
+
+            out.push(Branch {
+                ax,
+                ay,
+                az,
+                c1x,
+                c1y,
+                c1z,
+                c2x,
+                c2y,
+                c2z,
+                bx,
+                by,
+                bz,
+                r0,
+                r1,
+                len,
+                depth,
+                seed: hash_u32(tree_seed ^ sj ^ 0xBEEF_1234),
+            });
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Rasterization into chunk-local mask
+    // -------------------------------------------------------------------------
+
+    fn raster_tree_into_mask(&self, tree: &Tree, out: &mut TreeMaskCache) {
+        let side = out.size;
+
+        // --- trunk ---
+        let top_y = tree.base_y + tree.trunk_h;
+        let y0 = tree.base_y.max(out.origin[1]);
+        let y1 = top_y.min(out.origin[1] + side - 1);
+
+        for wy in y0..=y1 {
+            let (wx, wz) = self.trunk_wobble(tree, wy);
+            let cx = tree.tx as f32 + wx;
+            let cz = tree.tz as f32 + wz;
+            let rr = Self::trunk_radius_at(tree, wy).max(1.0);
+            let r = rr.ceil() as i32;
+            let rr2 = rr * rr;
+
+            let minx = (cx.floor() as i32 - r).max(out.origin[0]);
+            let maxx = (cx.ceil() as i32 + r).min(out.origin[0] + side - 1);
+            let minz = (cz.floor() as i32 - r).max(out.origin[2]);
+            let maxz = (cz.ceil() as i32 + r).min(out.origin[2] + side - 1);
+
+            for x in minx..=maxx {
+                let dx = (x as f32) - cx;
+                let dx2 = dx * dx;
+                for z in minz..=maxz {
+                    let dz = (z as f32) - cz;
+                    if dx2 + dz * dz <= rr2 {
+                        out.write_wood(x - out.origin[0], wy - out.origin[1], z - out.origin[2]);
+                    }
+                }
+            }
+        }
+
+        // --- top crown (leaf cluster at trunk tip) ---
+        if TOP_CROWN_ENABLE {
+            let vpm_f = config::VOXELS_PER_METER as f32;
+
+            let tip_y = tree.base_y + tree.trunk_h;
+            let (twx, twz) = self.trunk_wobble(tree, tip_y);
+
+            let cx = tree.tx as f32 + twx;
+            let cy = tip_y as f32 + TOP_CROWN_LIFT_M * vpm_f;
+            let cz = tree.tz as f32 + twz;
+
+            let crown_r =
+                Self::tuft_r_m(0, tree.seed ^ 0xC0A7_0001) * vpm_f * TOP_CROWN_R_SCALE;
+
+            // center tuft (tip profile)
+            self.raster_sphere_leaf_tuft_with_masks(
+                out,
+                cx,
+                cy,
+                cz,
+                crown_r,
+                tree.seed ^ 0xC0A7_CE17,
+                TIP_GUARANTEED_GATE_MASK,
+                TIP_GUARANTEED_INTERIOR_KEEP_MASK,
+                TIP_GUARANTEED_SHELL_DROP_MASK,
+            );
+
+            // ring tufts (sleeve profile) for a crown silhouette
+            let ring_r = crown_r * TOP_CROWN_RING_RAD_SCALE;
+            for i in 0..TOP_CROWN_RING_TUFTS {
+                let rr = hash_u32(tree.seed ^ 0xC0A7_1E99 ^ (i as u32).wrapping_mul(0x9E37_79B9));
+                let ang = u01(rr ^ 0xA1) * std::f32::consts::TAU;
+
+                let ox = ang.cos() * ring_r;
+                let oz = ang.sin() * ring_r;
+                let oy = Self::s11(rr ^ 0xB2) * (0.18 * vpm_f);
+
+                self.raster_sphere_leaf_tuft_with_masks(
+                    out,
+                    cx + ox,
+                    cy + oy,
+                    cz + oz,
+                    crown_r * (0.70 + 0.15 * u01(rr ^ 0xC3)),
+                    tree.seed ^ rr ^ 0xC0A7_7AF7,
+                    TUFT_SPARSE_GATE_MASK,
+                    TUFT_SPARSE_INTERIOR_KEEP_MASK,
+                    TUFT_SPARSE_SHELL_DROP_MASK,
+                );
+            }
+        }
+
+        // --- branches ---
+        let vpm_f = config::VOXELS_PER_METER as f32;
+
+        let primary_count = self.primary_count(tree);
+        let starts = self.primary_starts(tree, primary_count);
+        let ang0 = u01(hash_u32(tree.seed ^ 0xA0A0_0001)) * std::f32::consts::TAU;
+
+        let mut branches: Vec<Branch> = Vec::with_capacity(BRANCH_CAP.min(1024));
+
+        // primary branches
+        for i in 0..primary_count.min(32) {
+            let sy = starts[i];
+            let br_seed = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
+
+            let ang_j = Self::s11(hash_u32(br_seed ^ 0xABCD_0001)) * PRIMARY_ANG_JITTER;
+            let ang =
+                ang0 + (i as f32) * (std::f32::consts::TAU / (primary_count as f32)) + ang_j;
+
+            let dirx = ang.cos();
+            let dirz = ang.sin();
+
+            let len = (PRIMARY_LEN_M_MIN * vpm_f)
+                + u01(hash_u32(br_seed ^ 0x1111)) * (PRIMARY_LEN_M_RAND * vpm_f);
+
+            let h = ((sy - tree.base_y) as f32 / (tree.trunk_h as f32)).clamp(0.0, 1.0);
+            let p = u01(hash_u32(br_seed ^ 0x2222));
+            let pitch = (PRIMARY_PITCH_BASE + PRIMARY_PITCH_H_SCALE * h)
+                + (p * p) * (PRIMARY_PITCH_QUAD_BASE + PRIMARY_PITCH_QUAD_H_SCALE * h);
+
+            let br0 = (PRIMARY_R0_M_MIN * vpm_f)
+                + u01(hash_u32(br_seed ^ 0x3333)) * (PRIMARY_R0_M_RAND * vpm_f);
+            let br1 = br0
+                * (PRIMARY_R1_SCALE_MIN + PRIMARY_R1_SCALE_RAND * u01(hash_u32(br_seed ^ 0x3334)));
+
+            let (twx, twz) = self.trunk_wobble(tree, sy);
+            let ax = tree.tx as f32 + twx;
+            let ay = sy as f32;
+            let az = tree.tz as f32 + twz;
+
+            let bx = ax + dirx * len;
+            let by = ay + pitch * len;
+            let bz = az + dirz * len;
+
+            let bend = (PRIMARY_BEND_M_MIN * vpm_f)
+                + (PRIMARY_BEND_M_RAND * vpm_f) * u01(hash_u32(br_seed ^ 0x9000));
+            let k1 = Self::s11(hash_u32(br_seed ^ 0x9001));
+            let k2 = Self::s11(hash_u32(br_seed ^ 0x9002));
+            let u1 = Self::s11(hash_u32(br_seed ^ 0x9003));
+            let u2 = Self::s11(hash_u32(br_seed ^ 0x9004));
+
+            let perpx = -dirz;
+            let perpz = dirx;
+
+            let c1x = ax + dirx * (PRIMARY_C1_T * len)
+                + perpx * (bend * (PRIMARY_C1_BEND_SCALE * k1));
+            let c1z = az + dirz * (PRIMARY_C1_T * len)
+                + perpz * (bend * (PRIMARY_C1_BEND_SCALE * k1));
+            let c1y = ay + (pitch * len) * PRIMARY_C1_T + (PRIMARY_C1_Y_BEND_SCALE * bend * u1);
+
+            let c2x = ax + dirx * (PRIMARY_C2_T * len)
+                + perpx * (bend * (PRIMARY_C2_BEND_SCALE * k2));
+            let c2z = az + dirz * (PRIMARY_C2_T * len)
+                + perpz * (bend * (PRIMARY_C2_BEND_SCALE * k2));
+            let c2y = ay + (pitch * len) * PRIMARY_C2_T + (PRIMARY_C2_Y_BEND_SCALE * bend * u2);
+
+            branches.push(Branch {
+                ax,
+                ay,
+                az,
+                c1x,
+                c1y,
+                c1z,
+                c2x,
+                c2y,
+                c2z,
+                bx,
+                by,
+                bz,
+                r0: br0.max(1.0),
+                r1: br1.max(0.80),
+                len,
+                depth: 0,
+                seed: hash_u32(tree.seed ^ br_seed ^ 0x1A2B_3C4D),
+            });
+        }
+
+        // BFS recursion (generate)
+        let mut k = 0usize;
+        while k < branches.len() && branches.len() < BRANCH_CAP {
+            let b = branches[k];
+            self.child_branches_from_parent(&b, tree.seed, &mut branches);
+            k += 1;
+        }
+
+        // wood raster
+        for b in &branches {
+            let len_m = b.len / vpm_f;
+            let steps = (BRANCH_STEPS_BASE + (len_m / BRANCH_STEPS_LEN_DIV_M)).round() as i32;
+            let steps = steps.clamp(BRANCH_STEPS_MIN, BRANCH_STEPS_MAX);
+            self.raster_bezier_wood(out, b, steps);
+        }
+
+        // leaves raster
+        for b in &branches {
+            if (hash_u32(b.seed ^ 0x1357_2468) & LEAF_RARE_SKIP_MASK) == 0 {
+                continue;
+            }
+
+            let tuft_r = Self::tuft_r_m(b.depth, b.seed ^ 0x4440) * vpm_f;
+
+            // tip tuft
+            if LEAF_ALWAYS_TIP_FOR_ALL_BRANCHES {
+                self.raster_sphere_leaf_tuft_with_masks(
+                    out,
+                    b.bx,
+                    b.by,
+                    b.bz,
+                    tuft_r,
+                    b.seed ^ 0x1EE7_1EAF,
+                    TIP_GUARANTEED_GATE_MASK,
+                    TIP_GUARANTEED_INTERIOR_KEEP_MASK,
+                    TIP_GUARANTEED_SHELL_DROP_MASK,
+                );
+            }
+
+            // sleeve tufts along branch
+            let sleeve_n = Self::sleeve_n(b.depth);
+            for si in 0..sleeve_n {
+                let rr = hash_u32(b.seed ^ 0x9000_1000 ^ (si as u32).wrapping_mul(0x9E37_79B9));
+                let t = LEAF_SLEEVE_T_MIN + LEAF_SLEEVE_T_RAND * u01(rr ^ 0x0101);
+                let (mx, my, mz) = Self::bez_point(b, t);
+
+                let ox = Self::s11(rr ^ 0x0202) * (LEAF_SLEEVE_OFFSET_M_XZ * vpm_f);
+                let oy = u01(rr ^ 0x0303) * (LEAF_SLEEVE_OFFSET_M_Y * vpm_f);
+                let oz = Self::s11(rr ^ 0x0404) * (LEAF_SLEEVE_OFFSET_M_XZ * vpm_f);
+
+                self.raster_sphere_leaf_tuft_with_masks(
+                    out,
+                    mx + ox,
+                    my + oy,
+                    mz + oz,
+                    tuft_r * (0.55 + 0.10 * (si as f32)),
+                    b.seed ^ rr ^ 0x2AA2_2AA2,
+                    TUFT_SPARSE_GATE_MASK,
+                    TUFT_SPARSE_INTERIOR_KEEP_MASK,
+                    TUFT_SPARSE_SHELL_DROP_MASK,
+                );
+            }
+
+            // extra offset tip tuft (disabled by LEAF_OFFSET_TIP_MASK=0)
+            let h = hash_u32(b.seed ^ 0xABC0_0001);
+            if (h & LEAF_OFFSET_TIP_MASK) != 0 {
+                let rr = hash_u32(b.seed ^ 0xABC0_0002);
+                let ox = Self::s11(rr ^ 0xABC1) * (LEAF_OFFSET_M_XZ * vpm_f);
+                let oy = u01(rr ^ 0xABC2) * (LEAF_OFFSET_M_Y * vpm_f);
+                let oz = Self::s11(rr ^ 0xABC3) * (LEAF_OFFSET_M_XZ * vpm_f);
+
+                self.raster_sphere_leaf_tuft_with_masks(
+                    out,
+                    b.bx + ox,
+                    b.by + oy,
+                    b.bz + oz,
+                    tuft_r * 0.75,
+                    b.seed ^ 0x600D_600D,
+                    TUFT_SPARSE_GATE_MASK,
+                    TUFT_SPARSE_INTERIOR_KEEP_MASK,
+                    TUFT_SPARSE_SHELL_DROP_MASK,
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Wood rasterization
+    // -------------------------------------------------------------------------
+
+    fn raster_bezier_wood(&self, out: &mut TreeMaskCache, b: &Branch, steps: i32) {
+        let steps = steps.max(2);
+        let inv = 1.0 / (steps as f32);
+
+        let mut px = b.ax;
+        let mut py = b.ay;
+        let mut pz = b.az;
+
+        for i in 1..=steps {
+            let t = (i as f32) * inv;
+
+            let qx = Self::bezier3(b.ax, b.c1x, b.c2x, b.bx, t);
+            let qy = Self::bezier3(b.ay, b.c1y, b.c2y, b.by, t);
+            let qz = Self::bezier3(b.az, b.c1z, b.c2z, b.bz, t);
+
+            let rr0 = b.r0 + (b.r1 - b.r0) * (((i - 1) as f32) * inv);
+            let rr1 = b.r0 + (b.r1 - b.r0) * t;
+
+            Self::raster_segment_wood_capsule_stamps(out, px, py, pz, qx, qy, qz, rr0, rr1);
+
+            px = qx;
+            py = qy;
+            pz = qz;
+        }
+    }
+
+    fn raster_segment_wood_capsule_stamps(
+        out: &mut TreeMaskCache,
+        ax: f32, ay: f32, az: f32,
+        bx: f32, by: f32, bz: f32,
+        r0: f32, r1: f32,
+    ) {
+        let vx = bx - ax;
+        let vy = by - ay;
+        let vz = bz - az;
+
+        let len2 = vx*vx + vy*vy + vz*vz;
+        if len2 <= 1e-8 {
+            Self::stamp_sphere_wood(out, ax, ay, az, r0.max(r1));
+            return;
+        }
+        let len = len2.sqrt();
+
+        // Step size in voxels. 0.75 tends to be safe (no holes) but not too expensive.
+        let step = 0.75_f32;
+        let n = (len / step).ceil() as i32;
+
+        let inv_n = 1.0 / (n as f32);
+
+        for i in 0..=n {
+            let t = (i as f32) * inv_n;
+            let cx = ax + vx * t;
+            let cy = ay + vy * t;
+            let cz = az + vz * t;
+
+            let r = r0 + (r1 - r0) * t;
+            Self::stamp_sphere_wood(out, cx, cy, cz, r);
+        }
+    }
+
+    fn stamp_sphere_wood(out: &mut TreeMaskCache, cx: f32, cy: f32, cz: f32, r: f32) {
+        let rr = r.max(1.0);
+        let ir = rr.ceil() as i32;
+        let r2 = rr * rr;
+
+        let minx = (cx.floor() as i32 - ir).max(out.origin[0]);
+        let maxx = (cx.ceil()  as i32 + ir).min(out.origin[0] + out.size - 1);
+        let miny = (cy.floor() as i32 - ir).max(out.origin[1]);
+        let maxy = (cy.ceil()  as i32 + ir).min(out.origin[1] + out.size - 1);
+        let minz = (cz.floor() as i32 - ir).max(out.origin[2]);
+        let maxz = (cz.ceil()  as i32 + ir).min(out.origin[2] + out.size - 1);
+
+        for y in miny..=maxy {
+            let dy = (y as f32) - cy;
+            let dy2 = dy * dy;
+            for x in minx..=maxx {
+                let dx = (x as f32) - cx;
+                let dx2 = dx * dx;
+                for z in minz..=maxz {
+                    let dz = (z as f32) - cz;
+                    if dx2 + dy2 + dz*dz <= r2 {
+                        out.write_wood(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
+                    }
+                }
+            }
+        }
+    }
+
+
+    // -------------------------------------------------------------------------
+    // Leaf rasterization
+    // -------------------------------------------------------------------------
+
+    fn raster_sphere_leaf_tuft_with_masks(
+        &self,
+        out: &mut TreeMaskCache,
+        cx: f32,
+        cy: f32,
+        cz: f32,
+        r: f32,
+        seed: u32,
+        gate_mask: u32,
+        interior_keep_mask: u32,
+        shell_drop_mask: u32,
+    ) {
+        let rr = r.max(1.0);
+        let ir = rr.ceil() as i32;
+
+        let minx = (cx.floor() as i32 - ir).max(out.origin[0]);
+        let maxx = (cx.ceil() as i32 + ir).min(out.origin[0] + out.size - 1);
+        let miny = (cy.floor() as i32 - ir).max(out.origin[1]);
+        let maxy = (cy.ceil() as i32 + ir).min(out.origin[1] + out.size - 1);
+        let minz = (cz.floor() as i32 - ir).max(out.origin[2]);
+        let maxz = (cz.ceil() as i32 + ir).min(out.origin[2] + out.size - 1);
+
+        let r2 = rr * rr;
+
+        for y in miny..=maxy {
+            let py = y as f32;
+            let dy = (py - cy) * LEAF_SPHERE_Y_SCALE;
+            let dy2 = dy * dy;
+
+            for x in minx..=maxx {
+                let px = x as f32;
+                let dx = px - cx;
+                let dx2 = dx * dx;
+
+                for z in minz..=maxz {
+                    let pz = z as f32;
+                    let dz = pz - cz;
+                    let d2 = dx2 + dy2 + dz * dz;
+                    if d2 > r2 {
+                        continue;
+                    }
+
+                    // gate AFTER sphere test
+                    if (hash3(seed ^ 0xA11C_E5ED, x, y, z) & gate_mask) != 0 {
+                        continue;
+                    }
+
+                    // only now do sqrt + interior/shell hashing
+                    let shell2 = (LEAF_SHELL_THRESH * rr) * (LEAF_SHELL_THRESH * rr);
+                    if d2 < shell2 {
+                        let n = hash3(seed ^ 0xCAFE_BABE, x, y, z);
+                        if (n & interior_keep_mask) != 0 {
+                            continue;
+                        }
+                    } else {
+                        let n = hash3(seed ^ 0xD00D_F00D, x, y, z);
+                        if (n & shell_drop_mask) == 0 {
+                            continue;
+                        }
+                    }
+
+                    out.write_leaf(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // SVO bounds helper
+    // -------------------------------------------------------------------------
+
+    /// Used by the SVO builder to stamp conservative tree-top bounds.
+    pub fn tree_instance_at_meter(&self, xm: i32, zm: i32) -> Option<(i32, i32)> {
+        let (_seed, trunk_h_vox, crown_r_vox) = self.tree_at_meter_cell(xm, zm)?;
+        Some((trunk_h_vox, crown_r_vox))
     }
 }
 

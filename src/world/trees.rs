@@ -569,43 +569,6 @@ impl WorldGen {
         ((a - 0.5) * 2.0 * amp, (b - 0.5) * 2.0 * amp)
     }
 
-    #[inline]
-    fn dist2_point_segment(
-        px: f32,
-        py: f32,
-        pz: f32,
-        ax: f32,
-        ay: f32,
-        az: f32,
-        bx: f32,
-        by: f32,
-        bz: f32,
-    ) -> (f32 /*d2*/, f32 /*t*/) {
-        let abx = bx - ax;
-        let aby = by - ay;
-        let abz = bz - az;
-
-        let apx = px - ax;
-        let apy = py - ay;
-        let apz = pz - az;
-
-        let ab2 = abx * abx + aby * aby + abz * abz;
-        if ab2 <= 1e-8 {
-            return (apx * apx + apy * apy + apz * apz, 0.0);
-        }
-
-        let t = ((apx * abx + apy * aby + apz * abz) / ab2).clamp(0.0, 1.0);
-        let cx = ax + t * abx;
-        let cy = ay + t * aby;
-        let cz = az + t * abz;
-
-        let dx = px - cx;
-        let dy = py - cy;
-        let dz = pz - cz;
-
-        (dx * dx + dy * dy + dz * dz, t)
-    }
-
     // -------------------------------------------------------------------------
     // Primary layout
     // -------------------------------------------------------------------------
@@ -1096,25 +1059,27 @@ impl WorldGen {
         let maxx = (cx.ceil()  as i32 + ir).min(out.origin[0] + out.size - 1);
         let miny = (cy.floor() as i32 - ir).max(out.origin[1]);
         let maxy = (cy.ceil()  as i32 + ir).min(out.origin[1] + out.size - 1);
-        let minz = (cz.floor() as i32 - ir).max(out.origin[2]);
-        let maxz = (cz.ceil()  as i32 + ir).min(out.origin[2] + out.size - 1);
 
         for y in miny..=maxy {
             let dy = (y as f32) - cy;
-            let dy2 = dy * dy;
+            let dy2 = dy*dy;
             for x in minx..=maxx {
                 let dx = (x as f32) - cx;
-                let dx2 = dx * dx;
+                let dxy2 = dx*dx + dy2;
+                if dxy2 > r2 { continue; }
+
+                let zext = (r2 - dxy2).sqrt();
+                let minz = ((cz - zext).floor() as i32).max(out.origin[2]);
+                let maxz = ((cz + zext).ceil()  as i32).min(out.origin[2] + out.size - 1);
+
+                let lx = (x - out.origin[0]) as i32;
+                let ly = (y - out.origin[1]) as i32;
                 for z in minz..=maxz {
-                    let dz = (z as f32) - cz;
-                    if dx2 + dy2 + dz*dz <= r2 {
-                        out.write_wood(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
-                    }
+                    out.write_wood(lx, ly, z - out.origin[2]);
                 }
             }
         }
     }
-
 
     // -------------------------------------------------------------------------
     // Leaf rasterization
