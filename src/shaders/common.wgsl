@@ -117,8 +117,8 @@ const CLOUD_SOFTNESS : f32 = 0.10;
 const CLOUD_HORIZON_Y0 : f32 = 0.02;
 const CLOUD_HORIZON_Y1 : f32 = 0.25;
 
-const CLOUD_SKY_DARKEN : f32 = 0.45;
-const CLOUD_ABSORB     : f32 = 10.0;
+const CLOUD_SKY_DARKEN : f32 = 0.35;
+const CLOUD_ABSORB     : f32 = 8.0;
 
 const CLOUD_BASE_COL   : vec3<f32> = vec3<f32>(0.72, 0.74, 0.76);
 const CLOUD_SILVER_POW : f32       = 8.0;
@@ -182,15 +182,15 @@ const POST_EXPOSURE : f32 = 0.10;
 //// Grass “hair” (procedural blades)
 //// --------------------------------------------------------------------------
 
-const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.50;
+const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.20;
 const GRASS_BLADE_COUNT           : u32 = 2u;
 const GRASS_TRACE_STEPS           : u32 = 10u;
 const GRASS_HIT_EPS_VOX           : f32 = 0.02;
 const GRASS_STEP_MIN_VOX          : f32 = 0.03;
 
-const GRASS_VOXEL_SEGS            : f32 = 4.0;
-const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.16;
-const GRASS_VOXEL_TAPER           : f32 = 0.90;
+const GRASS_VOXEL_SEGS            : f32 = 3.0;
+const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.08;
+const GRASS_VOXEL_TAPER           : f32 = 0.70;
 const GRASS_OVERHANG_VOX          : f32 = 0.20;
 
 // Grass level-of-detail (LOD) distances in meters-ish (assuming rd normalized).
@@ -201,8 +201,8 @@ const GRASS_LOD_FAR_START : f32 = 40.0;
 const GRASS_BLADE_COUNT_MID : u32 = 2u;
 const GRASS_BLADE_COUNT_FAR : u32 = 1u;
 
-const GRASS_SEGS_MID : u32 = 4u;
-const GRASS_SEGS_FAR : u32 = 3u;
+const GRASS_SEGS_MID : u32 = 2u;
+const GRASS_SEGS_FAR : u32 = 1u;
 
 const GRASS_TRACE_STEPS_MID : u32 = 12u;
 const GRASS_TRACE_STEPS_FAR : u32 = 8u;
@@ -215,7 +215,18 @@ struct Node {
   child_base : u32,
   child_mask : u32,
   material   : u32,
-  _pad       : u32,
+  key       : u32,
+};
+
+struct NodeRopes {
+  px: u32, 
+  nx: u32, 
+  py: u32, 
+  ny: u32, 
+  pz: u32, 
+  nz: u32,
+  _pad0: u32, 
+  _pad1: u32,
 };
 
 struct Camera {
@@ -236,11 +247,11 @@ struct Camera {
 };
 
 struct ChunkMeta {
-  origin     : vec4<i32>,
-  node_base  : u32,
-  node_count : u32,
-  macro_base : u32,
-  _pad1      : u32,
+  origin       : vec4<i32>,
+  node_base    : u32,
+  node_count   : u32,
+  macro_base   : u32,
+  colinfo_base : u32,
 };
 
 //// --------------------------------------------------------------------------
@@ -252,6 +263,9 @@ struct ChunkMeta {
 @group(0) @binding(2) var<storage, read> nodes      : array<Node>;
 @group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
 @group(0) @binding(8) var<storage, read> macro_occ : array<u32>;
+@group(0) @binding(9) var<storage, read> node_ropes: array<NodeRopes>;
+@group(0) @binding(10) var<storage, read> chunk_colinfo : array<u32>;
+
 
 //// --------------------------------------------------------------------------
 //// Shared helpers
@@ -372,6 +386,31 @@ fn chunk_coord_from_pos(p: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
     i32(floor(p.z / chunk_size_m))
   );
 }
+
+fn chunk_max_depth() -> u32 {
+  // chunk_size is power-of-two; log2 = 31 - clz
+  return 31u - countLeadingZeros(cam.chunk_size);
+}
+
+// ---- Column info (64x64) ----
+// 4096 columns, packed 2x u16 per u32 => 2048 u32 words per chunk.
+const CHUNK_COL_WORDS_PER_CHUNK : u32 = 2048u;
+
+fn col_idx_64(ix: u32, iz: u32) -> u32 {
+  return iz * 64u + ix; // 0..4095
+}
+
+// returns (y8, mat8). y8==255 => empty column.
+fn colinfo_load(ch: ChunkMeta, ix: u32, iz: u32) -> vec2<u32> {
+  let idx  = col_idx_64(ix, iz);
+  let word = chunk_colinfo[ch.colinfo_base + (idx >> 1u)];
+  let half = select(word & 0xFFFFu, (word >> 16u) & 0xFFFFu, (idx & 1u) != 0u);
+
+  let y8   = half & 0xFFu;
+  let mat8 = (half >> 8u) & 0xFFu;
+  return vec2<u32>(y8, mat8);
+}
+
 
 //// --------------------------------------------------------------------------
 //// Hash / noise helpers (shared)
