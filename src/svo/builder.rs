@@ -25,6 +25,7 @@ fn should_cancel(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed)
 }
 
+
 /// Reusable scratch buffers for chunk building (reduces allocations & improves locality).
 pub struct BuildScratch {
     // 2D (side*side)
@@ -336,10 +337,10 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
                 let m: u32 = if wy < g {
                     if wy >= g - dirt_depth { DIRT } else { STONE }
                 } else if wy == g {
-                    let tm = tree_mask.material_fast(wx, wy, wz);
+                    let tm = tree_mask.material_local(lx as usize, ly as usize, lz as usize);
                     if tm == WOOD { WOOD } else { GRASS }
                 } else {
-                    let tm = tree_mask.material_fast(wx, wy, wz);
+                    let tm = tree_mask.material_local(lx as usize, ly as usize, lz as usize);
                     if tm != AIR { tm } else { AIR }
                 };
 

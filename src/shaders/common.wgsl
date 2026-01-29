@@ -182,15 +182,15 @@ const POST_EXPOSURE : f32 = 0.10;
 //// Grass “hair” (procedural blades)
 //// --------------------------------------------------------------------------
 
-const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.00;
-const GRASS_BLADE_COUNT           : u32 = 3u;
+const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.50;
+const GRASS_BLADE_COUNT           : u32 = 2u;
 const GRASS_TRACE_STEPS           : u32 = 10u;
 const GRASS_HIT_EPS_VOX           : f32 = 0.02;
 const GRASS_STEP_MIN_VOX          : f32 = 0.03;
 
 const GRASS_VOXEL_SEGS            : f32 = 4.0;
 const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.16;
-const GRASS_VOXEL_TAPER           : f32 = 0.70;
+const GRASS_VOXEL_TAPER           : f32 = 0.90;
 const GRASS_OVERHANG_VOX          : f32 = 0.20;
 
 // Grass level-of-detail (LOD) distances in meters-ish (assuming rd normalized).

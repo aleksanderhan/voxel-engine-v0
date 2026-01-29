@@ -250,6 +250,17 @@ fn idx3_strided(stride_z: usize, stride_y: usize, x: i32, y: i32, z: i32) -> usi
 
 impl TreeMaskCache {
     #[inline(always)]
+    pub fn material_local(&self, lx: usize, ly: usize, lz: usize) -> u32 {
+        // caller guarantees in-bounds
+        let i = ly * self.stride_y + lz * self.stride_z + lx;
+        match unsafe { *self.mask.get_unchecked(i) } {
+            1 => WOOD,
+            2 => LEAF,
+            _ => AIR,
+        }
+    }
+
+    #[inline(always)]
     pub fn contains_point_fast(&self, x: i32, y: i32, z: i32) -> u8 {
         let lx = x - self.origin[0];
         let ly = y - self.origin[1];
@@ -1034,7 +1045,7 @@ impl WorldGen {
         let len = len2.sqrt();
 
         // Step size in voxels. 0.75 tends to be safe (no holes) but not too expensive.
-        let step = 0.75_f32;
+        let step = (0.75_f32).max(0.40_f32 * r0.max(r1)); // tune
         let n = (len / step).ceil() as i32;
 
         let inv_n = 1.0 / (n as f32);
