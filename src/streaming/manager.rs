@@ -1,4 +1,12 @@
-// --- src/streaming/manager.rs ---
+// src/streaming/manager.rs
+// ------------------------
+// Chunk streaming + background SVO building + CPU cache.
+//
+// Behavior:
+// - Chunks are built once, then stored in a CPU cache (budgeted, LRU-ish).
+// - When chunks come back into range, we "promote" from cache: allocate GPU node arena
+//   range + upload nodes/meta, without rebuilding on worker threads.
+
 use std::collections::VecDeque;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -95,6 +103,8 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
             while let Ok(job) = rx_job.recv() {
                 let k = job.key;
 
+                // If we were already cancelled before starting, still notify the main thread
+                // so it can decrement `in_flight`.
                 if job.cancel.load(Ordering::Relaxed) {
                     if tx_done
                         .send(BuildDone {
@@ -114,16 +124,19 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
                     k.x * config::CHUNK_SIZE as i32,
                     k.y * config::CHUNK_SIZE as i32,
                     k.z * config::CHUNK_SIZE as i32,
+                    0,
                 ];
 
                 let nodes = build_chunk_svo_sparse_cancelable_with_scratch(
                     &gen,
-                    origin,
+                    [origin[0], origin[1], origin[2]],
                     config::CHUNK_SIZE,
                     job.cancel.as_ref(),
                     &mut scratch,
                 );
 
+                // If we got cancelled mid-build, still notify the main thread,
+                // but drop nodes to save main-thread work + upload pressure.
                 let canceled = job.cancel.load(Ordering::Relaxed);
                 let nodes = if canceled { Vec::new() } else { nodes };
 
@@ -146,10 +159,12 @@ fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender
 fn sort_queue_near_first(queue: &mut VecDeque<ChunkKey>, center: ChunkKey, cam_fwd: Vec3) {
     let mut v: Vec<ChunkKey> = queue.drain(..).collect();
 
+    // Horizontal forward (XZ) for “look direction”.
     let mut f = Vec2::new(cam_fwd.x, cam_fwd.z);
     if f.length_squared() > 1e-6 {
         f = f.normalize();
     } else {
+        // If forward is degenerate, just treat as no directional bias.
         f = Vec2::ZERO;
     }
 
@@ -167,16 +182,21 @@ fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
     let dz = (k.z - c.z) as f32;
     let dy = (k.y - c.y) as f32;
 
+    // Lower score = higher priority.
+    // Base distance (prefer close). Penalize vertical moves more.
     let base = dx.abs() + dz.abs() + 2.0 * dy.abs();
-    let dir = dx * fwd_xz.x + dz * fwd_xz.y;
 
+    // Directional bias: chunks in front (positive dot) get a lower score.
+    let dir = dx * fwd_xz.x + dz * fwd_xz.y; // dot(delta_xz, fwd)
+
+    // Tune weights.
     let front_bonus = 0.75;
     let behind_penalty = 0.25;
 
     let bias = if dir >= 0.0 {
         -front_bonus * dir
     } else {
-        -behind_penalty * dir
+        -behind_penalty * dir // dir is negative, so this increases score
     };
 
     base + bias
@@ -189,8 +209,9 @@ pub struct ChunkManager {
     build_queue: VecDeque<ChunkKey>,
 
     // Deduplicate queued keys (prevents unbounded queue growth).
-    queued_set: std::collections::HashSet<ChunkKey>, // <-- unchanged here; this is NOT per-frame.
-                                                 // keep it if you still want it.
+    // (Not per-frame; leave it as-is.)
+    queued_set: HashSet<ChunkKey>,
+
     // Only sort/purge when center chunk changes.
     last_center: Option<ChunkKey>,
 
@@ -209,16 +230,30 @@ pub struct ChunkManager {
     changed: bool,
     grid_dirty: bool,
 
+    // Node arena (in units of NodeGpu elements)
     arena: NodeArena,
 
+    // Chunk grid for GPU lookup
     grid_origin_chunk: [i32; 3],
     grid_dims: [u32; 3],
     chunk_grid: Vec<u32>,
 
+    // ----------------
+    // CPU chunk cache
+    // ----------------
     cache: HashMap<ChunkKey, CachedChunk>,
     cache_lru: VecDeque<(ChunkKey, u64)>,
     cache_stamp: u64,
     cache_bytes: usize,
+
+    // -----------------------------
+    // Perf: precomputed region offsets
+    // -----------------------------
+    active_offsets: Vec<(i32, i32, i32)>, // dx,dy,dz for ACTIVE
+    keep_offsets: Vec<(i32, i32, i32)>,   // dx,dy,dz for KEEP (currently used only if you want)
+
+    // Perf: reusable unload list (avoids per-frame alloc)
+    to_unload: Vec<ChunkKey>,
 }
 
 impl ChunkManager {
@@ -227,18 +262,23 @@ impl ChunkManager {
         let (tx_done, rx_done) = unbounded::<BuildDone>();
         spawn_workers(gen.clone(), rx_job, tx_done);
 
+        // Arena capacity in NodeGpu elements.
         let node_capacity = (config::NODE_BUDGET_BYTES / size_of::<NodeGpu>()) as u32;
 
+        // Grid size (KEEP box).
         let nx = (2 * config::KEEP_RADIUS + 1) as u32;
         let nz = nx;
         let ny = GRID_Y_COUNT;
         let grid_len = (nx * ny * nz) as usize;
 
+        let active_offsets = Self::build_offsets(config::ACTIVE_RADIUS);
+        let keep_offsets = Self::build_offsets(config::KEEP_RADIUS);
+
         Self {
             gen,
             chunks: HashMap::default(),
             build_queue: VecDeque::new(),
-            queued_set: std::collections::HashSet::default(),
+            queued_set: HashSet::default(),
             last_center: None,
 
             cancels: HashMap::default(),
@@ -249,9 +289,10 @@ impl ChunkManager {
             slot_to_key: Vec::new(),
             chunk_meta: Vec::new(),
             uploads: Vec::new(),
-            changed: false,
 
+            changed: false,
             grid_dirty: true,
+
             arena: NodeArena::new(node_capacity),
 
             grid_origin_chunk: [0, 0, 0],
@@ -262,11 +303,39 @@ impl ChunkManager {
             cache_lru: VecDeque::default(),
             cache_stamp: 1,
             cache_bytes: 0,
+
+            active_offsets,
+            keep_offsets,
+
+            to_unload: Vec::new(),
         }
     }
 
     // -------------------------------------------------------------------------
-    // NEW: Cheap region checks (replaces per-frame keep_set HashSet)
+    // Precomputed offsets
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn build_offsets(radius: i32) -> Vec<(i32, i32, i32)> {
+        let mut v = Vec::new();
+        v.reserve(
+            (GRID_Y_COUNT as usize)
+                * ((2 * radius + 1) as usize)
+                * ((2 * radius + 1) as usize),
+        );
+
+        for dy in GRID_Y_MIN_DY..=(GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1) {
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    v.push((dx, dy, dz));
+                }
+            }
+        }
+        v
+    }
+
+    // -------------------------------------------------------------------------
+    // Cheap region checks (no per-frame keep_set HashSet)
     // -------------------------------------------------------------------------
 
     #[inline(always)]
@@ -293,6 +362,7 @@ impl ChunkManager {
             && dy <= Self::y_band_max()
     }
 
+    // (Not currently used below, but kept for completeness.)
     #[inline(always)]
     fn in_active(center: ChunkKey, k: ChunkKey) -> bool {
         let dx = k.x - center.x;
@@ -308,12 +378,12 @@ impl ChunkManager {
     }
 
     // -------------------------------------------------------------------------
-    // Update (rewritten parts only)
+    // Streaming update
     // -------------------------------------------------------------------------
-
     pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
         self.uploads.clear();
 
+        // Center chunk (ground-anchored).
         let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
         let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
 
@@ -323,95 +393,99 @@ impl ChunkManager {
         let ground_y_vox = world.ground_height(cam_vx, cam_vz);
         let ground_cy = ground_y_vox.div_euclid(config::CHUNK_SIZE as i32);
 
-        let center = ChunkKey {
-            x: ccx,
-            y: ground_cy,
-            z: ccz,
-        };
+        let center = ChunkKey { x: ccx, y: ground_cy, z: ccz };
 
         // ---------------------------------------------------------------------
-        // Desired (ACTIVE) handling: no keep_set HashSet; just in_keep/in_active
+        // Desired (ACTIVE): iterate precomputed offsets without borrowing self
+        // for the duration of the loop (avoids E0502).
         // ---------------------------------------------------------------------
+        let n_active = self.active_offsets.len();
+        for i in 0..n_active {
+            let (dx, dy, dz) = self.active_offsets[i];
 
-        // Instead of `let desired = desired_chunks(...); for k in &desired { ... }`,
-        // we iterate directly to avoid allocating `desired` too (optional),
-        // while still preserving behavior.
+            let k = ChunkKey {
+                x: center.x + dx,
+                y: center.y + dy,
+                z: center.z + dz,
+            };
 
-        for dy in GRID_Y_MIN_DY..=(GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1) {
-            for dz in -config::ACTIVE_RADIUS..=config::ACTIVE_RADIUS {
-                for dx in -config::ACTIVE_RADIUS..=config::ACTIVE_RADIUS {
-                    let k = ChunkKey {
-                        x: center.x + dx,
-                        y: center.y + dy,
-                        z: center.z + dz,
-                    };
+            match self.chunks.get(&k) {
+                Some(ChunkState::Resident(_))
+                | Some(ChunkState::Queued)
+                | Some(ChunkState::Building) => {}
+                None | Some(ChunkState::Missing) => {
+                    // Cache hit: promote now, no build.
+                    if self.cache.get(&k).is_some() {
+                        let _ = self.try_promote_from_cache(center, k);
+                        continue;
+                    }
 
-                    match self.chunks.get(&k) {
-                        Some(ChunkState::Resident(_))
-                        | Some(ChunkState::Queued)
-                        | Some(ChunkState::Building) => {}
-                        None | Some(ChunkState::Missing) => {
-                            // Cache hit -> promote, no build queue.
-                            if self.cache.contains_key(&k) {
-                                let _ = self.try_promote_from_cache(center, k);
-                                continue;
-                            }
+                    // Cache miss: queue build.
+                    let c = self.cancel_token(k);
+                    c.store(false, Ordering::Relaxed);
 
-                            // Cache miss -> queue build.
-                            let c = self.cancel_token(k);
-                            c.store(false, Ordering::Relaxed);
+                    self.chunks.insert(k, ChunkState::Queued);
 
-                            self.chunks.insert(k, ChunkState::Queued);
-
-                            if self.queued_set.insert(k) {
-                                self.build_queue.push_back(k);
-                            }
-                        }
+                    // Dedupe queue entries.
+                    if self.queued_set.insert(k) {
+                        self.build_queue.push_back(k);
                     }
                 }
             }
         }
 
         // ---------------------------------------------------------------------
-        // Unload outside KEEP: replaced keep_set.contains with in_keep()
+        // Unload outside KEEP: reuse to_unload (no per-frame alloc) and avoid E0499
+        // by taking the vec before calling unload_chunk.
         // ---------------------------------------------------------------------
-        {
-            let keys_snapshot: Vec<ChunkKey> = self.chunks.keys().copied().collect();
-            for k in keys_snapshot {
-                if !Self::in_keep(center, k) {
-                    self.unload_chunk(k);
-                }
+        self.to_unload.clear();
+        for &k in self.chunks.keys() {
+            if !Self::in_keep(center, k) {
+                self.to_unload.push(k);
             }
         }
+
+        let mut unload_list = std::mem::take(&mut self.to_unload);
+        for k in unload_list.drain(..) {
+            self.unload_chunk(k);
+        }
+        // keep capacity for next frame
+        self.to_unload = unload_list;
 
         // Only purge + sort when the center chunk changes.
         let center_changed = self.last_center.map_or(true, |c| c != center);
         if center_changed {
             self.last_center = Some(center);
 
-            // Purge stale keys aggressively:
+            // Purge stale keys aggressively: keep only keys that are still queued and still in KEEP.
             self.build_queue.retain(|k| {
                 Self::in_keep(center, *k) && matches!(self.chunks.get(k), Some(ChunkState::Queued))
             });
 
+            // Rebuild queued_set from the queue so it matches reality.
             self.queued_set.clear();
             self.queued_set.extend(self.build_queue.iter().copied());
 
+            // Sort once per center change.
             sort_queue_near_first(&mut self.build_queue, center, cam_fwd);
         }
 
-        // Dispatch builds
+        // Dispatch builds (only for cache misses).
         while self.in_flight < config::MAX_IN_FLIGHT {
             let Some(k) = self.build_queue.pop_front() else { break; };
+
+            // Popped => no longer queued.
             self.queued_set.remove(&k);
 
             if !Self::in_keep(center, k) {
+                // Cancel if it was pending.
                 self.cancel_token(k).store(true, Ordering::Relaxed);
                 self.chunks.insert(k, ChunkState::Missing);
                 continue;
             }
 
-            if self.cache.contains_key(&k) {
+            // If it became cached since it was queued, don't rebuild it.
+            if self.cache.get(&k).is_some() {
                 self.chunks.insert(k, ChunkState::Missing);
                 let _ = self.try_promote_from_cache(center, k);
                 continue;
@@ -433,8 +507,10 @@ impl ChunkManager {
                 {
                     self.in_flight += 1;
                 } else {
+                    // Channel closed; keep it queued.
                     self.chunks.insert(k, ChunkState::Queued);
 
+                    // Put it back (dedup-safe).
                     if self.queued_set.insert(k) {
                         self.build_queue.push_back(k);
                     }
@@ -443,12 +519,14 @@ impl ChunkManager {
             }
         }
 
-        // Harvest done builds
+        // Harvest done builds.
         while let Ok(done) = self.rx_done.try_recv() {
             if self.in_flight > 0 {
                 self.in_flight -= 1;
             }
 
+            // If the job was canceled (either before start or mid-build),
+            // the chunk MUST NOT stay in Building forever.
             if done.canceled || done.cancel.load(Ordering::Relaxed) {
                 if self.chunks.get(&done.key).is_some() {
                     self.chunks.insert(done.key, ChunkState::Missing);
@@ -456,20 +534,23 @@ impl ChunkManager {
                 continue;
             }
 
-            // Replaced keep_set.contains(&done.key)
+            // If it finished but is no longer in KEEP, drop it and mark Missing.
             if !Self::in_keep(center, done.key) {
                 self.cancel_token(done.key).store(true, Ordering::Relaxed);
                 self.chunks.insert(done.key, ChunkState::Missing);
                 continue;
             }
 
+            // Still relevant: cache + try resident.
             self.on_build_done(center, done.key, done.nodes);
         }
 
+        // If the keep-grid origin would shift, the lookup mapping changes.
         if self.keep_origin_for(center) != self.grid_origin_chunk {
             self.grid_dirty = true;
         }
 
+        // Rebuild grid mapping for current KEEP region only when needed.
         let grid_changed = self.grid_dirty;
         if self.grid_dirty {
             self.rebuild_grid(center);
@@ -478,6 +559,7 @@ impl ChunkManager {
 
         grid_changed
     }
+
 
     // -------------------------------------------------------------------------
     // Internals
@@ -488,22 +570,6 @@ impl ChunkManager {
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicBool::new(false)))
             .clone()
-    }
-
-    fn desired_chunks(center: ChunkKey, radius: i32) -> Vec<ChunkKey> {
-        let mut out = Vec::new();
-        for dy in GRID_Y_MIN_DY..=(GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1) {
-            for dz in -radius..=radius {
-                for dx in -radius..=radius {
-                    out.push(ChunkKey {
-                        x: center.x + dx,
-                        y: center.y + dy,
-                        z: center.z + dz,
-                    });
-                }
-            }
-        }
-        out
     }
 
     fn evict_one_farthest(&mut self, center: ChunkKey, protect: ChunkKey) -> bool {
@@ -614,7 +680,6 @@ impl ChunkManager {
 
         let need = nodes.len() as u32;
 
-        // If we have nothing (shouldn't happen for non-air chunks, but be safe).
         if need == 0 {
             self.chunks.insert(key, ChunkState::Missing);
             return false;
@@ -686,15 +751,14 @@ impl ChunkManager {
     }
 
     fn try_promote_from_cache(&mut self, center: ChunkKey, key: ChunkKey) -> bool {
-        let Some(entry) = self.cache.get(&key).cloned() else {
-            return false;
+        // Avoid cloning the whole CachedChunk; just clone the Arc.
+        let nodes = match self.cache.get(&key) {
+            Some(e) => e.nodes.clone(),
+            None => return false,
         };
 
-        // Touch LRU.
         self.cache_touch(key);
-
-        // Try to make resident from cached nodes.
-        self.try_make_resident(center, key, entry.nodes)
+        self.try_make_resident(center, key, nodes)
     }
 
     fn on_build_done(&mut self, center: ChunkKey, key: ChunkKey, nodes: Vec<NodeGpu>) {
@@ -788,7 +852,7 @@ impl ChunkManager {
         }
     }
 
-    /// Compute the KEEP-grid origin for a given center (helper so we can detect origin shifts).
+    /// Compute the KEEP-grid origin for a given center.
     #[inline]
     fn keep_origin_for(&self, center: ChunkKey) -> [i32; 3] {
         let ox = center.x - config::KEEP_RADIUS;
@@ -798,9 +862,6 @@ impl ChunkManager {
     }
 
     /// Rebuild the chunk_grid mapping for the current KEEP volume.
-    ///
-    /// This is intentionally called only when `grid_dirty` is set, because it is O(ncells + nchunks)
-    /// and it forces a full GPU upload if you do it every frame.
     fn rebuild_grid(&mut self, center: ChunkKey) {
         let nx = (2 * config::KEEP_RADIUS + 1) as u32;
         let nz = nx;
@@ -847,6 +908,10 @@ impl ChunkManager {
         let idx = (iz * ny * nx) + (iy * nx) + ix;
         Some(idx as usize)
     }
+
+    // -------------------------------------------------------------------------
+    // Public API
+    // -------------------------------------------------------------------------
 
     pub fn chunk_count(&self) -> u32 {
         self.slot_to_key.len() as u32
