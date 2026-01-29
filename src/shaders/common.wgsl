@@ -202,6 +202,22 @@ const COMPOSITE_BEAM_COMPRESS : bool = true;
 const POST_EXPOSURE : f32 = 0.10;
 
 // ------------------------------------------------------------
+// Grass “hair” (procedural blades)
+// ------------------------------------------------------------
+
+// blade layer height in meters (scaled by voxel_size)
+const GRASS_LAYER_HEIGHT_VOX : f32 = 0.90;   // ~0.9 * voxel_size
+const GRASS_BLADE_RADIUS_VOX : f32 = 0.06;   // radius in voxel fractions
+const GRASS_BLADE_COUNT      : u32 = 4u;     // blades per voxel (keep small)
+const GRASS_TRACE_STEPS      : u32 = 10u;    // sphere-trace iterations
+const GRASS_HIT_EPS_VOX      : f32 = 0.02;   // hit threshold (voxel fractions)
+const GRASS_STEP_MIN_VOX     : f32 = 0.03;   // minimum step (voxel fractions)
+
+// lighting/transmittance (so grass doesn’t become a black wall in volumetrics)
+const GRASS_LIGHT_TRANSMIT : f32 = 0.70;
+
+
+// ------------------------------------------------------------
 // GPU structs (must match Rust layouts)
 // ------------------------------------------------------------
 
