@@ -8,7 +8,7 @@
 const CLIP_LEVELS_MAX : u32 = 16u;
 
 // March tuning
-const HF_MAX_STEPS : u32 = 120u;
+const HF_MAX_STEPS : u32 = 160u;
 const HF_BISECT    : u32 = 6u;
 
 // dt clamp (meters along ray)
@@ -54,32 +54,6 @@ fn clip_level_contains(xz: vec2<f32>, level: u32, guard: i32) -> bool {
   return (ix >= guard) && (iz >= guard) && (ix < (res_i - guard)) && (iz < (res_i - guard));
 }
 
-fn clip_choose_level(xz: vec2<f32>) -> u32 {
-  let cam_xz = vec2<f32>(cam.cam_pos.x, cam.cam_pos.z);
-  let d = max(abs(xz.x - cam_xz.x), abs(xz.y - cam_xz.y));
-
-  let res_f = f32(max(i32(clip.res), 1));
-  let n = min(clip.levels, CLIP_LEVELS_MAX);
-
-  // guard=2 keeps normal/AO taps (+/-cell) in-bounds
-  let guard: i32 = 2;
-
-  var best: u32 = max(clip.levels, 1u) - 1u;
-
-  for (var i: u32 = 0u; i < n; i = i + 1u) {
-    let cell = clip.level[i].z;
-    let half = 0.5 * res_f * cell;
-    let inner = 0.45 * half;
-
-    if (d <= inner && clip_level_contains(xz, i, guard)) {
-      best = i;
-      break;
-    }
-  }
-
-  return best;
-}
-
 fn clip_level_half_extent(level: u32) -> f32 {
   let res_f = f32(max(i32(clip.res), 1));
   let cell  = clip.level[level].z;
@@ -91,12 +65,12 @@ fn clip_level_half_extent(level: u32) -> f32 {
 // - outer_out: how far out of the *current* level you must be before switching up (to coarser)
 fn clip_inner_in(level: u32) -> f32 {
   // stricter than your old 0.45 * half (switch to finer only if clearly inside)
-  return 0.40 * clip_level_half_extent(level);
+  return 0.42 * clip_level_half_extent(level);
 }
 
 fn clip_outer_out(level: u32) -> f32 {
   // looser than your old 0.45 * half (switch to coarser only if clearly outside)
-  return 0.52 * clip_level_half_extent(level);
+  return 0.48 * clip_level_half_extent(level);
 }
 
 // Raw “best effort” level (your old logic, slightly simplified)
@@ -183,9 +157,10 @@ fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
 }
 
 fn clip_height_at(xz: vec2<f32>) -> f32 {
-  let lvl = clip_choose_level(xz);
+  let lvl = clip_choose_level_raw(xz);
   return clip_height_at_level(xz, lvl);
 }
+
 
 fn clip_normal_at_level_2tap(world_xz: vec2<f32>, level: u32) -> vec3<f32> {
   let cell = clip.level[level].z;
@@ -201,9 +176,10 @@ fn clip_normal_at_level_2tap(world_xz: vec2<f32>, level: u32) -> vec3<f32> {
 }
 
 fn clip_normal_at(xz: vec2<f32>) -> vec3<f32> {
-  let lvl = clip_choose_level(xz);
+  let lvl = clip_choose_level_raw(xz);
   return clip_normal_at_level_2tap(xz, lvl);
 }
+
 
 struct ClipHit {
   hit : bool,
@@ -268,11 +244,25 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
     s_prev = s;
     t_prev = t;
 
+    // Grazing-ray stabilization: also limit xz travel per step
     let vy = max(-rd.y, 0.12);
-    var dt = abs(s) / vy;
-    dt = clamp(dt, HF_DT_MIN, HF_DT_MAX);
+    let vh = max(length(rd.xz), 1e-4);
+
+    // Step suggested by vertical clearance (your original idea)
+    let dt_y = abs(s) / vy;
+
+    // Limit step so we advance only a small number of texels in xz
+    let cell = clip.level[lvl].z;
+    let dt_xz = (2.0 * cell) / vh; // ~2 texels per step in xz
+
+    // Take the smaller of the two (prevents skipping when looking sideways)
+    var dt = min(dt_y, dt_xz);
+
+    // Slightly smaller minimum helps near-ground detail (optional but usually better)
+    dt = clamp(dt, 0.25, HF_DT_MAX);
 
     t = t + dt;
+
   }
 
   return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
@@ -331,7 +321,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>) 
 
   // AO-lite for terrain: reuse voxel AO idea with cheap taps against heightfield itself
   // We approximate occlusion using height samples around the hitpoint.
-  let lvl = clip_choose_level(hp.xz);
+  let lvl = clip_choose_level_raw(hp.xz);
   let cell = clip.level[lvl].z;
 
   let h0  = clip_height_at_level(hp.xz, lvl);
