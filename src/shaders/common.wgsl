@@ -194,11 +194,11 @@ const GRASS_VOXEL_TAPER           : f32 = 0.70;
 const GRASS_OVERHANG_VOX          : f32 = 0.20;
 
 // Grass level-of-detail (LOD) distances in meters-ish (assuming rd normalized).
-const GRASS_LOD_MID_START : f32 = 18.0;
-const GRASS_LOD_FAR_START : f32 = 35.0;
+const GRASS_LOD_MID_START : f32 = 15.0;
+const GRASS_LOD_FAR_START : f32 = 40.0;
 
 // Mid/far quality knobs (tune freely)
-const GRASS_BLADE_COUNT_MID : u32 = 1u;
+const GRASS_BLADE_COUNT_MID : u32 = 2u;
 const GRASS_BLADE_COUNT_FAR : u32 = 1u;
 
 const GRASS_SEGS_MID : u32 = 2u;
