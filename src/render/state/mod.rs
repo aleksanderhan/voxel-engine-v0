@@ -232,6 +232,7 @@ impl Renderer {
         let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
         let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
         let u32_stride  = std::mem::size_of::<u32>() as u64;
+        let rope_stride = std::mem::size_of::<crate::render::gpu_types::NodeRopesGpu>() as u64;
 
         for u in uploads {
             // meta
@@ -249,12 +250,20 @@ impl Renderer {
                 }
             }
 
-            // NEW: macro occupancy
+            // macro occupancy
             if !u.macro_words.is_empty() {
                 let needed = u.macro_words.len() as u32;
                 if u.meta.macro_base + needed <= self.buffers.macro_capacity_u32 {
                     let off = (u.meta.macro_base as u64) * u32_stride;
                     self.queue.write_buffer(&self.buffers.macro_occ, off, bytemuck::cast_slice(u.macro_words.as_ref()));
+                }
+            }
+
+            if !u.ropes.is_empty() {
+                let needed = u.ropes.len() as u32;
+                if u.node_base + needed <= self.buffers.rope_capacity {
+                    let rope_off = (u.node_base as u64) * rope_stride;
+                    self.queue.write_buffer(&self.buffers.node_ropes, rope_off, bytemuck::cast_slice(u.ropes.as_ref()));
                 }
             }
         }

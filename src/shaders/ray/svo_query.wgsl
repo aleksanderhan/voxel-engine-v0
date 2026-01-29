@@ -57,9 +57,14 @@ fn query_leaf_at(
       return LeafQuery(bmin, size, n.material);
     }
 
-    if (size <= min_leaf) {
+    let max_d = chunk_max_depth();
+    if (d >= max_d) {
+      // We are at voxel resolution; if the node still isn't a LEAF_U32, treat missing child as air,
+      // but DO NOT blanket-return air here earlier than max depth.
+      // The loop will keep descending until leaf/missing child; this is just a safety stop.
       return LeafQuery(bmin, size, MAT_AIR);
     }
+
 
     let half = size * 0.5;
     let mid  = bmin + vec3<f32>(half);
@@ -91,12 +96,3 @@ fn query_leaf_at(
 
   return LeafQuery(bmin, size, MAT_AIR);
 }
-
-fn is_air(p: vec3<f32>, root_bmin: vec3<f32>, root_size: f32, node_base: u32, macro_base: u32) -> bool {
-  return query_leaf_at(p, root_bmin, root_size, node_base, macro_base).mat == MAT_AIR;
-}
-
-fn is_grass(p: vec3<f32>, root_bmin: vec3<f32>, root_size: f32, node_base: u32, macro_base: u32) -> bool {
-  return query_leaf_at(p, root_bmin, root_size, node_base, macro_base).mat == MAT_GRASS;
-}
-

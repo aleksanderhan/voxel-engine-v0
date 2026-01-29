@@ -117,7 +117,7 @@ const CLOUD_SOFTNESS : f32 = 0.10;
 const CLOUD_HORIZON_Y0 : f32 = 0.02;
 const CLOUD_HORIZON_Y1 : f32 = 0.25;
 
-const CLOUD_SKY_DARKEN : f32 = 0.65;
+const CLOUD_SKY_DARKEN : f32 = 0.45;
 const CLOUD_ABSORB     : f32 = 10.0;
 
 const CLOUD_BASE_COL   : vec3<f32> = vec3<f32>(0.72, 0.74, 0.76);
@@ -194,12 +194,12 @@ const GRASS_VOXEL_TAPER           : f32 = 0.90;
 const GRASS_OVERHANG_VOX          : f32 = 0.20;
 
 // Grass level-of-detail (LOD) distances in meters-ish (assuming rd normalized).
-const GRASS_LOD_MID_START : f32 = 18.0;
-const GRASS_LOD_FAR_START : f32 = 45.0;
+const GRASS_LOD_MID_START : f32 = 15.0;
+const GRASS_LOD_FAR_START : f32 = 40.0;
 
 // Mid/far quality knobs (tune freely)
-const GRASS_BLADE_COUNT_MID : u32 = 3u;
-const GRASS_BLADE_COUNT_FAR : u32 = 2u;
+const GRASS_BLADE_COUNT_MID : u32 = 2u;
+const GRASS_BLADE_COUNT_FAR : u32 = 1u;
 
 const GRASS_SEGS_MID : u32 = 4u;
 const GRASS_SEGS_FAR : u32 = 3u;
@@ -215,7 +215,18 @@ struct Node {
   child_base : u32,
   child_mask : u32,
   material   : u32,
-  _pad       : u32,
+  key       : u32,
+};
+
+struct NodeRopes {
+  px: u32, 
+  nx: u32, 
+  py: u32, 
+  ny: u32, 
+  pz: u32, 
+  nz: u32,
+  _pad0: u32, 
+  _pad1: u32,
 };
 
 struct Camera {
@@ -252,6 +263,7 @@ struct ChunkMeta {
 @group(0) @binding(2) var<storage, read> nodes      : array<Node>;
 @group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
 @group(0) @binding(8) var<storage, read> macro_occ : array<u32>;
+@group(0) @binding(9) var<storage, read> node_ropes: array<NodeRopes>;
 
 //// --------------------------------------------------------------------------
 //// Shared helpers
@@ -446,4 +458,9 @@ fn fbm(p: vec2<f32>) -> f32 {
     amp *= 0.5;
   }
   return sum;
+}
+
+fn chunk_max_depth() -> u32 {
+  // chunk_size is power-of-two; log2 = 31 - clz
+  return 31u - countLeadingZeros(cam.chunk_size);
 }

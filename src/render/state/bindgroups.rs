@@ -61,6 +61,11 @@ fn make_primary_bg(
                 binding: 8,
                 resource: buffers.macro_occ.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: buffers.node_ropes.as_entire_binding(),
+            },
+
         ],
     })
 }
@@ -94,6 +99,11 @@ fn make_scene_bg(
                 binding: 8, 
                 resource: buffers.macro_occ.as_entire_binding() 
             },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: buffers.node_ropes.as_entire_binding(),
+            },
+
         ],
     })
 }

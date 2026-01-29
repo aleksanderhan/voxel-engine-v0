@@ -1,7 +1,17 @@
 // src/shaders/ray/chunk_trace.wgsl
-//// --------------------------------------------------------------------------
-//// HitGeom + hybrid chunk tracing
-//// --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
+// HitGeom + chunk tracing (rope traversal + macro occupancy)
+//
+// Cleaned:
+// - Removed cached-path SVO query (unused now).
+// - Removed dead helpers (node_* key decode, global rope_next, etc).
+// - Kept only what trace_scene_voxels -> trace_chunk_rope_interval needs.
+// - Kept macro early-out + slab stepping + grass-on-solid-face probing.
+// --------------------------------------------------------------------------
+
+// --------------------------------------------------------------------------
+// HitGeom
+// --------------------------------------------------------------------------
 
 struct HitGeom {
   hit      : u32,
@@ -22,7 +32,6 @@ struct HitGeom {
   _pad4      : vec2<u32>,
 };
 
-
 fn miss_hitgeom() -> HitGeom {
   var h : HitGeom;
   h.hit = 0u;
@@ -36,7 +45,182 @@ fn miss_hitgeom() -> HitGeom {
   return h;
 }
 
-fn trace_chunk_hybrid_interval(
+// Strict half-open: [bmin, bmax)
+fn point_in_cube(p: vec3<f32>, bmin: vec3<f32>, size: f32) -> bool {
+  let bmax = bmin + vec3<f32>(size);
+  return (p.x >= bmin.x && p.x < bmax.x) &&
+         (p.y >= bmin.y && p.y < bmax.y) &&
+         (p.z >= bmin.z && p.z < bmax.z);
+}
+
+// --------------------------------------------------------------------------
+// Macro occupancy early-out (returns a MAT_AIR cube if empty, else size==0)
+// --------------------------------------------------------------------------
+
+struct MacroQuery {
+  bmin : vec3<f32>,
+  size : f32,
+  mat  : u32,
+};
+
+fn macro_leaf_or_invalid(
+  p_in: vec3<f32>,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  macro_base: u32
+) -> MacroQuery {
+  if (macro_base == INVALID_U32) {
+    return MacroQuery(vec3<f32>(0.0), 0.0, 0u);
+  }
+
+  let cell = macro_cell_size(root_size);
+  let lp = p_in - root_bmin;
+
+  let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
+  let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
+  let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
+
+  let bit = macro_bit_index(mx, my, mz);
+
+  if (!macro_test(macro_base, bit)) {
+    let macro_bmin = root_bmin + vec3<f32>(
+      f32(mx) * cell,
+      f32(my) * cell,
+      f32(mz) * cell
+    );
+    return MacroQuery(macro_bmin, cell, MAT_AIR);
+  }
+
+  return MacroQuery(vec3<f32>(0.0), 0.0, 0u);
+}
+
+// --------------------------------------------------------------------------
+// Key decoding -> cube
+// (matches the key encoding you already use)
+// --------------------------------------------------------------------------
+
+fn node_level(key: u32) -> u32 { return (key >> 18u) & 7u; }
+fn node_x(key: u32) -> u32 { return (key      ) & 63u; }
+fn node_y(key: u32) -> u32 { return (key >>  6u) & 63u; }
+fn node_z(key: u32) -> u32 { return (key >> 12u) & 63u; }
+
+fn node_cube_from_key(root_bmin: vec3<f32>, root_size: f32, key: u32) -> vec4<f32> {
+  let lvl = node_level(key);
+  let s = root_size / f32(1u << lvl);
+  let bmin = root_bmin + vec3<f32>(f32(node_x(key)), f32(node_y(key)), f32(node_z(key))) * s;
+  return vec4<f32>(bmin, s);
+}
+
+// --------------------------------------------------------------------------
+// Rope helpers (LOCAL indices)
+// --------------------------------------------------------------------------
+
+fn node_at(node_base: u32, local_idx: u32) -> Node {
+  return nodes[node_base + local_idx];
+}
+
+fn ropes_at(node_base: u32, local_idx: u32) -> NodeRopes {
+  return node_ropes[node_base + local_idx];
+}
+
+fn rope_next_local(node_base: u32, local_idx: u32, face: u32) -> u32 {
+  let r = ropes_at(node_base, local_idx);
+  if (face == 0u) { return r.px; }
+  if (face == 1u) { return r.nx; }
+  if (face == 2u) { return r.py; }
+  if (face == 3u) { return r.ny; }
+  if (face == 4u) { return r.pz; }
+  return r.nz;
+}
+
+fn exit_face_from_slab(rd: vec3<f32>, slab: CubeSlab) -> u32 {
+  // 0=+X,1=-X,2=+Y,3=-Y,4=+Z,5=-Z
+  let tx = slab.tmaxv.x;
+  let ty = slab.tmaxv.y;
+  let tz = slab.tmaxv.z;
+
+  var axis: u32 = 0u;
+  var best: f32 = tx;
+  if (ty < best) { best = ty; axis = 1u; }
+  if (tz < best) { best = tz; axis = 2u; }
+
+  if (axis == 0u) { return select(1u, 0u, rd.x > 0.0); }
+  if (axis == 1u) { return select(3u, 2u, rd.y > 0.0); }
+  return select(5u, 4u, rd.z > 0.0);
+}
+
+// --------------------------------------------------------------------------
+// Sparse descend from an arbitrary node cube (start_idx is LOCAL)
+// Returns a leaf cube; if the leaf is missing-child AIR, has_node=false.
+// --------------------------------------------------------------------------
+
+struct LeafState {
+  has_node  : bool,
+  idx_local : u32,       // valid only if has_node
+  bmin      : vec3<f32>,
+  size      : f32,
+  mat       : u32,
+};
+
+fn descend_leaf_sparse(
+  p_in      : vec3<f32>,
+  node_base : u32,
+  start_idx : u32,
+  start_bmin: vec3<f32>,
+  start_size: f32
+) -> LeafState {
+  var idx  : u32 = start_idx;
+  var bmin : vec3<f32> = start_bmin;
+  var size : f32 = start_size;
+
+  let max_d = chunk_max_depth();
+
+  for (var d: u32 = 0u; d < 32u; d = d + 1u) {
+    let n = node_at(node_base, idx);
+
+    if (n.child_base == LEAF_U32) {
+      return LeafState(true, idx, bmin, size, n.material);
+    }
+
+    if (d >= max_d) {
+      return LeafState(true, idx, bmin, size, MAT_AIR);
+    }
+
+    let half = size * 0.5;
+    let mid  = bmin + vec3<f32>(half);
+    let e    = 1e-6 * size;
+
+    let hx = select(0u, 1u, p_in.x > mid.x + e);
+    let hy = select(0u, 1u, p_in.y > mid.y + e);
+    let hz = select(0u, 1u, p_in.z > mid.z + e);
+    let ci = hx | (hy << 1u) | (hz << 2u);
+
+    let child_bmin = bmin + vec3<f32>(
+      select(0.0, half, hx != 0u),
+      select(0.0, half, hy != 0u),
+      select(0.0, half, hz != 0u)
+    );
+
+    let bit = 1u << ci;
+    if ((n.child_mask & bit) == 0u) {
+      return LeafState(false, INVALID_U32, child_bmin, half, MAT_AIR);
+    }
+
+    let r = child_rank(n.child_mask, ci);
+    idx  = n.child_base + r;      // LOCAL packed index
+    bmin = child_bmin;
+    size = half;
+  }
+
+  return LeafState(false, INVALID_U32, start_bmin, start_size, MAT_AIR);
+}
+
+// --------------------------------------------------------------------------
+// REAL rope traversal: AIR leaf => rope jump => use key to get neighbor cube
+// => descend starting from that neighbor node (NOT from root).
+// --------------------------------------------------------------------------
+
+fn trace_chunk_rope_interval(
   ro: vec3<f32>,
   rd: vec3<f32>,
   ch: ChunkMeta,
@@ -55,82 +239,65 @@ fn trace_chunk_hybrid_interval(
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
   let chunk_size_i = i32(cam.chunk_size);
 
+  var have_leaf: bool = false;
+  var leaf: LeafState;
+
   for (var step_i: u32 = 0u; step_i < cam.max_steps; step_i = step_i + 1u) {
     if (tcur > t_exit) { break; }
 
     let p  = ro + tcur * rd;
     let pq = p + rd * (1e-4 * vs);
 
-    let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base, ch.macro_base);
+    // Macro empty => big AIR slab step
+    let m = macro_leaf_or_invalid(pq, root_bmin, root_size, ch.macro_base);
+    if (m.size > 0.0) {
+      let slabm = cube_slab_inv(ro, inv, m.bmin, m.size);
+      tcur = max(slabm.t_exit, tcur) + eps_step;
+      have_leaf = false;
+      continue;
+    }
 
-    // ---- NEW: compute slab ONCE for this leaf, reuse for stepping/probing
-    let slab    = cube_slab_inv(ro, inv, q.bmin, q.size);
+    // Ensure leaf contains pq
+    if (!have_leaf || !point_in_cube(pq, leaf.bmin, leaf.size)) {
+      leaf = descend_leaf_sparse(pq, ch.node_base, 0u, root_bmin, root_size);
+      have_leaf = true;
+    }
+
+    let slab    = cube_slab_inv(ro, inv, leaf.bmin, leaf.size);
     let t_leave = slab.t_exit;
-    // ---------------------------------------------------------------
 
-    // AIR: probe grass slab just below when in blade layer
-    if (q.mat == MAT_AIR) {
-      let layer_h = GRASS_LAYER_HEIGHT_VOX * vs;
-      let bias = 0.05 * vs;
+    // AIR: rope traversal if we have a backing node
+    if (leaf.mat == MAT_AIR) {
+      let face = exit_face_from_slab(rd, slab);
+      tcur = max(t_leave, tcur) + eps_step;
 
-      var local = (p - root_bmin) - rd * bias;
-      local = clamp(local, vec3<f32>(0.0), vec3<f32>(root_size - 1e-6));
-
-      var ix = i32(floor(local.x / vs));
-      var iz = i32(floor(local.z / vs));
-      ix = clamp(ix, 0, chunk_size_i - 1);
-      iz = clamp(iz, 0, chunk_size_i - 1);
-
-      var iy = i32(floor((local.y - 1e-4 * vs) / vs)) - 1;
-      iy = clamp(iy, 0, chunk_size_i - 1);
-
-      let cell_bmin = root_bmin + vec3<f32>(f32(ix), f32(iy), f32(iz)) * vs;
-
-      let y_top = cell_bmin.y + vs;
-      if (p.y >= y_top - 1e-4 * vs && p.y <= y_top + layer_h + 1e-4 * vs) {
-        let c = cell_bmin + vec3<f32>(0.5 * vs, 0.5 * vs, 0.5 * vs);
-        if (is_grass(c, root_bmin, root_size, ch.node_base, ch.macro_base)) {
-          let cell_id_vox = vec3<f32>(
-            f32(ch.origin.x + ix),
-            f32(ch.origin.y + iy),
-            f32(ch.origin.z + iz)
-          );
-
-          // was: exit_time_from_cube_inv(...)
-          let t_leave_air = t_leave;
-          let tmax_probe  = min(min(t_leave_air, t_exit), tcur + q.size + 2.0 * vs);
-
-          let time_s   = cam.voxel_params.y;
-          let strength = cam.voxel_params.z;
-
-          let gh = try_grass_slab_hit(ro, rd, tcur, tmax_probe, cell_bmin, cell_id_vox, vs, time_s, strength);
-          if (gh.hit) {
-            var out = miss_hitgeom();
-            out.hit = 1u;
-            out.t   = gh.t;
-            out.mat = MAT_GRASS;
-            out.n   = gh.n;
-            out.root_bmin = root_bmin;
-            out.root_size = root_size;
-            out.node_base = ch.node_base;
-            out.macro_base = ch.macro_base;
-            return out;
-          }
-        }
+      if (!leaf.has_node) {
+        // missing-child AIR has no ropes; force re-descend next time
+        have_leaf = false;
+        continue;
       }
 
-      // was: exit_time_from_cube_inv(...)
-      tcur = max(t_leave, tcur) + eps_step;
+      let nidx = rope_next_local(ch.node_base, leaf.idx_local, face);
+      if (nidx == INVALID_U32) {
+        have_leaf = false;
+        continue;
+      }
+
+      // Neighbor node cube from key, then descend starting from that node cube.
+      let nk = node_at(ch.node_base, nidx).key;
+      let c  = node_cube_from_key(root_bmin, root_size, nk);
+
+      leaf = descend_leaf_sparse(pq, ch.node_base, nidx, c.xyz, c.w);
+      have_leaf = true;
       continue;
     }
 
     // Leaves: displaced cube hit
-    if (q.mat == MAT_LEAF) {
+    if (leaf.mat == MAT_LEAF) {
       let time_s   = cam.voxel_params.y;
       let strength = cam.voxel_params.z;
 
-      let h2 = leaf_displaced_cube_hit(ro, rd, q.bmin, q.size, time_s, strength, t_enter, t_exit);
-
+      let h2 = leaf_displaced_cube_hit(ro, rd, leaf.bmin, leaf.size, time_s, strength, t_enter, t_exit);
       if (h2.hit) {
         var out = miss_hitgeom();
         out.hit = 1u;
@@ -144,17 +311,15 @@ fn trace_chunk_hybrid_interval(
         return out;
       }
 
-      // was: exit_time_from_cube_inv(...)
       tcur = max(t_leave, tcur) + eps_step;
+      have_leaf = false;
       continue;
     }
 
-    // Solid: AABB face hit (use slab we already computed)
+    // Solid: face hit
     let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
-
     if (bh.hit) {
-      // If grass solid, try blades above the voxel under this hit (from above)
-      if (q.mat == MAT_GRASS) {
+      if (leaf.mat == MAT_GRASS) {
         let time_s   = cam.voxel_params.y;
         let strength = cam.voxel_params.z;
 
@@ -170,24 +335,25 @@ fn trace_chunk_hybrid_interval(
 
         let tmax_probe = min(bh.t, t_exit);
         let gh = try_grass_slab_hit(ro, rd, t_enter, tmax_probe, cell.bmin_m, cell.id_vox, vs, time_s, strength);
+
         if (gh.hit) {
-          var out = miss_hitgeom();
-          out.hit = 1u;
-          out.t   = gh.t;
-          out.mat = MAT_GRASS;
-          out.n   = gh.n;
-          out.root_bmin = root_bmin;
-          out.root_size = root_size;
-          out.node_base = ch.node_base;
-          out.macro_base = ch.macro_base;
-          return out;
+          var outg = miss_hitgeom();
+          outg.hit = 1u;
+          outg.t   = gh.t;
+          outg.mat = MAT_GRASS;
+          outg.n   = gh.n;
+          outg.root_bmin = root_bmin;
+          outg.root_size = root_size;
+          outg.node_base = ch.node_base;
+          outg.macro_base = ch.macro_base;
+          return outg;
         }
       }
 
       var out = miss_hitgeom();
       out.hit = 1u;
       out.t   = bh.t;
-      out.mat = q.mat;
+      out.mat = leaf.mat;
       out.n   = bh.n;
       out.root_bmin = root_bmin;
       out.root_size = root_size;
@@ -196,16 +362,18 @@ fn trace_chunk_hybrid_interval(
       return out;
     }
 
-    // Miss: step using the already-computed slab exit
+    // Miss solid: step out
     tcur = max(t_leave, tcur) + eps_step;
+    have_leaf = false;
   }
 
   return miss_hitgeom();
 }
 
-//// --------------------------------------------------------------------------
-//// Scene voxel tracing over streamed chunk grid (for main_primary)
-//// --------------------------------------------------------------------------
+
+// --------------------------------------------------------------------------
+// Scene voxel tracing over streamed chunk grid (for main_primary)
+// --------------------------------------------------------------------------
 
 struct VoxTraceResult {
   in_grid : bool,
@@ -213,9 +381,7 @@ struct VoxTraceResult {
   t_exit  : f32,
 };
 
-// DDA = Digital Differential Analyzer (grid-stepping along the ray)
 fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
-  // Fast out if no chunks
   if (cam.chunk_count == 0u) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0);
   }
@@ -256,12 +422,10 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
   var lcy: i32 = c.y - go.y;
   var lcz: i32 = c.z - go.z;
 
-  // If start is outside (should be rare if AABB hit), treat as out-of-grid.
   if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0);
   }
 
-  let stride_x: i32 = 1;
   let stride_y: i32 = nx;
   let stride_z: i32 = nx * ny;
 
@@ -294,14 +458,12 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
   if (abs(rd.y) < EPS_INV) { tMaxY = BIG_F32; }
   if (abs(rd.z) < EPS_INV) { tMaxZ = BIG_F32; }
 
-  // Linear-index step deltas
-  let didx_x: i32 = select(-stride_x, stride_x, rd.x > 0.0);
+  let didx_x: i32 = select(-1, 1, rd.x > 0.0);
   let didx_y: i32 = select(-stride_y, stride_y, rd.y > 0.0);
   let didx_z: i32 = select(-stride_z, stride_z, rd.z > 0.0);
 
   var best = miss_hitgeom();
 
-  // Conservative cap
   let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 1024u);
 
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
@@ -310,7 +472,6 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
     let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
     if (best.hit != 0u && (start_t + tNextLocal) >= best.t) { break; }
 
-    // Slot lookup via running linear index
     let slot = chunk_grid[u32(idx_i)];
     if (slot != INVALID_U32 && slot < cam.chunk_count) {
       let ch = chunks[slot];
@@ -318,11 +479,11 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
       let cell_enter = start_t + t_local;
       let cell_exit  = start_t + min(tNextLocal, t_exit_local);
 
-      let h = trace_chunk_hybrid_interval(ro, rd, ch, cell_enter, cell_exit);
+      let h = trace_chunk_rope_interval(ro, rd, ch, cell_enter, cell_exit);
       if (h.hit != 0u && h.t < best.t) { best = h; }
     }
 
-    // Advance DDA + update (lc*, idx_i)
+    // Advance DDA
     if (tMaxX < tMaxY) {
       if (tMaxX < tMaxZ) {
         lcx += step_x; idx_i += didx_x;
@@ -341,10 +502,8 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
       }
     }
 
-    // Local bounds (no origin adds)
     if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) { break; }
   }
 
   return VoxTraceResult(true, best, t_exit);
 }
-

@@ -14,8 +14,22 @@ pub struct NodeGpu {
     pub child_base: u32,
     pub child_mask: u32,
     pub material: u32,
-    pub _pad: u32,
+    pub key: u32, // packed spatial key: level + coord at that level
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct NodeRopesGpu {
+    pub px: u32,
+    pub nx: u32,
+    pub py: u32,
+    pub ny: u32,
+    pub pz: u32,
+    pub nz: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

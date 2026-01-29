@@ -4,7 +4,7 @@
 
 use crate::{
     config,
-    render::gpu_types::{ChunkMetaGpu, ClipmapGpu, NodeGpu},
+    render::gpu_types::{ChunkMetaGpu, ClipmapGpu, NodeGpu, NodeRopesGpu},
 };
 
 pub struct Buffers {
@@ -27,6 +27,10 @@ pub struct Buffers {
 
     pub macro_occ: wgpu::Buffer,
     pub macro_capacity_u32: u32,
+
+    pub node_ropes: wgpu::Buffer,
+    pub rope_capacity: u32, // in nodes
+
 }
 
 fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
@@ -89,6 +93,14 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         (macro_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
     );
 
+    let rope_capacity = node_capacity;
+    let node_ropes = make_storage_buffer(
+        device,
+        "svo_node_ropes",
+        (rope_capacity as u64) * (std::mem::size_of::<NodeRopesGpu>() as u64),
+    );
+
+
     Buffers {
         camera,
         overlay,
@@ -101,5 +113,7 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         grid_capacity,
         macro_occ,
         macro_capacity_u32,
+        node_ropes,
+        rope_capacity,
     }
 }
