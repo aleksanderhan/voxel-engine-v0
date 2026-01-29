@@ -57,42 +57,46 @@ fn point_in_cube(p: vec3<f32>, bmin: vec3<f32>, size: f32) -> bool {
 // Macro occupancy early-out (returns a MAT_AIR cube if empty, else size==0)
 // --------------------------------------------------------------------------
 
-struct MacroQuery {
-  bmin : vec3<f32>,
-  size : f32,
-  mat  : u32,
+// --------------------------------------------------------------------------
+// Macro cell cacheable query
+// --------------------------------------------------------------------------
+
+struct MacroCell {
+  bmin    : vec3<f32>,
+  size    : f32,
+  is_empty: bool,
 };
 
-fn macro_leaf_or_invalid(
+fn macro_cell_query(
   p_in: vec3<f32>,
   root_bmin: vec3<f32>,
   root_size: f32,
   macro_base: u32
-) -> MacroQuery {
+) -> MacroCell {
+  // No macro data => treat as "not empty" so traversal continues normally.
   if (macro_base == INVALID_U32) {
-    return MacroQuery(vec3<f32>(0.0), 0.0, 0u);
+    return MacroCell(vec3<f32>(0.0), 0.0, false);
   }
 
   let cell = macro_cell_size(root_size);
-  let lp = p_in - root_bmin;
+  let lp   = p_in - root_bmin;
 
   let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
   let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
   let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
 
+  let macro_bmin = root_bmin + vec3<f32>(
+    f32(mx) * cell,
+    f32(my) * cell,
+    f32(mz) * cell
+  );
+
   let bit = macro_bit_index(mx, my, mz);
+  let empty = !macro_test(macro_base, bit);
 
-  if (!macro_test(macro_base, bit)) {
-    let macro_bmin = root_bmin + vec3<f32>(
-      f32(mx) * cell,
-      f32(my) * cell,
-      f32(mz) * cell
-    );
-    return MacroQuery(macro_bmin, cell, MAT_AIR);
-  }
-
-  return MacroQuery(vec3<f32>(0.0), 0.0, 0u);
+  return MacroCell(macro_bmin, cell, empty);
 }
+
 
 // --------------------------------------------------------------------------
 // Key decoding -> cube
@@ -160,7 +164,14 @@ struct LeafState {
   bmin      : vec3<f32>,
   size      : f32,
   mat       : u32,
+
+  // nearest existing ancestor node/cube we can start from (anchor)
+  has_anchor   : bool,
+  anchor_idx   : u32,
+  anchor_bmin  : vec3<f32>,
+  anchor_size  : f32,
 };
+
 
 fn descend_leaf_sparse(
   p_in      : vec3<f32>,
@@ -179,11 +190,13 @@ fn descend_leaf_sparse(
     let n = node_at(node_base, idx);
 
     if (n.child_base == LEAF_U32) {
-      return LeafState(true, idx, bmin, size, n.material);
+      return LeafState(true, idx, bmin, size, n.material,
+                       false, 0u, vec3<f32>(0.0), 0.0);
     }
 
     if (d >= max_d) {
-      return LeafState(true, idx, bmin, size, MAT_AIR);
+      return LeafState(true, idx, bmin, size, MAT_AIR,
+                       false, 0u, vec3<f32>(0.0), 0.0);
     }
 
     let half = size * 0.5;
@@ -203,8 +216,13 @@ fn descend_leaf_sparse(
 
     let bit = 1u << ci;
     if ((n.child_mask & bit) == 0u) {
-      return LeafState(false, INVALID_U32, child_bmin, half, MAT_AIR);
+      // Missing child => implicit AIR cube, but parent node exists.
+      return LeafState(
+        false, INVALID_U32, child_bmin, half, MAT_AIR,
+        true,  idx,         bmin,      size
+      );
     }
+
 
     let r = child_rank(n.child_mask, ci);
     idx  = n.child_base + r;      // LOCAL packed index
@@ -212,7 +230,11 @@ fn descend_leaf_sparse(
     size = half;
   }
 
-  return LeafState(false, INVALID_U32, start_bmin, start_size, MAT_AIR);
+  return LeafState(
+    false, INVALID_U32, start_bmin, start_size, MAT_AIR,
+    false, INVALID_U32, vec3<f32>(0.0), 0.0
+  );
+
 }
 
 // --------------------------------------------------------------------------
@@ -226,6 +248,9 @@ fn trace_chunk_rope_interval(
   t_enter: f32,
   t_exit: f32
 ) -> HitGeom {
+  var have_macro: bool = false;
+  var macro_cell: MacroCell;
+
   let vs = cam.voxel_params.x;
 
   let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
@@ -254,15 +279,25 @@ fn trace_chunk_rope_interval(
     let pq = p + rd * (1e-4 * vs);
 
     // ----------------------------------------------------------------------
-    // Macro empty => big AIR slab step
+    // Macro empty => big AIR slab step (CACHED)
     // ----------------------------------------------------------------------
-    let m = macro_leaf_or_invalid(pq, root_bmin, root_size, ch.macro_base);
-    if (m.size > 0.0) {
-      let slabm = cube_slab_inv(ro, inv, m.bmin, m.size);
-      tcur = max(slabm.t_exit, tcur) + eps_step;
-      have_leaf = false;
-      continue;
+    if (ch.macro_base != INVALID_U32) {
+      if (!have_macro || !point_in_cube(pq, macro_cell.bmin, macro_cell.size)) {
+        macro_cell = macro_cell_query(pq, root_bmin, root_size, ch.macro_base);
+        have_macro = true;
+      }
+
+      if (macro_cell.is_empty) {
+        // Step across the whole empty macro cell
+        let slabm = cube_slab_inv(ro, inv, macro_cell.bmin, macro_cell.size);
+        tcur = max(slabm.t_exit, tcur) + eps_step;
+
+        // We jumped; leaf cache no longer valid
+        have_leaf = false;
+        continue;
+      }
     }
+
 
     // ----------------------------------------------------------------------
     // Ensure leaf contains pq
@@ -297,31 +332,20 @@ fn trace_chunk_rope_interval(
           // about 1 sample per voxel in xz (clamped)
           let n = clamp(u32(ceil(dist_xz / max(vs, 1e-6))), 1u, 16u);
 
-          for (var si: u32 = 0u; si < n; si = si + 1u) {
-            let a  = (f32(si) + 0.5) / f32(n);
-            let ts = mix(t0_probe, t1_probe, a);
-            let ps = ro + rd * ts;
+          if (leaf.size <= grass_probe_max_leaf) {
+            let t0_probe = max(t_enter, tcur - eps_step);
+            let t1_probe = min(t_leave, t_exit);
 
-            let lp = ps - root_bmin;
-            let lx_u = clamp(u32(floor(lp.x / vs)), 0u, 63u);
-            let lz_u = clamp(u32(floor(lp.z / vs)), 0u, 63u);
-
-            let e16 = colinfo_entry_u16(ch.colinfo_base, lx_u, lz_u);
-            let ci  = colinfo_decode(e16);
-
-            if (ci.valid && ci.mat == MAT_GRASS) {
-              let wx: i32 = origin_vox_i.x + i32(lx_u);
-              let wy: i32 = origin_vox_i.y + i32(ci.y_vox);
-              let wz: i32 = origin_vox_i.z + i32(lz_u);
-
-              let bmin_m = vec3<f32>(f32(wx), f32(wy), f32(wz)) * vs;
-              let id_vox = vec3<f32>(f32(wx), f32(wy), f32(wz));
-
-              let gh = try_grass_slab_hit(
+            if (t1_probe >= t0_probe) {
+              let gh = probe_grass_columns_xz_dda(
                 ro, rd,
                 t0_probe, t1_probe,
-                bmin_m, id_vox,
-                vs, time_s, strength
+                root_bmin,
+                origin_vox_i,
+                vs,
+                ch.colinfo_base,
+                time_s,
+                strength
               );
 
               if (gh.hit) {
@@ -338,43 +362,68 @@ fn trace_chunk_rope_interval(
               }
             }
           }
+
         }
       }
 
-      // ---- Rope traversal for AIR
+            // ---- Rope traversal for AIR
       let face = exit_face_from_slab(rd, slab);
 
-      // Advance to just past the current leaf
+      // Advance to just past the current (possibly virtual) AIR leaf
       tcur = max(t_leave, tcur) + eps_step;
 
-      if (!leaf.has_node) {
-        have_leaf = false;
-        continue;
-      }
+      // If we've left the chunk interval, stop early
+      if (tcur > t_exit) { break; }
 
-      let nidx = rope_next_local(ch.node_base, leaf.idx_local, face);
-      if (nidx == INVALID_U32) {
-        have_leaf = false;
-        continue;
-      }
-
-      // Recompute the query point *after* advancing tcur
+      // Recompute query point after advancing
       let p_next  = ro + tcur * rd;
       let pq_next = p_next + rd * (1e-4 * vs);
 
-      // If we've left the chunk interval, stop early
-      if (tcur > t_exit) {
-        break;
+      // CASE A: real AIR node exists -> use its ropes (unchanged path)
+      if (leaf.has_node) {
+        let nidx = rope_next_local(ch.node_base, leaf.idx_local, face);
+        if (nidx == INVALID_U32) { have_leaf = false; continue; }
+
+        let nk = node_at(ch.node_base, nidx).key;
+        let c  = node_cube_from_key(root_bmin, root_size, nk);
+        leaf = descend_leaf_sparse(pq_next, ch.node_base, nidx, c.xyz, c.w);
+        have_leaf = true;
+        continue;
       }
 
-      let nk = node_at(ch.node_base, nidx).key;
-      let c  = node_cube_from_key(root_bmin, root_size, nk);
+      // CASE B: missing-child AIR (virtual cube) -> use anchor
+      if (leaf.has_anchor) {
+        // First: if we’re still inside the anchor cube, just descend from anchor.
+        // This handles sibling-to-sibling movement inside the same parent cube,
+        // which ropes aren’t needed for.
+        if (point_in_cube(pq_next, leaf.anchor_bmin, leaf.anchor_size)) {
+          leaf = descend_leaf_sparse(
+            pq_next,
+            ch.node_base,
+            leaf.anchor_idx,
+            leaf.anchor_bmin,
+            leaf.anchor_size
+          );
+          have_leaf = true;
+          continue;
+        }
 
-      // Descend starting from the neighbor node's cube, using the UPDATED point
-      leaf = descend_leaf_sparse(pq_next, ch.node_base, nidx, c.xyz, c.w);
-      have_leaf = true;
+        // Otherwise: we exited the anchor cube through an external face.
+        // Use the anchor’s rope to jump laterally at that level.
+        let nidx2 = rope_next_local(ch.node_base, leaf.anchor_idx, face);
+        if (nidx2 == INVALID_U32) { have_leaf = false; continue; }
+
+        let nk2 = node_at(ch.node_base, nidx2).key;
+        let c2  = node_cube_from_key(root_bmin, root_size, nk2);
+
+        leaf = descend_leaf_sparse(pq_next, ch.node_base, nidx2, c2.xyz, c2.w);
+        have_leaf = true;
+        continue;
+      }
+
+      // Fallback: no anchor info (should be rare). Force re-descend from root.
+      have_leaf = false;
       continue;
-
     }
 
     // ----------------------------------------------------------------------
@@ -637,4 +686,129 @@ fn colinfo_decode(e16: u32) -> ColInfo {
     return ColInfo(false, 0u, 0u);
   }
   return ColInfo(true, y8, mat8);
+}
+
+
+// Visit each (lx,lz) column crossed by [t0,t1] once (XZ DDA).
+// Calls try_grass_slab_hit at most once per visited column.
+// Returns hit or miss.
+fn probe_grass_columns_xz_dda(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t0_in: f32,
+  t1_in: f32,
+  root_bmin: vec3<f32>,
+  origin_vox_i: vec3<i32>,
+  vs: f32,
+  colinfo_base: u32,
+  time_s: f32,
+  strength: f32
+) -> GrassHit {
+  // Clamp & early out
+  var t0 = t0_in;
+  var t1 = t1_in;
+  if (t1 <= t0) {
+    return GrassHit(false, BIG_F32, vec3<f32>(0.0));
+  }
+
+  // Start point (slightly nudged to avoid exact-boundary issues)
+  let eps = 1e-4 * vs;
+  var t = t0 + eps;
+  if (t > t1) { t = t0; }
+
+  var p = ro + rd * t;
+
+  // Local voxel coords in chunk (floating)
+  var lx_f = (p.x - root_bmin.x) / vs;
+  var lz_f = (p.z - root_bmin.z) / vs;
+
+  // Integer column indices
+  var lx: i32 = i32(floor(lx_f));
+  var lz: i32 = i32(floor(lz_f));
+
+  // Clamp to 0..63 (chunk is 64^3 in your code)
+  lx = clamp(lx, 0, 63);
+  lz = clamp(lz, 0, 63);
+
+  // Steps in X and Z
+  let stepX: i32 = select(-1, 1, rd.x > 0.0);
+  let stepZ: i32 = select(-1, 1, rd.z > 0.0);
+
+  // Setup X boundary crossing times (in ray-t space)
+  var tMaxX: f32 = BIG_F32;
+  var tDeltaX: f32 = BIG_F32;
+  if (abs(rd.x) >= EPS_INV) {
+    // Next voxel boundary in meters
+    let nextX = root_bmin.x + f32(select(lx, lx + 1, stepX > 0)) * vs;
+    tMaxX   = t + (nextX - p.x) / rd.x;
+    tDeltaX = vs / abs(rd.x);
+  }
+
+  // Setup Z boundary crossing times
+  var tMaxZ: f32 = BIG_F32;
+  var tDeltaZ: f32 = BIG_F32;
+  if (abs(rd.z) >= EPS_INV) {
+    let nextZ = root_bmin.z + f32(select(lz, lz + 1, stepZ > 0)) * vs;
+    tMaxZ   = t + (nextZ - p.z) / rd.z;
+    tDeltaZ = vs / abs(rd.z);
+  }
+
+  // Safety cap: max columns crossed within a tiny leaf is small.
+  // Still cap to be safe in edge cases / long segments.
+  let MAX_COLS: u32 = 128u;
+
+  for (var iter: u32 = 0u; iter < MAX_COLS; iter = iter + 1u) {
+    if (t > t1) { break; }
+
+    // End of current column interval is the next boundary (or t1)
+    let tNext = min(min(tMaxX, tMaxZ), t1);
+
+    // --- Check this column’s top map once
+    let lx_u: u32 = u32(lx);
+    let lz_u: u32 = u32(lz);
+
+    let e16 = colinfo_entry_u16(colinfo_base, lx_u, lz_u);
+    let ci  = colinfo_decode(e16);
+
+    if (ci.valid && ci.mat == MAT_GRASS) {
+      // World voxel coords for the grass cell (at column-top y)
+      let wx: i32 = origin_vox_i.x + lx;
+      let wy: i32 = origin_vox_i.y + i32(ci.y_vox);
+      let wz: i32 = origin_vox_i.z + lz;
+
+      let cell_bmin_m = vec3<f32>(f32(wx), f32(wy), f32(wz)) * vs;
+      let id_vox      = vec3<f32>(f32(wx), f32(wy), f32(wz));
+
+      // Tight per-column interval [t, tNext]
+      let gh = try_grass_slab_hit(
+        ro, rd,
+        t, tNext,
+        cell_bmin_m, id_vox,
+        vs, time_s, strength
+      );
+
+      if (gh.hit) { return gh; }
+    }
+
+    // Move to next column
+    if (tNext >= t1) { break; }
+
+    // Step across whichever boundary is hit first
+    if (tMaxX < tMaxZ) {
+      lx += stepX;
+      t = tMaxX + eps;
+      tMaxX += tDeltaX;
+    } else {
+      lz += stepZ;
+      t = tMaxZ + eps;
+      tMaxZ += tDeltaZ;
+    }
+
+    // Stop if we walked out of chunk xz bounds
+    if (lx < 0 || lx > 63 || lz < 0 || lz > 63) { break; }
+
+    p = ro + rd * t;
+  }
+
+  return GrassHit(false, BIG_F32, vec3<f32>(0.0));
 }
