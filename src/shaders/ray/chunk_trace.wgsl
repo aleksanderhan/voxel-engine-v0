@@ -272,36 +272,59 @@ fn trace_chunk_rope_interval(
   var have_leaf: bool = false;
   var leaf: LeafState;
 
-  for (var step_i: u32 = 0u; step_i < cam.max_steps; step_i = step_i + 1u) {
+  // Current macro interval end in ray-t (only meaningful if macro data exists)
+  var t_macro_exit: f32 = t_exit;
+
+  let have_macro_data = (ch.macro_base != INVALID_U32);
+
+  // Coarse phase: advance by empty macro cells. Fine phase: traverse leaves/ropes,
+  // but treat macro boundaries as "events" (NOT as leaf exits).
+  let MAX_ITERS: u32 = 4096u;
+
+  for (var it: u32 = 0u; it < MAX_ITERS; it = it + 1u) {
     if (tcur > t_exit) { break; }
 
-    let p  = ro + tcur * rd;
-    let pq = p + rd * (1e-4 * vs);
+    // ----------------------------------------------------------------------
+    // COARSE: macro cell update + empty jump
+    // ----------------------------------------------------------------------
+    if (have_macro_data) {
+      let pM  = ro + tcur * rd;
+      let pqM = pM + rd * (1e-4 * vs);
 
-    // ----------------------------------------------------------------------
-    // Macro empty => big AIR slab step (CACHED)
-    // ----------------------------------------------------------------------
-    if (ch.macro_base != INVALID_U32) {
-      if (!have_macro || !point_in_cube(pq, macro_cell.bmin, macro_cell.size)) {
-        macro_cell = macro_cell_query(pq, root_bmin, root_size, ch.macro_base);
+      if (!have_macro || !point_in_cube(pqM, macro_cell.bmin, macro_cell.size)) {
+        macro_cell = macro_cell_query(pqM, root_bmin, root_size, ch.macro_base);
         have_macro = true;
+
+        let slabm = cube_slab_inv(ro, inv, macro_cell.bmin, macro_cell.size);
+        t_macro_exit = min(slabm.t_exit, t_exit);
+
+        // NOTE: do NOT invalidate leaf here; a leaf cube can straddle macro boundaries.
+        // (Invalidating leaf here is what creates macro-grid seams.)
       }
 
       if (macro_cell.is_empty) {
-        // Step across the whole empty macro cell
-        let slabm = cube_slab_inv(ro, inv, macro_cell.bmin, macro_cell.size);
-        tcur = max(slabm.t_exit, tcur) + eps_step;
+        // Jump across the whole empty macro cell
+        tcur = max(t_macro_exit, tcur) + eps_step;
 
-        // We jumped; leaf cache no longer valid
+        // After a big jump, leaf cache is generally not useful.
         have_leaf = false;
         continue;
       }
+    } else {
+      // No macro data => treat whole interval as non-empty span
+      t_macro_exit = t_exit;
     }
 
+    // ----------------------------------------------------------------------
+    // FINE: ensure leaf contains point, then step by either:
+    //  - leaf exit (normal traversal), OR
+    //  - macro boundary event (refresh macro), whichever comes first.
+    //  Crucially, if macro boundary happens first, we DO NOT do rope traversal
+    //  because we did NOT exit the leaf.
+    // ----------------------------------------------------------------------
+    let p  = ro + tcur * rd;
+    let pq = p + rd * (1e-4 * vs);
 
-    // ----------------------------------------------------------------------
-    // Ensure leaf contains pq
-    // ----------------------------------------------------------------------
     if (!have_leaf || !point_in_cube(pq, leaf.bmin, leaf.size)) {
       leaf = descend_leaf_sparse(pq, ch.node_base, 0u, root_bmin, root_size);
       have_leaf = true;
@@ -310,76 +333,64 @@ fn trace_chunk_rope_interval(
     let slab    = cube_slab_inv(ro, inv, leaf.bmin, leaf.size);
     let t_leave = slab.t_exit;
 
+    // Next "event": either we leave the leaf, or (if macro data exists) we hit macro boundary.
+    let t_event = select(t_leave, min(t_leave, t_macro_exit), have_macro_data);
+
     // ----------------------------------------------------------------------
-    // AIR: optional air-side grass + rope traversal
+    // AIR path: grass probe only within [tcur, t_event], then:
+    //  - if event==macro boundary => advance to macro boundary and loop (no ropes)
+    //  - else event==leaf exit => do rope traversal as before
     // ----------------------------------------------------------------------
     if (leaf.mat == MAT_AIR) {
-      // ------------------------------------------------------------
-      // AIR-side grass (column map) — step across the AIR segment in xz
-      // ------------------------------------------------------------
+      // AIR-side grass probe (bounded to event)
       if (leaf.size <= grass_probe_max_leaf) {
         let t0_probe = max(t_enter, tcur - eps_step);
-        let t1_probe = min(t_leave, t_exit);
+        let t1_probe = min(t_event, t_exit);
 
         if (t1_probe >= t0_probe) {
-          // Decide how many samples based on projected travel in XZ
-          let p0 = ro + rd * t0_probe;
-          let p1 = ro + rd * t1_probe;
+          let gh = probe_grass_columns_xz_dda(
+            ro, rd,
+            t0_probe, t1_probe,
+            root_bmin,
+            origin_vox_i,
+            vs,
+            ch.colinfo_base,
+            time_s,
+            strength
+          );
 
-          let dxz = vec2<f32>(p1.x - p0.x, p1.z - p0.z);
-          let dist_xz = length(dxz);
-
-          // about 1 sample per voxel in xz (clamped)
-          let n = clamp(u32(ceil(dist_xz / max(vs, 1e-6))), 1u, 16u);
-
-          if (leaf.size <= grass_probe_max_leaf) {
-            let t0_probe = max(t_enter, tcur - eps_step);
-            let t1_probe = min(t_leave, t_exit);
-
-            if (t1_probe >= t0_probe) {
-              let gh = probe_grass_columns_xz_dda(
-                ro, rd,
-                t0_probe, t1_probe,
-                root_bmin,
-                origin_vox_i,
-                vs,
-                ch.colinfo_base,
-                time_s,
-                strength
-              );
-
-              if (gh.hit) {
-                var outg = miss_hitgeom();
-                outg.hit = 1u;
-                outg.t   = gh.t;
-                outg.mat = MAT_GRASS;
-                outg.n   = gh.n;
-                outg.root_bmin  = root_bmin;
-                outg.root_size  = root_size;
-                outg.node_base  = ch.node_base;
-                outg.macro_base = ch.macro_base;
-                return outg;
-              }
-            }
+          if (gh.hit) {
+            var outg = miss_hitgeom();
+            outg.hit = 1u;
+            outg.t   = gh.t;
+            outg.mat = MAT_GRASS;
+            outg.n   = gh.n;
+            outg.root_bmin  = root_bmin;
+            outg.root_size  = root_size;
+            outg.node_base  = ch.node_base;
+            outg.macro_base = ch.macro_base;
+            return outg;
           }
-
         }
       }
 
-            // ---- Rope traversal for AIR
+      // If we hit macro boundary before leaving the leaf, just advance to boundary and refresh macro.
+      if (have_macro_data && (t_macro_exit < t_leave)) {
+        tcur = max(t_macro_exit, tcur) + eps_step;
+        // leaf may still contain pq after boundary; keep cache
+        continue;
+      }
+
+      // Otherwise, we truly leave the leaf => rope traversal.
       let face = exit_face_from_slab(rd, slab);
 
-      // Advance to just past the current (possibly virtual) AIR leaf
       tcur = max(t_leave, tcur) + eps_step;
-
-      // If we've left the chunk interval, stop early
       if (tcur > t_exit) { break; }
 
-      // Recompute query point after advancing
       let p_next  = ro + tcur * rd;
       let pq_next = p_next + rd * (1e-4 * vs);
 
-      // CASE A: real AIR node exists -> use its ropes (unchanged path)
+      // CASE A: real AIR node exists -> use its ropes
       if (leaf.has_node) {
         let nidx = rope_next_local(ch.node_base, leaf.idx_local, face);
         if (nidx == INVALID_U32) { have_leaf = false; continue; }
@@ -393,9 +404,6 @@ fn trace_chunk_rope_interval(
 
       // CASE B: missing-child AIR (virtual cube) -> use anchor
       if (leaf.has_anchor) {
-        // First: if we’re still inside the anchor cube, just descend from anchor.
-        // This handles sibling-to-sibling movement inside the same parent cube,
-        // which ropes aren’t needed for.
         if (point_in_cube(pq_next, leaf.anchor_bmin, leaf.anchor_size)) {
           leaf = descend_leaf_sparse(
             pq_next,
@@ -408,8 +416,6 @@ fn trace_chunk_rope_interval(
           continue;
         }
 
-        // Otherwise: we exited the anchor cube through an external face.
-        // Use the anchor’s rope to jump laterally at that level.
         let nidx2 = rope_next_local(ch.node_base, leaf.anchor_idx, face);
         if (nidx2 == INVALID_U32) { have_leaf = false; continue; }
 
@@ -421,14 +427,24 @@ fn trace_chunk_rope_interval(
         continue;
       }
 
-      // Fallback: no anchor info (should be rare). Force re-descend from root.
+      // Fallback: force re-descend from root next iter
       have_leaf = false;
       continue;
     }
 
     // ----------------------------------------------------------------------
-    // Leaves: displaced cube hit
+    // Non-air: we must test for hits over the true leaf interval.
+    // But if macro boundary happens first AND we did not exit the leaf, we
+    // should just advance to macro boundary and loop (no ropes, no treating it as exit).
     // ----------------------------------------------------------------------
+    if (have_macro_data && (t_macro_exit < t_leave)) {
+      // Still inside same leaf, just crossing macro boundary
+      tcur = max(t_macro_exit, tcur) + eps_step;
+      // keep leaf cache (leaf can straddle macro boundary)
+      continue;
+    }
+
+    // LEAF material: displaced cube hit (true leaf interval)
     if (leaf.mat == MAT_LEAF) {
       let h2 = leaf_displaced_cube_hit(
         ro, rd,
@@ -450,14 +466,13 @@ fn trace_chunk_rope_interval(
         return out;
       }
 
+      // Miss: step out of this leaf
       tcur = max(t_leave, tcur) + eps_step;
       have_leaf = false;
       continue;
     }
 
-    // ----------------------------------------------------------------------
-    // Solid: face hit (+ optional grass-on-solid-face probe)
-    // ----------------------------------------------------------------------
+    // SOLID: face hit (true leaf interval)
     let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
     if (bh.hit) {
       // Optional grass-on-solid-face probe when the solid voxel is grass
@@ -507,15 +522,14 @@ fn trace_chunk_rope_interval(
       return out;
     }
 
-    // ----------------------------------------------------------------------
-    // Miss solid: step out
-    // ----------------------------------------------------------------------
+    // Miss solid: step out of leaf
     tcur = max(t_leave, tcur) + eps_step;
     have_leaf = false;
   }
 
   return miss_hitgeom();
 }
+
 
 
 // --------------------------------------------------------------------------
