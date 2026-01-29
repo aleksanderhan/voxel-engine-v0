@@ -20,12 +20,14 @@ struct ClipmapParams {
   res         : u32,
   base_cell_m : f32,
   _pad0       : f32,
-  // x=origin_x_m, y=origin_z_m, z=cell_size_m, w=packed offsets bits (off_x/off_z)
   level       : array<vec4<f32>, CLIP_LEVELS_MAX>,
+  offset      : array<vec4<u32>, CLIP_LEVELS_MAX>,
 };
+
 
 @group(0) @binding(6) var<uniform> clip : ClipmapParams;
 @group(0) @binding(7) var clip_height : texture_2d_array<f32>;
+
 
 fn imod(a: i32, m: i32) -> i32 {
   var r = a % m;
@@ -33,12 +35,11 @@ fn imod(a: i32, m: i32) -> i32 {
   return r;
 }
 
-fn clip_unpack_offsets(level: u32) -> vec2<i32> {
-  let bits: u32 = bitcast<u32>(clip.level[level].w);
-  let off_x: i32 = i32(bits & 0xFFFFu);
-  let off_z: i32 = i32((bits >> 16u) & 0xFFFFu);
-  return vec2<i32>(off_x, off_z);
+fn clip_offsets(level: u32) -> vec2<i32> {
+  let o = clip.offset[level];
+  return vec2<i32>(i32(o.x), i32(o.y));
 }
+
 
 fn clip_level_contains(xz: vec2<f32>, level: u32, guard: i32) -> bool {
   let res_i = max(i32(clip.res), 1);
@@ -79,6 +80,85 @@ fn clip_choose_level(xz: vec2<f32>) -> u32 {
   return best;
 }
 
+fn clip_level_half_extent(level: u32) -> f32 {
+  let res_f = f32(max(i32(clip.res), 1));
+  let cell  = clip.level[level].z;
+  return 0.5 * res_f * cell;
+}
+
+// Two thresholds = hysteresis band
+// - inner_in: how deep inside a *finer* level you must be before switching down (to finer)
+// - outer_out: how far out of the *current* level you must be before switching up (to coarser)
+fn clip_inner_in(level: u32) -> f32 {
+  // stricter than your old 0.45 * half (switch to finer only if clearly inside)
+  return 0.40 * clip_level_half_extent(level);
+}
+
+fn clip_outer_out(level: u32) -> f32 {
+  // looser than your old 0.45 * half (switch to coarser only if clearly outside)
+  return 0.52 * clip_level_half_extent(level);
+}
+
+// Raw “best effort” level (your old logic, slightly simplified)
+fn clip_choose_level_raw(xz: vec2<f32>) -> u32 {
+  let cam_xz = vec2<f32>(cam.cam_pos.x, cam.cam_pos.z);
+  let d = max(abs(xz.x - cam_xz.x), abs(xz.y - cam_xz.y));
+
+  let n = min(clip.levels, CLIP_LEVELS_MAX);
+  let guard: i32 = 2;
+
+  var best: u32 = max(clip.levels, 1u) - 1u;
+
+  for (var i: u32 = 0u; i < n; i = i + 1u) {
+    if (d <= clip_inner_in(i) && clip_level_contains(xz, i, guard)) {
+      best = i;
+      break;
+    }
+  }
+  return best;
+}
+
+// Stateful hysteresis choice (uses previous level as state)
+fn clip_choose_level_hyst(xz: vec2<f32>, prev: u32) -> u32 {
+  let cam_xz = vec2<f32>(cam.cam_pos.x, cam.cam_pos.z);
+  let d = max(abs(xz.x - cam_xz.x), abs(xz.y - cam_xz.y));
+
+  let n = min(clip.levels, CLIP_LEVELS_MAX);
+  let guard: i32 = 2;
+
+  var lvl = min(prev, n - 1u);
+
+  // If current level doesn't contain point (guarded), walk coarser until it does.
+  loop {
+    if (clip_level_contains(xz, lvl, guard) || lvl >= (n - 1u)) { break; }
+    lvl = lvl + 1u;
+  }
+
+  // Switch to coarser only when clearly outside current threshold
+  loop {
+    if (lvl >= (n - 1u)) { break; }
+    if (d > clip_outer_out(lvl)) {
+      lvl = lvl + 1u;
+      continue;
+    }
+    break;
+  }
+
+  // Switch to finer only when clearly inside finer threshold
+  loop {
+    if (lvl == 0u) { break; }
+    let fine = lvl - 1u;
+    if (d <= clip_inner_in(fine) && clip_level_contains(xz, fine, guard)) {
+      lvl = fine;
+      continue;
+    }
+    break;
+  }
+
+  return lvl;
+}
+
+
 fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
   let res_i = max(i32(clip.res), 1);
   let p = clip.level[level];
@@ -95,7 +175,7 @@ fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
     return -BIG_F32;
   }
 
-  let off = clip_unpack_offsets(level);
+  let off = clip_offsets(level);
   let sx = imod(ix + off.x, res_i);
   let sz = imod(iz + off.y, res_i);
 
@@ -140,7 +220,9 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
   var t = max(t_min, 0.0);
   var p = ro + rd * t;
 
-  var lvl: u32 = clip_choose_level(p.xz);
+  // Choose initial level and enforce monotonic (only same/coarser) as we march
+  var lvl_prev: u32 = clip_choose_level_raw(p.xz);
+  var lvl: u32 = lvl_prev;
 
   var h = clip_height_at_level(p.xz, lvl);
   var s_prev = p.y - h;
@@ -151,7 +233,10 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
 
     p = ro + rd * t;
 
-    lvl = clip_choose_level(p.xz);
+    // Monotonic LOD: prevent switching to a finer level mid-ray
+    let cand = clip_choose_level_hyst(p.xz, lvl_prev);
+    lvl = max(lvl_prev, cand);
+    lvl_prev = lvl;
 
     h = clip_height_at_level(p.xz, lvl);
     let s = p.y - h;
@@ -160,12 +245,12 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
       var a = t_prev;
       var b = t;
 
+      // Bisection against the SAME surface (same lvl), not a moving LOD surface
       for (var k: u32 = 0u; k < HF_BISECT; k = k + 1u) {
         let m = 0.5 * (a + b);
         let pm = ro + rd * m;
 
-        let mlvl = clip_choose_level(pm.xz);
-        let hm = clip_height_at_level(pm.xz, mlvl);
+        let hm = clip_height_at_level(pm.xz, lvl);
         let sm = pm.y - hm;
 
         if (sm > 0.0) { a = m; } else { b = m; }
@@ -174,8 +259,8 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
       let th = 0.5 * (a + b);
       let ph = ro + rd * th;
 
-      let hlvl = clip_choose_level(ph.xz);
-      let n = clip_normal_at_level_2tap(ph.xz, hlvl);
+      // Normal: you can keep using the same lvl for consistency
+      let n = clip_normal_at_level_2tap(ph.xz, lvl);
 
       return ClipHit(true, th, n, MAT_GRASS);
     }
@@ -192,6 +277,7 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
 
   return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
 }
+
 
 fn material_variation_clip(world_p: vec3<f32>, cell_size_m: f32, strength: f32) -> f32 {
   let cell = floor(world_p / cell_size_m);

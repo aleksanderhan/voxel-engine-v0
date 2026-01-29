@@ -37,9 +37,9 @@ pub struct ClipLevelParams {
     pub origin_x_m: f32,
     pub origin_z_m: f32,
     pub cell_size_m: f32,
-    pub inv_cell_size_m: f32,
     /// Packed torus offsets: off_x in low 16 bits, off_z in high 16 bits.
-    pub packed_offsets: u32,
+    pub off_x: u32,
+    pub off_z: u32,
 }
 
 /// CPU-side clipmap params (fed into GPU packing in `render/gpu_types.rs`).
@@ -106,11 +106,6 @@ impl Clipmap {
     #[inline]
     fn cell_to_origin_m(cell_x: i32, cell_z: i32, cell_m: f32) -> (f32, f32) {
         (cell_x as f32 * cell_m, cell_z as f32 * cell_m)
-    }
-
-    #[inline]
-    fn pack_offsets(off_x: u16, off_z: u16) -> u32 {
-        (off_x as u32) | ((off_z as u32) << 16)
     }
 
     #[inline]
@@ -304,8 +299,7 @@ impl Clipmap {
                 origin_x_m: 0.0,
                 origin_z_m: 0.0,
                 cell_size_m: 1.0,
-                inv_cell_size_m: 1.0,
-                packed_offsets: 0,
+                off_x: 0, off_z: 0,
             }; config::CLIPMAP_LEVELS_USIZE],
         };
 
@@ -314,18 +308,12 @@ impl Clipmap {
         let res_u = config::CLIPMAP_RES;
         let res_i = res_u as i32;
 
-        // If a level is throttled, we *still* must avoid sampling near/outside its edges,
-        // otherwise the shader clamp(ix/iz) will “stick” to the border and look mangled.
-        // So the throttle is “soft”: if the camera is getting too close to the edge of
-        // the currently committed window, we force an update even if the interval
-        // hasn’t elapsed yet.
         const EDGE_GUARD_TEXELS: i32 = 16; // tune: 8/16/24
 
         for i in 0..config::CLIPMAP_LEVELS {
             let li = i as usize;
 
             let cell_m = Self::level_cell_size(i);
-            let inv_cell_m = 1.0 / cell_m.max(1e-6);
 
             // Where we would LIKE this level to be this frame
             let (new_ox_c, new_oz_c) = Self::snapped_origin_cell(cam_pos_m.x, cam_pos_m.z, cell_m);
@@ -625,14 +613,14 @@ impl Clipmap {
                 Self::cell_to_origin_m(cx, cz, cell_m)
             };
 
-            let packed = Self::pack_offsets(off_x, off_z);
             params.level[li] = ClipLevelParams {
                 origin_x_m: commit_ox_m,
                 origin_z_m: commit_oz_m,
                 cell_size_m: cell_m,
-                inv_cell_size_m: inv_cell_m,
-                packed_offsets: packed,
+                off_x: off_x as u32,
+                off_z: off_z as u32,
             };
+
         }
 
         (params, uploads)

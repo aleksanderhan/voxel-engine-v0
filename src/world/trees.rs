@@ -135,7 +135,6 @@ const BRANCH_STEPS_MIN: i32 = 8;
 const BRANCH_STEPS_MAX: i32 = 30;
 const BRANCH_STEPS_BASE: f32 = 10.0;
 const BRANCH_STEPS_LEN_DIV_M: f32 = 0.30;
-const BRANCH_RADIUS_MIN_VOX: f32 = 0.55;
 
 // ----------------------------------------
 // Leaves
@@ -200,7 +199,6 @@ struct Tree {
     base_y: i32,   // touches ground
     trunk_h: i32,  // voxels
     crown_r: i32,  // voxels (horizontal extent)
-    canopy_h: i32, // conservative bounds / variety
     trunk_r0: f32, // voxels radius at base
     trunk_r1: f32, // voxels radius near top
     seed: u32,
@@ -254,26 +252,6 @@ impl TreeMaskCache {
         // caller guarantees in-bounds
         let i = ly * self.stride_y + lz * self.stride_z + lx;
         match unsafe { *self.mask.get_unchecked(i) } {
-            1 => WOOD,
-            2 => LEAF,
-            _ => AIR,
-        }
-    }
-
-    #[inline(always)]
-    pub fn contains_point_fast(&self, x: i32, y: i32, z: i32) -> u8 {
-        let lx = x - self.origin[0];
-        let ly = y - self.origin[1];
-        let lz = z - self.origin[2];
-        if (lx | ly | lz) < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
-            return 0;
-        }
-        self.mask[idx3_strided(self.stride_z, self.stride_y, lx, ly, lz)]
-    }
-
-    #[inline(always)]
-    pub fn material_fast(&self, x: i32, y: i32, z: i32) -> u32 {
-        match self.contains_point_fast(x, y, z) {
             1 => WOOD,
             2 => LEAF,
             _ => AIR,
@@ -450,17 +428,12 @@ impl WorldGen {
         let r0 = 0.45 * vpm + u01(hash_u32(seed ^ 0x1111)) * (0.30 * vpm);
         let r1 = 0.18 * vpm + u01(hash_u32(seed ^ 0x2222)) * (0.12 * vpm);
 
-        // kept for conservative bounds / variety
-        let canopy_h =
-            ((2.5 * vpm) + u01(hash_u32(seed ^ 0x3333)) * (2.0 * vpm)).round() as i32;
-
         Some(Tree {
             tx,
             tz,
             base_y: ground,
             trunk_h,
             crown_r,
-            canopy_h,
             trunk_r0: r0.max(1.0),
             trunk_r1: r1.max(1.0),
             seed,

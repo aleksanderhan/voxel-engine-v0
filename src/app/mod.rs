@@ -1,7 +1,10 @@
 // src/app/mod.rs
 // --------------
 //
-// Only change here is that ClipmapUpload now has x/y/w/h, so this compiles.
+// Clipmap fix (A): encode clipmap texture patches + clipmap uniform update
+// into the SAME command encoder, BEFORE the compute pass.
+//
+// This prevents uniforms (origin/offset) from getting ahead of the texture uploads.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -72,7 +75,6 @@ pub struct App {
     fps_last: Instant,
 
     frame_index: u32,
-
 }
 
 impl App {
@@ -191,17 +193,10 @@ impl App {
             self.renderer.write_chunk_grid(self.chunks.chunk_grid());
         }
 
-        // 3) clipmap update + uploads
+        // 3) clipmap update (CPU only; DO NOT write to GPU here)
         let t = self.start_time.elapsed().as_secs_f32();
         let (clip_params_cpu, clip_uploads) = self.clipmap.update(self.world.as_ref(), cam_pos, t);
-
         let clip_gpu = ClipmapGpu::from_cpu(&clip_params_cpu);
-        self.renderer.write_clipmap(&clip_gpu);
-
-        for up in clip_uploads {
-            self.renderer
-                .write_clipmap_patch(up.level, up.x, up.y, up.w, up.h, &up.data_f16);
-        }
 
         // 4) camera matrices -> CameraGpu
         let aspect = self.config.width as f32 / self.config.height as f32;
@@ -251,10 +246,9 @@ impl App {
             self.fps_value,
             self.config.width,
             self.config.height,
-            8, // scale (match what you want)
+            8, // scale
         );
         self.renderer.write_overlay(&overlay);
-
 
         // 6) update scene buffers if changed
         self.renderer.apply_chunk_uploads(self.chunks.take_uploads());
@@ -284,6 +278,11 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("encoder"),
             });
+
+        // IMPORTANT: clipmap uploads + uniform update go into the same encoder,
+        // and must happen BEFORE encode_compute() (which samples the clipmap).
+        self.renderer
+            .encode_clipmap_updates(&mut encoder, &clip_gpu, &clip_uploads);
 
         self.renderer
             .encode_compute(&mut encoder, self.config.width, self.config.height);

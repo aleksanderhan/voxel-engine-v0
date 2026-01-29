@@ -330,9 +330,6 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
         for lz in 0..cs_i {
             for lx in 0..cs_i {
-                let wx = chunk_ox + lx;
-                let wz = chunk_oz + lz;
-
                 let col = idx2(side, lx as usize, lz as usize);
                 let g = scratch.ground[col];
 

@@ -6,6 +6,7 @@
 // GPU uniform uses vec4 per level with packed offsets in .w.
 
 use bytemuck::{Pod, Zeroable};
+use crate::config;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
@@ -48,11 +49,16 @@ pub struct CameraGpu {
 ///
 /// Matches `shaders/clipmap.wgsl`.
 ///
-/// Per level vec4:
+/// Per level vec4<f32>:
 ///   x = origin_x_m
 ///   y = origin_z_m
 ///   z = cell_size_m
-///   w = packed offsets bits (off_x u16 | (off_z u16 << 16)) stored via f32::from_bits
+///   w = unused (0)
+///
+/// Per level vec4<u32>:
+///   x = off_x (toroidal offset in texels)
+///   y = off_z
+///   z/w unused (0)
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct ClipmapGpu {
@@ -61,21 +67,22 @@ pub struct ClipmapGpu {
     pub base_cell_m: f32,
     pub _pad0: f32,
 
-    pub level: [[f32; 4]; crate::config::CLIPMAP_LEVELS_USIZE],
+    pub level:  [[f32; 4]; config::CLIPMAP_LEVELS_USIZE],
+    pub offset: [[u32; 4]; config::CLIPMAP_LEVELS_USIZE],
 }
 
 impl ClipmapGpu {
     pub fn from_cpu(cpu: &crate::clipmap::ClipmapParamsCpu) -> Self {
-        let mut level = [[0.0f32; 4]; crate::config::CLIPMAP_LEVELS_USIZE];
+        let mut level  = [[0.0f32; 4]; config::CLIPMAP_LEVELS_USIZE];
+        let mut offset = [[0u32; 4]; config::CLIPMAP_LEVELS_USIZE];
 
-        for i in 0..crate::config::CLIPMAP_LEVELS_USIZE {
+        for i in 0..config::CLIPMAP_LEVELS_USIZE {
             let p = cpu.level[i];
-            level[i] = [
-                p.origin_x_m,
-                p.origin_z_m,
-                p.cell_size_m,
-                f32::from_bits(p.packed_offsets),
-            ];
+
+            level[i] = [p.origin_x_m, p.origin_z_m, p.cell_size_m, 0.0];
+
+            // NOTE: these fields change on CPU side in the next patch (ClipLevelParams)
+            offset[i] = [p.off_x, p.off_z, 0, 0];
         }
 
         Self {
@@ -84,9 +91,11 @@ impl ClipmapGpu {
             base_cell_m: cpu.base_cell_m,
             _pad0: 0.0,
             level,
+            offset,
         }
     }
 }
+
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]

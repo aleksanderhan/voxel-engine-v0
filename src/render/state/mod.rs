@@ -8,7 +8,7 @@ pub mod textures;
 
 use crate::{
     config,
-    render::gpu_types::{CameraGpu, ClipmapGpu, OverlayGpu},
+    render::gpu_types::{CameraGpu, OverlayGpu},
     streaming::ChunkUpload,
 };
 
@@ -31,6 +31,10 @@ pub struct Renderer {
     bind_groups: BindGroups,
 
     ping: usize,
+}
+
+fn align_up(v: usize, a: usize) -> usize {
+    (v + (a - 1)) & !(a - 1)
 }
 
 impl Renderer {
@@ -140,100 +144,6 @@ impl Renderer {
     pub fn write_overlay(&self, ov: &OverlayGpu) {
         self.queue
             .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
-    }
-
-    pub fn write_clipmap(&self, clip: &ClipmapGpu) {
-        self.queue
-            .write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
-    }
-
-    /// FP16 clipmap patch upload into a sub-rectangle of a level.
-    ///
-    /// `data_f16` is w*h u16 values (IEEE half bits), row-major for the patch.
-    ///
-    /// IMPORTANT: WebGPU requires `bytes_per_row` to be a multiple of 256 bytes.
-    /// For narrow strips (especially columns), we pad each row on the CPU when needed.
-    pub fn write_clipmap_patch(&self, level: u32, x: u32, y: u32, w: u32, h: u32, data_f16: &[u16]) {
-        let res = config::CLIPMAP_RES;
-        if level >= config::CLIPMAP_LEVELS {
-            return;
-        }
-        if w == 0 || h == 0 {
-            return;
-        }
-        if x + w > res || y + h > res {
-            return;
-        }
-
-        let expected = (w as usize) * (h as usize);
-        if data_f16.len() != expected {
-            return;
-        }
-
-        // Source row pitch (tightly packed)
-        let row_bytes = (w * 2) as usize; // R16Float => 2 bytes per texel
-
-        // WebGPU alignment requirement
-        let align = 256usize;
-        let padded_row_bytes = ((row_bytes + align - 1) / align) * align;
-
-        let bytes: Vec<u8>;
-        let bytes_ref: &[u8];
-
-        if padded_row_bytes == row_bytes {
-            bytes_ref = bytemuck::cast_slice(data_f16);
-        } else {
-            // Pad each row up to padded_row_bytes
-            bytes = {
-                let mut out = vec![0u8; padded_row_bytes * (h as usize)];
-                let src: &[u8] = bytemuck::cast_slice(data_f16);
-
-                for row in 0..(h as usize) {
-                    let src_off = row * row_bytes;
-                    let dst_off = row * padded_row_bytes;
-                    out[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
-                }
-                out
-            };
-            bytes_ref = &bytes;
-        }
-
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.textures.clip_height.tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: level },
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytes_ref,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(padded_row_bytes as u32),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-
-    /// Convenience full-level upload (kept for compatibility / debugging).
-    pub fn write_clipmap_level(&self, level: u32, data_f16: &[u16]) {
-        let res = config::CLIPMAP_RES as usize;
-        let expected = res * res;
-        if data_f16.len() != expected {
-            return;
-        }
-        self.write_clipmap_patch(
-            level,
-            0,
-            0,
-            config::CLIPMAP_RES,
-            config::CLIPMAP_RES,
-            data_f16,
-        );
     }
 
     pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
@@ -348,6 +258,127 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    pub fn encode_clipmap_patch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        level: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        data_f16: &[u16],
+    ) {
+        let res = config::CLIPMAP_RES;
+        if level >= config::CLIPMAP_LEVELS { return; }
+        if w == 0 || h == 0 { return; }
+        if x + w > res || y + h > res { return; }
+
+        let expected = (w as usize) * (h as usize);
+        if data_f16.len() != expected { return; }
+
+        // Tight row pitch in bytes (R16Float = 2 bytes/texel)
+        let row_bytes = (w as usize) * 2;
+
+        // WebGPU: bytes_per_row must be multiple of 256
+        let padded_row_bytes = align_up(row_bytes, 256);
+
+        // Prepare padded bytes (only when needed)
+        let bytes: Vec<u8>;
+        let bytes_ref: &[u8];
+
+        if padded_row_bytes == row_bytes {
+            bytes_ref = bytemuck::cast_slice(data_f16);
+        } else {
+            let src: &[u8] = bytemuck::cast_slice(data_f16);
+            let mut out = vec![0u8; padded_row_bytes * (h as usize)];
+
+            for row in 0..(h as usize) {
+                let src_off = row * row_bytes;
+                let dst_off = row * padded_row_bytes;
+                out[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
+            }
+
+            bytes = out;
+            bytes_ref = &bytes;
+        }
+
+        // Staging buffer for this patch
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("clipmap_patch_staging"),
+            size: bytes_ref.len() as u64,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+
+        {
+            let mut view = staging.slice(..).get_mapped_range_mut();
+            view.copy_from_slice(bytes_ref);
+        }
+        staging.unmap();
+
+        encoder.copy_buffer_to_texture(
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes as u32),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::ImageCopyTexture {
+                texture: &self.textures.clip_height.tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: level },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Encode clipmap uniform upload into the *current encoder* (no queue.write_buffer).
+    pub fn encode_clipmap_uniform(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        clip: &crate::render::gpu_types::ClipmapGpu,
+    ) {
+        let bytes = bytemuck::bytes_of(clip);
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("clipmap_uniform_staging"),
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+
+        {
+            let mut view = staging.slice(..).get_mapped_range_mut();
+            view.copy_from_slice(bytes);
+        }
+        staging.unmap();
+
+        encoder.copy_buffer_to_buffer(&staging, 0, &self.buffers.clipmap, 0, bytes.len() as u64);
+    }
+
+    /// Encode: (1) all patch uploads, then (2) uniform update — in the same encoder.
+    pub fn encode_clipmap_updates(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        clip: &crate::render::gpu_types::ClipmapGpu,
+        uploads: &[crate::clipmap::ClipmapUpload],
+    ) {
+        // 1) texture first
+        for u in uploads {
+            self.encode_clipmap_patch(encoder, u.level, u.x, u.y, u.w, u.h, &u.data_f16);
+        }
+
+        // 2) uniform second
+        self.encode_clipmap_uniform(encoder, clip);
     }
 
 }

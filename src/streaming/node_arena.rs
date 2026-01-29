@@ -112,17 +112,4 @@ impl NodeArena {
             }
         }
     }
-
-    // Optional: quick stats for debugging.
-    pub fn free_range_count(&self) -> usize {
-        self.free.len()
-    }
-
-    pub fn largest_free_range(&self) -> u32 {
-        self.free.iter().map(|r| r.len).max().unwrap_or(0)
-    }
-
-    pub fn total_free(&self) -> u32 {
-        self.free.iter().map(|r| r.len).sum()
-    }
 }

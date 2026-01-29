@@ -64,7 +64,6 @@ struct Resident {
     slot: u32,      // index into chunk_meta (dense)
     node_base: u32, // base index into global node arena
     node_count: u32,
-    macro_words: Arc<[u32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -219,7 +218,6 @@ fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
 }
 
 pub struct ChunkManager {
-    gen: Arc<WorldGen>,
 
     // Only non-missing states live here: Missing == absence from the map.
     chunks: HashMap<ChunkKey, ChunkState>,
@@ -267,7 +265,6 @@ pub struct ChunkManager {
     // Perf: precomputed region offsets
     // -----------------------------
     active_offsets: Vec<(i32, i32, i32)>, // dx,dy,dz for ACTIVE
-    keep_offsets: Vec<(i32, i32, i32)>,   // dx,dy,dz for KEEP (currently used only if you want)
 
     // Perf: reusable unload list (avoids per-frame alloc)
     to_unload: Vec<ChunkKey>,
@@ -289,10 +286,8 @@ impl ChunkManager {
         let grid_len = (nx * ny * nz) as usize;
 
         let active_offsets = Self::build_offsets(config::ACTIVE_RADIUS);
-        let keep_offsets = Self::build_offsets(config::KEEP_RADIUS);
 
         Self {
-            gen,
             chunks: HashMap::default(),
             build_queue: VecDeque::new(),
             queued_set: HashSet::default(),
@@ -322,7 +317,6 @@ impl ChunkManager {
             cache_bytes: 0,
 
             active_offsets,
-            keep_offsets,
 
             to_unload: Vec::new(),
         }
@@ -375,21 +369,6 @@ impl ChunkManager {
             && dx <= config::KEEP_RADIUS
             && dz >= -config::KEEP_RADIUS
             && dz <= config::KEEP_RADIUS
-            && dy >= Self::y_band_min()
-            && dy <= Self::y_band_max()
-    }
-
-    // (Not currently used below, but kept for completeness.)
-    #[inline(always)]
-    fn in_active(center: ChunkKey, k: ChunkKey) -> bool {
-        let dx = k.x - center.x;
-        let dz = k.z - center.z;
-        let dy = k.y - center.y;
-
-        dx >= -config::ACTIVE_RADIUS
-            && dx <= config::ACTIVE_RADIUS
-            && dz >= -config::ACTIVE_RADIUS
-            && dz <= config::ACTIVE_RADIUS
             && dy >= Self::y_band_min()
             && dy <= Self::y_band_max()
     }
@@ -754,7 +733,6 @@ impl ChunkManager {
                 slot,
                 node_base,
                 node_count: need,
-                macro_words: macro_words.clone(),
             }),
         );
 

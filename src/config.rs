@@ -4,7 +4,7 @@
 
 pub const CHUNK_SIZE: u32 = 64;
 
-pub const ACTIVE_RADIUS: i32 = 12;
+pub const ACTIVE_RADIUS: i32 = 3;
 pub const KEEP_RADIUS: i32 = ACTIVE_RADIUS * 2;
 
 pub const VOXEL_SIZE_M_F32: f32 = 0.10;
@@ -13,8 +13,8 @@ pub const VOXEL_SIZE_M_F64: f64 = 0.10;
 // Keep this explicit so you can change voxel size later without hunting constants.
 pub const VOXELS_PER_METER: i32 = 10; // 1.0 / 0.10
 
-pub const WORKER_THREADS: usize = 8;
-pub const MAX_IN_FLIGHT: usize = 16;
+pub const WORKER_THREADS: usize = 4;
+pub const MAX_IN_FLIGHT: usize = 8;
 
 // GPU node arena budget (storage buffer capacity).
 pub const NODE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
@@ -39,10 +39,10 @@ pub const CLIPMAP_LEVELS: u32 = 16;
 pub const CLIPMAP_LEVELS_USIZE: usize = CLIPMAP_LEVELS as usize;
 
 // Texture resolution per level (square).
-pub const CLIPMAP_RES: u32 = 256;
+pub const CLIPMAP_RES: u32 = 512;
 
 // Base cell size (meters) for level 0. Level i cell size = BASE * 2^i.
-pub const CLIPMAP_BASE_CELL_M: f32 = 0.5;
+pub const CLIPMAP_BASE_CELL_M: f32 = 0.25;
 
 // How often we allow a full refresh per level at most (seconds).
 // (Prevents thrashing if you ever tie updates to very tiny camera jitter.)
