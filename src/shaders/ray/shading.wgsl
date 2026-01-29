@@ -19,11 +19,6 @@ fn hemi_ambient(n: vec3<f32>, sky_up: vec3<f32>) -> vec3<f32> {
   return mix(grd, sky_up, upw);
 }
 
-fn hash31(p: vec3<f32>) -> f32 {
-  let h = dot(p, vec3<f32>(127.1, 311.7, 74.7));
-  return fract(sin(h) * 43758.5453);
-}
-
 fn material_variation(world_p: vec3<f32>, cell_size_m: f32) -> f32 {
   let cell = floor(world_p / cell_size_m);
   return (hash31(cell) - 0.5) * 2.0;

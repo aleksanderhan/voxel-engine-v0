@@ -51,14 +51,10 @@ fn sdf_box(p: vec3<f32>, c: vec3<f32>, b: vec3<f32>) -> f32 {
   return outside + inside;
 }
 
-fn hash13(p: vec3<f32>) -> f32 {
-  return fract(sin(dot(p, vec3<f32>(127.1, 311.7, 74.7))) * 43758.5453);
-}
-
 fn grass_root_uv(cell_id_vox: vec3<f32>, i: u32) -> vec2<f32> {
   let fi = f32(i);
-  let u = hash13(cell_id_vox + vec3<f32>(fi, 0.0, 0.0));
-  let v = hash13(cell_id_vox + vec3<f32>(0.0, fi, 0.0));
+  let u = hash31(cell_id_vox + vec3<f32>(fi, 0.0, 0.0));
+  let v = hash31(cell_id_vox + vec3<f32>(0.0, fi, 0.0));
   return vec2<f32>(u, v);
 }
 
@@ -92,7 +88,7 @@ fn grass_sdf_lod(
     return BIG_F32;
   }
 
-  let blade_len = layer_h * (0.65 + 0.35 * hash13(cell_id_vox + vec3<f32>(9.1, 3.7, 5.2)));
+  let blade_len = layer_h * (0.65 + 0.35 * hash31(cell_id_vox + vec3<f32>(9.1, 3.7, 5.2)));
 
   // Choose blade count + seg count by LOD
   var blade_count: u32 = GRASS_BLADE_COUNT;
@@ -124,7 +120,7 @@ fn grass_sdf_lod(
       cell_bmin_m.z + uz * vs
     );
 
-    let ph = hash13(cell_id_vox + vec3<f32>(f32(i) * 7.3, 1.1, 2.9));
+    let ph = hash31(cell_id_vox + vec3<f32>(f32(i) * 7.3, 1.1, 2.9));
 
     for (var s: u32 = 0u; s < segs; s = s + 1u) {
       let t01 = (f32(s) + 0.5) / max(f32(segs), 1.0);

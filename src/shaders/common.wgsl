@@ -356,9 +356,44 @@ fn chunk_coord_from_pos(p: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
 //// Hash / noise helpers (shared)
 //// --------------------------------------------------------------------------
 
+const U32_TO_F01 : f32 = 1.0 / 4294967296.0; // 2^-32
+
+fn hash_u32(x: u32) -> u32 {
+  // Murmur3 finalizer-like mix (good diffusion, cheap)
+  var v = x;
+  v ^= v >> 16u;
+  v *= 0x7feb352du;
+  v ^= v >> 15u;
+  v *= 0x846ca68bu;
+  v ^= v >> 16u;
+  return v;
+}
+
+fn hash2_u32(x: u32, y: u32) -> u32 {
+  // simple combine then mix
+  return hash_u32(x * 0x8da6b343u ^ y * 0xd8163841u);
+}
+
+// Replacement: 2D -> [0,1)
 fn hash12(p: vec2<f32>) -> f32 {
-  let h = dot(p, vec2<f32>(127.1, 311.7));
-  return fract(sin(h) * 43758.5453);
+  // Most of your callsites already pass integer-ish coordinates (floor() outputs),
+  // but this also works fine for pixel coords by flooring.
+  let ix: u32 = bitcast<u32>(i32(floor(p.x)));
+  let iy: u32 = bitcast<u32>(i32(floor(p.y)));
+  let h: u32 = hash2_u32(ix, iy);
+  return f32(h) * U32_TO_F01;
+}
+
+fn hash3_u32(x: u32, y: u32, z: u32) -> u32 {
+  return hash_u32(x * 0x8da6b343u ^ y * 0xd8163841u ^ z * 0xcb1ab31fu);
+}
+
+fn hash31(p: vec3<f32>) -> f32 {
+  let ix: u32 = bitcast<u32>(i32(floor(p.x)));
+  let iy: u32 = bitcast<u32>(i32(floor(p.y)));
+  let iz: u32 = bitcast<u32>(i32(floor(p.z)));
+  let h: u32 = hash3_u32(ix, iy, iz);
+  return f32(h) * U32_TO_F01;
 }
 
 fn value_noise(p: vec2<f32>) -> f32 {
