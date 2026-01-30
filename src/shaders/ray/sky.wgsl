@@ -3,7 +3,7 @@
 //// Sky
 //// --------------------------------------------------------------------------
 
-fn sky_color(rd: vec3<f32>) -> vec3<f32> {
+fn sky_color_base(rd: vec3<f32>) -> vec3<f32> {
   // Base vertical gradient
   let tsky = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
   var col = mix(
@@ -21,27 +21,28 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
 
   col *= SKY_EXPOSURE;
 
-  // Sun term (NO acos): work directly in mu = cos(angle)
+  // Sun term (NO acos)
   let mu = clamp(dot(rd, SUN_DIR), -1.0, 1.0);
 
-  // Sun disc/halo (kept here to avoid magic numbers in main)
   let SUN_DISC_ANGULAR_RADIUS : f32 = 0.009;
   let SUN_DISC_SOFTNESS       : f32 = 0.004;
 
-  // Convert angular edges to mu-space edges. cos() is decreasing on [0, pi],
-  // so edges are reversed for smoothstep in mu-space.
   let mu_inner = cos(SUN_DISC_ANGULAR_RADIUS);
   let mu_outer = cos(SUN_DISC_ANGULAR_RADIUS + SUN_DISC_SOFTNESS);
 
-  // Disc: 1 inside, smooth falloff over softness region
   let disc = smoothstep(mu_outer, mu_inner, mu);
 
-  // Halo: approximate exp(-ang*k) without acos using exp in (1 - mu).
-  // For small angles: 1 - mu ~= ang^2 / 2, so this gives a tight halo.
-  // Tune k_halo if you want wider/narrower.
   let k_halo = 9000.0;
   let halo = 0.15 * exp(-k_halo * max(0.0, 1.0 - mu));
 
+  col += SUN_COLOR * SUN_INTENSITY * (disc + halo);
+  return col;
+}
+
+fn sky_color(rd: vec3<f32>) -> vec3<f32> {
+  var col = sky_color_base(rd);
+
+  // Clouds only affect the rendered sky (NOT the ambient driver anymore)
   var cloud = 0.0;
 
   if (rd.y > 0.01) {
@@ -59,7 +60,7 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
 
       col *= mix(1.0, CLOUD_SKY_DARKEN, cloud);
 
-      let toward_sun = clamp(mu, 0.0, 1.0);
+      let toward_sun = clamp(dot(rd, SUN_DIR), 0.0, 1.0);
       let silver = pow(toward_sun, CLOUD_SILVER_POW) * CLOUD_SILVER_STR;
       let cloud_col = mix(CLOUD_BASE_COL, vec3<f32>(1.0), silver);
 
@@ -67,12 +68,13 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
     }
   }
 
-  var sun_term = (disc + halo);
+  // Optional: dim sun disc through clouds (keep your existing behavior)
   if (CLOUD_DIM_SUN_DISC) {
-    let Tc_view = exp(-CLOUD_ABSORB * cloud * CLOUD_SUN_DISC_ABSORB_SCALE);
-    sun_term *= Tc_view;
+    let Tc_view = exp(-CLOUD_SHADOW_ABSORB * cloud * CLOUD_SUN_DISC_ABSORB_SCALE);
+    // This scales only the sun contribution already in col; easiest is to re-add sun separately,
+    // but keep it minimal: treat Tc_view as extra darkening for very bright sun spot:
+    col = mix(col, col * Tc_view, cloud);
   }
 
-  col += SUN_COLOR * SUN_INTENSITY * sun_term;
   return col;
 }

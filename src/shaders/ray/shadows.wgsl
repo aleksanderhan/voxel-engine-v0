@@ -10,7 +10,7 @@ fn trace_chunk_shadow_trans_interval(
   t_exit: f32
 ) -> f32 {
   let voxel_size = cam.voxel_params.x;
-  let nudge_s = 0.18 * voxel_size;
+  let nudge_s = 0.20 * voxel_size;
 
   let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
   let root_bmin = root_bmin_vox * voxel_size;

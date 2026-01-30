@@ -128,7 +128,9 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>) -> ve
   let vs = cam.voxel_params.x;
   let hp_shadow  = hp + hg.n * (0.75 * vs);
 
-  let vis  = sun_transmittance(hp_shadow, SUN_DIR);
+  let Tc  = cloud_sun_transmittance(hp_shadow, SUN_DIR);
+  let vis_geom = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
+
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
   let ao = select(1.0, voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base), hg.hit != 0u);
@@ -145,8 +147,6 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>) -> ve
     dapple = 0.90 + 0.10 * (0.6 * d0 + 0.4 * d1);
   }
 
-  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis * dapple;
-
   let v = normalize(-rd);
   let h = normalize(v + SUN_DIR);
 
@@ -160,7 +160,8 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>) -> ve
   let f0   = material_f0(hg.mat);
   let fres = fresnel_schlick(ndv, f0);
 
-  let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis;
+  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis_geom * Tc * dapple;
+  let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis_geom * Tc;
 
   return base * (ambient + direct) + 0.20 * spec_col;
 }

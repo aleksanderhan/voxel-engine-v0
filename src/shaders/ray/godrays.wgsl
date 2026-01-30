@@ -80,7 +80,7 @@ fn godray_integrate_5(
     if (Tv < GODRAY_TV_CUTOFF) { break; }
 
     let Ts_geom = sun_transmittance_geom_only(p, SUN_DIR);
-    let Tc      = cloud_sun_transmittance(p, SUN_DIR);
+    let Tc      = cloud_sun_transmittance_fast(p, SUN_DIR);
 
     let Tc_vol  = mix(1.0, Tc, CLOUD_GODRAY_W);
     let Ts_soft = pow(clamp(Ts_geom, 0.0, 1.0), 0.75);

@@ -46,7 +46,7 @@ const SHADOW_STEPS : u32 = 32u;
 const SHADOW_DISPLACED_LEAVES : bool = false;
 const VOLUME_DISPLACED_LEAVES : bool = true;
 
-const VSM_STEPS            : u32 = 24u;
+const VSM_STEPS            : u32 = 16u;
 const LEAF_LIGHT_TRANSMIT  : f32 = 0.50;
 const GRASS_LIGHT_TRANSMIT : f32 = 0.70;
 const MIN_TRANS            : f32 = 0.03;
@@ -117,8 +117,13 @@ const CLOUD_SOFTNESS : f32 = 0.10;
 const CLOUD_HORIZON_Y0 : f32 = 0.02;
 const CLOUD_HORIZON_Y1 : f32 = 0.25;
 
-const CLOUD_SKY_DARKEN : f32 = 0.35;
-const CLOUD_ABSORB     : f32 = 8.0;
+// How clouds darken the SKY appearance (keep low)
+const CLOUD_SKY_DARKEN : f32 = 0.04;
+
+// How much clouds attenuate SUNLIGHT hitting the world (can be much higher)
+const CLOUD_SHADOW_ABSORB   : f32 = 4.0;   // try 4..12
+const CLOUD_SHADOW_STRENGTH : f32 = 0.8;   // 0..1 (mix control)
+
 
 const CLOUD_BASE_COL   : vec3<f32> = vec3<f32>(0.72, 0.74, 0.76);
 const CLOUD_SILVER_POW : f32       = 8.0;
@@ -184,7 +189,7 @@ const POST_EXPOSURE : f32 = 0.15;
 
 const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.20;
 const GRASS_BLADE_COUNT           : u32 = 2u;
-const GRASS_TRACE_STEPS           : u32 = 10u;
+const GRASS_TRACE_STEPS           : u32 = 7u;
 const GRASS_HIT_EPS_VOX           : f32 = 0.02;
 const GRASS_STEP_MIN_VOX          : f32 = 0.03;
 
@@ -204,8 +209,8 @@ const GRASS_BLADE_COUNT_FAR : u32 = 1u;
 const GRASS_SEGS_MID : u32 = 2u;
 const GRASS_SEGS_FAR : u32 = 1u;
 
-const GRASS_TRACE_STEPS_MID : u32 = 12u;
-const GRASS_TRACE_STEPS_FAR : u32 = 8u;
+const GRASS_TRACE_STEPS_MID : u32 = 6u;
+const GRASS_TRACE_STEPS_FAR : u32 = 4u;
 
 //// --------------------------------------------------------------------------
 //// GPU structs (must match Rust layouts)

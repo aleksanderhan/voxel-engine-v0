@@ -28,7 +28,7 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px, res);
   let sky = sky_color(rd);
-  let sky_up = sky_color(vec3<f32>(0.0, 1.0, 0.0));
+  let sky_up = sky_color_base(vec3<f32>(0.0, 1.0, 0.0));
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
 
