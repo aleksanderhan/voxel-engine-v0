@@ -1,2007 +1,1384 @@
-// src/app/mod.rs
-// --------------
-// src/app/mod.rs
-// --------------
-//
-// Clipmap fix (A): encode clipmap texture patches + clipmap uniform update
-// into the SAME command encoder, BEFORE the compute pass.
-//
-// This prevents uniforms (origin/offset) from getting ahead of the texture uploads.
+// src/streaming/manager.rs
+// ------------------------
+// src/streaming/manager.rs
+// ------------------------
+// Chunk streaming + background SVO building + CPU cache.
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::VecDeque;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use winit::{
-    event::*,
-    event_loop::{ControlFlow, EventLoop},
-    window::Window,
+use std::mem::size_of;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
+use glam::{Vec2, Vec3};
+
 use crate::{
-    camera::Camera,
-    clipmap::Clipmap,
     config,
-    input::InputState,
-    render::{CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
-    streaming::ChunkManager,
+    render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu},
+    svo::{build_chunk_svo_sparse_cancelable_with_scratch, BuildScratch},
     world::WorldGen,
 };
 
-pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
-    let mut app = App::new(window).await;
+use super::NodeArena;
 
-    event_loop
-        .run(move |event, elwt| {
-            elwt.set_control_flow(ControlFlow::Wait);
+const INVALID_U32: u32 = 0xFFFF_FFFF;
 
-            match &event {
-                Event::AboutToWait => {
-                    app.window.request_redraw();
+// Vertical band dy in [-1..=2]
+const GRID_Y_MIN_DY: i32 = -1;
+const GRID_Y_COUNT: u32 = 4;
+
+const EVICT_ATTEMPTS: usize = 8;
+
+// 8^3 bits = 512 bits = 16 u32
+const MACRO_WORDS_PER_CHUNK: u32 = 16;
+const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
+
+// 64x64 columns, packed 2x u16 per u32 => 2048 u32 per chunk
+const COLINFO_WORDS_PER_CHUNK: u32 = 2048;
+const COLINFO_WORDS_PER_CHUNK_USIZE: usize = 2048;
+
+const MAX_UPLOADS_PER_FRAME: usize = 8;            // start 6–12
+const MAX_UPLOAD_BYTES_PER_FRAME: usize = 4 << 20; // start 2–8 MB
+
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+struct ChunkKey {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+enum ChunkState {
+    Queued,
+    Building,
+    Uploading(Uploading),
+    Resident(Resident),
+}
+
+#[derive(Clone, Debug)]
+struct Uploading {
+    slot: u32,
+    node_base: u32,
+    node_count: u32,
+    uploaded: bool,
+}
+
+
+#[derive(Clone, Debug)]
+struct Resident {
+    slot: u32,
+    node_base: u32,
+    node_count: u32,
+}
+
+#[derive(Clone, Debug)]
+struct BuildJob {
+    key: ChunkKey,
+    cancel: Arc<AtomicBool>,
+}
+
+struct BuildDone {
+    key: ChunkKey,
+    cancel: Arc<AtomicBool>,
+    canceled: bool,
+    nodes: Vec<NodeGpu>,
+    macro_words: Vec<u32>,
+    ropes: Vec<NodeRopesGpu>,
+    colinfo_words: Vec<u32>,
+}
+
+pub struct ChunkUpload {
+    pub key: ChunkKey,
+    pub slot: u32,
+    pub meta: ChunkMetaGpu,
+
+    pub node_base: u32,
+    pub nodes: Arc<[NodeGpu]>,
+
+    pub macro_words: Arc<[u32]>,
+
+    pub ropes: Arc<[NodeRopesGpu]>,
+
+    pub colinfo_words: Arc<[u32]>,
+
+    pub completes_residency: bool,
+}
+
+// -----------------------------
+// CPU cache (budgeted, LRU-ish)
+// -----------------------------
+
+#[derive(Clone)]
+struct CachedChunk {
+    nodes: Arc<[NodeGpu]>,
+    ropes: Arc<[NodeRopesGpu]>,
+    macro_words: Arc<[u32]>,
+    colinfo_words: Arc<[u32]>,
+    bytes: usize,
+    stamp: u64,
+}
+
+fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender<BuildDone>) {
+    for _ in 0..config::WORKER_THREADS {
+        let gen = gen.clone();
+        let rx_job = rx_job.clone();
+        let tx_done = tx_done.clone();
+
+        std::thread::spawn(move || {
+            let mut scratch = BuildScratch::new();
+
+            while let Ok(job) = rx_job.recv() {
+                let k = job.key;
+
+                if job.cancel.load(Ordering::Relaxed) {
+                    let _ = tx_done.send(BuildDone {
+                        key: k,
+                        cancel: job.cancel,
+                        canceled: true,
+                        nodes: Vec::new(),
+                        macro_words: Vec::new(),
+                        ropes: Vec::new(),
+                        colinfo_words: Vec::new()
+                    });
+                    continue;
                 }
-                Event::WindowEvent {
-                    event: WindowEvent::RedrawRequested,
-                    ..
-                } => {
-                    app.frame(elwt);
-                }
-                _ => {
-                    app.handle_event(event, elwt);
-                }
+
+                let origin = [
+                    k.x * config::CHUNK_SIZE as i32,
+                    k.y * config::CHUNK_SIZE as i32,
+                    k.z * config::CHUNK_SIZE as i32,
+                    0,
+                ];
+
+                let (nodes, macro_words, ropes, colinfo_words) = build_chunk_svo_sparse_cancelable_with_scratch(
+                    &gen,
+                    [origin[0], origin[1], origin[2]],
+                    config::CHUNK_SIZE,
+                    job.cancel.as_ref(),
+                    &mut scratch,
+                );
+
+                let canceled = job.cancel.load(Ordering::Relaxed);
+                let (nodes, macro_words, ropes) = if canceled {
+                    (Vec::new(), Vec::new(), Vec::new())
+                } else {
+                    (nodes, macro_words, ropes)
+                };
+
+                let _ = tx_done.send(BuildDone {
+                    key: k,
+                    cancel: job.cancel,
+                    canceled,
+                    nodes,
+                    macro_words,
+                    ropes,
+                    colinfo_words
+                });
             }
-        })
-        .unwrap();
+        });
+    }
 }
 
-pub struct App {
-    window: Arc<Window>,
-    start_time: Instant,
+fn sort_queue_near_first(queue: &mut VecDeque<ChunkKey>, center: ChunkKey, cam_fwd: Vec3) {
+    let mut v: Vec<ChunkKey> = queue.drain(..).collect();
 
-    _instance: wgpu::Instance,
-    surface: wgpu::Surface<'static>,
-    _adapter: wgpu::Adapter,
-    _surface_format: wgpu::TextureFormat,
-    config: wgpu::SurfaceConfiguration,
+    let mut f = Vec2::new(cam_fwd.x, cam_fwd.z);
+    if f.length_squared() > 1e-6 {
+        f = f.normalize();
+    } else {
+        f = Vec2::ZERO;
+    }
 
-    renderer: Renderer,
+    v.sort_by(|a, b| {
+        let sa = chunk_priority_score(*a, center, f);
+        let sb = chunk_priority_score(*b, center, f);
+        sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    world: Arc<WorldGen>,
-    chunks: ChunkManager,
-
-    clipmap: Clipmap,
-
-    input: InputState,
-    camera: Camera,
-
-    fps_value: u32,
-    fps_frames: u32,
-    fps_last: Instant,
-
-    frame_index: u32,
+    queue.extend(v);
 }
 
-impl App {
-    pub async fn new(window: Arc<Window>) -> Self {
-        let start_time = Instant::now();
-        let size = window.inner_size();
+fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
+    let dx = (k.x - c.x) as f32;
+    let dz = (k.z - c.z) as f32;
+    let dy = (k.y - c.y) as f32;
 
-        let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window.clone()).unwrap();
+    let base = dx.abs() + dz.abs() + 2.0 * dy.abs();
+    let dir = dx * fwd_xz.x + dz * fwd_xz.y;
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&surface),
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-            })
-            .await
-            .unwrap();
+    let front_bonus = 0.75;
+    let behind_penalty = 0.25;
 
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps.formats[0];
+    let bias = if dir >= 0.0 {
+        -front_bonus * dir
+    } else {
+        -behind_penalty * dir
+    };
 
-        let config_sc = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: surface_caps.present_modes[0],
-            alpha_mode: surface_caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
+    base + bias
+}
 
-        let renderer =
-            Renderer::new(&adapter, surface_format, config_sc.width, config_sc.height).await;
+pub struct ChunkManager {
+    chunks: HashMap<ChunkKey, ChunkState>,
+    build_queue: VecDeque<ChunkKey>,
+    queued_set: HashSet<ChunkKey>,
+    last_center: Option<ChunkKey>,
 
-        surface.configure(renderer.device(), &config_sc);
+    cancels: HashMap<ChunkKey, Arc<AtomicBool>>,
 
-        let world = Arc::new(WorldGen::new(12345));
-        let chunks = ChunkManager::new(world.clone());
+    tx_job: Sender<BuildJob>,
+    rx_done: Receiver<BuildDone>,
+    in_flight: usize,
 
-        let camera = Camera::new(config_sc.width as f32 / config_sc.height as f32);
-        let input = InputState::default();
+    slot_to_key: Vec<ChunkKey>,
+    chunk_meta: Vec<ChunkMetaGpu>,
+    uploads: VecDeque<ChunkUpload>,
 
-        let clipmap = Clipmap::new();
+    changed: bool,
+    grid_dirty: bool,
+
+    arena: NodeArena,
+
+    grid_origin_chunk: [i32; 3],
+    grid_dims: [u32; 3],
+    chunk_grid: Vec<u32>,
+
+    cache: HashMap<ChunkKey, CachedChunk>,
+    cache_lru: VecDeque<(ChunkKey, u64)>,
+    cache_stamp: u64,
+    cache_bytes: usize,
+
+    active_offsets: Vec<(i32, i32, i32)>,
+    to_unload: Vec<ChunkKey>,
+
+    slot_macro: Vec<Arc<[u32]>>,
+    slot_colinfo: Vec<Arc<[u32]>>,
+
+    resident_slots: usize,
+
+    col_ground_cy: Vec<i32>,
+}
+
+impl ChunkManager {
+    pub fn new(gen: Arc<WorldGen>) -> Self {
+        let cap = (config::MAX_IN_FLIGHT * 2).max(8);
+
+        let (tx_job, rx_job) = bounded::<BuildJob>(cap);
+        let (tx_done, rx_done) = bounded::<BuildDone>(cap);
+
+        spawn_workers(gen.clone(), rx_job, tx_done);
+
+        let node_capacity = (config::NODE_BUDGET_BYTES / size_of::<NodeGpu>()) as u32;
+
+        let nx = (2 * config::KEEP_RADIUS + 1) as u32;
+        let nz = nx;
+        let ny = GRID_Y_COUNT;
+        let grid_len = (nx * ny * nz) as usize;
+
+        let active_offsets = Self::build_offsets(config::ACTIVE_RADIUS);
 
         Self {
-            window,
-            start_time,
-            _instance: instance,
-            surface,
-            _adapter: adapter,
-            _surface_format: surface_format,
-            config: config_sc,
-            renderer,
-            world,
-            chunks,
-            clipmap,
-            input,
-            camera,
-            fps_value: 0,
-            fps_frames: 0,
-            fps_last: Instant::now(),
-            frame_index: 0,
+            chunks: HashMap::default(),
+            build_queue: VecDeque::new(),
+            queued_set: HashSet::default(),
+            last_center: None,
+
+            cancels: HashMap::default(),
+            tx_job,
+            rx_done,
+            in_flight: 0,
+
+            slot_to_key: Vec::new(),
+            chunk_meta: Vec::new(),
+            uploads: VecDeque::new(),
+
+            changed: false,
+            grid_dirty: true,
+
+            arena: NodeArena::new(node_capacity),
+
+            grid_origin_chunk: [0, 0, 0],
+            grid_dims: [nx, ny, nz],
+            chunk_grid: vec![INVALID_U32; grid_len],
+
+            cache: HashMap::default(),
+            cache_lru: VecDeque::default(),
+            cache_stamp: 1,
+            cache_bytes: 0,
+
+            active_offsets,
+            to_unload: Vec::new(),
+
+            slot_macro: Vec::new(),
+            slot_colinfo: Vec::new(),
+
+            resident_slots: 0,
+
+            col_ground_cy: Vec::new(),
         }
     }
 
-    pub fn handle_event(
-        &mut self,
-        event: Event<()>,
-        elwt: &winit::event_loop::EventLoopWindowTarget<()>,
-    ) {
-        match event {
-            Event::DeviceEvent { event, .. } => {
-                self.input.on_device_event(&event);
+    #[inline]
+    fn build_offsets(radius: i32) -> Vec<(i32, i32, i32)> {
+        let mut v = Vec::new();
+        v.reserve(
+            (GRID_Y_COUNT as usize)
+                * ((2 * radius + 1) as usize)
+                * ((2 * radius + 1) as usize),
+        );
+
+        for dy in GRID_Y_MIN_DY..=(GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1) {
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    v.push((dx, dy, dz));
+                }
             }
+        }
+        v
+    }
 
-            Event::WindowEvent { event, .. } => {
-                let _ = self.input.on_window_event(&event, &self.window);
+    #[inline(always)]
+    fn y_band_min() -> i32 {
+        GRID_Y_MIN_DY
+    }
 
-                match event {
-                    WindowEvent::CloseRequested => elwt.exit(),
+    #[inline(always)]
+    fn y_band_max() -> i32 {
+        GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1
+    }
 
-                    WindowEvent::Resized(new_size) => {
-                        self.config.width = new_size.width.max(1);
-                        self.config.height = new_size.height.max(1);
+    #[inline(always)]
+    fn in_keep(&self, center: ChunkKey, k: ChunkKey) -> bool {
+        let dx = k.x - center.x;
+        let dz = k.z - center.z;
 
-                        self.surface.configure(self.renderer.device(), &self.config);
-                        self.renderer
-                            .resize_output(self.config.width, self.config.height);
+        if dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS { return false; }
+        if dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS { return false; }
 
-                        // IMPORTANT: the resize recreated clip_height, so force reupload next frame
-                        self.clipmap.invalidate_all();
+        let Some(ground_cy) = self.ground_cy_for_column(k.x, k.z) else {
+            return false; // outside cached area
+        };
+
+        let dy = k.y - ground_cy;
+        dy >= Self::y_band_min() && dy <= Self::y_band_max()
+    }
+
+    pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
+        // --- camera -> chunk center (x,z) and "ground-based" center.y ---
+        let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
+        let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
+
+        let ccx = cam_vx.div_euclid(config::CHUNK_SIZE as i32);
+        let ccz = cam_vz.div_euclid(config::CHUNK_SIZE as i32);
+
+        let ground_y_vox = world.ground_height(cam_vx, cam_vz);
+        let ground_cy = ground_y_vox.div_euclid(config::CHUNK_SIZE as i32);
+
+        let center = ChunkKey { x: ccx, y: ground_cy, z: ccz };
+
+        // --- ensure column-height cache is built BEFORE anyone indexes it ---
+        let new_origin = self.keep_origin_for(center);
+        let origin_changed = self.col_ground_cy.is_empty() || new_origin != self.grid_origin_chunk;
+
+        if origin_changed {
+            self.grid_origin_chunk = new_origin; // bounds used by ground_cy_for_column()
+            self.rebuild_column_ground(world.as_ref(), center);
+            self.grid_dirty = true; // keep-origin move implies grid needs rebuild
+        }
+
+        // --- ACTIVE: enqueue/restore chunks around the camera ---
+        let n_active = self.active_offsets.len();
+        for i in 0..n_active {
+            let (dx, dy, dz) = self.active_offsets[i];
+
+            let x = center.x + dx;
+            let z = center.z + dz;
+
+            // use cached column ground height
+            let ground_cy_col = self.ground_cy_for_column(x, z).unwrap_or(center.y);
+
+            let k = ChunkKey {
+                x,
+                y: ground_cy_col + dy,
+                z,
+            };
+
+            match self.chunks.get(&k) {
+                Some(ChunkState::Resident(_))
+                | Some(ChunkState::Uploading(_))
+                | Some(ChunkState::Queued)
+                | Some(ChunkState::Building) => {
+                    // already exists / in progress
+                }
+                None => {
+                    if self.cache.get(&k).is_some() {
+                        let _ = self.try_promote_from_cache(center, k);
+                        continue;
                     }
 
-                    _ => {}
+                    let c = self.cancel_token(k);
+                    c.store(false, Ordering::Relaxed);
+
+                    self.chunks.insert(k, ChunkState::Queued);
+
+                    if self.queued_set.insert(k) {
+                        self.build_queue.push_back(k);
+                    }
+                }
+            }
+        }
+
+        // --- Unload outside KEEP (cheap now: uses cached ground heights) ---
+        self.to_unload.clear();
+        for &k in self.chunks.keys() {
+            if !self.in_keep(center, k) {
+                self.to_unload.push(k);
+            }
+        }
+
+        let mut unload_list = std::mem::take(&mut self.to_unload);
+        for k in unload_list.drain(..) {
+            self.unload_chunk(k);
+        }
+        self.to_unload = unload_list;
+
+        // --- handle center change (queue cleanup + resort) ---
+        let center_changed = self.last_center.map_or(true, |c| c != center);
+        if center_changed {
+            self.last_center = Some(center);
+
+            // retain only queued + still in keep, WITHOUT panicking on cache
+            let origin = self.grid_origin_chunk; // Copy
+            let nx = (2 * config::KEEP_RADIUS + 1) as i32;
+
+            self.build_queue.retain(|k| {
+                // still queued?
+                if !matches!(self.chunks.get(k), Some(ChunkState::Queued)) {
+                    return false;
+                }
+
+                // keep-radius check
+                let dx = k.x - center.x;
+                let dz = k.z - center.z;
+                if dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS {
+                    return false;
+                }
+                if dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS {
+                    return false;
+                }
+
+                // column cache lookup (safe)
+                let ix = k.x - origin[0];
+                let iz = k.z - origin[2];
+                if ix < 0 || iz < 0 || ix >= nx || iz >= nx {
+                    return false;
+                }
+
+                let idx = (iz * nx + ix) as usize;
+                let Some(ground_cy) = self.col_ground_cy.get(idx).copied() else {
+                    return false;
+                };
+
+                let dy = k.y - ground_cy;
+                dy >= Self::y_band_min() && dy <= Self::y_band_max()
+            });
+
+            self.queued_set.clear();
+            self.queued_set.extend(self.build_queue.iter().copied());
+
+            sort_queue_near_first(&mut self.build_queue, center, cam_fwd);
+        }
+
+        // --- Dispatch builds ---
+        while self.in_flight < config::MAX_IN_FLIGHT {
+            let Some(k) = self.build_queue.pop_front() else { break; };
+            self.queued_set.remove(&k);
+
+            if !self.in_keep(center, k) {
+                self.cancel_token(k).store(true, Ordering::Relaxed);
+                self.chunks.remove(&k);
+                continue;
+            }
+
+            if self.cache.get(&k).is_some() {
+                self.chunks.remove(&k);
+                let _ = self.try_promote_from_cache(center, k);
+                continue;
+            }
+
+            if matches!(self.chunks.get(&k), Some(ChunkState::Queued)) {
+                self.chunks.insert(k, ChunkState::Building);
+
+                let cancel = self.cancel_token(k);
+                cancel.store(false, Ordering::Relaxed);
+
+                match self.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone() }) {
+                    Ok(()) => {
+                        self.in_flight += 1;
+                    }
+
+                    Err(TrySendError::Full(_job)) => {
+                        self.chunks.insert(k, ChunkState::Queued);
+                        // retry next frame
+                        self.build_queue.push_front(k);
+                        self.queued_set.insert(k);
+                        break;
+                    }
+
+                    Err(TrySendError::Disconnected(_job)) => {
+                        self.chunks.insert(k, ChunkState::Queued);
+                        self.build_queue.push_front(k);
+                        self.queued_set.insert(k);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // --- Harvest done builds (bounded per frame) ---
+        const MAX_DONE_PER_FRAME: usize = 16;
+
+        let mut done_count = 0usize;
+        while done_count < MAX_DONE_PER_FRAME {
+            let Ok(done) = self.rx_done.try_recv() else { break; };
+            done_count += 1;
+
+            if self.in_flight > 0 {
+                self.in_flight -= 1;
+            }
+
+            // Drop stale completions (job from an old cancel token)
+            let Some(cur_cancel) = self.cancels.get(&done.key) else {
+                continue;
+            };
+            if !Arc::ptr_eq(cur_cancel, &done.cancel) {
+                continue;
+            }
+
+            if done.canceled || done.cancel.load(Ordering::Relaxed) {
+                self.chunks.remove(&done.key);
+                continue;
+            }
+
+            if !self.in_keep(center, done.key) {
+                self.cancel_token(done.key).store(true, Ordering::Relaxed);
+                self.chunks.remove(&done.key);
+                continue;
+            }
+
+            self.on_build_done(
+                center,
+                done.key,
+                done.nodes,
+                done.macro_words,
+                done.ropes,
+                done.colinfo_words,
+            );
+        }
+
+        // --- Grid rebuild if needed ---
+        let grid_changed = self.grid_dirty;
+        if self.grid_dirty {
+            self.rebuild_grid(center);
+            self.grid_dirty = false;
+        }
+
+        grid_changed
+    }
+
+   
+    fn cancel_token(&mut self, key: ChunkKey) -> Arc<AtomicBool> {
+        self.cancels
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    fn evict_one_farthest(&mut self, center: ChunkKey, protect: ChunkKey) -> bool {
+        if self.slot_to_key.is_empty() {
+            return false;
+        }
+
+        let mut best: Option<(f32, ChunkKey)> = None;
+        for &k in &self.slot_to_key {
+            if k == protect {
+                continue;
+            }
+            let dx = (k.x - center.x) as f32;
+            let dz = (k.z - center.z) as f32;
+            let dy = (k.y - center.y) as f32;
+
+            let d = dx * dx + dz * dz + 4.0 * dy * dy;
+
+            if best.map_or(true, |(bd, _)| d > bd) {
+                best = Some((d, k));
+            }
+        }
+
+        if let Some((_, k)) = best {
+            self.unload_chunk(k);
+            return true;
+        }
+
+        false
+    }
+
+    // ----------------
+    // Cache helpers
+    // ----------------
+
+    fn cache_touch(&mut self, key: ChunkKey) {
+        if let Some(e) = self.cache.get_mut(&key) {
+            self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
+            e.stamp = self.cache_stamp;
+            self.cache_lru.push_back((key, e.stamp));
+            self.maybe_compact_lru();
+        }
+    }
+
+    fn maybe_compact_lru(&mut self) {
+        // heuristic: if the lru list is way bigger than cache, rebuild it
+        let max = self.cache.len().saturating_mul(8).max(1024);
+        if self.cache_lru.len() <= max {
+            return;
+        }
+
+        let mut new = VecDeque::with_capacity(self.cache.len());
+        for (k, e) in self.cache.iter() {
+            new.push_back((*k, e.stamp));
+        }
+        self.cache_lru = new;
+    }
+
+
+    fn cache_put(
+        &mut self,
+        key: ChunkKey,
+        nodes: Arc<[NodeGpu]>,
+        macro_words: Arc<[u32]>,
+        ropes: Arc<[NodeRopesGpu]>,
+        colinfo_words: Arc<[u32]>,
+    ) {
+        if let Some(old) = self.cache.remove(&key) {
+            self.cache_bytes = self.cache_bytes.saturating_sub(old.bytes);
+        }
+
+        self.cache_stamp = self.cache_stamp.wrapping_add(1).max(1);
+        let stamp = self.cache_stamp;
+
+        let bytes =
+            nodes.len() * size_of::<NodeGpu>()
+            + ropes.len() * size_of::<NodeRopesGpu>()
+            + macro_words.len() * size_of::<u32>()
+            + colinfo_words.len() * size_of::<u32>();
+
+        self.cache.insert(
+            key,
+            CachedChunk {
+                nodes,
+                ropes,
+                macro_words,
+                colinfo_words,
+                bytes,
+                stamp,
+            },
+        );
+
+        self.cache_bytes = self.cache_bytes.saturating_add(bytes);
+        self.cache_lru.push_back((key, stamp));
+
+        self.evict_cache_as_needed();
+    }
+
+    fn evict_cache_as_needed(&mut self) {
+        let budget = config::CHUNK_CACHE_BUDGET_BYTES;
+
+        while self.cache_bytes > budget {
+            let Some((k, stamp)) = self.cache_lru.pop_front() else { break; };
+
+            let should_evict = self
+                .cache
+                .get(&k)
+                .map(|e| e.stamp == stamp)
+                .unwrap_or(false);
+
+            if !should_evict {
+                continue;
+            }
+
+            if let Some(ev) = self.cache.remove(&k) {
+                self.cache_bytes = self.cache_bytes.saturating_sub(ev.bytes);
+            }
+        }
+    }
+
+    // -------------------------------
+    // Resident creation / promotion
+    // -------------------------------
+
+    fn try_make_uploading(
+        &mut self,
+        center: ChunkKey,
+        key: ChunkKey,
+        nodes: Arc<[NodeGpu]>,
+        macro_words: Arc<[u32]>,
+        ropes: Arc<[NodeRopesGpu]>,
+        colinfo_words: Arc<[u32]>,
+    ) -> bool {
+        if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
+            return true;
+        }
+        
+        let need = nodes.len() as u32;
+        if need == 0 {
+            self.chunks.remove(&key);
+            return false;
+        }
+        if macro_words.len() != MACRO_WORDS_PER_CHUNK_USIZE {
+            self.chunks.remove(&key);
+            return false;
+        }
+        if ropes.len() != nodes.len() {
+            self.chunks.remove(&key);
+            return false;
+        }
+        if colinfo_words.len() != COLINFO_WORDS_PER_CHUNK_USIZE {
+            self.chunks.remove(&key);
+            return false;
+        }
+
+        let mut node_base = self.arena.alloc(need);
+        if node_base.is_none() {
+            for _ in 0..EVICT_ATTEMPTS {
+                if !self.evict_one_farthest(center, key) {
+                    break;
+                }
+                node_base = self.arena.alloc(need);
+                if node_base.is_some() {
+                    break;
+                }
+            }
+        }
+
+        let Some(node_base) = node_base else {
+            self.chunks.remove(&key);
+            return false;
+        };
+
+        let slot = self.slot_to_key.len() as u32;
+        self.slot_to_key.push(key);
+
+        self.slot_macro.push(macro_words.clone());
+        self.slot_colinfo.push(colinfo_words.clone());
+
+        let macro_base = slot * MACRO_WORDS_PER_CHUNK;
+
+        let origin_vox = [
+            key.x * config::CHUNK_SIZE as i32,
+            key.y * config::CHUNK_SIZE as i32,
+            key.z * config::CHUNK_SIZE as i32,
+        ];
+
+        let colinfo_base = slot * COLINFO_WORDS_PER_CHUNK;
+
+        let meta = ChunkMetaGpu {
+            origin: [origin_vox[0], origin_vox[1], origin_vox[2], 0],
+            node_base,
+            node_count: need,
+            macro_base,
+            colinfo_base,
+        };
+
+        self.chunk_meta.push(meta);
+
+        self.chunks.insert(
+            key,
+            ChunkState::Uploading(Uploading { slot, node_base, node_count: need, uploaded: false }),
+        );
+
+        self.uploads.push_back(ChunkUpload {
+            key,
+            slot,
+            meta,
+            node_base,
+            nodes,
+            macro_words,
+            ropes,
+            colinfo_words,
+            completes_residency: true,
+        });
+
+        true
+    }
+
+    fn try_promote_from_cache(&mut self, center: ChunkKey, key: ChunkKey) -> bool {
+        let (nodes, macro_words, ropes) = match self.cache.get(&key) {
+            Some(e) => (e.nodes.clone(), e.macro_words.clone(), e.ropes.clone()),
+            None => return false,
+        };
+        let (nodes, macro_words, ropes, colinfo_words) = match self.cache.get(&key) {
+            Some(e) => (e.nodes.clone(), e.macro_words.clone(), e.ropes.clone(), e.colinfo_words.clone()),
+            None => return false,
+        };
+
+        self.cache_touch(key);
+        self.try_make_uploading(center, key, nodes, macro_words, ropes, colinfo_words)
+    }
+
+    fn on_build_done(
+        &mut self,
+        center: ChunkKey,
+        key: ChunkKey,
+        nodes: Vec<NodeGpu>,
+        macro_words: Vec<u32>,
+        ropes: Vec<NodeRopesGpu>,
+        colinfo_words: Vec<u32>
+    ) {
+        if let Some(c) = self.cancels.get(&key) {
+            if c.load(Ordering::Relaxed) {
+                self.chunks.remove(&key);
+                return;
+            }
+        }
+
+        let nodes_arc: Arc<[NodeGpu]> = nodes.into();
+        let macro_arc: Arc<[u32]> = macro_words.into();
+        let ropes_arc: Arc<[NodeRopesGpu]> = ropes.into();
+        let colinfo_arc: Arc<[u32]> = colinfo_words.into();
+
+        self.cache_put(key, nodes_arc.clone(), macro_arc.clone(), ropes_arc.clone(), colinfo_arc.clone());
+
+        if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
+            return;
+        }
+
+        let ok = self.try_make_uploading(center, key, nodes_arc, macro_arc, ropes_arc, colinfo_arc);
+        if !ok {
+            self.chunks.remove(&key);
+        }
+    }
+
+    #[inline]
+    fn enqueue_slot_rewrite(&mut self, slot: usize) {
+        // Rewrite meta + per-slot macro/colinfo at the NEW slot offsets.
+        // High priority: push_front so budgeting doesn't delay correctness-critical remaps.
+        let key = self.slot_to_key[slot];
+        let slot_u32 = slot as u32;
+
+        self.uploads.push_front(ChunkUpload {
+            key,
+            slot: slot_u32,
+            meta: self.chunk_meta[slot],
+            node_base: 0,
+            nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
+            macro_words: self.slot_macro[slot].clone(),
+            ropes: Arc::<[NodeRopesGpu]>::from(Vec::<NodeRopesGpu>::new()),
+            colinfo_words: self.slot_colinfo[slot].clone(),
+            completes_residency: false,
+        });
+    }
+
+    #[inline]
+    fn swap_slots(&mut self, a: usize, b: usize) {
+        if a == b {
+            return;
+        }
+
+        let ka = self.slot_to_key[a];
+        let kb = self.slot_to_key[b];
+
+        // Swap CPU slot ownership
+        self.slot_to_key.swap(a, b);
+        self.chunk_meta.swap(a, b);
+        self.slot_macro.swap(a, b);
+        self.slot_colinfo.swap(a, b);
+
+        // Fix per-slot bases in meta for BOTH slots
+        self.chunk_meta[a].macro_base = (a as u32) * MACRO_WORDS_PER_CHUNK;
+        self.chunk_meta[a].colinfo_base = (a as u32) * COLINFO_WORDS_PER_CHUNK;
+        self.chunk_meta[b].macro_base = (b as u32) * MACRO_WORDS_PER_CHUNK;
+        self.chunk_meta[b].colinfo_base = (b as u32) * COLINFO_WORDS_PER_CHUNK;
+
+        // Update state.slot for BOTH chunks
+        if let Some(st) = self.chunks.get_mut(&ka) {
+            match st {
+                ChunkState::Resident(r) => r.slot = b as u32,
+                ChunkState::Uploading(u) => u.slot = b as u32,
+                _ => {}
+            }
+        }
+        if let Some(st) = self.chunks.get_mut(&kb) {
+            match st {
+                ChunkState::Resident(r) => r.slot = a as u32,
+                ChunkState::Uploading(u) => u.slot = a as u32,
+                _ => {}
+            }
+        }
+    }
+
+    fn unload_chunk(&mut self, key: ChunkKey) {
+        let Some(state) = self.chunks.remove(&key) else { return; };
+
+        match state {
+            ChunkState::Resident(res) => {
+                // Free node arena allocation
+                self.arena.free(res.node_base, res.node_count);
+
+                let dead = res.slot as usize;
+
+                // --- Step 1: keep resident prefix dense ---
+                // Swap dead resident slot with last resident slot.
+                let last_res = self.resident_slots.saturating_sub(1);
+                debug_assert!(dead < self.resident_slots, "resident slot out of prefix");
+
+                if dead != last_res {
+                    self.swap_slots(dead, last_res);
+
+                    // dead now holds a DIFFERENT resident chunk; rewrite it immediately
+                    self.enqueue_slot_rewrite(dead);
+                }
+
+                // Removed resident is now sitting at `last_res` (which is about to become uploading boundary)
+                self.resident_slots = last_res;
+
+                // --- Step 2: remove physical slot entry (compact arrays) ---
+                let remove_idx = last_res;
+                let last_slot = self.slot_to_key.len().saturating_sub(1);
+
+                if remove_idx != last_slot {
+                    // This may swap with an Uploading slot. That's OK because swap_slots()
+                    // also retargets any pending uploads.
+                    self.swap_slots(remove_idx, last_slot);
+
+                    // remove_idx now holds the moved chunk (resident or uploading); if it's resident, it
+                    // must be correct immediately; if it's uploading, rewrite is still fine (and cheap).
+                    self.enqueue_slot_rewrite(remove_idx);
+                }
+
+                // Drop the last slot
+                self.slot_to_key.pop();
+                self.chunk_meta.pop();
+                self.slot_macro.pop();
+                self.slot_colinfo.pop();
+
+                self.grid_dirty = true;
+                self.changed = true;
+            }
+
+            ChunkState::Uploading(up) => {
+                // Uploading chunks also allocated arena + slots. They may still have pending uploads.
+                self.arena.free(up.node_base, up.node_count);
+
+                let dead = up.slot as usize;
+
+                // Uploading slots should be outside the resident prefix
+                debug_assert!(dead >= self.resident_slots, "uploading slot inside resident prefix");
+
+                let last_slot = self.slot_to_key.len().saturating_sub(1);
+
+                if dead != last_slot {
+                    self.swap_slots(dead, last_slot);
+
+                    // dead now holds moved uploading chunk; keep its slot data consistent
+                    self.enqueue_slot_rewrite(dead);
+                }
+
+                self.slot_to_key.pop();
+                self.chunk_meta.pop();
+                self.slot_macro.pop();
+                self.slot_colinfo.pop();
+
+                // grid/chunk_count exclude uploading, so typically no grid change
+                self.changed = true;
+            }
+
+            ChunkState::Queued | ChunkState::Building => {
+                self.cancel_token(key).store(true, Ordering::Relaxed);
+                self.queued_set.remove(&key);
+
+                self.grid_dirty = true;
+                self.changed = true;
+            }
+        }
+
+        self.cancels.remove(&key);
+    }
+
+
+    #[inline]
+    fn keep_origin_for(&self, center: ChunkKey) -> [i32; 3] {
+        let ox = center.x - config::KEEP_RADIUS;
+        let oz = center.z - config::KEEP_RADIUS;
+        let oy = center.y + GRID_Y_MIN_DY;
+        [ox, oy, oz]
+    }
+
+    fn rebuild_grid(&mut self, center: ChunkKey) {
+        let nx = (2 * config::KEEP_RADIUS + 1) as u32;
+        let nz = nx;
+        let ny = GRID_Y_COUNT;
+
+        self.grid_dims = [nx, ny, nz];
+        self.grid_origin_chunk = self.keep_origin_for(center);
+
+        let needed = (nx * ny * nz) as usize;
+        if self.chunk_grid.len() != needed {
+            self.chunk_grid.resize(needed, INVALID_U32);
+        }
+        self.chunk_grid.fill(INVALID_U32);
+
+        // IMPORTANT: only residents live in [0 .. resident_slots)
+        let n = self.resident_slots.min(self.slot_to_key.len());
+        for slot in 0..n {
+            let k = self.slot_to_key[slot];
+            if let Some(idx) = self.grid_index_for_chunk(k) {
+                self.chunk_grid[idx] = slot as u32;
+            }
+        }
+    }
+
+    #[inline]
+    fn grid_index_for_chunk(&self, k: ChunkKey) -> Option<usize> {
+        let [ox, oy, oz] = self.grid_origin_chunk;
+        let [nx, ny, nz] = self.grid_dims;
+
+        let ix = k.x - ox;
+        let iy = k.y - oy;
+        let iz = k.z - oz;
+
+        if ix < 0 || iy < 0 || iz < 0 {
+            return None;
+        }
+
+        let ix = ix as u32;
+        let iy = iy as u32;
+        let iz = iz as u32;
+
+        if ix >= nx || iy >= ny || iz >= nz {
+            return None;
+        }
+
+        let idx = (iz * ny * nx) + (iy * nx) + ix;
+        Some(idx as usize)
+    }
+
+    // -------------------------------------------------------------------------
+    // Public API
+    // -------------------------------------------------------------------------
+
+    pub fn chunk_count(&self) -> u32 {
+        self.resident_slots as u32
+    }
+
+    pub fn grid_origin(&self) -> [i32; 3] {
+        self.grid_origin_chunk
+    }
+
+    pub fn grid_dims(&self) -> [u32; 3] {
+        self.grid_dims
+    }
+
+    pub fn chunk_grid(&self) -> &[u32] {
+        &self.chunk_grid
+    }
+
+    #[inline]
+    fn upload_bytes(u: &ChunkUpload) -> usize {
+        // meta always written (one struct)
+        let mut b = size_of::<ChunkMetaGpu>();
+
+        b += u.nodes.len() * size_of::<NodeGpu>();
+        b += u.macro_words.len() * size_of::<u32>();
+        b += u.ropes.len() * size_of::<NodeRopesGpu>();
+        b += u.colinfo_words.len() * size_of::<u32>();
+        b
+    }
+
+    pub fn take_uploads(&mut self) -> Vec<ChunkUpload> {
+        // drain everything (old behavior, but VecDeque-compatible)
+        self.uploads.drain(..).collect()
+    }
+
+    pub fn take_uploads_budgeted(&mut self) -> Vec<ChunkUpload> {
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+
+        while let Some(mut u) = self.uploads.pop_front() {
+            if out.len() >= MAX_UPLOADS_PER_FRAME {
+                // put back (optional) if you want strict FIFO
+                self.uploads.push_front(u);
+                break;
+            }
+
+            // Resolve current slot from current chunk state
+            let slot = match self.chunks.get(&u.key) {
+                Some(ChunkState::Resident(r)) => r.slot,
+                Some(ChunkState::Uploading(up)) => up.slot,
+                _ => continue, // chunk is gone or not slot-backed anymore; drop upload
+            };
+
+            u.slot = slot;
+            u.meta.macro_base = slot * MACRO_WORDS_PER_CHUNK;
+            u.meta.colinfo_base = slot * COLINFO_WORDS_PER_CHUNK;
+
+            let ub = Self::upload_bytes(&u);
+            if bytes + ub > MAX_UPLOAD_BYTES_PER_FRAME && !out.is_empty() {
+                // put back and stop
+                self.uploads.push_front(u);
+                break;
+            }
+
+            bytes += ub;
+            out.push(u);
+        }
+
+        out
+    }
+
+
+    pub fn commit_uploads_applied(&mut self, applied: &[ChunkUpload]) -> bool {
+        let mut any_promoted = false;
+
+        // 1) Mark finished uploads (order doesn't matter)
+        for u in applied {
+            if !u.completes_residency { continue; }
+
+            if let Some(ChunkState::Uploading(up)) = self.chunks.get_mut(&u.key) {
+                up.uploaded = true;
+            }
+        }
+
+        // 2) Promote in-order as far as possible
+        loop {
+            if self.resident_slots >= self.slot_to_key.len() {
+                break;
+            }
+
+            let slot = self.resident_slots;
+            let key = self.slot_to_key[slot];
+
+            // Check readiness without cloning
+            let ready = matches!(
+                self.chunks.get(&key),
+                Some(ChunkState::Uploading(Uploading { uploaded: true, .. }))
+            );
+            if !ready {
+                break;
+            }
+
+            // Promote by mutating in-place
+            if let Some(st) = self.chunks.get_mut(&key) {
+                if let ChunkState::Uploading(up) = st {
+                    // copy out fields before overwriting st
+                    let slot_u32 = up.slot;
+                    let node_base = up.node_base;
+                    let node_count = up.node_count;
+
+                    *st = ChunkState::Resident(Resident {
+                        slot: slot_u32,
+                        node_base,
+                        node_count,
+                    });
+
+                    self.resident_slots += 1;
+                    any_promoted = true;
+                    continue;
                 }
             }
 
-            Event::AboutToWait => self.frame(elwt),
-
-            _ => {}
-        }
-    }
-
-    fn frame(&mut self, elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
-        // 1) camera integrate
-        self.camera.integrate_input(&mut self.input);
-        self.frame_index = self.frame_index.wrapping_add(1);
-
-        // 2) streaming update
-        let cam_pos = self.camera.position();
-        let cam_fwd = self.camera.forward();
-        let grid_changed = self.chunks.update(&self.world, cam_pos, cam_fwd);
-        if grid_changed {
-            self.renderer.write_chunk_grid(self.chunks.chunk_grid());
+            break;
         }
 
-        // 3) clipmap update (CPU only; DO NOT write to GPU here)
-        let t = self.start_time.elapsed().as_secs_f32();
-        let (clip_params_cpu, clip_uploads) = self.clipmap.update(self.world.as_ref(), cam_pos, t);
-        let clip_gpu = ClipmapGpu::from_cpu(&clip_params_cpu);
 
-        // 4) camera matrices -> CameraGpu
-        let aspect = self.config.width as f32 / self.config.height as f32;
-        let cf = self.camera.frame_matrices(aspect);
+        if any_promoted {
+            self.grid_dirty = true;
+            self.changed = true;
 
-        let max_steps = (config::CHUNK_SIZE * 2).clamp(64, 256);
-
-        let (rw, rh) = self.renderer.internal_dims();
-
-        let cam_gpu = CameraGpu {
-            view_inv: cf.view_inv.to_cols_array_2d(),
-            proj_inv: cf.proj_inv.to_cols_array_2d(),
-            cam_pos: [cf.pos.x, cf.pos.y, cf.pos.z, 1.0],
-
-            chunk_size: config::CHUNK_SIZE,
-            chunk_count: self.chunks.chunk_count(),
-            max_steps,
-            frame_index: self.frame_index,
-
-            voxel_params: [config::VOXEL_SIZE_M_F32, t, 2.0, 0.002],
-
-            grid_origin_chunk: [
-                self.chunks.grid_origin()[0],
-                self.chunks.grid_origin()[1],
-                self.chunks.grid_origin()[2],
-                0,
-            ],
-            grid_dims: [
-                self.chunks.grid_dims()[0],
-                self.chunks.grid_dims()[1],
-                self.chunks.grid_dims()[2],
-                0,
-            ],
-            render_present_px: [rw, rh, self.config.width, self.config.height],
-        };
-
-        self.renderer.write_camera(&cam_gpu);
-
-        // 5) fps overlay
-        self.fps_frames += 1;
-        let dt = self.fps_last.elapsed().as_secs_f32();
-        if dt >= 0.25 {
-            let fps = (self.fps_frames as f32) / dt;
-            self.fps_value = fps.round() as u32;
-            self.fps_frames = 0;
-            self.fps_last = Instant::now();
-        }
-
-        let overlay = OverlayGpu::from_fps_and_dims(
-            self.fps_value,
-            self.config.width,
-            self.config.height,
-            8, // scale
-        );
-        self.renderer.write_overlay(&overlay);
-
-        // 6) update scene buffers if changed
-        self.renderer.apply_chunk_uploads(self.chunks.take_uploads());
-
-        // 7) acquire frame + encode passes
-        let frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
-
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.surface.configure(self.renderer.device(), &self.config);
-                return;
+            if let Some(center) = self.last_center {
+                self.rebuild_grid(center);
+                self.grid_dirty = false;
             }
+            return true;
+        }
 
-            Err(wgpu::SurfaceError::Timeout) => return,
+        false
+    }
 
-            Err(wgpu::SurfaceError::OutOfMemory) => {
-                elwt.exit();
-                return;
+    fn rebuild_column_ground(&mut self, world: &WorldGen, center: ChunkKey) {
+        let [ox, _, oz] = self.keep_origin_for(center);
+
+        let nx = (2 * config::KEEP_RADIUS + 1) as i32;
+        let nz = nx;
+
+        self.col_ground_cy.resize((nx * nz) as usize, 0);
+
+        let cs = config::CHUNK_SIZE as i32;
+        let half = cs / 2;
+
+        for dz in 0..nz {
+            for dx in 0..nx {
+                let cx = ox + dx;
+                let cz = oz + dz;
+
+                let wx = cx * cs + half;
+                let wz = cz * cs + half;
+
+                let ground_y_vox = world.ground_height(wx, wz);
+                self.col_ground_cy[(dz * nx + dx) as usize] = ground_y_vox.div_euclid(cs);
             }
-        };
-
-        let frame_view = frame.texture.create_view(&Default::default());
-
-        let mut encoder = self
-            .renderer
-            .device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("encoder"),
-            });
-
-        // IMPORTANT: clipmap uploads + uniform update go into the same encoder,
-        // and must happen BEFORE encode_compute() (which samples the clipmap).
-        self.renderer
-            .encode_clipmap_updates(&mut encoder, &clip_gpu, &clip_uploads);
-
-        self.renderer
-            .encode_compute(&mut encoder, self.config.width, self.config.height);
-
-        self.renderer.encode_blit(&mut encoder, &frame_view);
-
-        self.renderer.queue().submit(Some(encoder.finish()));
-        
-        self.renderer.device().poll(wgpu::Maintain::Poll);
-
-        frame.present();
-    }
-}
-
-// src/render/gpu_types.rs
-// -----------------------
-// src/render/gpu_types.rs
-// -----------------------
-//
-// Fix: ClipLevelParams now has `packed_offsets`, but we keep its existing
-// `inv_cell_size_m` field on CPU side.
-// GPU uniform uses vec4 per level with packed offsets in .w.
-
-use bytemuck::{Pod, Zeroable};
-use crate::config;
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
-pub struct NodeGpu {
-    pub child_base: u32,
-    pub child_mask: u32,
-    pub material: u32,
-    pub key: u32, // packed spatial key: level + coord at that level
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
-pub struct NodeRopesGpu {
-    pub px: u32,
-    pub nx: u32,
-    pub py: u32,
-    pub ny: u32,
-    pub pz: u32,
-    pub nz: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-}
-
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct ChunkMetaGpu {
-    pub origin: [i32; 4],
-    pub node_base: u32,
-    pub node_count: u32,
-    pub macro_base: u32,
-    pub colinfo_base: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct CameraGpu {
-    pub view_inv: [[f32; 4]; 4],
-    pub proj_inv: [[f32; 4]; 4],
-    pub cam_pos: [f32; 4],
-
-    pub chunk_size: u32,
-    pub chunk_count: u32,
-    pub max_steps: u32,
-    pub frame_index: u32,
-
-    pub voxel_params: [f32; 4],
-
-    pub grid_origin_chunk: [i32; 4],
-    pub grid_dims: [u32; 4],
-
-    pub render_present_px: [u32; 4],
-}
-
-/// Clipmap uniform payload.
-///
-/// Matches `shaders/clipmap.wgsl`.
-///
-/// Per level vec4<f32>:
-///   x = origin_x_m
-///   y = origin_z_m
-///   z = cell_size_m
-///   w = unused (0)
-///
-/// Per level vec4<u32>:
-///   x = off_x (toroidal offset in texels)
-///   y = off_z
-///   z/w unused (0)
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct ClipmapGpu {
-    pub levels: u32,
-    pub res: u32,
-    pub base_cell_m: f32,
-    pub _pad0: f32,
-
-    pub level:  [[f32; 4]; config::CLIPMAP_LEVELS_USIZE],
-    pub offset: [[u32; 4]; config::CLIPMAP_LEVELS_USIZE],
-}
-
-impl ClipmapGpu {
-    pub fn from_cpu(cpu: &crate::clipmap::ClipmapParamsCpu) -> Self {
-        let mut level  = [[0.0f32; 4]; config::CLIPMAP_LEVELS_USIZE];
-        let mut offset = [[0u32; 4]; config::CLIPMAP_LEVELS_USIZE];
-
-        for i in 0..config::CLIPMAP_LEVELS_USIZE {
-            let p = cpu.level[i];
-
-            level[i] = [p.origin_x_m, p.origin_z_m, p.cell_size_m, 0.0];
-
-            // NOTE: these fields change on CPU side in the next patch (ClipLevelParams)
-            offset[i] = [p.off_x, p.off_z, 0, 0];
-        }
-
-        Self {
-            levels: cpu.levels,
-            res: cpu.res,
-            base_cell_m: cpu.base_cell_m,
-            _pad0: 0.0,
-            level,
-            offset,
         }
     }
-}
 
+    #[inline]
+    fn ground_cy_for_column(&self, cx: i32, cz: i32) -> Option<i32> {
+        let [ox, _, oz] = self.grid_origin_chunk;
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
-pub struct OverlayGpu {
-    // packed digits: d0 | d1<<8 | d2<<16 | d3<<24 (d0=ones, d3=thousands)
-    pub digits_packed: u32,
+        let nx = (2 * config::KEEP_RADIUS + 1) as i32;
+        let nz = nx;
 
-    // HUD rectangle in framebuffer pixel coords (top-left origin)
-    pub origin_x: u32,
-    pub origin_y: u32,
-    pub total_w:  u32,
-
-    pub digit_h:  u32,
-    pub scale:    u32,
-    pub stride:   u32, // digit_w + gap
-    pub _pad0:    u32, // explicit padding to 32 bytes
-}
-
-impl OverlayGpu {
-    pub fn from_fps_and_dims(fps: u32, width: u32, _height: u32, scale: u32) -> Self {
-        // digits
-        let mut v = fps.min(9999);
-        let d0 = (v % 10) as u32; v /= 10;
-        let d1 = (v % 10) as u32; v /= 10;
-        let d2 = (v % 10) as u32; v /= 10;
-        let d3 = (v % 10) as u32;
-
-        let digits_packed = d0 | (d1 << 8) | (d2 << 16) | (d3 << 24);
-
-        // layout
-        let margin: u32 = 12;
-        let digit_w = 3 * scale;
-        let digit_h = 5 * scale;
-        let gap     = 1 * scale;
-        let stride  = digit_w + gap;
-        let total_w = 4 * digit_w + 3 * gap;
-
-        let ox_i = width as i32 - margin as i32 - total_w as i32;
-        let oy_i = margin as i32;
-
-        let origin_x = ox_i.max(0) as u32;
-        let origin_y = oy_i.max(0) as u32;
-
-        Self {
-            digits_packed,
-            origin_x,
-            origin_y,
-            total_w,
-            digit_h,
-            scale,
-            stride,
-            _pad0: 0,
+        let ix = cx - ox;
+        let iz = cz - oz;
+        if ix < 0 || iz < 0 || ix >= nx || iz >= nz {
+            return None;
         }
+
+        let idx = (iz * nx + ix) as usize;
+        self.col_ground_cy.get(idx).copied()
     }
+
 }
 
-// src/render/mod.rs
-// -----------------
-// src/render/mod.rs
+// src/streaming/mod.rs
+// --------------------
+// src/streaming/mod.rs
+// --------------------
+// Chunk streaming + node arena + uploads.
 
-pub mod gpu_types;
-pub mod resources;
-pub mod shaders;
-pub mod state;
+pub mod manager;
+pub mod node_arena;
 
-pub use gpu_types::*;
-pub use state::Renderer;
+pub use manager::{ChunkManager, ChunkUpload};
+pub use node_arena::NodeArena;
 
-// src/render/resources.rs
-// -----------------------
-// src/render/resources.rs
-//
-// Small GPU resource helpers that don't fit cleanly into the renderer "state" modules.
-//
-// Right now this file provides the final full-resolution output texture:
-// - written as a STORAGE texture by the composite compute pass
-// - sampled as a regular texture by the final blit render pass
-//
-// Keeping this as a tiny helper makes the main texture set code a bit cleaner.
-
-/// Wrapper for the renderer's final output texture view.
-///
-/// The renderer stores only the TextureView; the view keeps the underlying texture alive
-/// for as long as it exists (wgpu uses ref-counted internal ownership).
-pub struct OutputTex {
-    /// Texture view bound in bind groups (storage write in compute, sampled in blit).
-    pub view: wgpu::TextureView,
-}
-
-/// Create the final output texture (full resolution).
-///
-/// Properties:
-/// - Format: RGBA16F (high dynamic range, good for post-processing)
-/// - Usage:
-///   - STORAGE_BINDING: composite pass writes into it as a storage texture
-///   - TEXTURE_BINDING: blit pass samples it in the fragment shader
-///
-/// Notes:
-/// - wgpu forbids zero-sized textures, so we clamp `w`/`h` to at least 1.
-pub fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> OutputTex {
-    // Avoid creating zero-sized textures (can happen during minimize/resizes).
-    let w = w.max(1);
-    let h = h.max(1);
-
-    // Allocate the GPU texture backing store.
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("output_tex"),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
-        // Must support both compute writes and render sampling.
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-
-    // Default view covers the whole texture.
-    let view = tex.create_view(&Default::default());
-
-    OutputTex { view }
-}
-
-// src/render/shaders.rs
-// ---------------------
-// src/render/shaders.rs
-//
-// Centralized shader sources. WGSL has no native include mechanism in wgpu,
-// so we concatenate multiple WGSL files into a single source string.
-
-pub const RAY_CS_WGSL: &str = concat!(
-    include_str!("../shaders/common.wgsl"),
-    "\n",
-
-    // ray_core split into concern-specific modules (order matters)
-    include_str!("../shaders/ray/clouds.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/phase.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/sky.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/fog.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/aabb.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/wind.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/svo_query.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/leaves.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/grass.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/chunk_trace.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/shadows.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/shading.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/godrays.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/composite.wgsl"),
-    "\n",
-
-    include_str!("../shaders/clipmap.wgsl"),
-    "\n",
-    include_str!("../shaders/ray_main.wgsl"),
-    "\n",
-);
-
-pub const BLIT_WGSL: &str = include_str!("../shaders/blit.wgsl");
-
-#[inline]
-pub fn ray_cs_wgsl() -> &'static str {
-    RAY_CS_WGSL
-}
-
-#[inline]
-pub fn blit_wgsl() -> &'static str {
-    BLIT_WGSL
-}
-
-// src/render/state/bindgroups.rs
-// ------------------------------
-// src/render/state/bindgroups.rs
-//
-// Bind group creation.
-
-use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
-
-pub struct BindGroups {
-    pub primary: wgpu::BindGroup,
-    pub scene: wgpu::BindGroup,
-    pub godray: [wgpu::BindGroup; 2],
-    pub composite: [wgpu::BindGroup; 2],
-    pub empty: wgpu::BindGroup,
-    pub blit: wgpu::BindGroup,
-}
-
-fn make_primary_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    buffers: &Buffers,
-    textures: &TextureSet,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("primary_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffers.camera.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buffers.chunk.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: buffers.node.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: buffers.chunk_grid.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&textures.color.view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: wgpu::BindingResource::TextureView(&textures.depth.view),
-            },
-            // Clipmap params uniform
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: buffers.clipmap.as_entire_binding(),
-            },
-            // Clipmap height texture array
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 8,
-                resource: buffers.macro_occ.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 9,
-                resource: buffers.node_ropes.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 10,
-                resource: buffers.colinfo.as_entire_binding(),
-            },
-
-        ],
-    })
-}
-
-fn make_scene_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    buffers: &Buffers,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("scene_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffers.camera.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buffers.chunk.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: buffers.node.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: buffers.chunk_grid.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry { 
-                binding: 8, 
-                resource: buffers.macro_occ.as_entire_binding() 
-            },
-            wgpu::BindGroupEntry {
-                binding: 9,
-                resource: buffers.node_ropes.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 10,
-                resource: buffers.colinfo.as_entire_binding(),
-            },
-
-        ],
-    })
-}
-
-fn make_godray_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    depth_view: &wgpu::TextureView,
-    hist_view: &wgpu::TextureView,
-    out_view: &wgpu::TextureView,
-    label: &str,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(depth_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(hist_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(out_view),
-            },
-        ],
-    })
-}
-
-fn make_composite_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    color_view: &wgpu::TextureView,
-    godray_view: &wgpu::TextureView,
-    output_view: &wgpu::TextureView,
-    depth_view: &wgpu::TextureView,
-    godray_sampler: &wgpu::Sampler,
-    label: &str,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(color_view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(godray_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(output_view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
-            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(godray_sampler) },
-        ],
-    })
-}
-
-
-
-fn make_blit_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    output_view: &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-    overlay_buf: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("blit_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(output_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: overlay_buf.as_entire_binding(),
-            },
-        ],
-    })
-}
-
-pub fn create_bind_groups(
-    device: &wgpu::Device,
-    layouts: &Layouts,
-    buffers: &Buffers,
-    textures: &TextureSet,
-    sampler: &wgpu::Sampler,
-) -> BindGroups {
-    let primary = make_primary_bg(device, &layouts.primary, buffers, textures);
-    let scene = make_scene_bg(device, &layouts.scene, buffers);
-
-    let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("empty_bg"),
-        layout: &layouts.empty,
-        entries: &[],
-    });
-
-    let godray = [
-        make_godray_bg(
-            device,
-            &layouts.godray,
-            &textures.depth.view,
-            &textures.godray[0].view,
-            &textures.godray[1].view,
-            "godray_bg_a_to_b",
-        ),
-        make_godray_bg(
-            device,
-            &layouts.godray,
-            &textures.depth.view,
-            &textures.godray[1].view,
-            &textures.godray[0].view,
-            "godray_bg_b_to_a",
-        ),
-    ];
-
-    let composite = [
-        make_composite_bg(
-            device,
-            &layouts.composite,
-            &textures.color.view,
-            &textures.godray[0].view,
-            &textures.output.view,
-            &textures.depth.view,
-            sampler,
-            "composite_bg_read_a",
-        ),
-        make_composite_bg(
-            device,
-            &layouts.composite,
-            &textures.color.view,
-            &textures.godray[1].view,
-            &textures.output.view,
-            &textures.depth.view,
-            sampler,
-            "composite_bg_read_b",
-        ),
-    ];
-
-    let blit = make_blit_bg(
-        device,
-        &layouts.blit,
-        &textures.output.view,
-        sampler,
-        &buffers.overlay,
-    );
-
-    BindGroups {
-        primary,
-        scene,
-        godray,
-        composite,
-        empty,
-        blit,
-    }
-}
-
-// src/render/state/buffers.rs
+// src/streaming/node_arena.rs
 // ---------------------------
-// src/render/state/buffers.rs
+// src/streaming/node_arena.rs
 //
-// Persistent GPU buffers and capacities.
+// Very simple free-list arena for node ranges (in units of NodeGpu elements).
+// Improvements:
+// - free() now fully coalesces adjacent ranges (fixes long-run fragmentation).
+// - alloc() uses best-fit (smallest range that fits) to reduce fragmentation further.
 
-use crate::{
-    config,
-    render::gpu_types::{ChunkMetaGpu, ClipmapGpu, NodeGpu, NodeRopesGpu},
-};
-
-pub struct Buffers {
-    // --- Uniforms ---
-    pub camera: wgpu::Buffer,
-    pub overlay: wgpu::Buffer,
-
-    /// Clipmap params (primary compute pass only).
-    pub clipmap: wgpu::Buffer,
-
-    // --- Storage buffers ---
-    pub node: wgpu::Buffer,
-    pub chunk: wgpu::Buffer,
-    pub chunk_grid: wgpu::Buffer,
-
-    // --- Capacities ---
-    pub node_capacity: u32,
-    pub chunk_capacity: u32,
-    pub grid_capacity: u32,
-
-    pub macro_occ: wgpu::Buffer,
-    pub macro_capacity_u32: u32,
-
-    pub node_ropes: wgpu::Buffer,
-    pub rope_capacity: u32, // in nodes
-
-    pub colinfo: wgpu::Buffer,
-    pub colinfo_capacity_u32: u32,
-
+#[derive(Clone, Copy, Debug)]
+struct Range {
+    start: u32,
+    len: u32,
 }
 
-fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: std::mem::size_of::<T>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
+pub struct NodeArena {
+    free: Vec<Range>, // kept sorted by start
 }
 
-fn make_storage_buffer(device: &wgpu::Device, label: &str, size_bytes: u64) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: size_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
-
-pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
-    let camera = make_uniform_buffer::<crate::render::gpu_types::CameraGpu>(device, "camera_buf");
-    let overlay = make_uniform_buffer::<crate::render::gpu_types::OverlayGpu>(device, "overlay_buf");
-
-    let clipmap = make_uniform_buffer::<ClipmapGpu>(device, "clipmap_buf");
-
-    let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
-
-    let node = make_storage_buffer(
-        device,
-        "svo_nodes_arena",
-        (node_capacity as u64) * (std::mem::size_of::<NodeGpu>() as u64),
-    );
-
-    let chunk_capacity =
-        (2 * config::KEEP_RADIUS + 1) as u32 * 4u32 * (2 * config::KEEP_RADIUS + 1) as u32;
-
-    let chunk = make_storage_buffer(
-        device,
-        "chunk_meta_persistent",
-        (chunk_capacity as u64) * (std::mem::size_of::<ChunkMetaGpu>() as u64),
-    );
-
-    let grid_capacity = chunk_capacity;
-
-    let chunk_grid = make_storage_buffer(
-        device,
-        "chunk_grid_buf",
-        (grid_capacity as u64) * (std::mem::size_of::<u32>() as u64),
-    );
-
-    // ---- macro occupancy: 8^3 bits = 512 bits = 16 u32 words per chunk ----
-    const MACRO_WORDS_PER_CHUNK: u32 = 16;
-    let macro_capacity_u32 = chunk_capacity * MACRO_WORDS_PER_CHUNK;
-    let macro_occ = make_storage_buffer(
-        device,
-        "macro_occ_buf",
-        (macro_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
-    );
-
-    let rope_capacity = node_capacity;
-    let node_ropes = make_storage_buffer(
-        device,
-        "svo_node_ropes",
-        (rope_capacity as u64) * (std::mem::size_of::<NodeRopesGpu>() as u64),
-    );
-
-    // ---- column info: 64*64 columns packed => 2048 u32 per chunk ----
-    const COLINFO_WORDS_PER_CHUNK: u32 = 2048;
-    let colinfo_capacity_u32 = chunk_capacity * COLINFO_WORDS_PER_CHUNK;
-    let colinfo = make_storage_buffer(
-        device,
-        "chunk_colinfo_buf",
-        (colinfo_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
-    );
-
-    Buffers {
-        camera,
-        overlay,
-        clipmap,
-        node,
-        chunk,
-        chunk_grid,
-        node_capacity,
-        chunk_capacity,
-        grid_capacity,
-        macro_occ,
-        macro_capacity_u32,
-        node_ropes,
-        rope_capacity,
-        colinfo,
-        colinfo_capacity_u32,
-    }
-}
-
-// src/render/state/layout.rs
-// --------------------------
-// src/render/state/layout.rs
-//
-// Bind group layouts and small helpers.
-
-pub struct Layouts {
-    pub primary: wgpu::BindGroupLayout,
-    pub scene: wgpu::BindGroupLayout,
-    pub godray: wgpu::BindGroupLayout,
-    pub composite: wgpu::BindGroupLayout,
-    pub empty: wgpu::BindGroupLayout,
-    pub blit: wgpu::BindGroupLayout,
-}
-
-fn bgl_sampler(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-        count: None,
-    }
-}
-
-
-fn bgl_uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn bgl_storage_ro(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn bgl_tex_sample_2d(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    sample_type: wgpu::TextureSampleType,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Texture {
-            sample_type,
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
-
-fn bgl_tex_sample_2d_array(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    sample_type: wgpu::TextureSampleType,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Texture {
-            sample_type,
-            view_dimension: wgpu::TextureViewDimension::D2Array,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
-
-fn bgl_storage_tex_wo(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    format: wgpu::TextureFormat,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::StorageTexture {
-            access: wgpu::StorageTextureAccess::WriteOnly,
-            format,
-            view_dimension: wgpu::TextureViewDimension::D2,
-        },
-        count: None,
-    }
-}
-
-pub fn create_layouts(device: &wgpu::Device) -> Layouts {
-    let cs_vis = wgpu::ShaderStages::COMPUTE;
-
-    let scene_entries: [wgpu::BindGroupLayoutEntry; 7] = [
-        bgl_uniform(0, cs_vis),
-        bgl_storage_ro(1, cs_vis),
-        bgl_storage_ro(2, cs_vis),
-        bgl_storage_ro(3, cs_vis),
-        bgl_storage_ro(8, cs_vis),
-        bgl_storage_ro(9, cs_vis),
-        bgl_storage_ro(10, cs_vis),
-    ];
-
-    let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("scene_bgl"),
-        entries: &scene_entries,
-    });
-
-    // PRIMARY: add clipmap uniform + clipmap height texture array
-    // bindings:
-    // 0 camera
-    // 1 chunks
-    // 2 nodes
-    // 3 chunk_grid
-    // 4 color storage
-    // 5 depth storage
-    // 6 clipmap uniform
-    // 7 clipmap height texture array (R32Float)
-    // 8 macro_occ
-    let mut primary_entries = Vec::with_capacity(8);
-    primary_entries.extend_from_slice(&scene_entries);
-
-    primary_entries.push(bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba16Float));
-    primary_entries.push(bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float));
-
-    primary_entries.push(bgl_uniform(6, cs_vis));
-    primary_entries.push(bgl_tex_sample_2d_array(
-        7,
-        cs_vis,
-        wgpu::TextureSampleType::Float { filterable: false },
-    ));
-
-    let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("primary_bgl"),
-        entries: &primary_entries,
-    });
-
-    let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("godray_bgl"),
-        entries: &[
-            bgl_tex_sample_2d(
-                0,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            bgl_tex_sample_2d(
-                1,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
-        ],
-    });
-
-    let composite = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("composite_bgl"),
-        entries: &[
-            bgl_tex_sample_2d(
-                0,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: true },
-            ),
-            bgl_tex_sample_2d(
-                1,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: true },
-            ),
-            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
-
-            // full-res depth for depth-aware upsample
-            bgl_tex_sample_2d(
-                3,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-
-            // NEW: sampler for godray_tex (used by textureSampleLevel)
-            bgl_sampler(4, cs_vis),
-        ],
-    });
-
-    let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("empty_bgl"),
-        entries: &[],
-    });
-
-    let blit = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("blit_bgl"),
-        entries: &[
-            bgl_tex_sample_2d(
-                0,
-                wgpu::ShaderStages::FRAGMENT,
-                wgpu::TextureSampleType::Float { filterable: true },
-            ),
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            bgl_uniform(2, wgpu::ShaderStages::FRAGMENT),
-        ],
-    });
-
-    Layouts {
-        primary,
-        scene,
-        godray,
-        composite,
-        empty,
-        blit,
-    }
-}
-
-// src/render/state/mod.rs
-// -----------------------
-// src/render/state/mod.rs
-// -----------------------
-mod bindgroups;
-mod buffers;
-mod layout;
-mod pipelines;
-pub mod textures;
-
-use crate::{
-    config,
-    render::gpu_types::{CameraGpu, OverlayGpu},
-    streaming::ChunkUpload,
-};
-
-use bindgroups::{create_bind_groups, BindGroups};
-use buffers::{create_persistent_buffers, Buffers};
-use layout::{create_layouts, Layouts};
-use pipelines::{create_pipelines, Pipelines};
-use textures::{create_textures, quarter_dim, TextureSet};
-
-pub struct Renderer {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-
-    sampler: wgpu::Sampler,
-
-    layouts: Layouts,
-    pipelines: Pipelines,
-    buffers: Buffers,
-    textures: TextureSet,
-    bind_groups: BindGroups,
-
-    ping: usize,
-
-    render_scale: f32,
-    internal_w: u32,
-    internal_h: u32,
-}
-
-fn align_up(v: usize, a: usize) -> usize {
-    (v + (a - 1)) & !(a - 1)
-}
-
-impl Renderer {
-    pub async fn new(
-        adapter: &wgpu::Adapter,
-        surface_format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) -> Self {
-        let adapter_limits = adapter.limits();
-        let required_limits = wgpu::Limits {
-            max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
-            max_buffer_size: adapter_limits.max_buffer_size,
-            ..wgpu::Limits::default()
-        };
-
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-
-        let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ray_cs"),
-            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::ray_cs_wgsl().into()),
-        });
-
-        let fs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit"),
-            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::blit_wgsl().into()),
-        });
-
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("linear_clamp_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest, // level 0 anyway
-            ..Default::default()
-        });
-
-        let layouts = create_layouts(&device);
-        let buffers = create_persistent_buffers(&device);
-
-        let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
-
-        let render_scale = config::RENDER_SCALE;
-        let internal_w = ((width as f32) * render_scale).round() as u32;
-        let internal_h = ((height as f32) * render_scale).round() as u32;
-        
-        let textures = create_textures(&device, width, height, internal_w, internal_h);
-        let bind_groups = create_bind_groups(&device, &layouts, &buffers, &textures, &sampler);
-
+impl NodeArena {
+    pub fn new(capacity: u32) -> Self {
         Self {
-            device,
-            queue,
-            sampler,
-            layouts,
-            pipelines,
-            buffers,
-            textures,
-            bind_groups,
-            ping: 0,
-            render_scale,
-            internal_w,
-            internal_h,
+            free: vec![Range {
+                start: 0,
+                len: capacity,
+            }],
         }
     }
 
-    pub fn device(&self) -> &wgpu::Device {
-        &self.device
-    }
-
-    pub fn queue(&self) -> &wgpu::Queue {
-        &self.queue
-    }
-
-    pub fn resize_output(&mut self, width: u32, height: u32) {
-        self.internal_w = ((width as f32) * self.render_scale).round() as u32;
-        self.internal_h = ((height as f32) * self.render_scale).round() as u32;
-
-        self.textures = create_textures(&self.device, width, height, self.internal_w, self.internal_h);
-
-        self.bind_groups = create_bind_groups(
-            &self.device, &self.layouts, &self.buffers, &self.textures, &self.sampler,
-        );
-
-        self.ping = 0;
-    }
-
-    pub fn write_chunk_grid(&self, grid: &[u32]) {
-        let n = grid.len().min(self.buffers.grid_capacity as usize);
-        self.queue.write_buffer(
-            &self.buffers.chunk_grid,
-            0,
-            bytemuck::cast_slice(&grid[..n]),
-        );
-    }
-
-    pub fn write_camera(&self, cam: &CameraGpu) {
-        self.queue
-            .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
-    }
-
-    pub fn write_overlay(&self, ov: &OverlayGpu) {
-        self.queue
-            .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
-    }
-
-    pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("primary_pass"),
-                timestamp_writes: None,
-            });
-
-            cpass.set_pipeline(&self.pipelines.primary);
-            cpass.set_bind_group(0, &self.bind_groups.primary, &[]);
-
-            let gx = (self.internal_w + 7) / 8;
-            let gy = (self.internal_h + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
-
+    /// Allocate a contiguous range of `len` elements.
+    /// Returns the start index in the arena, or None if no free range fits.
+    pub fn alloc(&mut self, len: u32) -> Option<u32> {
+        if len == 0 {
+            return Some(0);
         }
 
-        let ping = self.ping;
-        let pong = 1 - ping;
+        // Best-fit: choose the smallest free range that still fits.
+        let mut best_i: Option<usize> = None;
+        let mut best_len: u32 = u32::MAX;
 
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("godray_pass"),
-                timestamp_writes: None,
-            });
-
-            cpass.set_pipeline(&self.pipelines.godray);
-            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-            cpass.set_bind_group(1, &self.bind_groups.godray[ping], &[]);
-
-            let qw = quarter_dim(self.internal_w);
-            let qh = quarter_dim(self.internal_h);
-
-            let gx = (qw + 7) / 8;
-            let gy = (qh + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
-
-        }
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("composite_pass"),
-                timestamp_writes: None,
-            });
-
-            cpass.set_pipeline(&self.pipelines.composite);
-
-            // group(0) must match layouts.scene now
-            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-
-            // group(1) is still empty (or you can omit setting it)
-            cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
-
-            // group(2) is your composite textures
-            cpass.set_bind_group(2, &self.bind_groups.composite[pong], &[]);
-
-            let gx = (width + 7) / 8;
-            let gy = (height + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
-
-        }
-
-        self.ping = pong;
-    }
-
-    pub fn encode_blit(&self, encoder: &mut wgpu::CommandEncoder, frame_view: &wgpu::TextureView) {
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("blit_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: frame_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
-        rpass.set_pipeline(&self.pipelines.blit);
-        rpass.set_bind_group(0, &self.bind_groups.blit, &[]);
-        rpass.draw(0..3, 0..1);
-    }
-
-    pub fn apply_chunk_uploads(&self, uploads: Vec<ChunkUpload>) {
-        let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
-        let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
-        let u32_stride  = std::mem::size_of::<u32>() as u64;
-        let rope_stride = std::mem::size_of::<crate::render::gpu_types::NodeRopesGpu>() as u64;
-
-        for u in uploads {
-            // meta
-            if u.slot < self.buffers.chunk_capacity {
-                let meta_off = (u.slot as u64) * meta_stride;
-                self.queue.write_buffer(&self.buffers.chunk, meta_off, bytemuck::bytes_of(&u.meta));
-            }
-
-            // nodes
-            if !u.nodes.is_empty() {
-                let needed = u.nodes.len() as u32;
-                if u.node_base + needed <= self.buffers.node_capacity {
-                    let node_off = (u.node_base as u64) * node_stride;
-                    self.queue.write_buffer(&self.buffers.node, node_off, bytemuck::cast_slice(u.nodes.as_ref()));
+        for (i, r) in self.free.iter().enumerate() {
+            if r.len >= len && r.len < best_len {
+                best_len = r.len;
+                best_i = Some(i);
+                if r.len == len {
+                    break; // perfect fit
                 }
             }
-
-            // macro occupancy
-            if !u.macro_words.is_empty() {
-                let needed = u.macro_words.len() as u32;
-                if u.meta.macro_base + needed <= self.buffers.macro_capacity_u32 {
-                    let off = (u.meta.macro_base as u64) * u32_stride;
-                    self.queue.write_buffer(&self.buffers.macro_occ, off, bytemuck::cast_slice(u.macro_words.as_ref()));
-                }
-            }
-
-            if !u.ropes.is_empty() {
-                let needed = u.ropes.len() as u32;
-                if u.node_base + needed <= self.buffers.rope_capacity {
-                    let rope_off = (u.node_base as u64) * rope_stride;
-                    self.queue.write_buffer(&self.buffers.node_ropes, rope_off, bytemuck::cast_slice(u.ropes.as_ref()));
-                }
-            }
-
-            // colinfo (64*64 columns packed => 2048 u32 per chunk)
-            if !u.colinfo_words.is_empty() {
-                let needed = u.colinfo_words.len() as u32;
-                if u.meta.colinfo_base + needed <= self.buffers.colinfo_capacity_u32 {
-                    let off = (u.meta.colinfo_base as u64) * u32_stride;
-                    self.queue.write_buffer(
-                        &self.buffers.colinfo,
-                        off,
-                        bytemuck::cast_slice(u.colinfo_words.as_ref()),
-                    );
-                }
-            }
-
         }
-    }
 
-    pub fn encode_clipmap_patch(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        level: u32,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-        data_f16: &[u16],
-    ) {
-        let res = config::CLIPMAP_RES;
-        if level >= config::CLIPMAP_LEVELS { return; }
-        if w == 0 || h == 0 { return; }
-        if x + w > res || y + h > res { return; }
+        let i = best_i?;
+        let r = self.free[i];
+        let start = r.start;
 
-        let expected = (w as usize) * (h as usize);
-        if data_f16.len() != expected { return; }
-
-        // Tight row pitch in bytes (R16Float = 2 bytes/texel)
-        let row_bytes = (w as usize) * 2;
-
-        // WebGPU: bytes_per_row must be multiple of 256
-        let padded_row_bytes = align_up(row_bytes, 256);
-
-        // Prepare padded bytes (only when needed)
-        let bytes: Vec<u8>;
-        let bytes_ref: &[u8];
-
-        if padded_row_bytes == row_bytes {
-            bytes_ref = bytemuck::cast_slice(data_f16);
+        if r.len == len {
+            self.free.remove(i);
         } else {
-            let src: &[u8] = bytemuck::cast_slice(data_f16);
-            let mut out = vec![0u8; padded_row_bytes * (h as usize)];
+            self.free[i] = Range {
+                start: r.start + len,
+                len: r.len - len,
+            };
+        }
 
-            for row in 0..(h as usize) {
-                let src_off = row * row_bytes;
-                let dst_off = row * padded_row_bytes;
-                out[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
+        Some(start)
+    }
+
+    /// Free a previously allocated range.
+    pub fn free(&mut self, start: u32, len: u32) {
+        if len == 0 {
+            return;
+        }
+
+        // Insert sorted by start (log n search).
+        let idx = self
+            .free
+            .binary_search_by_key(&start, |r| r.start)
+            .unwrap_or_else(|i| i);
+
+        self.free.insert(idx, Range { start, len });
+
+        // Fully coalesce with neighbors (both directions).
+        self.coalesce_at(idx);
+    }
+
+    fn coalesce_at(&mut self, mut i: usize) {
+        // Merge backward as long as possible.
+        while i > 0 {
+            let a = self.free[i - 1];
+            let b = self.free[i];
+            if a.start + a.len == b.start {
+                self.free[i - 1] = Range {
+                    start: a.start,
+                    len: a.len + b.len,
+                };
+                self.free.remove(i);
+                i -= 1;
+            } else {
+                break;
             }
-
-            bytes = out;
-            bytes_ref = &bytes;
         }
 
-        // Staging buffer for this patch
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("clipmap_patch_staging"),
-            size: bytes_ref.len() as u64,
-            usage: wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-
-        {
-            let mut view = staging.slice(..).get_mapped_range_mut();
-            view.copy_from_slice(bytes_ref);
+        // Merge forward as long as possible.
+        while i + 1 < self.free.len() {
+            let a = self.free[i];
+            let b = self.free[i + 1];
+            if a.start + a.len == b.start {
+                self.free[i] = Range {
+                    start: a.start,
+                    len: a.len + b.len,
+                };
+                self.free.remove(i + 1);
+            } else {
+                break;
+            }
         }
-        staging.unmap();
-
-        encoder.copy_buffer_to_texture(
-            wgpu::ImageCopyBuffer {
-                buffer: &staging,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row_bytes as u32),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::ImageCopyTexture {
-                texture: &self.textures.clip_height.tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: level },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-
-    /// Encode clipmap uniform upload into the *current encoder* (no queue.write_buffer).
-    pub fn encode_clipmap_uniform(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        clip: &crate::render::gpu_types::ClipmapGpu,
-    ) {
-        let bytes = bytemuck::bytes_of(clip);
-
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("clipmap_uniform_staging"),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-
-        {
-            let mut view = staging.slice(..).get_mapped_range_mut();
-            view.copy_from_slice(bytes);
-        }
-        staging.unmap();
-
-        encoder.copy_buffer_to_buffer(&staging, 0, &self.buffers.clipmap, 0, bytes.len() as u64);
-    }
-
-    /// Encode: (1) all patch uploads, then (2) uniform update — in the same encoder.
-    pub fn encode_clipmap_updates(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        clip: &crate::render::gpu_types::ClipmapGpu,
-        uploads: &[crate::clipmap::ClipmapUpload],
-    ) {
-        // 1) texture first
-        for u in uploads {
-            self.encode_clipmap_patch(encoder, u.level, u.x, u.y, u.w, u.h, &u.data_f16);
-        }
-
-        // 2) uniform second
-        self.encode_clipmap_uniform(encoder, clip);
-    }
-
-    pub fn internal_dims(&self) -> (u32, u32) {
-        (self.internal_w.max(1), self.internal_h.max(1))
-    }
-
-}
-
-// src/render/state/pipelines.rs
-// -----------------------------
-// src/render/state/pipelines.rs
-//
-// Pipeline creation.
-// This is intentionally isolated so the renderer logic (per-frame encoding) isn't
-// buried under wgpu setup boilerplate.
-//
-// Terminology:
-// - BindGroupLayout (BGL): describes what resources exist at @group/@binding.
-// - PipelineLayout (PL): ordered list of BGLs for group(0), group(1), ...
-// - Pipeline: compiled/validated shader entry point + fixed state + pipeline layout.
-//
-// Rule of thumb:
-// The order of BGLs in `bind_group_layouts` must match the group indices used in WGSL.
-// If a shader references @group(2), then the pipeline layout must include entries
-// for group(0) and group(1) as well (even if they're "empty" placeholders).
-
-use super::layout::Layouts;
-
-pub struct Pipelines {
-    /// Compute pipeline for the primary full-resolution pass (writes color/depth).
-    pub primary: wgpu::ComputePipeline,
-
-    /// Compute pipeline for the quarter-resolution godray pass (ping-pong temporal).
-    pub godray: wgpu::ComputePipeline,
-
-    /// Compute pipeline for the full-resolution composite pass (writes final output).
-    pub composite: wgpu::ComputePipeline,
-
-    /// Render pipeline for the final blit to the swapchain (fullscreen triangle).
-    pub blit: wgpu::RenderPipeline,
-}
-
-/// Helper to build a compute pipeline with a specific entry point and bind group layout list.
-///
-/// `bgls` order defines the pipeline layout's group indices:
-/// - bgls[0] => group(0)
-/// - bgls[1] => group(1)
-/// - ...
-fn make_compute_pipeline(
-    device: &wgpu::Device,
-    label: &str,
-    module: &wgpu::ShaderModule,
-    entry: &str,
-    bgls: &[&wgpu::BindGroupLayout],
-) -> wgpu::ComputePipeline {
-    // Create a pipeline layout named "{label}_pl" that fixes the bind group schema.
-    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(&format!("{label}_pl")),
-        bind_group_layouts: bgls,
-        // No push constants used by these shaders.
-        push_constant_ranges: &[],
-    });
-
-    // Create the compute pipeline referencing the WGSL entry point.
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(label),
-        layout: Some(&pl),
-        module,
-        entry_point: entry,
-        compilation_options: Default::default(),
-    })
-}
-
-/// Create all pipelines (compute + blit).
-///
-/// Inputs:
-/// - `cs_module`: WGSL module containing compute entry points.
-/// - `fs_module`: WGSL module containing vertex/fragment entry points for blit.
-/// - `surface_format`: swapchain format used for the final render target.
-pub fn create_pipelines(
-    device: &wgpu::Device,
-    layouts: &Layouts,
-    cs_module: &wgpu::ShaderModule,
-    fs_module: &wgpu::ShaderModule,
-    surface_format: wgpu::TextureFormat,
-) -> Pipelines {
-    // -------------------------------------------------------------------------
-    // Compute pipelines
-    // -------------------------------------------------------------------------
-
-    // Primary pass:
-    // Uses group(0) = layouts.primary, which includes:
-    // - camera + scene buffers
-    // - storage outputs for color/depth
-    let primary = make_compute_pipeline(
-        device,
-        "primary_pipeline",
-        cs_module,
-        "main_primary",
-        &[&layouts.primary],
-    );
-
-    // Godray pass:
-    // Uses:
-    //   group(0) = layouts.scene  (camera + scene buffers only)
-    //   group(1) = layouts.godray (depth sample + history sample + out storage)
-    let godray = make_compute_pipeline(
-        device,
-        "godray_pipeline",
-        cs_module,
-        "main_godray",
-        &[&layouts.scene, &layouts.godray],
-    );
-
-    // Composite pass:
-    // Shader reads from @group(2) (color + godray + output storage).
-    // wgpu requires the pipeline layout to include group(0) and group(1) slots too,
-    // so we provide empty placeholder layouts for those indices.
-    let composite = make_compute_pipeline(
-        device,
-        "composite_pipeline",
-        cs_module,
-        "main_composite",
-        // group(0)=scene (cam + buffers), group(1)=empty, group(2)=composite textures
-        &[&layouts.scene, &layouts.empty, &layouts.composite],
-    );
-
-    // -------------------------------------------------------------------------
-    // Render pipeline: blit
-    // -------------------------------------------------------------------------
-    //
-    // Full-screen triangle approach:
-    // - No vertex buffers.
-    // - Vertex shader generates positions from vertex_index.
-    // - Fragment shader samples the renderer output texture.
-
-    // Pipeline layout for blit uses a single bind group: group(0) = layouts.blit.
-    let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("blit_pl"),
-        bind_group_layouts: &[&layouts.blit],
-        push_constant_ranges: &[],
-    });
-
-    // Render pipeline state:
-    // - Targets the swapchain format.
-    // - Uses REPLACE blending (overwrite framebuffer).
-    // - Default primitive/multisample state is fine for a simple fullscreen draw.
-    let blit = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("blit_pipeline"),
-        layout: Some(&blit_pl),
-        vertex: wgpu::VertexState {
-            module: fs_module,
-            entry_point: "vs_main",
-            // No vertex buffers; vertices are synthesized in the vertex shader.
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: fs_module,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                // Overwrite swapchain pixel with sampled color.
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        // Default triangle list, CCW front face, etc. (fullscreen triangle doesn't care much).
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-    });
-
-    Pipelines {
-        primary,
-        godray,
-        composite,
-        blit,
-    }
-}
-
-// src/render/state/textures.rs
-// ----------------------------
-// src/render/state/textures.rs
-// ----------------------------
-
-use crate::{
-    config,
-    render::resources::{create_output_texture, OutputTex},
-};
-
-pub struct Tex2D {
-    pub view: wgpu::TextureView,
-}
-
-pub struct Tex2DArray {
-    pub tex: wgpu::Texture,
-    pub view: wgpu::TextureView,
-}
-
-pub struct TextureSet {
-    pub output: OutputTex,
-    pub color: Tex2D,
-    pub depth: Tex2D,
-    pub godray: [Tex2D; 2],
-
-    pub clip_height: Tex2DArray,
-}
-
-pub fn quarter_dim(x: u32) -> u32 {
-    (x + 3) / 4
-}
-
-fn make_tex2d(
-    device: &wgpu::Device,
-    label: &str,
-    w: u32,
-    h: u32,
-    format: wgpu::TextureFormat,
-    usage: wgpu::TextureUsages,
-) -> Tex2D {
-    let w = w.max(1);
-    let h = h.max(1);
-
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage,
-        view_formats: &[],
-    });
-
-    let view = tex.create_view(&Default::default());
-    Tex2D { view }
-}
-
-fn make_tex2d_array(
-    device: &wgpu::Device,
-    label: &str,
-    w: u32,
-    h: u32,
-    layers: u32,
-    format: wgpu::TextureFormat,
-    usage: wgpu::TextureUsages,
-) -> Tex2DArray {
-    let w = w.max(1);
-    let h = h.max(1);
-    let layers = layers.max(1);
-
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: layers,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage,
-        view_formats: &[],
-    });
-
-    let view = tex.create_view(&wgpu::TextureViewDescriptor {
-        label: Some(&format!("{label}_view")),
-        format: Some(format),
-        dimension: Some(wgpu::TextureViewDimension::D2Array),
-        aspect: wgpu::TextureAspect::All,
-        base_mip_level: 0,
-        mip_level_count: Some(1),
-        base_array_layer: 0,
-        array_layer_count: Some(layers),
-    });
-
-    Tex2DArray { tex, view }
-}
-
-pub fn create_textures(
-    device: &wgpu::Device,
-    out_w: u32,
-    out_h: u32,
-    internal_w: u32,
-    internal_h: u32,
-) -> TextureSet {
-
-    let rw_tex_usage =
-        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
-
-    let output = create_output_texture(device, out_w, out_h);
-
-    let color = make_tex2d(
-        device,
-        "color_tex",
-        internal_w,
-        internal_h,
-        wgpu::TextureFormat::Rgba16Float,
-        rw_tex_usage,
-    );
-
-    let depth = make_tex2d(
-        device,
-        "depth_tex",
-        internal_w,
-        internal_h,
-        wgpu::TextureFormat::R32Float,
-        rw_tex_usage,
-    );
-
-    let qw = quarter_dim(internal_w);
-    let qh = quarter_dim(internal_h);
-
-    let godray = [
-        make_tex2d(device, "godray_a", qw, qh, wgpu::TextureFormat::Rgba16Float, rw_tex_usage),
-        make_tex2d(device, "godray_b", qw, qh, wgpu::TextureFormat::Rgba16Float, rw_tex_usage),
-    ];
-
-
-    // FP16 clipmap height: R16Float (half bandwidth vs R32Float)
-    let clip_height = make_tex2d_array(
-        device,
-        "clip_height",
-        config::CLIPMAP_RES,
-        config::CLIPMAP_RES,
-        config::CLIPMAP_LEVELS,
-        wgpu::TextureFormat::R16Float,
-        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-    );
-
-    TextureSet {
-        output,
-        color,
-        depth,
-        godray,
-        clip_height,
     }
 }
 

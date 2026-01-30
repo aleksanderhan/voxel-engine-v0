@@ -151,6 +151,7 @@ impl FrameProf {
             self.t_encode_blit = 0.0;
             self.t_submit = 0.0;
             self.t_poll = 0.0;
+            self.t_poll_wait = 0.0;
             self.t_present = 0.0;
             self.clip_uploads = 0;
             self.clip_bytes = 0;
