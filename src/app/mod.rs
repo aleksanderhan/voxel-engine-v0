@@ -282,10 +282,8 @@ impl App {
                 label: Some("encoder"),
             });
 
-        // IMPORTANT: clipmap uploads + uniform update go into the same encoder,
-        // and must happen BEFORE encode_compute() (which samples the clipmap).
-        self.renderer
-            .encode_clipmap_updates(&mut encoder, &clip_gpu, &clip_uploads);
+        // BEFORE encode_compute:
+        self.renderer.write_clipmap_updates(&clip_gpu, &clip_uploads);
 
         self.renderer
             .encode_compute(&mut encoder, self.config.width, self.config.height);
@@ -293,6 +291,9 @@ impl App {
         self.renderer.encode_blit(&mut encoder, &frame_view);
 
         self.renderer.queue().submit(Some(encoder.finish()));
+        
+        self.renderer.device().poll(wgpu::Maintain::Poll);
+
         frame.present();
     }
 }

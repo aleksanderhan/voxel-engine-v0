@@ -35,6 +35,8 @@ pub struct Renderer {
     render_scale: f32,
     internal_w: u32,
     internal_h: u32,
+
+    clip_scratch: Vec<u8>,
 }
 
 fn align_up(v: usize, a: usize) -> usize {
@@ -113,6 +115,7 @@ impl Renderer {
             render_scale,
             internal_w,
             internal_h,
+            clip_scratch: Vec::new(),
         }
     }
 
@@ -296,125 +299,53 @@ impl Renderer {
         }
     }
 
-    pub fn encode_clipmap_patch(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        level: u32,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-        data_f16: &[u16],
-    ) {
-        let res = config::CLIPMAP_RES;
-        if level >= config::CLIPMAP_LEVELS { return; }
-        if w == 0 || h == 0 { return; }
-        if x + w > res || y + h > res { return; }
-
-        let expected = (w as usize) * (h as usize);
-        if data_f16.len() != expected { return; }
-
-        // Tight row pitch in bytes (R16Float = 2 bytes/texel)
-        let row_bytes = (w as usize) * 2;
-
-        // WebGPU: bytes_per_row must be multiple of 256
-        let padded_row_bytes = align_up(row_bytes, 256);
-
-        // Prepare padded bytes (only when needed)
-        let bytes: Vec<u8>;
-        let bytes_ref: &[u8];
-
-        if padded_row_bytes == row_bytes {
-            bytes_ref = bytemuck::cast_slice(data_f16);
-        } else {
-            let src: &[u8] = bytemuck::cast_slice(data_f16);
-            let mut out = vec![0u8; padded_row_bytes * (h as usize)];
-
-            for row in 0..(h as usize) {
-                let src_off = row * row_bytes;
-                let dst_off = row * padded_row_bytes;
-                out[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
-            }
-
-            bytes = out;
-            bytes_ref = &bytes;
-        }
-
-        // Staging buffer for this patch
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("clipmap_patch_staging"),
-            size: bytes_ref.len() as u64,
-            usage: wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-
-        {
-            let mut view = staging.slice(..).get_mapped_range_mut();
-            view.copy_from_slice(bytes_ref);
-        }
-        staging.unmap();
-
-        encoder.copy_buffer_to_texture(
-            wgpu::ImageCopyBuffer {
-                buffer: &staging,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row_bytes as u32),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::ImageCopyTexture {
-                texture: &self.textures.clip_height.tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: level },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-
-    /// Encode clipmap uniform upload into the *current encoder* (no queue.write_buffer).
-    pub fn encode_clipmap_uniform(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        clip: &crate::render::gpu_types::ClipmapGpu,
-    ) {
-        let bytes = bytemuck::bytes_of(clip);
-
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("clipmap_uniform_staging"),
-            size: bytes.len() as u64,
-            usage: wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-
-        {
-            let mut view = staging.slice(..).get_mapped_range_mut();
-            view.copy_from_slice(bytes);
-        }
-        staging.unmap();
-
-        encoder.copy_buffer_to_buffer(&staging, 0, &self.buffers.clipmap, 0, bytes.len() as u64);
-    }
-
-    /// Encode: (1) all patch uploads, then (2) uniform update — in the same encoder.
-    pub fn encode_clipmap_updates(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
+    pub fn write_clipmap_updates(
+        &mut self,
         clip: &crate::render::gpu_types::ClipmapGpu,
         uploads: &[crate::clipmap::ClipmapUpload],
     ) {
-        // 1) texture first
+        let scratch = &mut self.clip_scratch;
+
+        // 1) texture patches
         for u in uploads {
-            self.encode_clipmap_patch(encoder, u.level, u.x, u.y, u.w, u.h, &u.data_f16);
+            let w = u.w as usize;
+            let h = u.h as usize;
+            if w == 0 || h == 0 { continue; }
+
+            let row_bytes = w * 2;                 // R16Float => 2 bytes/texel
+            let padded = align_up(row_bytes, 256); // required
+            let needed = padded * h;
+
+            scratch.clear();
+            scratch.resize(needed, 0);
+
+            // copy row-by-row into padded scratch
+            let src: &[u8] = bytemuck::cast_slice(&u.data_f16);
+            for row in 0..h {
+                let s0 = row * row_bytes;
+                let d0 = row * padded;
+                scratch[d0..d0 + row_bytes].copy_from_slice(&src[s0..s0 + row_bytes]);
+            }
+
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.textures.clip_height.tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: u.x, y: u.y, z: u.level },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &scratch,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(u.h),
+                },
+                wgpu::Extent3d { width: u.w, height: u.h, depth_or_array_layers: 1 },
+            );
         }
 
-        // 2) uniform second
-        self.encode_clipmap_uniform(encoder, clip);
+        // 2) uniform
+        self.queue.write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
     }
 
     pub fn internal_dims(&self) -> (u32, u32) {
