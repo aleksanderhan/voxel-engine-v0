@@ -34,6 +34,10 @@ impl ChunkCache {
         }
     }
 
+    pub fn stats(&self) -> (usize, usize, usize) {
+        (self.bytes, self.map.len(), self.lru.len())
+    }
+
     pub fn get(&self, key: &ChunkKey) -> Option<&CachedChunk> {
         self.map.get(key)
     }

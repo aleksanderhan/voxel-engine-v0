@@ -19,6 +19,8 @@ use crate::{
     render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu},
     world::WorldGen,
 };
+use crate::streaming::types::StreamStats;
+
 
 use super::{
     NodeArena,
@@ -318,6 +320,7 @@ impl ChunkManager {
             for k in stale_queued {
                 self.cancel_token(k).store(true, Ordering::Relaxed);
                 self.chunks.remove(&k);
+                self.cancels.remove(&k);
                 self.queued_set.remove(&k);
                 // build_queue cleanup happens below via retain()
             }
@@ -362,11 +365,13 @@ impl ChunkManager {
             if !self.in_keep(center, k) {
                 self.cancel_token(k).store(true, Ordering::Relaxed);
                 self.chunks.remove(&k);
+                self.cancels.remove(&k);
                 continue;
             }
 
             if self.cache.get(&k).is_some() {
                 self.chunks.remove(&k);
+                self.cancels.remove(&k);
                 let _ = self.try_promote_from_cache(center, k);
                 continue;
             }
@@ -387,6 +392,15 @@ impl ChunkManager {
                     }
                 }
             }
+
+            println!(
+    "[streamcfg] ACTIVE_RADIUS={} active_offsets={} total_slots={} resident_slots={}",
+    config::ACTIVE_RADIUS,
+    self.active_offsets.len(),
+    self.slot_to_key.len(),
+    self.resident_slots,
+);
+
         }
 
         // --- Harvest done builds (bounded per frame) ---
@@ -406,6 +420,7 @@ impl ChunkManager {
 
             if done.canceled || done.cancel.load(Ordering::Relaxed) {
                 self.chunks.remove(&done.key);
+                self.cancels.remove(&done.key);
                 continue;
             }
 
@@ -1229,7 +1244,54 @@ impl ChunkManager {
         q.insert(pos, u);
     }
 
+    pub fn stats(&self) -> StreamStats {
+        let mut s = StreamStats::default();
 
+        if let Some(c) = self.last_center {
+            s.center = (c.x, c.y, c.z);
+        }
+
+        s.resident_slots = self.resident_slots as u32;
+        s.total_slots    = self.slot_to_key.len() as u32;
+        s.chunks_map     = self.chunks.len() as u32;
+
+        for st in self.chunks.values() {
+            match st {
+                ChunkState::Queued        => s.st_queued += 1,
+                ChunkState::Building      => s.st_building += 1,
+                ChunkState::Uploading(_)  => s.st_uploading += 1,
+                ChunkState::Resident(_)   => s.st_resident += 1,
+            }
+        }
+
+        s.in_flight = self.in_flight as u32;
+        s.done_backlog = self.rx_done.len() as u32;
+
+        s.up_rewrite = self.uploads_rewrite.len() as u32;
+        s.up_active  = self.uploads_active.len() as u32;
+        s.up_other   = self.uploads_other.len() as u32;
+
+        let (cb, ce, cl) = self.cache.stats();
+        s.cache_bytes   = cb as u64;
+        s.cache_entries = ce as u32;
+        s.cache_lru     = cl as u32;
+
+        s.build_queue_len = self.build_queue.len() as u32;
+        s.queued_set_len  = self.queued_set.len() as u32;
+        s.cancels_len     = self.cancels.len() as u32;
+
+        // count orphans precisely
+        let mut orphan = 0u32;
+        for (k, st) in self.chunks.iter() {
+            if matches!(st, ChunkState::Queued) && !self.queued_set.contains(k) {
+                orphan += 1;
+            }
+        }
+        s.orphan_queued = orphan;
+
+
+        s
+    }
 
 
 }

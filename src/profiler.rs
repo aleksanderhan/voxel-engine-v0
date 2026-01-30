@@ -1,4 +1,5 @@
 use std::time::{Duration, Instant};
+use crate::streaming::types::StreamStats;
 
 pub struct FrameProf {
     pub frame: u64,
@@ -91,7 +92,7 @@ impl FrameProf {
         self.chunk_uploads += n as u64;
     }
 
-    pub fn end_frame(&mut self, frame_ms: f64) {
+    pub fn end_frame(&mut self, frame_ms: f64, stream: Option<StreamStats>) {
         self.frame += 1;
         self.n_frames += 1;
         self.max_frame_ms = self.max_frame_ms.max(frame_ms);
@@ -158,6 +159,29 @@ impl FrameProf {
             self.chunk_uploads = 0;
             self.max_frame_ms = 0.0;
         }
+
+        if let Some(s) = stream {
+            println!(
+                concat!(
+                    "  [stream] center=({},{},{}) slots={}/{} chunks={} ",
+                    "Q={} B={} U={} R={} in_flight={} done_backlog={}\n",
+                    "           uploads: rw={} act={} oth={} | cache: {:.1}MB entries={} lru={}\n",
+                    "           build_q={} queued_set={} cancels={} orphanQ={}\n",
+                ),
+                s.center.0, s.center.1, s.center.2,
+                s.resident_slots, s.total_slots, s.chunks_map,
+                s.st_queued, s.st_building, s.st_uploading, s.st_resident,
+                s.in_flight, s.done_backlog,
+                s.up_rewrite, s.up_active, s.up_other,
+                (s.cache_bytes as f64) / (1024.0 * 1024.0),
+                s.cache_entries, s.cache_lru,
+                s.build_queue_len, s.queued_set_len, s.cancels_len, s.orphan_queued
+            );
+
+        }
+
+        
+
     }
 
     #[inline]

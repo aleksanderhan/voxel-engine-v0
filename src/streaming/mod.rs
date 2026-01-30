@@ -4,11 +4,11 @@
 pub mod manager;
 pub mod node_arena;
 
-mod types;
+pub mod types;
 mod priority;
 mod workers;
 mod cache;
 
 pub use manager::ChunkManager;
-pub use types::ChunkUpload;
+pub use types::{StreamStats, ChunkUpload};
 pub use node_arena::NodeArena;

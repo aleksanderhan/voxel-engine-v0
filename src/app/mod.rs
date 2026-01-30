@@ -280,17 +280,18 @@ impl App {
         let chunk_uploads = self.chunks.take_uploads_budgeted();
         self.profiler.add_chunk_uploads(chunk_uploads.len());
 
-        // commit uses a slice, so borrow before moving
+        // 1) apply to GPU first
+        self.renderer.apply_chunk_uploads(&chunk_uploads);
+
+        // 2) then commit (may rebuild grid)
         let grid_changed2 = self.chunks.commit_uploads_applied(&chunk_uploads);
 
-        self.renderer.apply_chunk_uploads(chunk_uploads);
-
+        // 3) then write grid if needed
         if grid_changed2 {
             self.renderer.write_chunk_grid(self.chunks.chunk_grid());
         }
 
         self.profiler.chunk_up(crate::profiler::FrameProf::mark_ms(t0));
-
 
         // 7) acquire frame
         let t0 = Instant::now();
@@ -350,7 +351,9 @@ impl App {
 
         // 12) end-of-frame
         let frame_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
-        self.profiler.end_frame(frame_ms);
+        let ss = self.chunks.stats();
+        self.profiler.end_frame(frame_ms, Some(ss));
+
     }
 
 

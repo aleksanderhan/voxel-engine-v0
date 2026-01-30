@@ -123,17 +123,6 @@ fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
   return mix(hx0, hx1, fz);
 }
 
-fn clip_height_at(xz: vec2<f32>) -> f32 {
-  let lvl = clip_best_level(xz, 2);
-  return clip_height_at_level(xz, lvl);
-}
-
-fn clip_normal_at(xz: vec2<f32>) -> vec3<f32> {
-  let lvl = clip_best_level(xz, 2);
-  return clip_normal_at_level_2tap(xz, lvl);
-}
-
-
 fn clip_normal_at_level_2tap(world_xz: vec2<f32>, level: u32) -> vec3<f32> {
   let cell = clip.level[level].z;
 

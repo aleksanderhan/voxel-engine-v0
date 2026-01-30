@@ -93,3 +93,35 @@ pub fn y_band_min() -> i32 {
 pub fn y_band_max() -> i32 {
     GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1
 }
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamStats {
+    pub center: (i32, i32, i32),
+
+    pub resident_slots: u32,
+    pub total_slots: u32,
+    pub chunks_map: u32,
+
+    pub st_queued: u32,
+    pub st_building: u32,
+    pub st_uploading: u32,
+    pub st_resident: u32,
+
+    pub in_flight: u32,
+    pub done_backlog: u32,
+
+    pub up_rewrite: u32,
+    pub up_active: u32,
+    pub up_other: u32,
+
+    pub cache_bytes: u64,
+    pub cache_entries: u32,
+    pub cache_lru: u32,
+
+    // NEW
+    pub build_queue_len: u32,
+    pub queued_set_len: u32,
+    pub cancels_len: u32,
+
+    pub orphan_queued: u32,
+}

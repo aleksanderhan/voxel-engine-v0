@@ -244,7 +244,7 @@ impl Renderer {
         rpass.draw(0..3, 0..1);
     }
 
-    pub fn apply_chunk_uploads(&self, uploads: Vec<ChunkUpload>) {
+    pub fn apply_chunk_uploads(&self, uploads: &[ChunkUpload]) {
         let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
         let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
         let u32_stride  = std::mem::size_of::<u32>() as u64;
@@ -262,7 +262,11 @@ impl Renderer {
                 let needed = u.nodes.len() as u32;
                 if u.node_base + needed <= self.buffers.node_capacity {
                     let node_off = (u.node_base as u64) * node_stride;
-                    self.queue.write_buffer(&self.buffers.node, node_off, bytemuck::cast_slice(u.nodes.as_ref()));
+                    self.queue.write_buffer(
+                        &self.buffers.node,
+                        node_off,
+                        bytemuck::cast_slice(u.nodes.as_ref()),
+                    );
                 }
             }
 
@@ -271,19 +275,28 @@ impl Renderer {
                 let needed = u.macro_words.len() as u32;
                 if u.meta.macro_base + needed <= self.buffers.macro_capacity_u32 {
                     let off = (u.meta.macro_base as u64) * u32_stride;
-                    self.queue.write_buffer(&self.buffers.macro_occ, off, bytemuck::cast_slice(u.macro_words.as_ref()));
+                    self.queue.write_buffer(
+                        &self.buffers.macro_occ,
+                        off,
+                        bytemuck::cast_slice(u.macro_words.as_ref()),
+                    );
                 }
             }
 
+            // ropes
             if !u.ropes.is_empty() {
                 let needed = u.ropes.len() as u32;
                 if u.node_base + needed <= self.buffers.rope_capacity {
                     let rope_off = (u.node_base as u64) * rope_stride;
-                    self.queue.write_buffer(&self.buffers.node_ropes, rope_off, bytemuck::cast_slice(u.ropes.as_ref()));
+                    self.queue.write_buffer(
+                        &self.buffers.node_ropes,
+                        rope_off,
+                        bytemuck::cast_slice(u.ropes.as_ref()),
+                    );
                 }
             }
 
-            // colinfo (64*64 columns packed => 2048 u32 per chunk)
+            // colinfo
             if !u.colinfo_words.is_empty() {
                 let needed = u.colinfo_words.len() as u32;
                 if u.meta.colinfo_base + needed <= self.buffers.colinfo_capacity_u32 {
@@ -295,9 +308,9 @@ impl Renderer {
                     );
                 }
             }
-
         }
     }
+
 
     pub fn write_clipmap_updates(
         &mut self,
