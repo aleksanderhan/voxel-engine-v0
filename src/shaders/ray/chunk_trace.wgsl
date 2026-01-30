@@ -456,8 +456,18 @@ let MAX_ITERS: u32 = 256u + cam.chunk_size * 8u;
     // AIR leaf path
     // ------------------------------------------------------------
     if (leaf.mat == MAT_AIR) {
-      // Grass probe bounded to [tcur, t_leave] (macro boundary already handled above)
-      if (leaf.size <= grass_probe_max_leaf) {
+      // Grass probing scales with distance (LOD = level of detail):
+      // - near: probe normally
+      // - mid: probe only for smaller leaves
+      // - far: skip probing entirely
+      let lod_probe = grass_lod_from_t(tcur);
+
+      var grass_leaf_limit = grass_probe_max_leaf; // default near
+      if (lod_probe == 1u) {
+        grass_leaf_limit = cam.voxel_params.x;     // mid: only probe 1-voxel leaves
+      }
+
+      if (lod_probe != 2u && leaf.size <= grass_leaf_limit) {
         let t0_probe = max(t_enter, tcur - eps_step);
         let t1_probe = min(t_leave, t_exit);
 
@@ -487,6 +497,7 @@ let MAX_ITERS: u32 = 256u + cam.chunk_size * 8u;
           }
         }
       }
+
 
       // True leaf exit => rope traversal
       let face = exit_face_from_slab(rd, slab);
