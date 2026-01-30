@@ -31,6 +31,10 @@ pub struct Renderer {
     bind_groups: BindGroups,
 
     ping: usize,
+
+    render_scale: f32,
+    internal_w: u32,
+    internal_h: u32,
 }
 
 fn align_up(v: usize, a: usize) -> usize {
@@ -87,10 +91,13 @@ impl Renderer {
         let layouts = create_layouts(&device);
         let buffers = create_persistent_buffers(&device);
 
-        let textures = create_textures(&device, width, height);
-
         let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
 
+        let render_scale = 0.75;
+        let internal_w = ((width as f32) * render_scale).round() as u32;
+        let internal_h = ((height as f32) * render_scale).round() as u32;
+        
+        let textures = create_textures(&device, width, height, internal_w, internal_h);
         let bind_groups = create_bind_groups(&device, &layouts, &buffers, &textures, &sampler);
 
         Self {
@@ -103,6 +110,9 @@ impl Renderer {
             textures,
             bind_groups,
             ping: 0,
+            render_scale,
+            internal_w,
+            internal_h,
         }
     }
 
@@ -115,13 +125,13 @@ impl Renderer {
     }
 
     pub fn resize_output(&mut self, width: u32, height: u32) {
-        self.textures = create_textures(&self.device, width, height);
+        self.internal_w = ((width as f32) * self.render_scale).round() as u32;
+        self.internal_h = ((height as f32) * self.render_scale).round() as u32;
+
+        self.textures = create_textures(&self.device, width, height, self.internal_w, self.internal_h);
+
         self.bind_groups = create_bind_groups(
-            &self.device,
-            &self.layouts,
-            &self.buffers,
-            &self.textures,
-            &self.sampler,
+            &self.device, &self.layouts, &self.buffers, &self.textures, &self.sampler,
         );
 
         self.ping = 0;
@@ -156,18 +166,16 @@ impl Renderer {
             cpass.set_pipeline(&self.pipelines.primary);
             cpass.set_bind_group(0, &self.bind_groups.primary, &[]);
 
-            let gx = (width + 7) / 8;
-            let gy = (height + 7) / 8;
+            let gx = (self.internal_w + 7) / 8;
+            let gy = (self.internal_h + 7) / 8;
             cpass.dispatch_workgroups(gx, gy, 1);
+
         }
 
         let ping = self.ping;
         let pong = 1 - ping;
 
         {
-            let qw = quarter_dim(width);
-            let qh = quarter_dim(height);
-
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("godray_pass"),
                 timestamp_writes: None,
@@ -177,9 +185,13 @@ impl Renderer {
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
             cpass.set_bind_group(1, &self.bind_groups.godray[ping], &[]);
 
+            let qw = quarter_dim(self.internal_w);
+            let qh = quarter_dim(self.internal_h);
+
             let gx = (qw + 7) / 8;
             let gy = (qh + 7) / 8;
             cpass.dispatch_workgroups(gx, gy, 1);
+
         }
 
         {
@@ -202,6 +214,7 @@ impl Renderer {
             let gx = (width + 7) / 8;
             let gy = (height + 7) / 8;
             cpass.dispatch_workgroups(gx, gy, 1);
+
         }
 
         self.ping = pong;
@@ -402,6 +415,10 @@ impl Renderer {
 
         // 2) uniform second
         self.encode_clipmap_uniform(encoder, clip);
+    }
+
+    pub fn internal_dims(&self) -> (u32, u32) {
+        (self.internal_w.max(1), self.internal_h.max(1))
     }
 
 }

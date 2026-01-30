@@ -100,20 +100,24 @@ fn make_tex2d_array(
     Tex2DArray { tex, view }
 }
 
-pub fn create_textures(device: &wgpu::Device, width: u32, height: u32) -> TextureSet {
-    let width = width.max(1);
-    let height = height.max(1);
+pub fn create_textures(
+    device: &wgpu::Device,
+    out_w: u32,
+    out_h: u32,
+    internal_w: u32,
+    internal_h: u32,
+) -> TextureSet {
 
     let rw_tex_usage =
         wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
 
-    let output = create_output_texture(device, width, height);
+    let output = create_output_texture(device, out_w, out_h);
 
     let color = make_tex2d(
         device,
         "color_tex",
-        width,
-        height,
+        internal_w,
+        internal_h,
         wgpu::TextureFormat::Rgba16Float,
         rw_tex_usage,
     );
@@ -121,33 +125,20 @@ pub fn create_textures(device: &wgpu::Device, width: u32, height: u32) -> Textur
     let depth = make_tex2d(
         device,
         "depth_tex",
-        width,
-        height,
+        internal_w,
+        internal_h,
         wgpu::TextureFormat::R32Float,
         rw_tex_usage,
     );
 
-    let qw = quarter_dim(width);
-    let qh = quarter_dim(height);
+    let qw = quarter_dim(internal_w);
+    let qh = quarter_dim(internal_h);
 
     let godray = [
-        make_tex2d(
-            device,
-            "godray_a",
-            qw,
-            qh,
-            wgpu::TextureFormat::Rgba16Float,
-            rw_tex_usage,
-        ),
-        make_tex2d(
-            device,
-            "godray_b",
-            qw,
-            qh,
-            wgpu::TextureFormat::Rgba16Float,
-            rw_tex_usage,
-        ),
+        make_tex2d(device, "godray_a", qw, qh, wgpu::TextureFormat::Rgba16Float, rw_tex_usage),
+        make_tex2d(device, "godray_b", qw, qh, wgpu::TextureFormat::Rgba16Float, rw_tex_usage),
     ];
+
 
     // FP16 clipmap height: R16Float (half bandwidth vs R32Float)
     let clip_height = make_tex2d_array(

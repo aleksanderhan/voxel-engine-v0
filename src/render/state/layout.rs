@@ -168,7 +168,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             bgl_tex_sample_2d(
                 0,
                 cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
+                wgpu::TextureSampleType::Float { filterable: true },
             ),
             bgl_tex_sample_2d(
                 1,

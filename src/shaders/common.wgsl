@@ -244,12 +244,17 @@ struct Camera {
   max_steps   : u32,
   frame_index : u32,
 
-  // x = voxel_size_m, y = time_seconds, z = wind_strength, w = fog_density
   voxel_params : vec4<f32>,
 
   grid_origin_chunk : vec4<i32>,
   grid_dims         : vec4<u32>,
+
+  // xy = render size in pixels, zw = present size in pixels
+  render_present_px : vec4<u32>,
+
+  
 };
+
 
 struct ChunkMeta {
   origin       : vec4<i32>,
@@ -490,4 +495,33 @@ fn fbm(p: vec2<f32>) -> f32 {
     amp *= 0.5;
   }
   return sum;
+}
+
+
+fn render_dims_f() -> vec2<f32> {
+  return vec2<f32>(f32(cam.render_present_px.x), f32(cam.render_present_px.y));
+}
+fn present_dims_f() -> vec2<f32> {
+  return vec2<f32>(f32(cam.render_present_px.z), f32(cam.render_present_px.w));
+}
+
+// Map a present pixel center (in present pixel coords) -> normalized UV over render
+fn uv_render_from_present_px(px_present: vec2<f32>) -> vec2<f32> {
+  let pd = present_dims_f();
+  return (px_present) / pd;
+}
+
+// Map present pixel center -> render pixel center (float)
+fn px_render_from_present_px(px_present: vec2<f32>) -> vec2<f32> {
+  let rd = render_dims_f();
+  let uv = uv_render_from_present_px(px_present);
+  return uv * rd;
+}
+
+fn ip_render_from_present_px(px_present: vec2<f32>) -> vec2<i32> {
+  let rd = render_dims_f();
+  let pr = px_render_from_present_px(px_present);
+  let ix = clamp(i32(floor(pr.x)), 0, i32(rd.x) - 1);
+  let iy = clamp(i32(floor(pr.y)), 0, i32(rd.y) - 1);
+  return vec2<i32>(ix, iy);
 }

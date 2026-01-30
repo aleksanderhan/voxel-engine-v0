@@ -204,6 +204,8 @@ impl App {
 
         let max_steps = (config::CHUNK_SIZE * 2).clamp(64, 256);
 
+        let (rw, rh) = self.renderer.internal_dims();
+
         let cam_gpu = CameraGpu {
             view_inv: cf.view_inv.to_cols_array_2d(),
             proj_inv: cf.proj_inv.to_cols_array_2d(),
@@ -228,6 +230,7 @@ impl App {
                 self.chunks.grid_dims()[2],
                 0,
             ],
+            render_present_px: [rw, rh, self.config.width, self.config.height],
         };
 
         self.renderer.write_camera(&cam_gpu);

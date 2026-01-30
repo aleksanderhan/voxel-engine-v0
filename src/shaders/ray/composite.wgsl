@@ -86,22 +86,32 @@ fn godray_sample_bilerp(
   return (k * c) / denom;
 }
 
-fn composite_pixel(
-  ip: vec2<i32>,
-  px: vec2<f32>,
+fn composite_pixel_mapped(
+  ip_render: vec2<i32>,
+  px_render: vec2<f32>,
   color_tex: texture_2d<f32>,
   godray_tex: texture_2d<f32>,
   godray_samp: sampler,
   depth_full: texture_2d<f32>
 ) -> vec4<f32> {
-  let dims = textureDimensions(color_tex);
+  // Render-space dims (NOT present/out_img dims)
+  let rdims_u = textureDimensions(color_tex);
+  let rdims_i = vec2<i32>(i32(rdims_u.x), i32(rdims_u.y));
+  let fd      = vec2<f32>(f32(rdims_u.x), f32(rdims_u.y));
+
+  // Clamp render ip defensively
+  let ip = vec2<i32>(
+    clamp(ip_render.x, 0, rdims_i.x - 1),
+    clamp(ip_render.y, 0, rdims_i.y - 1)
+  );
+
+  // Base color in render space
   let base = textureLoad(color_tex, ip, 0).xyz;
 
-  // Normalized UV in full-res space (works even if godray_tex is quarter-res)
-  let fd = vec2<f32>(f32(dims.x), f32(dims.y));
-  let uv = (px + vec2<f32>(0.5)) / fd;
+  // UV normalized in render space
+  let uv = px_render / fd;
 
-  // Godray taps (5 total)
+  // Godray taps in render-texel units (stable across dynamic res)
   let du = vec2<f32>(1.0 / fd.x, 0.0);
   let dv = vec2<f32>(0.0, 1.0 / fd.y);
 
@@ -111,12 +121,12 @@ fn composite_pixel(
   let gN = godray_sample_linear(uv + dv,   godray_tex, godray_samp);
   let gS = godray_sample_linear(uv - dv,   godray_tex, godray_samp);
 
-  // Depth edge weights (4 depth taps, cheap)
+  // Depth edge weights (render-space integer taps)
   let d0 = textureLoad(depth_full, ip, 0).x;
 
-  let ipE = vec2<i32>(min(ip.x + 1, i32(dims.x) - 1), ip.y);
-  let ipW = vec2<i32>(max(ip.x - 1, 0),              ip.y);
-  let ipN = vec2<i32>(ip.x, min(ip.y + 1, i32(dims.y) - 1));
+  let ipE = vec2<i32>(min(ip.x + 1, rdims_i.x - 1), ip.y);
+  let ipW = vec2<i32>(max(ip.x - 1, 0),            ip.y);
+  let ipN = vec2<i32>(ip.x, min(ip.y + 1, rdims_i.y - 1));
   let ipS = vec2<i32>(ip.x, max(ip.y - 1, 0));
 
   let dE = textureLoad(depth_full, ipE, 0).x;
@@ -140,12 +150,11 @@ fn composite_pixel(
   god_lin = max(god_lin - vec3<f32>(GODRAY_BLACK_LEVEL), vec3<f32>(0.0));
   god_lin = god_lin / (god_lin + vec3<f32>(GODRAY_KNEE_COMPOSITE));
 
-  let god_far = smoothstep(GODRAY_FADE_NEAR, GODRAY_FADE_FAR, d0);
+  let god_far   = smoothstep(GODRAY_FADE_NEAR, GODRAY_FADE_FAR, d0);
   let god_scale = GODRAY_COMPOSITE_SCALE * mix(1.0, 0.25, god_far);
 
   var hdr = max(base + god_scale * god_lin, vec3<f32>(0.0));
 
-  // --- rest of your bloom/tonemap code unchanged ---
   // Bloom (hue-preserving + distance-faded)
   let bloom_thresh = 1.4;
   let bloom_k      = 0.12;
@@ -153,10 +162,10 @@ fn composite_pixel(
 
   let b0 = bright_extract_hue(hdr, bloom_thresh);
 
-  let ipx1 = vec2<i32>(clamp(ip.x + 2, 0, i32(dims.x) - 1), ip.y);
-  let ipx0 = vec2<i32>(clamp(ip.x - 2, 0, i32(dims.x) - 1), ip.y);
-  let ipy1 = vec2<i32>(ip.x, clamp(ip.y + 2, 0, i32(dims.y) - 1));
-  let ipy0 = vec2<i32>(ip.x, clamp(ip.y - 2, 0, i32(dims.y) - 1));
+  let ipx1 = vec2<i32>(clamp(ip.x + 2, 0, rdims_i.x - 1), ip.y);
+  let ipx0 = vec2<i32>(clamp(ip.x - 2, 0, rdims_i.x - 1), ip.y);
+  let ipy1 = vec2<i32>(ip.x, clamp(ip.y + 2, 0, rdims_i.y - 1));
+  let ipy0 = vec2<i32>(ip.x, clamp(ip.y - 2, 0, rdims_i.y - 1));
 
   let hx1 = max(textureLoad(color_tex, ipx1, 0).xyz, vec3<f32>(0.0));
   let hx0 = max(textureLoad(color_tex, ipx0, 0).xyz, vec3<f32>(0.0));
@@ -173,9 +182,9 @@ fn composite_pixel(
   hdr += bloom_k_eff * min(bloom, bloom_max);
 
   // Distance-safe saturation compensation (HDR)
-  let lum_w = vec3<f32>(0.2126, 0.7152, 0.0722);
-  let l_hdr = max(dot(hdr, lum_w), 1e-6);
-  let gray_hdr = vec3<f32>(l_hdr);
+  let lum_w  = vec3<f32>(0.2126, 0.7152, 0.0722);
+  let l_hdr  = max(dot(hdr, lum_w), 1e-6);
+  let gray_h = vec3<f32>(l_hdr);
 
   let t_sat = smoothstep(30.0, 100.0, d0);
 
@@ -184,7 +193,7 @@ fn composite_pixel(
   let hi = smoothstep(1.6, 6.0, l_hdr);
   sat_boost = mix(sat_boost, 1.0, 0.55 * hi);
 
-  hdr = mix(gray_hdr, hdr, sat_boost);
+  hdr = mix(gray_h, hdr, sat_boost);
 
   // Tonemap (luma-preserving)
   var c = tonemap_aces_luma(hdr * POST_EXPOSURE);
@@ -193,7 +202,7 @@ fn composite_pixel(
 
   // Dither/grain before gamma
   let fi = f32(cam.frame_index & 1023u);
-  let n = hash12(px * 1.7 + vec2<f32>(fi, 0.0)) - 0.5;
+  let n  = hash12(px_render * 1.7 + vec2<f32>(fi, 0.0)) - 0.5;
   c += vec3<f32>(n / 1024.0);
 
   let ldr = gamma_encode(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));

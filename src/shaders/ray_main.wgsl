@@ -99,12 +99,24 @@ fn main_godray(@builtin(global_invocation_id) gid3: vec3<u32>) {
 
 @compute @workgroup_size(8, 8, 1)
 fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let dims = textureDimensions(out_img);
-  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  let out_dims = textureDimensions(out_img);
+  if (gid.x >= out_dims.x || gid.y >= out_dims.y) { return; }
 
-  let ip = vec2<i32>(i32(gid.x), i32(gid.y));
-  let px = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+  // present pixel center
+  let px_present = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
 
-  let outc = composite_pixel(ip, px, color_tex, godray_tex, godray_samp, depth_full);
-  textureStore(out_img, ip, outc);
+  // mapped render integer pixel
+  let ip_render = ip_render_from_present_px(px_present);
+
+  // mapped render pixel center (float)
+  let px_render = px_render_from_present_px(px_present);
+
+  let outc = composite_pixel_mapped(
+    ip_render, px_render,
+    color_tex, godray_tex, godray_samp,
+    depth_full
+  );
+
+  let ip_out = vec2<i32>(i32(gid.x), i32(gid.y));
+  textureStore(out_img, ip_out, outc);
 }
