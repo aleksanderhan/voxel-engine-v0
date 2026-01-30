@@ -93,7 +93,7 @@ impl Renderer {
 
         let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
 
-        let render_scale = 0.75;
+        let render_scale = config::RENDER_SCALE;
         let internal_w = ((width as f32) * render_scale).round() as u32;
         let internal_h = ((height as f32) * render_scale).round() as u32;
         

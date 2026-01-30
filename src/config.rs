@@ -13,6 +13,8 @@ pub const VOXEL_SIZE_M_F64: f64 = 0.10;
 // Keep this explicit so you can change voxel size later without hunting constants.
 pub const VOXELS_PER_METER: i32 = 10; // 1.0 / 0.10
 
+pub const RENDER_SCALE: f32 = 0.5;
+
 pub const WORKER_THREADS: usize = 8;
 pub const MAX_IN_FLIGHT: usize = 16;
 
