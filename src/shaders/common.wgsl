@@ -118,7 +118,7 @@ const CLOUD_HORIZON_Y0 : f32 = 0.02;
 const CLOUD_HORIZON_Y1 : f32 = 0.25;
 
 // How clouds darken the SKY appearance (keep low)
-const CLOUD_SKY_DARKEN : f32 = 0.04;
+const CLOUD_SKY_DARKEN : f32 = 0.4;
 
 // How much clouds attenuate SUNLIGHT hitting the world (can be much higher)
 const CLOUD_SHADOW_ABSORB   : f32 = 4.0;   // try 4..12

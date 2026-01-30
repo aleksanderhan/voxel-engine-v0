@@ -11,6 +11,7 @@ use crate::{
     render::gpu_types::{CameraGpu, OverlayGpu},
     streaming::ChunkUpload,
 };
+use bytemuck::{Pod, bytes_of, cast_slice};
 
 use bindgroups::{create_bind_groups, BindGroups};
 use buffers::{create_persistent_buffers, Buffers};
@@ -39,8 +40,85 @@ pub struct Renderer {
     clip_scratch: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct Region {
+    off: u64,
+    data: Vec<u8>,
+}
+
+fn merge_adjacent(mut regions: Vec<Region>) -> Vec<Region> {
+    if regions.is_empty() { return regions; }
+    regions.sort_by_key(|r| r.off);
+
+    let mut out: Vec<Region> = Vec::with_capacity(regions.len());
+    out.push(regions.remove(0));
+
+    for r in regions {
+        let last = out.last_mut().unwrap();
+        let last_end = last.off + last.data.len() as u64;
+
+        if r.off == last_end {
+            last.data.extend_from_slice(&r.data);
+        } else {
+            out.push(r);
+        }
+    }
+    out
+}
+
+// T must be Pod so we can cast to bytes safely.
+fn push_typed_region<T: Pod>(regions: &mut Vec<Region>, off_elems: u32, stride: u64, slice: &[T]) {
+    if slice.is_empty() { return; }
+    let off = (off_elems as u64) * stride;
+    let bytes: &[u8] = bytemuck::cast_slice(slice);
+    regions.push(Region { off, data: bytes.to_vec() });
+}
+
+
 fn align_up(v: usize, a: usize) -> usize {
     (v + (a - 1)) & !(a - 1)
+}
+
+fn batch_write_meta(
+    queue: &wgpu::Queue,
+    dst: &wgpu::Buffer,
+    meta_stride: u64,
+    uploads: &[crate::streaming::ChunkUpload],
+    chunk_capacity: u32,
+) {
+    // Collect (slot, meta)
+    let mut items: Vec<(u32, crate::render::gpu_types::ChunkMetaGpu)> = Vec::with_capacity(uploads.len());
+    for u in uploads {
+        if u.slot < chunk_capacity {
+            items.push((u.slot, u.meta));
+        }
+    }
+    if items.is_empty() { return; }
+
+    // Sort by slot so we can find contiguous runs
+    items.sort_by_key(|(slot, _)| *slot);
+
+    // Emit contiguous runs of slots as one write each
+    let mut i = 0usize;
+    while i < items.len() {
+        let start_slot = items[i].0;
+        let mut run_len = 1usize;
+
+        while i + run_len < items.len() && items[i + run_len].0 == start_slot + run_len as u32 {
+            run_len += 1;
+        }
+
+        // Build a contiguous vec of metas and write once
+        let mut run: Vec<crate::render::gpu_types::ChunkMetaGpu> = Vec::with_capacity(run_len);
+        for k in 0..run_len {
+            run.push(items[i + k].1);
+        }
+
+        let dst_off = (start_slot as u64) * meta_stride;
+        queue.write_buffer(dst, dst_off, cast_slice(&run));
+
+        i += run_len;
+    }
 }
 
 impl Renderer {
@@ -250,36 +328,35 @@ impl Renderer {
         let u32_stride  = std::mem::size_of::<u32>() as u64;
         let rope_stride = std::mem::size_of::<crate::render::gpu_types::NodeRopesGpu>() as u64;
 
-        for u in uploads {
-            // meta
-            if u.slot < self.buffers.chunk_capacity {
-                let meta_off = (u.slot as u64) * meta_stride;
-                self.queue.write_buffer(&self.buffers.chunk, meta_off, bytemuck::bytes_of(&u.meta));
-            }
+        // 1) Meta in big runs
+        batch_write_meta(
+            self.queue(),
+            &self.buffers.chunk,
+            meta_stride,
+            uploads,
+            self.buffers.chunk_capacity,
+        );
 
+        // 2) Nodes / macro / ropes / colinfo as merged byte regions
+        let mut node_regions: Vec<Region> = Vec::new();
+        let mut macro_regions: Vec<Region> = Vec::new();
+        let mut rope_regions: Vec<Region> = Vec::new();
+        let mut colinfo_regions: Vec<Region> = Vec::new();
+
+        for u in uploads {
             // nodes
             if !u.nodes.is_empty() {
                 let needed = u.nodes.len() as u32;
                 if u.node_base + needed <= self.buffers.node_capacity {
-                    let node_off = (u.node_base as u64) * node_stride;
-                    self.queue.write_buffer(
-                        &self.buffers.node,
-                        node_off,
-                        bytemuck::cast_slice(u.nodes.as_ref()),
-                    );
+                    push_typed_region(&mut node_regions, u.node_base, node_stride, u.nodes.as_ref());
                 }
             }
 
-            // macro occupancy
+            // macro occupancy (u32)
             if !u.macro_words.is_empty() {
                 let needed = u.macro_words.len() as u32;
                 if u.meta.macro_base + needed <= self.buffers.macro_capacity_u32 {
-                    let off = (u.meta.macro_base as u64) * u32_stride;
-                    self.queue.write_buffer(
-                        &self.buffers.macro_occ,
-                        off,
-                        bytemuck::cast_slice(u.macro_words.as_ref()),
-                    );
+                    push_typed_region(&mut macro_regions, u.meta.macro_base, u32_stride, u.macro_words.as_ref());
                 }
             }
 
@@ -287,29 +364,34 @@ impl Renderer {
             if !u.ropes.is_empty() {
                 let needed = u.ropes.len() as u32;
                 if u.node_base + needed <= self.buffers.rope_capacity {
-                    let rope_off = (u.node_base as u64) * rope_stride;
-                    self.queue.write_buffer(
-                        &self.buffers.node_ropes,
-                        rope_off,
-                        bytemuck::cast_slice(u.ropes.as_ref()),
-                    );
+                    push_typed_region(&mut rope_regions, u.node_base, rope_stride, u.ropes.as_ref());
                 }
             }
 
-            // colinfo
+            // colinfo (u32)
             if !u.colinfo_words.is_empty() {
                 let needed = u.colinfo_words.len() as u32;
                 if u.meta.colinfo_base + needed <= self.buffers.colinfo_capacity_u32 {
-                    let off = (u.meta.colinfo_base as u64) * u32_stride;
-                    self.queue.write_buffer(
-                        &self.buffers.colinfo,
-                        off,
-                        bytemuck::cast_slice(u.colinfo_words.as_ref()),
-                    );
+                    push_typed_region(&mut colinfo_regions, u.meta.colinfo_base, u32_stride, u.colinfo_words.as_ref());
                 }
             }
         }
+
+        // Merge adjacent regions so we do far fewer write_buffer calls
+        for r in merge_adjacent(node_regions) {
+            self.queue.write_buffer(&self.buffers.node, r.off, &r.data);
+        }
+        for r in merge_adjacent(macro_regions) {
+            self.queue.write_buffer(&self.buffers.macro_occ, r.off, &r.data);
+        }
+        for r in merge_adjacent(rope_regions) {
+            self.queue.write_buffer(&self.buffers.node_ropes, r.off, &r.data);
+        }
+        for r in merge_adjacent(colinfo_regions) {
+            self.queue.write_buffer(&self.buffers.colinfo, r.off, &r.data);
+        }
     }
+
 
 
     pub fn write_clipmap_updates(

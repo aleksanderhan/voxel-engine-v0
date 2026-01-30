@@ -72,6 +72,8 @@ pub struct App {
     frame_index: u32,
 
     profiler: crate::profiler::FrameProf,
+    last_submit: Option<wgpu::SubmissionIndex>,
+
 }
 
 impl App {
@@ -148,6 +150,7 @@ impl App {
             fps_last: Instant::now(),
             frame_index: 0,
             profiler: crate::profiler::FrameProf::new(),
+            last_submit: None,
         }
     }
 
@@ -280,20 +283,29 @@ impl App {
         let chunk_uploads = self.chunks.take_uploads_budgeted();
         self.profiler.add_chunk_uploads(chunk_uploads.len());
 
-        // 1) apply to GPU first
+        // 1) apply to GPU
         self.renderer.apply_chunk_uploads(&chunk_uploads);
 
-        // 2) then commit (may rebuild grid)
+        // 2) commit (may rebuild grid / residency state)
         let grid_changed2 = self.chunks.commit_uploads_applied(&chunk_uploads);
 
-        // 3) then write grid if needed
+        // 3) write grid if needed
         if grid_changed2 {
             self.renderer.write_chunk_grid(self.chunks.chunk_grid());
         }
 
         self.profiler.chunk_up(crate::profiler::FrameProf::mark_ms(t0));
 
-        // 7) acquire frame
+        // 7a) wait for previous GPU submission (if any)
+        let t0 = Instant::now();
+        if let Some(si) = self.last_submit.as_ref() {
+            self.renderer
+                .device()
+                .poll(wgpu::Maintain::WaitForSubmissionIndex(si.clone()));
+        }
+        self.profiler.acq_gpu_wait(crate::profiler::FrameProf::mark_ms(t0));
+
+        // 7b) swapchain acquire
         let t0 = Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -307,7 +319,8 @@ impl App {
                 return;
             }
         };
-        self.profiler.acquire(crate::profiler::FrameProf::mark_ms(t0));
+        self.profiler.acq_swapchain(crate::profiler::FrameProf::mark_ms(t0));
+
 
         let frame_view = frame.texture.create_view(&Default::default());
 
@@ -336,7 +349,8 @@ impl App {
 
         // 9) submit
         let t0 = Instant::now();
-        self.renderer.queue().submit(Some(encoder.finish()));
+        let si = self.renderer.queue().submit(Some(encoder.finish()));
+        self.last_submit = Some(si);
         self.profiler.submit(crate::profiler::FrameProf::mark_ms(t0));
 
         // 10) poll

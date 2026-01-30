@@ -13,7 +13,6 @@ pub struct FrameProf {
     pub t_cam_write: f64,
     pub t_overlay: f64,
     pub t_chunk_uploads: f64,
-    pub t_acquire: f64,
     pub t_encode_clipmap: f64,
     pub t_encode_compute: f64,
     pub t_encode_blit: f64,
@@ -28,6 +27,9 @@ pub struct FrameProf {
     pub max_frame_ms: f64,
 
     pub t_poll_wait: f64,
+
+    pub t_acq_gpu_wait: f64,
+    pub t_acq_swapchain: f64,
 
 }
 
@@ -45,7 +47,6 @@ impl FrameProf {
             t_cam_write: 0.0,
             t_overlay: 0.0,
             t_chunk_uploads: 0.0,
-            t_acquire: 0.0,
             t_encode_clipmap: 0.0,
             t_encode_compute: 0.0,
             t_encode_blit: 0.0,
@@ -60,6 +61,10 @@ impl FrameProf {
             max_frame_ms: 0.0,
 
             t_poll_wait: 0.0,
+
+            t_acq_gpu_wait: 0.0,
+            t_acq_swapchain: 0.0,
+
         }
     }
 
@@ -75,7 +80,6 @@ impl FrameProf {
     #[inline] pub fn cam_write(&mut self, ms: f64) { self.t_cam_write += ms; }
     #[inline] pub fn overlay(&mut self, ms: f64) { self.t_overlay += ms; }
     #[inline] pub fn chunk_up(&mut self, ms: f64) { self.t_chunk_uploads += ms; }
-    #[inline] pub fn acquire(&mut self, ms: f64) { self.t_acquire += ms; }
     #[inline] pub fn enc_clip(&mut self, ms: f64) { self.t_encode_clipmap += ms; }
     #[inline] pub fn enc_comp(&mut self, ms: f64) { self.t_encode_compute += ms; }
     #[inline] pub fn enc_blit(&mut self, ms: f64) { self.t_encode_blit += ms; }
@@ -103,7 +107,7 @@ impl FrameProf {
 
             let avg_frame = avg(
                 self.t_cam + self.t_stream + self.t_clipmap_update + self.t_cam_write + self.t_overlay
-                    + self.t_chunk_uploads + self.t_acquire + self.t_encode_clipmap + self.t_encode_compute
+                    + self.t_chunk_uploads + self.t_acq_gpu_wait + self.t_acq_swapchain + self.t_encode_clipmap + self.t_encode_compute
                     + self.t_encode_blit + self.t_submit + self.t_poll + self.t_poll_wait + self.t_present
             );
 
@@ -111,7 +115,7 @@ impl FrameProf {
                 concat!(
                     "\n[prof] frames={} avg_frame={:.2}ms max_frame={:.2}ms\n",
                     "  cam={:.2} stream={:.2} clip_update={:.2} cam_write={:.2} overlay={:.2}\n",
-                    "  chunk_up={:.2} acquire={:.2} enc_clip={:.2} enc_comp={:.2} enc_blit={:.2}\n",
+                    "  chunk_up={:.2} acq_gpu={:.2} acq_sc={:.2} enc_clip={:.2} enc_comp={:.2} enc_blit={:.2}\n",
                     "  submit={:.2} poll={:.2} poll_wait={:.2} present={:.2}\n",
                     "  clip_uploads/frame={:.1} clip_kb/frame={:.1} chunk_uploads/frame={:.1}\n"
                 ),
@@ -124,7 +128,8 @@ impl FrameProf {
                 avg(self.t_cam_write),
                 avg(self.t_overlay),
                 avg(self.t_chunk_uploads),
-                avg(self.t_acquire),
+                avg(self.t_acq_gpu_wait),
+                avg(self.t_acq_swapchain),
                 avg(self.t_encode_clipmap),
                 avg(self.t_encode_compute),
                 avg(self.t_encode_blit),
@@ -146,7 +151,6 @@ impl FrameProf {
             self.t_cam_write = 0.0;
             self.t_overlay = 0.0;
             self.t_chunk_uploads = 0.0;
-            self.t_acquire = 0.0;
             self.t_encode_clipmap = 0.0;
             self.t_encode_compute = 0.0;
             self.t_encode_blit = 0.0;
@@ -158,6 +162,9 @@ impl FrameProf {
             self.clip_bytes = 0;
             self.chunk_uploads = 0;
             self.max_frame_ms = 0.0;
+            self.t_acq_gpu_wait = 0.0;
+            self.t_acq_swapchain = 0.0;
+
         }
 
         if let Some(s) = stream {
@@ -188,5 +195,9 @@ impl FrameProf {
     pub fn poll_wait(&mut self, ms: f64) {
         self.t_poll_wait += ms;
     }
+
+    #[inline] pub fn acq_gpu_wait(&mut self, ms: f64) { self.t_acq_gpu_wait += ms; }
+    #[inline] pub fn acq_swapchain(&mut self, ms: f64) { self.t_acq_swapchain += ms; }
+
 
 }

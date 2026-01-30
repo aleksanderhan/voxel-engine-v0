@@ -393,14 +393,6 @@ impl ChunkManager {
                 }
             }
 
-            println!(
-    "[streamcfg] ACTIVE_RADIUS={} active_offsets={} total_slots={} resident_slots={}",
-    config::ACTIVE_RADIUS,
-    self.active_offsets.len(),
-    self.slot_to_key.len(),
-    self.resident_slots,
-);
-
         }
 
         // --- Harvest done builds (bounded per frame) ---
