@@ -1,1729 +1,3866 @@
-// src/render/gpu_types.rs
-// -----------------------
-// src/render/gpu_types.rs
-// -----------------------
-//
-// Fix: ClipLevelParams now has `packed_offsets`, but we keep its existing
-// `inv_cell_size_m` field on CPU side.
-// GPU uniform uses vec4 per level with packed offsets in .w.
-
-use bytemuck::{Pod, Zeroable};
-use crate::config;
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
-pub struct NodeGpu {
-    pub child_base: u32,
-    pub child_mask: u32,
-    pub material: u32,
-    pub key: u32, // packed spatial key: level + coord at that level
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
-pub struct NodeRopesGpu {
-    pub px: u32,
-    pub nx: u32,
-    pub py: u32,
-    pub ny: u32,
-    pub pz: u32,
-    pub nz: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-}
-
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct ChunkMetaGpu {
-    pub origin: [i32; 4],
-    pub node_base: u32,
-    pub node_count: u32,
-    pub macro_base: u32,
-    pub colinfo_base: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct CameraGpu {
-    pub view_inv: [[f32; 4]; 4],
-    pub proj_inv: [[f32; 4]; 4],
-    pub cam_pos: [f32; 4],
-
-    pub chunk_size: u32,
-    pub chunk_count: u32,
-    pub max_steps: u32,
-    pub frame_index: u32,
-
-    pub voxel_params: [f32; 4],
-
-    pub grid_origin_chunk: [i32; 4],
-    pub grid_dims: [u32; 4],
-
-    pub render_present_px: [u32; 4],
-}
-
-/// Clipmap uniform payload.
-///
-/// Matches `shaders/clipmap.wgsl`.
-///
-/// Per level vec4<f32>:
-///   x = origin_x_m
-///   y = origin_z_m
-///   z = cell_size_m
-///   w = unused (0)
-///
-/// Per level vec4<u32>:
-///   x = off_x (toroidal offset in texels)
-///   y = off_z
-///   z/w unused (0)
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct ClipmapGpu {
-    pub levels: u32,
-    pub res: u32,
-    pub base_cell_m: f32,
-    pub _pad0: f32,
-
-    pub level:  [[f32; 4]; config::CLIPMAP_LEVELS_USIZE],
-    pub offset: [[u32; 4]; config::CLIPMAP_LEVELS_USIZE],
-}
-
-impl ClipmapGpu {
-    pub fn from_cpu(cpu: &crate::clipmap::ClipmapParamsCpu) -> Self {
-        let mut level  = [[0.0f32; 4]; config::CLIPMAP_LEVELS_USIZE];
-        let mut offset = [[0u32; 4]; config::CLIPMAP_LEVELS_USIZE];
-
-        for i in 0..config::CLIPMAP_LEVELS_USIZE {
-            let p = cpu.level[i];
-
-            level[i] = [p.origin_x_m, p.origin_z_m, p.cell_size_m, 0.0];
-
-            // NOTE: these fields change on CPU side in the next patch (ClipLevelParams)
-            offset[i] = [p.off_x, p.off_z, 0, 0];
-        }
-
-        Self {
-            levels: cpu.levels,
-            res: cpu.res,
-            base_cell_m: cpu.base_cell_m,
-            _pad0: 0.0,
-            level,
-            offset,
-        }
-    }
-}
-
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
-pub struct OverlayGpu {
-    // packed digits: d0 | d1<<8 | d2<<16 | d3<<24 (d0=ones, d3=thousands)
-    pub digits_packed: u32,
-
-    // HUD rectangle in framebuffer pixel coords (top-left origin)
-    pub origin_x: u32,
-    pub origin_y: u32,
-    pub total_w:  u32,
-
-    pub digit_h:  u32,
-    pub scale:    u32,
-    pub stride:   u32, // digit_w + gap
-    pub _pad0:    u32, // explicit padding to 32 bytes
-}
-
-impl OverlayGpu {
-    pub fn from_fps_and_dims(fps: u32, width: u32, _height: u32, scale: u32) -> Self {
-        // digits
-        let mut v = fps.min(9999);
-        let d0 = (v % 10) as u32; v /= 10;
-        let d1 = (v % 10) as u32; v /= 10;
-        let d2 = (v % 10) as u32; v /= 10;
-        let d3 = (v % 10) as u32;
-
-        let digits_packed = d0 | (d1 << 8) | (d2 << 16) | (d3 << 24);
-
-        // layout
-        let margin: u32 = 12;
-        let digit_w = 3 * scale;
-        let digit_h = 5 * scale;
-        let gap     = 1 * scale;
-        let stride  = digit_w + gap;
-        let total_w = 4 * digit_w + 3 * gap;
-
-        let ox_i = width as i32 - margin as i32 - total_w as i32;
-        let oy_i = margin as i32;
-
-        let origin_x = ox_i.max(0) as u32;
-        let origin_y = oy_i.max(0) as u32;
-
-        Self {
-            digits_packed,
-            origin_x,
-            origin_y,
-            total_w,
-            digit_h,
-            scale,
-            stride,
-            _pad0: 0,
-        }
-    }
-}
-
-// src/render/mod.rs
-// -----------------
-// src/render/mod.rs
-
-pub mod gpu_types;
-pub mod resources;
-pub mod shaders;
-pub mod state;
-
-pub use gpu_types::*;
-pub use state::Renderer;
-
-// src/render/resources.rs
-// -----------------------
-// src/render/resources.rs
-//
-// Small GPU resource helpers that don't fit cleanly into the renderer "state" modules.
-//
-// Right now this file provides the final full-resolution output texture:
-// - written as a STORAGE texture by the composite compute pass
-// - sampled as a regular texture by the final blit render pass
-//
-// Keeping this as a tiny helper makes the main texture set code a bit cleaner.
-
-/// Wrapper for the renderer's final output texture view.
-///
-/// The renderer stores only the TextureView; the view keeps the underlying texture alive
-/// for as long as it exists (wgpu uses ref-counted internal ownership).
-pub struct OutputTex {
-    /// Texture view bound in bind groups (storage write in compute, sampled in blit).
-    pub view: wgpu::TextureView,
-}
-
-/// Create the final output texture (full resolution).
-///
-/// Properties:
-/// - Format: RGBA16F (high dynamic range, good for post-processing)
-/// - Usage:
-///   - STORAGE_BINDING: composite pass writes into it as a storage texture
-///   - TEXTURE_BINDING: blit pass samples it in the fragment shader
-///
-/// Notes:
-/// - wgpu forbids zero-sized textures, so we clamp `w`/`h` to at least 1.
-pub fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> OutputTex {
-    // Avoid creating zero-sized textures (can happen during minimize/resizes).
-    let w = w.max(1);
-    let h = h.max(1);
-
-    // Allocate the GPU texture backing store.
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("output_tex"),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
-        // Must support both compute writes and render sampling.
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-
-    // Default view covers the whole texture.
-    let view = tex.create_view(&Default::default());
-
-    OutputTex { view }
-}
-
-// src/render/shaders.rs
+// src/shaders/blit.wgsl
 // ---------------------
-// src/render/shaders.rs
+// src/shaders/blit.wgsl
+// ---------------------
+// Minimal fullscreen blit + tiny HUD (FPS) optimized for speed:
+// A) No digit work unless pixel is inside HUD rect
+// B) HUD layout + digits are precomputed on CPU and passed in a uniform
+// C) Digit masks are a LUT (no if-chain)
 //
-// Centralized shader sources. WGSL has no native include mechanism in wgpu,
-// so we concatenate multiple WGSL files into a single source string.
+// Bindings (match Rust bind group layout `layouts.blit`):
+//   @group(0) @binding(0): sampled output texture (img)
+//   @group(0) @binding(1): sampler (samp)
+//   @group(0) @binding(2): uniform overlay struct (packed digits + HUD layout)
 
-pub const RAY_CS_WGSL: &str = concat!(
-    include_str!("../shaders/common.wgsl"),
-    "\n",
+@group(0) @binding(0) var img : texture_2d<f32>;
+@group(0) @binding(1) var samp : sampler;
 
-    // ray_core split into concern-specific modules (order matters)
-    include_str!("../shaders/ray/clouds.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/phase.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/sky.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/fog.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/aabb.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/wind.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/svo_query.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/leaves.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/grass.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/chunk_trace.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/shadows.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/shading.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/godrays.wgsl"),
-    "\n",
-    include_str!("../shaders/ray/composite.wgsl"),
-    "\n",
+// CPU-precomputed overlay:
+// - digits_packed = d0 | d1<<8 | d2<<16 | d3<<24  (d0=ones, d3=thousands)
+// - origin_x/origin_y/total_w/digit_h/scale/stride are computed on CPU
+struct Overlay {
+  digits_packed : u32,
+  origin_x : u32,
+  origin_y : u32,
+  total_w  : u32,
 
-    include_str!("../shaders/clipmap.wgsl"),
-    "\n",
-    include_str!("../shaders/ray_main.wgsl"),
-    "\n",
-);
+  digit_h  : u32,
+  scale    : u32,
+  stride   : u32,
+  _pad0    : u32,
+};
+@group(0) @binding(2) var<uniform> overlay : Overlay;
 
-pub const BLIT_WGSL: &str = include_str!("../shaders/blit.wgsl");
 
-#[inline]
-pub fn ray_cs_wgsl() -> &'static str {
-    RAY_CS_WGSL
+// -----------------------------------------------------------------------------
+// 3x5 digit font helpers (LUT)
+// -----------------------------------------------------------------------------
+
+fn digit_mask(d: u32) -> u32 {
+  switch (d) {
+    case 0u: { return 0x7B6Fu; }
+    case 1u: { return 0x749Au; }
+    case 2u: { return 0x73E7u; }
+    case 3u: { return 0x79E7u; }
+    case 4u: { return 0x49EDu; }
+    case 5u: { return 0x79CFu; }
+    case 6u: { return 0x7BCFu; }
+    case 7u: { return 0x4927u; }
+    case 8u: { return 0x7BEFu; }
+    case 9u: { return 0x79EFu; }
+    default: { return 0u; }
+  }
 }
 
-#[inline]
-pub fn blit_wgsl() -> &'static str {
-    BLIT_WGSL
+fn mask_bit(mask: u32, x: u32, y: u32) -> bool {
+  let bit = y * 3u + x;           // x in [0..2], y in [0..4]
+  return ((mask >> bit) & 1u) != 0u;
 }
 
-// src/render/state/bindgroups.rs
-// ------------------------------
-// src/render/state/bindgroups.rs
+fn unpack_digit(packed: u32, i: u32) -> u32 {
+  // i: 0=d0 ones, 1=d1 tens, 2=d2 hundreds, 3=d3 thousands
+  return (packed >> (8u * i)) & 0xFFu;
+}
+
+// -----------------------------------------------------------------------------
+// Fullscreen triangle vertex shader
+// -----------------------------------------------------------------------------
+
+struct VSOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VSOut {
+  var p = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 3.0, -1.0),
+    vec2<f32>(-1.0,  3.0)
+  );
+
+  var uv = array<vec2<f32>, 3>(
+    vec2<f32>(0.0,  1.0),
+    vec2<f32>(2.0,  1.0),
+    vec2<f32>(0.0, -1.0)
+  );
+
+  var o: VSOut;
+  o.pos = vec4<f32>(p[i], 0.0, 1.0);
+  o.uv  = uv[i];
+  return o;
+}
+
+// -----------------------------------------------------------------------------
+// Fragment shader: sample + tonemap + FPS HUD
+// -----------------------------------------------------------------------------
+
+@fragment
+fn fs_main(
+  @builtin(position) frag_pos: vec4<f32>,
+  @location(0) uv: vec2<f32>
+) -> @location(0) vec4<f32> {
+
+  // Sample the renderer's final output texture.
+  let c = textureSample(img, samp, uv);
+
+  // Simple tonemap-ish curve: c / (c + 1)
+  var rgb = c.rgb / (c.rgb + vec3<f32>(1.0));
+
+  // ---- FPS overlay ----
+  // Early bounds test: if not inside the HUD rect, do nothing (fast path).
+  let px = vec2<u32>(u32(frag_pos.x), u32(frag_pos.y));
+
+  let ox = overlay.origin_x;
+  let oy = overlay.origin_y;
+
+  if (px.x >= ox && px.x < (ox + overlay.total_w) &&
+      px.y >= oy && px.y < (oy + overlay.digit_h)) {
+
+    let local_x = px.x - ox;
+    let local_y = px.y - oy;
+
+    let scale   = overlay.scale;
+    let stride  = overlay.stride;      // digit_w + gap
+    let digit_w = 3u * scale;
+
+    // digit_i: 0..3 left->right
+    let digit_i = local_x / stride;
+
+    // x within digit+gap region
+    let in_x = local_x - digit_i * stride;
+
+    // inside digit area (not gap) and in range
+    if (digit_i < 4u && in_x < digit_w) {
+      let cell_x = in_x    / scale;    // 0..2
+      let cell_y = local_y / scale;    // 0..4
+
+      if (cell_y < 5u) {
+        // thousands..ones left->right: digit_i=0 => d3, digit_i=3 => d0
+        let which = 3u - digit_i;      // maps to packed index (0..3)
+        let dig   = unpack_digit(overlay.digits_packed, which);
+        let m     = digit_mask(dig);
+
+        if (mask_bit(m, cell_x, cell_y)) {
+          rgb = vec3<f32>(1.0, 1.0, 1.0);
+        }
+      }
+    }
+  }
+
+  return vec4<f32>(rgb, 1.0);
+}
+
+// src/shaders/clipmap.wgsl
+// ------------------------
+// src/shaders/clipmap.wgsl
+// ------------------------
 //
-// Bind group creation.
+// Toroidal (ring) clipmap storage, but NO LOD selection in shader.
+// We always sample a single fixed level (coarsest by default).
 
-use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
+const CLIP_LEVELS_MAX : u32 = 16u;
 
-pub struct BindGroups {
-    pub primary: wgpu::BindGroup,
-    pub scene: wgpu::BindGroup,
-    pub godray: [wgpu::BindGroup; 2],
-    pub composite: [wgpu::BindGroup; 2],
-    pub empty: wgpu::BindGroup,
-    pub blit: wgpu::BindGroup,
+// March tuning
+const HF_MAX_STEPS : u32 = 96u;
+const HF_BISECT    : u32 = 5u;
+
+// dt clamp (meters along ray)
+const HF_DT_MIN : f32 = 1.00;
+const HF_DT_MAX : f32 = 48.0;
+
+struct ClipmapParams {
+  levels      : u32,
+  res         : u32,
+  base_cell_m : f32,
+  _pad0       : f32,
+  level       : array<vec4<f32>, CLIP_LEVELS_MAX>,
+  offset      : array<vec4<u32>, CLIP_LEVELS_MAX>,
+};
+
+@group(0) @binding(6) var<uniform> clip : ClipmapParams;
+@group(0) @binding(7) var clip_height : texture_2d_array<f32>;
+
+fn imod(a: i32, m: i32) -> i32 {
+  var r = a % m;
+  if (r < 0) { r = r + m; }
+  return r;
 }
 
-fn make_primary_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    buffers: &Buffers,
-    textures: &TextureSet,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("primary_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffers.camera.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buffers.chunk.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: buffers.node.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: buffers.chunk_grid.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&textures.color.view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: wgpu::BindingResource::TextureView(&textures.depth.view),
-            },
-            // Clipmap params uniform
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: buffers.clipmap.as_entire_binding(),
-            },
-            // Clipmap height texture array
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 8,
-                resource: buffers.macro_occ.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 9,
-                resource: buffers.node_ropes.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 10,
-                resource: buffers.colinfo.as_entire_binding(),
-            },
-
-        ],
-    })
+fn clip_offsets(level: u32) -> vec2<i32> {
+  let o = clip.offset[level];
+  return vec2<i32>(i32(o.x), i32(o.y));
 }
 
-fn make_scene_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    buffers: &Buffers,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("scene_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffers.camera.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buffers.chunk.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: buffers.node.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: buffers.chunk_grid.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry { 
-                binding: 8, 
-                resource: buffers.macro_occ.as_entire_binding() 
-            },
-            wgpu::BindGroupEntry {
-                binding: 9,
-                resource: buffers.node_ropes.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 10,
-                resource: buffers.colinfo.as_entire_binding(),
-            },
-
-        ],
-    })
+// Fixed level choice: coarsest level (max range).
+// If you want a specific level index, return that instead.
+fn clip_fixed_level() -> u32 {
+  let n = min(clip.levels, CLIP_LEVELS_MAX);
+  return max(n, 1u) - 1u;
 }
 
-fn make_godray_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    depth_view: &wgpu::TextureView,
-    hist_view: &wgpu::TextureView,
-    out_view: &wgpu::TextureView,
-    label: &str,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(depth_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(hist_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(out_view),
-            },
-        ],
-    })
+struct HSample { h: f32, ok: bool };
+
+fn clip_height_at_level_ok(world_xz: vec2<f32>, level: u32) -> HSample {
+  let res_i = max(i32(clip.res), 1);
+  let p = clip.level[level];
+  let origin = vec2<f32>(p.x, p.y);
+  let cell   = max(p.z, 1e-6);
+
+  let uv = (world_xz - origin) / cell;
+  let ix = i32(floor(uv.x));
+  let iz = i32(floor(uv.y));
+
+  if (ix < 0 || iz < 0 || ix >= res_i || iz >= res_i) {
+    return HSample(0.0, false);
+  }
+
+  let off = clip_offsets(level);
+  let sx = imod(ix + off.x, res_i);
+  let sz = imod(iz + off.y, res_i);
+
+  let h = textureLoad(clip_height, vec2<i32>(sx, sz), i32(level), 0).x;
+  return HSample(h, true);
 }
 
-fn make_composite_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    color_view: &wgpu::TextureView,
-    godray_view: &wgpu::TextureView,
-    output_view: &wgpu::TextureView,
-    depth_view: &wgpu::TextureView,
-    godray_sampler: &wgpu::Sampler,
-    label: &str,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(color_view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(godray_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(output_view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
-            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(godray_sampler) },
-        ],
-    })
+fn clip_height_texel(level: u32, ix: i32, iz: i32) -> f32 {
+  let res_i = max(i32(clip.res), 1);
+
+  if (ix < 0 || iz < 0 || ix >= res_i || iz >= res_i) {
+    return -BIG_F32;
+  }
+
+  let off = clip_offsets(level);
+  let sx = imod(ix + off.x, res_i);
+  let sz = imod(iz + off.y, res_i);
+
+  return textureLoad(clip_height, vec2<i32>(sx, sz), i32(level), 0).x;
+}
+
+// Bilinear height sample. IMPORTANT: matches CPU building at (tx+0.5)*cell.
+// We shift by 0.5 so integer texels correspond to sample centers.
+fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
+  let res_i = max(i32(clip.res), 1);
+  let p = clip.level[level];
+  let origin = vec2<f32>(p.x, p.y);
+  let cell   = max(p.z, 1e-6);
+
+  // uv in texel units, where texel centers are at N+0.5
+  let uv = (world_xz - origin) / cell;
+
+  // Align so ix,iz index texel centers
+  let st = uv - vec2<f32>(0.5, 0.5);
+
+  let ix0 = i32(floor(st.x));
+  let iz0 = i32(floor(st.y));
+  let ix1 = ix0 + 1;
+  let iz1 = iz0 + 1;
+
+  // If the bilerp footprint goes out of range, mark invalid
+  if (ix0 < 0 || iz0 < 0 || ix1 >= res_i || iz1 >= res_i) {
+    return -BIG_F32;
+  }
+
+  let fx = fract(st.x);
+  let fz = fract(st.y);
+
+  let h00 = clip_height_texel(level, ix0, iz0);
+  let h10 = clip_height_texel(level, ix1, iz0);
+  let h01 = clip_height_texel(level, ix0, iz1);
+  let h11 = clip_height_texel(level, ix1, iz1);
+
+  if (h00 <= -0.5 * BIG_F32 || h10 <= -0.5 * BIG_F32 || h01 <= -0.5 * BIG_F32 || h11 <= -0.5 * BIG_F32) {
+    return -BIG_F32;
+  }
+
+  let hx0 = mix(h00, h10, fx);
+  let hx1 = mix(h01, h11, fx);
+  return mix(hx0, hx1, fz);
+}
+
+fn clip_normal_at_level_2tap(world_xz: vec2<f32>, level: u32) -> vec3<f32> {
+  let cell = clip.level[level].z;
+
+  let h0 = clip_height_at_level_ok(world_xz, level);
+  let hx = clip_height_at_level_ok(world_xz + vec2<f32>(cell, 0.0), level);
+  let hz = clip_height_at_level_ok(world_xz + vec2<f32>(0.0, cell), level);
+
+  if (!h0.ok || !hx.ok || !hz.ok) {
+    return vec3<f32>(0.0, 1.0, 0.0);
+  }
+
+  let dhx = (hx.h - h0.h) / max(cell, 1e-4);
+  let dhz = (hz.h - h0.h) / max(cell, 1e-4);
+
+  return normalize(vec3<f32>(-dhx, 1.0, -dhz));
+}
+
+struct ClipHit {
+  hit : bool,
+  t   : f32,
+  n   : vec3<f32>,
+  mat : u32,
+};
+
+fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> ClipHit {
+  if (rd.y >= -1e-4) {
+    return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+  }
+
+  var t = max(t_min, 0.0);
+  var p = ro + rd * t;
+
+  // Start with the finest level that contains the starting point.
+  // From here on, we only move to COARSER levels if/when we fall out of coverage.
+  var lvl: u32 = clip_best_level(p.xz, 2);
+
+  var h = clip_height_at_level(p.xz, lvl);
+  var s_prev = p.y - h;
+  var t_prev = t;
+
+  for (var i: u32 = 0u; i < HF_MAX_STEPS; i = i + 1u) {
+    if (t > t_max) { break; }
+
+    p = ro + rd * t;
+
+    // Coverage-only "LOD": ensure p is inside the chosen level window.
+    // IMPORTANT: this only ever increases lvl (coarser), never decreases.
+    lvl = clip_ensure_contains(p.xz, lvl, 2);
+
+    h = clip_height_at_level(p.xz, lvl);
+    let s = p.y - h;
+
+    if (s <= 0.0 && s_prev > 0.0) {
+      var a = t_prev;
+      var b = t;
+
+      // Bisection against the SAME surface (same lvl), no level switching here.
+      for (var k: u32 = 0u; k < HF_BISECT; k = k + 1u) {
+        let m = 0.5 * (a + b);
+        let pm = ro + rd * m;
+
+        let hm = clip_height_at_level(pm.xz, lvl);
+        let sm = pm.y - hm;
+
+        if (sm > 0.0) { a = m; } else { b = m; }
+      }
+
+      let th = 0.5 * (a + b);
+      let ph = ro + rd * th;
+
+      let n = clip_normal_at_level_2tap(ph.xz, lvl);
+      return ClipHit(true, th, n, MAT_GRASS);
+    }
+
+    s_prev = s;
+    t_prev = t;
+
+    // Step control: vertical clearance + xz-texel travel limit
+    let vy = max(-rd.y, 0.12);
+    let vh = max(length(rd.xz), 1e-4);
+
+    let dt_y = abs(s) / vy;
+
+    let cell = clip.level[lvl].z;
+    let dt_xz = (2.0 * cell) / vh; // ~2 texels per step in xz
+
+    var dt = min(dt_y, dt_xz);
+
+    // Keep your clamp policy (you can swap 0.25 back to HF_DT_MIN if you prefer)
+    dt = clamp(dt, 0.25, HF_DT_MAX);
+
+    t = t + dt;
+  }
+
+  return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
 }
 
 
-
-fn make_blit_bg(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    output_view: &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-    overlay_buf: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("blit_bg"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(output_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: overlay_buf.as_entire_binding(),
-            },
-        ],
-    })
+fn material_variation_clip(world_p: vec3<f32>, cell_size_m: f32, strength: f32) -> f32 {
+  let cell = floor(world_p / cell_size_m);
+  return (hash31(cell) - 0.5) * strength;
 }
 
-pub fn create_bind_groups(
-    device: &wgpu::Device,
-    layouts: &Layouts,
-    buffers: &Buffers,
-    textures: &TextureSet,
-    sampler: &wgpu::Sampler,
-) -> BindGroups {
-    let primary = make_primary_bg(device, &layouts.primary, buffers, textures);
-    let scene = make_scene_bg(device, &layouts.scene, buffers);
+fn apply_material_variation_clip(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f32> {
+  var c = base;
 
-    let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("empty_bg"),
-        layout: &layouts.empty,
-        entries: &[],
-    });
+  if (mat == MAT_GRASS) {
+    let v0 = material_variation_clip(hp, 3.0, 1.0);
+    let v1 = material_variation_clip(hp, 0.75, 0.35);
+    let v  = v0 + v1;
 
-    let godray = [
-        make_godray_bg(
-            device,
-            &layouts.godray,
-            &textures.depth.view,
-            &textures.godray[0].view,
-            &textures.godray[1].view,
-            "godray_bg_a_to_b",
-        ),
-        make_godray_bg(
-            device,
-            &layouts.godray,
-            &textures.depth.view,
-            &textures.godray[1].view,
-            &textures.godray[0].view,
-            "godray_bg_b_to_a",
-        ),
-    ];
+    c += vec3<f32>(0.10 * v, 0.18 * v, 0.06 * v);
+    c *= (1.0 + 0.06 * v);
+    c = clamp(c, vec3<f32>(0.0), vec3<f32>(2.0));
+  } else if (mat == MAT_DIRT) {
+    let v = material_variation_clip(hp, 1.5, 0.8);
+    c += vec3<f32>(0.05 * v, 0.03 * v, 0.01 * v);
+    c *= (1.0 + 0.08 * v);
+    c = clamp(c, vec3<f32>(0.0), vec3<f32>(2.0));
+  } else if (mat == MAT_STONE) {
+    let v = material_variation_clip(hp, 2.0, 0.9);
+    c *= (1.0 + 0.10 * v);
+    c = clamp(c, vec3<f32>(0.0), vec3<f32>(2.0));
+  }
 
-    let composite = [
-        make_composite_bg(
-            device,
-            &layouts.composite,
-            &textures.color.view,
-            &textures.godray[0].view,
-            &textures.output.view,
-            &textures.depth.view,
-            sampler,
-            "composite_bg_read_a",
-        ),
-        make_composite_bg(
-            device,
-            &layouts.composite,
-            &textures.color.view,
-            &textures.godray[1].view,
-            &textures.output.view,
-            &textures.depth.view,
-            sampler,
-            "composite_bg_read_b",
-        ),
-    ];
+  return c;
+}
 
-    let blit = make_blit_bg(
-        device,
-        &layouts.blit,
-        &textures.output.view,
-        sampler,
-        &buffers.overlay,
+fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>) -> vec3<f32> {
+  let hp = ro + ch.t * rd;
+
+  var base = color_for_material(ch.mat);
+  base = apply_material_variation_clip(base, ch.mat, hp);
+
+  let voxel_size = cam.voxel_params.x;
+  let hp_shadow  = hp + ch.n * (0.75 * voxel_size);
+
+  let vis  = sun_transmittance(hp_shadow, SUN_DIR);
+  let diff = max(dot(ch.n, SUN_DIR), 0.0);
+
+  // AO-lite for terrain: cheap taps against heightfield itself (fixed lvl)
+  let lvl = clip_best_level(hp.xz, 2);
+  let cell = clip.level[lvl].z;
+
+
+  let h0  = clip_height_at_level(hp.xz, lvl);
+  let hx1 = clip_height_at_level(hp.xz + vec2<f32>( cell, 0.0), lvl);
+  let hx0 = clip_height_at_level(hp.xz + vec2<f32>(-cell, 0.0), lvl);
+  let hz1 = clip_height_at_level(hp.xz + vec2<f32>(0.0,  cell), lvl);
+  let hz0 = clip_height_at_level(hp.xz + vec2<f32>(0.0, -cell), lvl);
+
+  let occ =
+    max(0.0, hx1 - h0) +
+    max(0.0, hx0 - h0) +
+    max(0.0, hz1 - h0) +
+    max(0.0, hz0 - h0);
+
+  let ao = clamp(1.0 - 0.65 * occ / max(cell, 1e-3), 0.45, 1.0);
+
+  let amb_col = hemi_ambient(ch.n, sky_up);
+  let amb_strength = 0.10;
+  let ambient = amb_col * amb_strength * ao;
+
+  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis;
+
+  let vdir = normalize(-rd);
+  let hdir = normalize(vdir + SUN_DIR);
+  let ndv  = max(dot(ch.n, vdir), 0.0);
+  let ndh  = max(dot(ch.n, hdir), 0.0);
+
+  var rough = 0.85;
+  if (ch.mat == MAT_STONE) { rough = 0.50; }
+  if (ch.mat == MAT_DIRT)  { rough = 0.90; }
+  if (ch.mat == MAT_GRASS) { rough = 0.88; }
+
+  let shininess = mix(8.0, 96.0, 1.0 - rough);
+  let spec = pow(ndh, shininess);
+
+  var f0 = 0.03;
+  if (ch.mat == MAT_STONE) { f0 = 0.04; }
+  let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(ndv, 0.0, 1.0), 5.0);
+
+  let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis;
+
+  return base * (ambient + direct) + 0.18 * spec_col;
+}
+
+fn clip_level_contains(xz: vec2<f32>, level: u32, guard: i32) -> bool {
+  let res_i = max(i32(clip.res), 1);
+  let p = clip.level[level];
+  let origin = vec2<f32>(p.x, p.y);
+  let cell   = max(p.z, 1e-6);
+
+  let uv = (xz - origin) / cell;
+  let ix = i32(floor(uv.x));
+  let iz = i32(floor(uv.y));
+
+  return (ix >= guard) && (iz >= guard) && (ix < (res_i - guard)) && (iz < (res_i - guard));
+}
+
+// Finest available level that contains xz (coverage-based).
+fn clip_best_level(xz: vec2<f32>, guard: i32) -> u32 {
+  let n = min(clip.levels, CLIP_LEVELS_MAX);
+  for (var i: u32 = 0u; i < n; i = i + 1u) {
+    if (clip_level_contains(xz, i, guard)) { return i; }
+  }
+  return max(n, 1u) - 1u;
+}
+
+// Ensure containment by moving only to coarser levels.
+fn clip_ensure_contains(xz: vec2<f32>, lvl_in: u32, guard: i32) -> u32 {
+  let n = min(clip.levels, CLIP_LEVELS_MAX);
+  var lvl = min(lvl_in, n - 1u);
+  loop {
+    if (clip_level_contains(xz, lvl, guard) || lvl >= (n - 1u)) { break; }
+    lvl = lvl + 1u;
+  }
+  return lvl;
+}
+
+// src/shaders/common.wgsl
+// -----------------------
+// src/shaders/common.wgsl
+//
+// Shared WGSL:
+// - Constants / tuning knobs
+// - GPU-side struct defs + scene bindings (group 0)
+// - Shared math + grid helpers + hashes/noise
+//
+// NOTE: Pass-specific textures/images + compute entrypoints live in ray_main.wgsl.
+
+//// --------------------------------------------------------------------------
+//// IDs / numeric
+//// --------------------------------------------------------------------------
+
+const LEAF_U32    : u32 = 0xFFFFFFFFu; // Node.child_base sentinel
+const INVALID_U32 : u32 = 0xFFFFFFFFu;
+
+const BIG_F32 : f32 = 1e30;
+const EPS_INV : f32 = 1e-8;
+
+//// --------------------------------------------------------------------------
+//// Materials
+//// --------------------------------------------------------------------------
+
+const MAT_AIR   : u32 = 0u;
+const MAT_GRASS : u32 = 1u;
+const MAT_DIRT  : u32 = 2u;
+const MAT_STONE : u32 = 3u;
+const MAT_WOOD  : u32 = 4u;
+const MAT_LEAF  : u32 = 5u;
+
+//// --------------------------------------------------------------------------
+//// Sun / sky (shared, but shading logic lives in ray_core.wgsl)
+//// --------------------------------------------------------------------------
+
+const SUN_DIR       : vec3<f32> = vec3<f32>(0.61237244, 0.5, 0.61237244);
+const SUN_COLOR     : vec3<f32> = vec3<f32>(1.0, 0.94, 0.72);
+const SUN_INTENSITY : f32       = 5.0;
+
+//// --------------------------------------------------------------------------
+//// Shadows / volumetric shadowing
+//// --------------------------------------------------------------------------
+
+const SHADOW_BIAS  : f32 = 2e-4;
+const SHADOW_STEPS : u32 = 32u;
+
+const SHADOW_DISPLACED_LEAVES : bool = false;
+const VOLUME_DISPLACED_LEAVES : bool = true;
+
+const VSM_STEPS            : u32 = 16u;
+const LEAF_LIGHT_TRANSMIT  : f32 = 0.50;
+const GRASS_LIGHT_TRANSMIT : f32 = 0.70;
+const MIN_TRANS            : f32 = 0.03;
+
+//// --------------------------------------------------------------------------
+//// Godrays (tuning knobs)
+//// --------------------------------------------------------------------------
+
+const GODRAY_ENERGY_BOOST    : f32 = 8.0;
+const GODRAY_KNEE_INTEGRATE  : f32 = 0.35;
+const GODRAY_COMPOSITE_SCALE : f32 = 6.5;
+
+const GODRAY_FADE_NEAR : f32 = 60.0;
+const GODRAY_FADE_FAR  : f32 = 160.0;
+
+const GODRAY_KNEE_COMPOSITE : f32 = 0.25;
+
+//// --------------------------------------------------------------------------
+//// Fog / volumetrics
+//// --------------------------------------------------------------------------
+
+const FOG_HEIGHT_FALLOFF : f32 = 0.18;
+const FOG_MAX_DIST       : f32 = 100.0;
+
+const FOG_PRIMARY_SCALE : f32 = 0.02;
+const FOG_GODRAY_SCALE  : f32 = 1.0;
+
+const FOG_COLOR_GROUND    : vec3<f32> = vec3<f32>(0.40, 0.42, 0.45);
+const FOG_COLOR_SKY_BLEND : f32       = 0.10;
+
+const GODRAY_MAX_DIST : f32 = 80.0;
+
+const GODRAY_SCATTER_HEIGHT_FALLOFF : f32 = 0.04;
+const GODRAY_SCATTER_MIN_FRAC       : f32 = 0.35;
+
+const GODRAY_BLACK_LEVEL : f32 = 0.004;
+
+const GODRAY_TS_LP_ALPHA : f32 = 0.40;
+const GODRAY_EDGE0       : f32 = 0.004;
+const GODRAY_EDGE1       : f32 = 0.035;
+
+const GODRAY_BASE_HAZE       : f32 = 0.04;
+const GODRAY_HAZE_NEAR_FADE  : f32 = 18.0;
+const CLOUD_GODRAY_W         : f32 = 0.25;
+
+const GODRAY_TV_CUTOFF   : f32 = 0.02;
+const GODRAY_STEPS_FAST  : u32 = 16u;
+
+//// --------------------------------------------------------------------------
+//// Phase
+//// --------------------------------------------------------------------------
+
+const INV_4PI     : f32 = 0.0795774715;
+const PHASE_G     : f32 = 0.25;
+const PHASE_MIE_W : f32 = 0.20;
+
+//// --------------------------------------------------------------------------
+//// Fractal clouds
+//// --------------------------------------------------------------------------
+
+const CLOUD_H        : f32      = 200.0;
+const CLOUD_UV_SCALE : f32      = 0.002;
+const CLOUD_WIND     : vec2<f32> = vec2<f32>(0.020, 0.012);
+
+const CLOUD_COVERAGE : f32 = 0.45;
+const CLOUD_SOFTNESS : f32 = 0.10;
+
+const CLOUD_HORIZON_Y0 : f32 = 0.02;
+const CLOUD_HORIZON_Y1 : f32 = 0.25;
+
+// How clouds darken the SKY appearance (keep low)
+const CLOUD_SKY_DARKEN : f32 = 0.4;
+
+// How much clouds attenuate SUNLIGHT hitting the world (can be much higher)
+const CLOUD_SHADOW_ABSORB   : f32 = 4.0;   // try 4..12
+const CLOUD_SHADOW_STRENGTH : f32 = 0.8;   // 0..1 (mix control)
+
+
+const CLOUD_BASE_COL   : vec3<f32> = vec3<f32>(0.72, 0.74, 0.76);
+const CLOUD_SILVER_POW : f32       = 8.0;
+const CLOUD_SILVER_STR : f32       = 0.6;
+const CLOUD_BLEND      : f32       = 0.85;
+
+const CLOUD_DIM_SUN_DISC            : bool = true;
+const CLOUD_SUN_DISC_ABSORB_SCALE   : f32  = 0.8;
+
+const SKY_EXPOSURE : f32 = 0.40;
+
+//// --------------------------------------------------------------------------
+//// Leaf wind (displaced cubes)
+//// --------------------------------------------------------------------------
+
+const WIND_CELL_FREQ : f32      = 2.5;
+const WIND_DIR_XZ    : vec2<f32> = vec2<f32>(0.9, 0.4);
+
+const WIND_RAMP_Y0 : f32 = 2.0;
+const WIND_RAMP_Y1 : f32 = 14.0;
+
+const WIND_GUST_TIME_FREQ    : f32 = 0.9;
+const WIND_FLUTTER_TIME_FREQ : f32 = 4.2;
+
+const WIND_GUST_XZ_FREQ    : vec2<f32> = vec2<f32>(0.35, 0.22);
+const WIND_FLUTTER_XZ_FREQ : vec2<f32> = vec2<f32>(1.7,  1.1);
+
+const WIND_GUST_WEIGHT    : f32 = 0.75;
+const WIND_FLUTTER_WEIGHT : f32 = 0.25;
+
+const WIND_VERTICAL_SCALE  : f32 = 0.25;
+const LEAF_VERTICAL_REDUCE : f32 = 0.15;
+
+const LEAF_OFFSET_AMP       : f32 = 0.75;
+const LEAF_OFFSET_MAX_FRAC  : f32 = 0.75;
+
+const LEAF_LOD_DISP_START : f32 = 25.0;
+const LEAF_LOD_DISP_END   : f32 = 70.0;
+
+const WIND_PHASE_OFF_1 : vec3<f32> = vec3<f32>(19.0, 7.0, 11.0);
+const TAU             : f32        = 6.28318530718;
+
+//// --------------------------------------------------------------------------
+//// Ray / post
+//// --------------------------------------------------------------------------
+
+const PRIMARY_NUDGE_VOXEL_FRAC : f32 = 1e-4;
+
+const GODRAY_BLOCK_SIZE : i32 = 4;
+
+const J0_SCALE : f32 = 1.31;
+const J1_SCALE : f32 = 2.11;
+const J2_SCALE : f32 = 3.01;
+const J3_SCALE : f32 = 4.19;
+
+const COMPOSITE_SHARPEN : f32 = 0.15;
+
+const POST_EXPOSURE : f32 = 0.15;
+
+//// --------------------------------------------------------------------------
+//// Grass “hair” (procedural blades)
+//// --------------------------------------------------------------------------
+
+const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.20;
+const GRASS_BLADE_COUNT           : u32 = 2u;
+const GRASS_TRACE_STEPS           : u32 = 7u;
+const GRASS_HIT_EPS_VOX           : f32 = 0.02;
+const GRASS_STEP_MIN_VOX          : f32 = 0.03;
+
+const GRASS_VOXEL_SEGS            : f32 = 3.0;
+const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.08;
+const GRASS_VOXEL_TAPER           : f32 = 0.70;
+const GRASS_OVERHANG_VOX          : f32 = 0.20;
+
+// Grass level-of-detail (LOD) distances in meters-ish (assuming rd normalized).
+const GRASS_LOD_MID_START : f32 = 15.0;
+const GRASS_LOD_FAR_START : f32 = 40.0;
+
+// Mid/far quality knobs (tune freely)
+const GRASS_BLADE_COUNT_MID : u32 = 2u;
+const GRASS_BLADE_COUNT_FAR : u32 = 1u;
+
+const GRASS_SEGS_MID : u32 = 2u;
+const GRASS_SEGS_FAR : u32 = 1u;
+
+const GRASS_TRACE_STEPS_MID : u32 = 6u;
+const GRASS_TRACE_STEPS_FAR : u32 = 4u;
+
+//// --------------------------------------------------------------------------
+//// GPU structs (must match Rust layouts)
+//// --------------------------------------------------------------------------
+
+struct Node {
+  child_base : u32,
+  child_mask : u32,
+  material   : u32,
+  key       : u32,
+};
+
+struct NodeRopes {
+  px: u32, 
+  nx: u32, 
+  py: u32, 
+  ny: u32, 
+  pz: u32, 
+  nz: u32,
+  _pad0: u32, 
+  _pad1: u32,
+};
+
+struct Camera {
+  view_inv    : mat4x4<f32>,
+  proj_inv    : mat4x4<f32>,
+  cam_pos     : vec4<f32>,
+
+  chunk_size  : u32,
+  chunk_count : u32,
+  max_steps   : u32,
+  frame_index : u32,
+
+  voxel_params : vec4<f32>,
+
+  grid_origin_chunk : vec4<i32>,
+  grid_dims         : vec4<u32>,
+
+  // xy = render size in pixels, zw = present size in pixels
+  render_present_px : vec4<u32>,
+
+  
+};
+
+
+struct ChunkMeta {
+  origin       : vec4<i32>,
+  node_base    : u32,
+  node_count   : u32,
+  macro_base   : u32,
+  colinfo_base : u32,
+};
+
+//// --------------------------------------------------------------------------
+//// Scene bindings (group 0) - shared across passes
+//// --------------------------------------------------------------------------
+
+@group(0) @binding(0) var<uniform> cam : Camera;
+@group(0) @binding(1) var<storage, read> chunks     : array<ChunkMeta>;
+@group(0) @binding(2) var<storage, read> nodes      : array<Node>;
+@group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
+@group(0) @binding(8) var<storage, read> macro_occ : array<u32>;
+@group(0) @binding(9) var<storage, read> node_ropes: array<NodeRopes>;
+@group(0) @binding(10) var<storage, read> chunk_colinfo : array<u32>;
+
+
+//// --------------------------------------------------------------------------
+//// Shared helpers
+//// --------------------------------------------------------------------------
+
+const MACRO_DIM : u32 = 8u;          // 8x8x8 macro cells per chunk
+const MACRO_WORDS_PER_CHUNK : u32 = 16u; // 512 bits / 32
+
+fn macro_cell_size(root_size: f32) -> f32 {
+  return root_size / f32(MACRO_DIM);
+}
+
+// bit index = mx + 8*(my + 8*mz) in [0..511]
+fn macro_bit_index(mx: u32, my: u32, mz: u32) -> u32 {
+  return mx + MACRO_DIM * (my + MACRO_DIM * mz);
+}
+
+fn macro_test(macro_base: u32, bit: u32) -> bool {
+  let w = bit >> 5u;
+  let b = bit & 31u;
+  let word = macro_occ[macro_base + w];
+  return (word & (1u << b)) != 0u;
+}
+
+
+fn safe_inv(x: f32) -> f32 {
+  return select(1.0 / x, BIG_F32, abs(x) < EPS_INV);
+}
+
+fn ray_dir_from_pixel(px: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
+  let ndc = vec4<f32>(
+    2.0 * px.x / res.x - 1.0,
+    1.0 - 2.0 * px.y / res.y,
+    1.0,
+    1.0
+  );
+
+  let view = cam.proj_inv * ndc;
+  let vdir = vec4<f32>(view.xyz / view.w, 0.0);
+  let wdir = (cam.view_inv * vdir).xyz;
+  return normalize(wdir);
+}
+
+fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
+  let eps = 1e-8;
+
+  var t_enter = -1e30;
+  var t_exit  =  1e30;
+
+  if (abs(rd.x) < eps) {
+    if (ro.x < bmin.x || ro.x > bmax.x) { return vec2<f32>(1.0, 0.0); }
+  } else {
+    let inv = 1.0 / rd.x;
+    let t0 = (bmin.x - ro.x) * inv;
+    let t1 = (bmax.x - ro.x) * inv;
+    t_enter = max(t_enter, min(t0, t1));
+    t_exit  = min(t_exit,  max(t0, t1));
+  }
+
+  if (abs(rd.y) < eps) {
+    if (ro.y < bmin.y || ro.y > bmax.y) { return vec2<f32>(1.0, 0.0); }
+  } else {
+    let inv = 1.0 / rd.y;
+    let t0 = (bmin.y - ro.y) * inv;
+    let t1 = (bmax.y - ro.y) * inv;
+    t_enter = max(t_enter, min(t0, t1));
+    t_exit  = min(t_exit,  max(t0, t1));
+  }
+
+  if (abs(rd.z) < eps) {
+    if (ro.z < bmin.z || ro.z > bmax.z) { return vec2<f32>(1.0, 0.0); }
+  } else {
+    let inv = 1.0 / rd.z;
+    let t0 = (bmin.z - ro.z) * inv;
+    let t1 = (bmax.z - ro.z) * inv;
+    t_enter = max(t_enter, min(t0, t1));
+    t_exit  = min(t_exit,  max(t0, t1));
+  }
+
+  return vec2<f32>(t_enter, t_exit);
+}
+
+fn child_rank(mask: u32, ci: u32) -> u32 {
+  let bit = 1u << ci;
+  let lower = mask & (bit - 1u);
+  return countOneBits(lower);
+}
+
+fn grid_lookup_slot(cx: i32, cy: i32, cz: i32) -> u32 {
+  let ox = cam.grid_origin_chunk.x;
+  let oy = cam.grid_origin_chunk.y;
+  let oz = cam.grid_origin_chunk.z;
+
+  let ix_i = cx - ox;
+  let iy_i = cy - oy;
+  let iz_i = cz - oz;
+
+  if (ix_i < 0 || iy_i < 0 || iz_i < 0) { return INVALID_U32; }
+
+  let nx = cam.grid_dims.x;
+  let ny = cam.grid_dims.y;
+  let nz = cam.grid_dims.z;
+
+  let ix = u32(ix_i);
+  let iy = u32(iy_i);
+  let iz = u32(iz_i);
+
+  if (ix >= nx || iy >= ny || iz >= nz) { return INVALID_U32; }
+
+  let idx = (iz * ny * nx) + (iy * nx) + ix;
+  return chunk_grid[idx];
+}
+
+fn chunk_coord_from_pos(p: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
+  return vec3<i32>(
+    i32(floor(p.x / chunk_size_m)),
+    i32(floor(p.y / chunk_size_m)),
+    i32(floor(p.z / chunk_size_m))
+  );
+}
+
+fn chunk_max_depth() -> u32 {
+  // chunk_size is power-of-two; log2 = 31 - clz
+  return 31u - countLeadingZeros(cam.chunk_size);
+}
+
+// ---- Column info (64x64) ----
+// 4096 columns, packed 2x u16 per u32 => 2048 u32 words per chunk.
+const CHUNK_COL_WORDS_PER_CHUNK : u32 = 2048u;
+
+fn col_idx_64(ix: u32, iz: u32) -> u32 {
+  return iz * 64u + ix; // 0..4095
+}
+
+// returns (y8, mat8). y8==255 => empty column.
+fn colinfo_load(ch: ChunkMeta, ix: u32, iz: u32) -> vec2<u32> {
+  let idx  = col_idx_64(ix, iz);
+  let word = chunk_colinfo[ch.colinfo_base + (idx >> 1u)];
+  let half = select(word & 0xFFFFu, (word >> 16u) & 0xFFFFu, (idx & 1u) != 0u);
+
+  let y8   = half & 0xFFu;
+  let mat8 = (half >> 8u) & 0xFFu;
+  return vec2<u32>(y8, mat8);
+}
+
+
+//// --------------------------------------------------------------------------
+//// Hash / noise helpers (shared)
+//// --------------------------------------------------------------------------
+
+const U32_TO_F01 : f32 = 1.0 / 4294967296.0; // 2^-32
+
+fn hash_u32(x: u32) -> u32 {
+  // Murmur3 finalizer-like mix (good diffusion, cheap)
+  var v = x;
+  v ^= v >> 16u;
+  v *= 0x7feb352du;
+  v ^= v >> 15u;
+  v *= 0x846ca68bu;
+  v ^= v >> 16u;
+  return v;
+}
+
+fn hash2_u32(x: u32, y: u32) -> u32 {
+  // simple combine then mix
+  return hash_u32(x * 0x8da6b343u ^ y * 0xd8163841u);
+}
+
+// Replacement: 2D -> [0,1)
+fn hash12(p: vec2<f32>) -> f32 {
+  // Most of your callsites already pass integer-ish coordinates (floor() outputs),
+  // but this also works fine for pixel coords by flooring.
+  let ix: u32 = bitcast<u32>(i32(floor(p.x)));
+  let iy: u32 = bitcast<u32>(i32(floor(p.y)));
+  let h: u32 = hash2_u32(ix, iy);
+  return f32(h) * U32_TO_F01;
+}
+
+fn hash3_u32(x: u32, y: u32, z: u32) -> u32 {
+  return hash_u32(x * 0x8da6b343u ^ y * 0xd8163841u ^ z * 0xcb1ab31fu);
+}
+
+fn hash31(p: vec3<f32>) -> f32 {
+  let ix: u32 = bitcast<u32>(i32(floor(p.x)));
+  let iy: u32 = bitcast<u32>(i32(floor(p.y)));
+  let iz: u32 = bitcast<u32>(i32(floor(p.z)));
+  let h: u32 = hash3_u32(ix, iy, iz);
+  return f32(h) * U32_TO_F01;
+}
+
+fn value_noise(p: vec2<f32>) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+
+  let a = hash12(i);
+  let b = hash12(i + vec2<f32>(1.0, 0.0));
+  let c = hash12(i + vec2<f32>(0.0, 1.0));
+  let d = hash12(i + vec2<f32>(1.0, 1.0));
+
+  let u = f * f * (3.0 - 2.0 * f);
+
+  let x1 = mix(a, b, u.x);
+  let x2 = mix(c, d, u.x);
+  return mix(x1, x2, u.y);
+}
+
+fn fbm(p: vec2<f32>) -> f32 {
+  var x = p;
+  var sum = 0.0;
+  var amp = 0.5;
+
+  let rot = mat2x2<f32>(0.8, -0.6, 0.6, 0.8);
+
+  for (var i: u32 = 0u; i < 5u; i = i + 1u) {
+    sum += amp * value_noise(x);
+    x = rot * x * 2.0 + vec2<f32>(17.0, 9.0);
+    amp *= 0.5;
+  }
+  return sum;
+}
+
+
+fn render_dims_f() -> vec2<f32> {
+  return vec2<f32>(f32(cam.render_present_px.x), f32(cam.render_present_px.y));
+}
+fn present_dims_f() -> vec2<f32> {
+  return vec2<f32>(f32(cam.render_present_px.z), f32(cam.render_present_px.w));
+}
+
+// Map a present pixel center (in present pixel coords) -> normalized UV over render
+fn uv_render_from_present_px(px_present: vec2<f32>) -> vec2<f32> {
+  let pd = present_dims_f();
+  return (px_present) / pd;
+}
+
+// Map present pixel center -> render pixel center (float)
+fn px_render_from_present_px(px_present: vec2<f32>) -> vec2<f32> {
+  let rd = render_dims_f();
+  let uv = uv_render_from_present_px(px_present);
+  return uv * rd;
+}
+
+fn ip_render_from_present_px(px_present: vec2<f32>) -> vec2<i32> {
+  let rd = render_dims_f();
+  let pr = px_render_from_present_px(px_present);
+  let ix = clamp(i32(floor(pr.x)), 0, i32(rd.x) - 1);
+  let iy = clamp(i32(floor(pr.y)), 0, i32(rd.y) - 1);
+  return vec2<i32>(ix, iy);
+}
+
+// src/shaders/ray/aabb.wgsl
+// -------------------------
+// src/shaders/ray/aabb.wgsl
+//// --------------------------------------------------------------------------
+//// AABB helpers (vectorized slab + reuse)
+//// --------------------------------------------------------------------------
+
+fn max3(v: vec3<f32>) -> f32 { return max(v.x, max(v.y, v.z)); }
+fn min3(v: vec3<f32>) -> f32 { return min(v.x, min(v.y, v.z)); }
+
+struct CubeSlab {
+  tminv   : vec3<f32>,
+  tmaxv   : vec3<f32>,
+  t_enter : f32,
+  t_exit  : f32,
+};
+
+// Compute slab interval for axis-aligned cube using precomputed inv(rd).
+fn cube_slab_inv(
+  ro: vec3<f32>,
+  inv: vec3<f32>,
+  bmin: vec3<f32>,
+  size: f32
+) -> CubeSlab {
+  let bmax = bmin + vec3<f32>(size);
+
+  let t0 = (bmin - ro) * inv;
+  let t1 = (bmax - ro) * inv;
+
+  let tminv = min(t0, t1);
+  let tmaxv = max(t0, t1);
+
+  let t_enter = max3(tminv);
+  let t_exit  = min3(tmaxv);
+
+  return CubeSlab(tminv, tmaxv, t_enter, t_exit);
+}
+
+struct BoxHit {
+  hit    : bool,
+  t      : f32,
+  t_exit : f32,        // <-- add this so callsites can step without recomputing
+  n      : vec3<f32>,
+};
+
+// Normal + hit interval computed from a precomputed slab.
+// (Uses argmax(tminv) for face selection; no eps comparisons.)
+fn cube_hit_normal_from_slab(
+  rd: vec3<f32>,
+  slab: CubeSlab,
+  t_min: f32,
+  t_max: f32
+) -> BoxHit {
+  let t0 = max(slab.t_enter, t_min);
+
+  if (slab.t_exit < t0 || t0 > t_max) {
+    return BoxHit(false, BIG_F32, slab.t_exit, vec3<f32>(0.0));
+  }
+
+  // Which axis produced t_enter? (argmax of tminv)
+  var axis: u32 = 0u;
+  var best: f32 = slab.tminv.x;
+  if (slab.tminv.y > best) { best = slab.tminv.y; axis = 1u; }
+  if (slab.tminv.z > best) { best = slab.tminv.z; axis = 2u; }
+
+  var n = vec3<f32>(0.0);
+  if (axis == 0u) { n = vec3<f32>(select( 1.0, -1.0, rd.x > 0.0), 0.0, 0.0); }
+  if (axis == 1u) { n = vec3<f32>(0.0, select( 1.0, -1.0, rd.y > 0.0), 0.0); }
+  if (axis == 2u) { n = vec3<f32>(0.0, 0.0, select( 1.0, -1.0, rd.z > 0.0)); }
+
+  return BoxHit(true, t0, slab.t_exit, n);
+}
+
+// Keep your original signature, but now vectorized internally.
+fn aabb_hit_normal_inv(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  inv: vec3<f32>,
+  bmin: vec3<f32>,
+  size: f32,
+  t_min: f32,
+  t_max: f32
+) -> BoxHit {
+  let slab = cube_slab_inv(ro, inv, bmin, size);
+  return cube_hit_normal_from_slab(rd, slab, t_min, t_max);
+}
+
+// Optional: keep this for older callsites (now just returns slab.t_exit).
+fn exit_time_from_cube_inv(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  inv: vec3<f32>,
+  bmin: vec3<f32>,
+  size: f32
+) -> f32 {
+  let slab = cube_slab_inv(ro, inv, bmin, size);
+  return slab.t_exit;
+}
+
+// src/shaders/ray/chunk_trace.wgsl
+// --------------------------------
+// src/shaders/ray/chunk_trace.wgsl
+// --------------------------------------------------------------------------
+// HitGeom + chunk tracing (rope traversal + macro occupancy)
+//
+// Cleaned:
+// - Removed cached-path SVO query (unused now).
+// - Removed dead helpers (node_* key decode, global rope_next, etc).
+// - Kept only what trace_scene_voxels -> trace_chunk_rope_interval needs.
+// - Kept macro early-out + slab stepping + grass-on-solid-face probing.
+// --------------------------------------------------------------------------
+
+// --------------------------------------------------------------------------
+// HitGeom
+// --------------------------------------------------------------------------
+
+struct HitGeom {
+  hit      : u32,
+  mat      : u32,
+  _pad0    : u32,
+  _pad1    : u32,
+
+  t        : f32,
+  _pad2    : vec3<f32>,
+
+  n        : vec3<f32>,
+  _pad3    : f32,
+
+  root_bmin  : vec3<f32>,
+  root_size  : f32,
+  node_base  : u32,
+  macro_base : u32,
+  _pad4      : vec2<u32>,
+};
+
+fn miss_hitgeom() -> HitGeom {
+  var h : HitGeom;
+  h.hit = 0u;
+  h.mat = MAT_AIR;
+  h.t   = BIG_F32;
+  h.n   = vec3<f32>(0.0);
+  h.root_bmin = vec3<f32>(0.0);
+  h.root_size = 0.0;
+  h.node_base = 0u;
+  h.macro_base = INVALID_U32;
+  return h;
+}
+
+// Strict half-open: [bmin, bmax)
+fn point_in_cube(p: vec3<f32>, bmin: vec3<f32>, size: f32) -> bool {
+  let bmax = bmin + vec3<f32>(size);
+  return (p.x >= bmin.x && p.x < bmax.x) &&
+         (p.y >= bmin.y && p.y < bmax.y) &&
+         (p.z >= bmin.z && p.z < bmax.z);
+}
+
+// --------------------------------------------------------------------------
+// Macro occupancy early-out (returns a MAT_AIR cube if empty, else size==0)
+// --------------------------------------------------------------------------
+
+// --------------------------------------------------------------------------
+// Macro cell cacheable query
+// --------------------------------------------------------------------------
+
+struct MacroCell {
+  bmin    : vec3<f32>,
+  size    : f32,
+  is_empty: bool,
+};
+
+fn macro_cell_query(
+  p_in: vec3<f32>,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  macro_base: u32
+) -> MacroCell {
+  // No macro data => treat as "not empty" so traversal continues normally.
+  if (macro_base == INVALID_U32) {
+    return MacroCell(vec3<f32>(0.0), 0.0, false);
+  }
+
+  let cell = macro_cell_size(root_size);
+  let lp   = p_in - root_bmin;
+
+  let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
+  let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
+  let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
+
+  let macro_bmin = root_bmin + vec3<f32>(
+    f32(mx) * cell,
+    f32(my) * cell,
+    f32(mz) * cell
+  );
+
+  let bit = macro_bit_index(mx, my, mz);
+  let empty = !macro_test(macro_base, bit);
+
+  return MacroCell(macro_bmin, cell, empty);
+}
+
+
+// --------------------------------------------------------------------------
+// Key decoding -> cube
+// (matches the key encoding you already use)
+// --------------------------------------------------------------------------
+
+fn node_level(key: u32) -> u32 { return (key >> 18u) & 7u; }
+fn node_x(key: u32) -> u32 { return (key      ) & 63u; }
+fn node_y(key: u32) -> u32 { return (key >>  6u) & 63u; }
+fn node_z(key: u32) -> u32 { return (key >> 12u) & 63u; }
+
+fn node_cube_from_key(root_bmin: vec3<f32>, root_size: f32, key: u32) -> vec4<f32> {
+  let lvl = node_level(key);
+  let s = root_size / f32(1u << lvl);
+  let bmin = root_bmin + vec3<f32>(f32(node_x(key)), f32(node_y(key)), f32(node_z(key))) * s;
+  return vec4<f32>(bmin, s);
+}
+
+// --------------------------------------------------------------------------
+// Rope helpers (LOCAL indices)
+// --------------------------------------------------------------------------
+
+fn node_at(node_base: u32, local_idx: u32) -> Node {
+  return nodes[node_base + local_idx];
+}
+
+fn ropes_at(node_base: u32, local_idx: u32) -> NodeRopes {
+  return node_ropes[node_base + local_idx];
+}
+
+fn rope_next_local(node_base: u32, local_idx: u32, face: u32) -> u32 {
+  let r = ropes_at(node_base, local_idx);
+  if (face == 0u) { return r.px; }
+  if (face == 1u) { return r.nx; }
+  if (face == 2u) { return r.py; }
+  if (face == 3u) { return r.ny; }
+  if (face == 4u) { return r.pz; }
+  return r.nz;
+}
+
+fn exit_face_from_slab(rd: vec3<f32>, slab: CubeSlab) -> u32 {
+  // 0=+X,1=-X,2=+Y,3=-Y,4=+Z,5=-Z
+  let tx = slab.tmaxv.x;
+  let ty = slab.tmaxv.y;
+  let tz = slab.tmaxv.z;
+
+  var axis: u32 = 0u;
+  var best: f32 = tx;
+  if (ty < best) { best = ty; axis = 1u; }
+  if (tz < best) { best = tz; axis = 2u; }
+
+  if (axis == 0u) { return select(1u, 0u, rd.x > 0.0); }
+  if (axis == 1u) { return select(3u, 2u, rd.y > 0.0); }
+  return select(5u, 4u, rd.z > 0.0);
+}
+
+// --------------------------------------------------------------------------
+// Sparse descend from an arbitrary node cube (start_idx is LOCAL)
+// Returns a leaf cube; if the leaf is missing-child AIR, has_node=false.
+// --------------------------------------------------------------------------
+
+struct LeafState {
+  has_node  : bool,
+  idx_local : u32,       // valid only if has_node
+  bmin      : vec3<f32>,
+  size      : f32,
+  mat       : u32,
+
+  // nearest existing ancestor node/cube we can start from (anchor)
+  has_anchor   : bool,
+  anchor_idx   : u32,
+  anchor_bmin  : vec3<f32>,
+  anchor_size  : f32,
+};
+
+
+fn descend_leaf_sparse(
+  p_in      : vec3<f32>,
+  node_base : u32,
+  start_idx : u32,
+  start_bmin: vec3<f32>,
+  start_size: f32
+) -> LeafState {
+  var idx  : u32 = start_idx;
+  var bmin : vec3<f32> = start_bmin;
+  var size : f32 = start_size;
+
+  let max_d = chunk_max_depth();
+
+  for (var d: u32 = 0u; d < 32u; d = d + 1u) {
+    let n = node_at(node_base, idx);
+
+    if (n.child_base == LEAF_U32) {
+      return LeafState(true, idx, bmin, size, n.material,
+                       false, 0u, vec3<f32>(0.0), 0.0);
+    }
+
+    if (d >= max_d) {
+      return LeafState(true, idx, bmin, size, MAT_AIR,
+                       false, 0u, vec3<f32>(0.0), 0.0);
+    }
+
+    let half = size * 0.5;
+    let mid  = bmin + vec3<f32>(half);
+    let e    = 1e-6 * size;
+
+    let hx = select(0u, 1u, p_in.x > mid.x + e);
+    let hy = select(0u, 1u, p_in.y > mid.y + e);
+    let hz = select(0u, 1u, p_in.z > mid.z + e);
+    let ci = hx | (hy << 1u) | (hz << 2u);
+
+    let child_bmin = bmin + vec3<f32>(
+      select(0.0, half, hx != 0u),
+      select(0.0, half, hy != 0u),
+      select(0.0, half, hz != 0u)
     );
 
-    BindGroups {
-        primary,
-        scene,
-        godray,
-        composite,
-        empty,
-        blit,
+    let bit = 1u << ci;
+    if ((n.child_mask & bit) == 0u) {
+      // Missing child => implicit AIR cube, but parent node exists.
+      return LeafState(
+        false, INVALID_U32, child_bmin, half, MAT_AIR,
+        true,  idx,         bmin,      size
+      );
     }
+
+
+    let r = child_rank(n.child_mask, ci);
+    idx  = n.child_base + r;      // LOCAL packed index
+    bmin = child_bmin;
+    size = half;
+  }
+
+  return LeafState(
+    false, INVALID_U32, start_bmin, start_size, MAT_AIR,
+    false, INVALID_U32, vec3<f32>(0.0), 0.0
+  );
+
 }
 
-// src/render/state/buffers.rs
+// --------------------------------------------------------------------------
+// REAL rope traversal: AIR leaf => rope jump => use key to get neighbor cube
+// => descend starting from that neighbor node (NOT from root).
+// --------------------------------------------------------------------------
+// --------------------------------------------------------------------------
+// Macro 3D DDA (digital differential analyzer) for macro occupancy stepping
+// --------------------------------------------------------------------------
+
+struct MacroDDA {
+  valid  : bool,
+  cell   : f32,
+
+  mx     : i32,
+  my     : i32,
+  mz     : i32,
+
+  stepX  : i32,
+  stepY  : i32,
+  stepZ  : i32,
+
+  tMaxX  : f32,
+  tMaxY  : f32,
+  tMaxZ  : f32,
+
+  tDeltaX: f32,
+  tDeltaY: f32,
+  tDeltaZ: f32,
+};
+
+fn macro_dda_init(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  inv: vec3<f32>,
+  tcur: f32,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  macro_base: u32
+) -> MacroDDA {
+  var m: MacroDDA;
+  m.valid = (macro_base != INVALID_U32);
+  if (!m.valid) {
+    m.cell = 0.0;
+    return m;
+  }
+
+  m.cell = macro_cell_size(root_size);
+
+  let p  = ro + rd * tcur;
+  let lp = p - root_bmin;
+
+  // current macro cell indices
+  let mx0 = i32(floor(lp.x / m.cell));
+  let my0 = i32(floor(lp.y / m.cell));
+  let mz0 = i32(floor(lp.z / m.cell));
+
+  // clamp into [0 .. MACRO_DIM-1]
+  let md = i32(MACRO_DIM) - 1;
+  m.mx = clamp(mx0, 0, md);
+  m.my = clamp(my0, 0, md);
+  m.mz = clamp(mz0, 0, md);
+
+  m.stepX = select(-1, 1, rd.x > 0.0);
+  m.stepY = select(-1, 1, rd.y > 0.0);
+  m.stepZ = select(-1, 1, rd.z > 0.0);
+
+  // next boundary plane index in macro grid space
+  let nx = m.mx + select(0, 1, m.stepX > 0);
+  let ny = m.my + select(0, 1, m.stepY > 0);
+  let nz = m.mz + select(0, 1, m.stepZ > 0);
+
+  // boundary positions in world space
+  let bx = root_bmin.x + f32(nx) * m.cell;
+  let by = root_bmin.y + f32(ny) * m.cell;
+  let bz = root_bmin.z + f32(nz) * m.cell;
+
+  // tMax values in ray-t space
+  m.tMaxX = select(BIG_F32, tcur + (bx - p.x) * inv.x, abs(rd.x) >= EPS_INV);
+  m.tMaxY = select(BIG_F32, tcur + (by - p.y) * inv.y, abs(rd.y) >= EPS_INV);
+  m.tMaxZ = select(BIG_F32, tcur + (bz - p.z) * inv.z, abs(rd.z) >= EPS_INV);
+
+  // tDelta: distance (in t) to cross one macro cell along each axis
+  m.tDeltaX = select(BIG_F32, m.cell * abs(inv.x), abs(rd.x) >= EPS_INV);
+  m.tDeltaY = select(BIG_F32, m.cell * abs(inv.y), abs(rd.y) >= EPS_INV);
+  m.tDeltaZ = select(BIG_F32, m.cell * abs(inv.z), abs(rd.z) >= EPS_INV);
+
+  return m;
+}
+
+fn macro_dda_exit_t(m: MacroDDA, t_exit: f32) -> f32 {
+  return min(t_exit, min(m.tMaxX, min(m.tMaxY, m.tMaxZ)));
+}
+
+fn macro_dda_step(m: ptr<function, MacroDDA>) {
+  // step to next macro cell along smallest tMax axis
+  if ((*m).tMaxX < (*m).tMaxY) {
+    if ((*m).tMaxX < (*m).tMaxZ) {
+      (*m).mx += (*m).stepX;
+      (*m).tMaxX += (*m).tDeltaX;
+    } else {
+      (*m).mz += (*m).stepZ;
+      (*m).tMaxZ += (*m).tDeltaZ;
+    }
+  } else {
+    if ((*m).tMaxY < (*m).tMaxZ) {
+      (*m).my += (*m).stepY;
+      (*m).tMaxY += (*m).tDeltaY;
+    } else {
+      (*m).mz += (*m).stepZ;
+      (*m).tMaxZ += (*m).tDeltaZ;
+    }
+  }
+
+  // if we stepped outside the macro grid, mark invalid so we stop using it
+  let md = i32(MACRO_DIM) - 1;
+  if ((*m).mx < 0 || (*m).my < 0 || (*m).mz < 0 ||
+      (*m).mx > md || (*m).my > md || (*m).mz > md) {
+    (*m).valid = false;
+  }
+}
+
+fn macro_dda_is_empty(m: MacroDDA, macro_base: u32) -> bool {
+  // m.valid must be true to call this
+  let mxu = u32(m.mx);
+  let myu = u32(m.my);
+  let mzu = u32(m.mz);
+  let bit = macro_bit_index(mxu, myu, mzu);
+  return !macro_test(macro_base, bit);
+}
+
+// --------------------------------------------------------------------------
+// Rewritten traversal (macro DDA + leaf/rope traversal)
+// --------------------------------------------------------------------------
+fn trace_chunk_rope_interval(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  ch: ChunkMeta,
+  t_enter: f32,
+  t_exit: f32
+) -> HitGeom {
+  let vs = cam.voxel_params.x;
+
+  let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
+  let root_bmin     = root_bmin_vox * vs;
+  let root_size     = f32(cam.chunk_size) * vs;
+
+  let eps_step = 1e-4 * vs;
+  var tcur     = max(t_enter, 0.0) + eps_step;
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  // Only probe grass when we are in small-enough air leaves
+  let grass_probe_max_leaf = 2.0 * vs;
+
+  let origin_vox_i = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
+  let time_s       = cam.voxel_params.y;
+  let strength     = cam.voxel_params.z;
+
+  var have_leaf: bool = false;
+  var leaf: LeafState;
+
+  // Macro DDA setup (valid==false if no macro data)
+  var m = macro_dda_init(ro, rd, inv, tcur, root_bmin, root_size, ch.macro_base);
+
+  let MAX_ITERS: u32 = 4096u;
+
+  for (var it: u32 = 0u; it < MAX_ITERS; it = it + 1u) {
+    if (tcur > t_exit) { break; }
+
+    // ------------------------------------------------------------
+    // COARSE: macro empty jump using macro 3D DDA
+    // ------------------------------------------------------------
+    var t_macro_exit: f32 = t_exit;
+
+    if (m.valid) {
+      t_macro_exit = macro_dda_exit_t(m, t_exit);
+
+      if (macro_dda_is_empty(m, ch.macro_base)) {
+        // Jump across empty macro cell
+        tcur = max(t_macro_exit, tcur) + eps_step;
+        have_leaf = false;
+
+        if (tcur > t_exit) { break; }
+
+        // Advance macro DDA to next macro cell
+        macro_dda_step(&m);
+        continue;
+      }
+    }
+
+    // ------------------------------------------------------------
+    // FINE: leaf traversal (rope traversal only on true leaf exit)
+    // ------------------------------------------------------------
+    let p  = ro + tcur * rd;
+    let pq = p + rd * (1e-4 * vs);
+
+    if (!have_leaf || !point_in_cube(pq, leaf.bmin, leaf.size)) {
+      leaf = descend_leaf_sparse(pq, ch.node_base, 0u, root_bmin, root_size);
+      have_leaf = true;
+    }
+
+    let slab    = cube_slab_inv(ro, inv, leaf.bmin, leaf.size);
+    let t_leave = slab.t_exit;
+
+    // Macro boundary event happens before leaf exit => advance to macro boundary
+    // IMPORTANT: do not treat as leaf exit; do not do ropes.
+    if (m.valid && (t_macro_exit < t_leave)) {
+      tcur = max(t_macro_exit, tcur) + eps_step;
+
+      if (tcur > t_exit) { break; }
+
+      macro_dda_step(&m);
+      // leaf can straddle macro boundaries; keep cache
+      continue;
+    }
+
+    // ------------------------------------------------------------
+    // AIR leaf path
+    // ------------------------------------------------------------
+    if (leaf.mat == MAT_AIR) {
+      // Grass probe bounded to [tcur, t_leave] (macro boundary already handled above)
+      if (leaf.size <= grass_probe_max_leaf) {
+        let t0_probe = max(t_enter, tcur - eps_step);
+        let t1_probe = min(t_leave, t_exit);
+
+        if (t1_probe >= t0_probe) {
+          let gh = probe_grass_columns_xz_dda(
+            ro, rd,
+            t0_probe, t1_probe,
+            root_bmin,
+            origin_vox_i,
+            vs,
+            ch.colinfo_base,
+            time_s,
+            strength
+          );
+
+          if (gh.hit) {
+            var outg = miss_hitgeom();
+            outg.hit = 1u;
+            outg.t   = gh.t;
+            outg.mat = MAT_GRASS;
+            outg.n   = gh.n;
+            outg.root_bmin  = root_bmin;
+            outg.root_size  = root_size;
+            outg.node_base  = ch.node_base;
+            outg.macro_base = ch.macro_base;
+            return outg;
+          }
+        }
+      }
+
+      // True leaf exit => rope traversal
+      let face = exit_face_from_slab(rd, slab);
+
+      tcur = max(t_leave, tcur) + eps_step;
+      if (tcur > t_exit) { break; }
+
+      let p_next  = ro + tcur * rd;
+      let pq_next = p_next + rd * (1e-4 * vs);
+
+      // CASE A: real AIR node exists -> use its ropes
+      if (leaf.has_node) {
+        let nidx = rope_next_local(ch.node_base, leaf.idx_local, face);
+        if (nidx == INVALID_U32) { have_leaf = false; continue; }
+
+        let nk = node_at(ch.node_base, nidx).key;
+        let c  = node_cube_from_key(root_bmin, root_size, nk);
+        leaf = descend_leaf_sparse(pq_next, ch.node_base, nidx, c.xyz, c.w);
+        have_leaf = true;
+        continue;
+      }
+
+      // CASE B: missing-child AIR (virtual cube) -> use anchor
+      if (leaf.has_anchor) {
+        if (point_in_cube(pq_next, leaf.anchor_bmin, leaf.anchor_size)) {
+          leaf = descend_leaf_sparse(
+            pq_next,
+            ch.node_base,
+            leaf.anchor_idx,
+            leaf.anchor_bmin,
+            leaf.anchor_size
+          );
+          have_leaf = true;
+          continue;
+        }
+
+        let nidx2 = rope_next_local(ch.node_base, leaf.anchor_idx, face);
+        if (nidx2 == INVALID_U32) { have_leaf = false; continue; }
+
+        let nk2 = node_at(ch.node_base, nidx2).key;
+        let c2  = node_cube_from_key(root_bmin, root_size, nk2);
+
+        leaf = descend_leaf_sparse(pq_next, ch.node_base, nidx2, c2.xyz, c2.w);
+        have_leaf = true;
+        continue;
+      }
+
+      // Fallback: re-descend from root next iter
+      have_leaf = false;
+      continue;
+    }
+
+    // ------------------------------------------------------------
+    // Non-air leaf path (macro boundary already handled above)
+    // ------------------------------------------------------------
+
+    // Displaced leaf material
+    if (leaf.mat == MAT_LEAF) {
+      let h2 = leaf_displaced_cube_hit(
+        ro, rd,
+        leaf.bmin, leaf.size,
+        time_s, strength,
+        t_enter, t_exit
+      );
+
+      if (h2.hit) {
+        var out = miss_hitgeom();
+        out.hit = 1u;
+        out.t   = h2.t;
+        out.mat = MAT_LEAF;
+        out.n   = h2.n;
+        out.root_bmin  = root_bmin;
+        out.root_size  = root_size;
+        out.node_base  = ch.node_base;
+        out.macro_base = ch.macro_base;
+        return out;
+      }
+
+      // Miss: step out of this leaf
+      tcur = max(t_leave, tcur) + eps_step;
+      have_leaf = false;
+      continue;
+    }
+
+    // Solid hit
+    let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
+    if (bh.hit) {
+      // Optional grass-on-solid-face probe when solid voxel is grass
+      if (leaf.mat == MAT_GRASS) {
+        let hp = ro + bh.t * rd;
+
+        let cell = pick_grass_cell_in_chunk(
+          hp, rd,
+          root_bmin,
+          origin_vox_i,
+          vs,
+          i32(cam.chunk_size)
+        );
+
+        let tmax_probe = min(bh.t, t_exit);
+
+        let gh = try_grass_slab_hit(
+          ro, rd,
+          t_enter, tmax_probe,
+          cell.bmin_m, cell.id_vox,
+          vs, time_s, strength
+        );
+
+        if (gh.hit) {
+          var outg = miss_hitgeom();
+          outg.hit = 1u;
+          outg.t   = gh.t;
+          outg.mat = MAT_GRASS;
+          outg.n   = gh.n;
+          outg.root_bmin  = root_bmin;
+          outg.root_size  = root_size;
+          outg.node_base  = ch.node_base;
+          outg.macro_base = ch.macro_base;
+          return outg;
+        }
+      }
+
+      var out = miss_hitgeom();
+      out.hit = 1u;
+      out.t   = bh.t;
+      out.mat = leaf.mat;
+      out.n   = bh.n;
+      out.root_bmin  = root_bmin;
+      out.root_size  = root_size;
+      out.node_base  = ch.node_base;
+      out.macro_base = ch.macro_base;
+      return out;
+    }
+
+    // Miss solid: step out of leaf
+    tcur = max(t_leave, tcur) + eps_step;
+    have_leaf = false;
+  }
+
+  return miss_hitgeom();
+}
+
+// --------------------------------------------------------------------------
+// Scene voxel tracing over streamed chunk grid (for main_primary)
+// --------------------------------------------------------------------------
+
+struct VoxTraceResult {
+  in_grid : bool,
+  best    : HitGeom,
+  t_exit  : f32,
+};
+
+fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
+  if (cam.chunk_count == 0u) {
+    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+  }
+
+  let voxel_size   = cam.voxel_params.x;
+  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
+
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+
+  // Grid bounds in meters
+  let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
+  let grid_bmax = grid_bmin + vec3<f32>(f32(gd.x), f32(gd.y), f32(gd.z)) * chunk_size_m;
+
+  // Ray vs grid AABB
+  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  var t_enter = max(rtg.x, 0.0);
+  let t_exit  = rtg.y;
+
+  if (t_exit < t_enter) {
+    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+  }
+
+  // Nudge inside
+  let nudge_p = PRIMARY_NUDGE_VOXEL_FRAC * voxel_size;
+  let start_t = t_enter + nudge_p;
+  let p0      = ro + start_t * rd;
+
+  // World chunk coords at start
+  let c = chunk_coord_from_pos(p0, chunk_size_m);
+
+  // Local grid coords (0..dims-1) and running linear index
+  let nx: i32 = i32(gd.x);
+  let ny: i32 = i32(gd.y);
+  let nz: i32 = i32(gd.z);
+
+  var lcx: i32 = c.x - go.x;
+  var lcy: i32 = c.y - go.y;
+  var lcz: i32 = c.z - go.z;
+
+  if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) {
+    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+  }
+
+  let stride_y: i32 = nx;
+  let stride_z: i32 = nx * ny;
+
+  var idx_i: i32 = (lcz * ny + lcy) * nx + lcx;
+
+  // DDA setup (in ray-param space, relative to p0)
+  var t_local: f32 = 0.0;
+  let t_exit_local = max(t_exit - start_t, 0.0);
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  let step_x: i32 = select(-1, 1, rd.x > 0.0);
+  let step_y: i32 = select(-1, 1, rd.y > 0.0);
+  let step_z: i32 = select(-1, 1, rd.z > 0.0);
+
+  // Next chunk boundary in meters (world chunk coords from c)
+  let bx = select(f32(c.x) * chunk_size_m, f32(c.x + 1) * chunk_size_m, rd.x > 0.0);
+  let by = select(f32(c.y) * chunk_size_m, f32(c.y + 1) * chunk_size_m, rd.y > 0.0);
+  let bz = select(f32(c.z) * chunk_size_m, f32(c.z + 1) * chunk_size_m, rd.z > 0.0);
+
+  var tMaxX: f32 = (bx - p0.x) * inv.x;
+  var tMaxY: f32 = (by - p0.y) * inv.y;
+  var tMaxZ: f32 = (bz - p0.z) * inv.z;
+
+  let tDeltaX: f32 = abs(chunk_size_m * inv.x);
+  let tDeltaY: f32 = abs(chunk_size_m * inv.y);
+  let tDeltaZ: f32 = abs(chunk_size_m * inv.z);
+
+  if (abs(rd.x) < EPS_INV) { tMaxX = BIG_F32; }
+  if (abs(rd.y) < EPS_INV) { tMaxY = BIG_F32; }
+  if (abs(rd.z) < EPS_INV) { tMaxZ = BIG_F32; }
+
+  let didx_x: i32 = select(-1, 1, rd.x > 0.0);
+  let didx_y: i32 = select(-stride_y, stride_y, rd.y > 0.0);
+  let didx_z: i32 = select(-stride_z, stride_z, rd.z > 0.0);
+
+  var best = miss_hitgeom();
+
+  let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 1024u);
+
+  for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
+    if (t_local > t_exit_local) { break; }
+
+    let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
+    if (best.hit != 0u && (start_t + tNextLocal) >= best.t) { break; }
+
+    let slot = chunk_grid[u32(idx_i)];
+    if (slot != INVALID_U32 && slot < cam.chunk_count) {
+      let ch = chunks[slot];
+
+      let cell_enter = start_t + t_local;
+      let cell_exit  = start_t + min(tNextLocal, t_exit_local);
+
+      let h = trace_chunk_rope_interval(ro, rd, ch, cell_enter, cell_exit);
+      if (h.hit != 0u && h.t < best.t) { best = h; }
+    }
+
+    // Advance DDA
+    if (tMaxX < tMaxY) {
+      if (tMaxX < tMaxZ) {
+        lcx += step_x; idx_i += didx_x;
+        t_local = tMaxX; tMaxX += tDeltaX;
+      } else {
+        lcz += step_z; idx_i += didx_z;
+        t_local = tMaxZ; tMaxZ += tDeltaZ;
+      }
+    } else {
+      if (tMaxY < tMaxZ) {
+        lcy += step_y; idx_i += didx_y;
+        t_local = tMaxY; tMaxY += tDeltaY;
+      } else {
+        lcz += step_z; idx_i += didx_z;
+        t_local = tMaxZ; tMaxZ += tDeltaZ;
+      }
+    }
+
+    if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) { break; }
+  }
+
+  return VoxTraceResult(true, best, t_exit);
+}
+
+// --------------------------------------------------------------------------
+// Column-top map (64x64)
+// - Each (x,z) has a packed u16 entry: (mat8<<8) | y8
+// - y8=255 means empty column (all air)
+// - Two entries per u32 word => 2048 u32 words per chunk
+// --------------------------------------------------------------------------
+
+fn colinfo_entry_u16(colinfo_base: u32, lx: u32, lz: u32) -> u32 {
+  // idx in [0..4095]
+  let idx = lz * 64u + lx;
+  let w = idx >> 1u;          // 0..2047
+  let word = chunk_colinfo[colinfo_base + w];
+  if ((idx & 1u) == 0u) {
+    return word & 0xFFFFu;
+  }
+  return (word >> 16u) & 0xFFFFu;
+}
+
+struct ColInfo {
+  valid : bool,
+  y_vox : u32,   // 0..63
+  mat   : u32,   // 0..255 (we only care if == MAT_GRASS)
+};
+
+fn colinfo_decode(e16: u32) -> ColInfo {
+  let y8   = e16 & 0xFFu;
+  let mat8 = (e16 >> 8u) & 0xFFu;
+  if (y8 == 255u) {
+    return ColInfo(false, 0u, 0u);
+  }
+  return ColInfo(true, y8, mat8);
+}
+
+
+// Visit each (lx,lz) column crossed by [t0,t1] once (XZ DDA).
+// Calls try_grass_slab_hit at most once per visited column.
+// Returns hit or miss.
+fn probe_grass_columns_xz_dda(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t0_in: f32,
+  t1_in: f32,
+  root_bmin: vec3<f32>,
+  origin_vox_i: vec3<i32>,
+  vs: f32,
+  colinfo_base: u32,
+  time_s: f32,
+  strength: f32
+) -> GrassHit {
+  // Clamp & early out
+  var t0 = t0_in;
+  var t1 = t1_in;
+  if (t1 <= t0) {
+    return GrassHit(false, BIG_F32, vec3<f32>(0.0));
+  }
+
+  // Start point (slightly nudged to avoid exact-boundary issues)
+  let eps = 1e-4 * vs;
+  var t = t0 + eps;
+  if (t > t1) { t = t0; }
+
+  var p = ro + rd * t;
+
+  // Local voxel coords in chunk (floating)
+  var lx_f = (p.x - root_bmin.x) / vs;
+  var lz_f = (p.z - root_bmin.z) / vs;
+
+  // Integer column indices
+  var lx: i32 = i32(floor(lx_f));
+  var lz: i32 = i32(floor(lz_f));
+
+  // Clamp to 0..63 (chunk is 64^3 in your code)
+  lx = clamp(lx, 0, 63);
+  lz = clamp(lz, 0, 63);
+
+  // Steps in X and Z
+  let stepX: i32 = select(-1, 1, rd.x > 0.0);
+  let stepZ: i32 = select(-1, 1, rd.z > 0.0);
+
+  // Setup X boundary crossing times (in ray-t space)
+  var tMaxX: f32 = BIG_F32;
+  var tDeltaX: f32 = BIG_F32;
+  if (abs(rd.x) >= EPS_INV) {
+    // Next voxel boundary in meters
+    let nextX = root_bmin.x + f32(select(lx, lx + 1, stepX > 0)) * vs;
+    tMaxX   = t + (nextX - p.x) / rd.x;
+    tDeltaX = vs / abs(rd.x);
+  }
+
+  // Setup Z boundary crossing times
+  var tMaxZ: f32 = BIG_F32;
+  var tDeltaZ: f32 = BIG_F32;
+  if (abs(rd.z) >= EPS_INV) {
+    let nextZ = root_bmin.z + f32(select(lz, lz + 1, stepZ > 0)) * vs;
+    tMaxZ   = t + (nextZ - p.z) / rd.z;
+    tDeltaZ = vs / abs(rd.z);
+  }
+
+  // Safety cap: max columns crossed within a tiny leaf is small.
+  // Still cap to be safe in edge cases / long segments.
+  let MAX_COLS: u32 = 128u;
+
+  for (var iter: u32 = 0u; iter < MAX_COLS; iter = iter + 1u) {
+    if (t > t1) { break; }
+
+    // End of current column interval is the next boundary (or t1)
+    let tNext = min(min(tMaxX, tMaxZ), t1);
+
+    // --- Check this column’s top map once
+    let lx_u: u32 = u32(lx);
+    let lz_u: u32 = u32(lz);
+
+    let e16 = colinfo_entry_u16(colinfo_base, lx_u, lz_u);
+    let ci  = colinfo_decode(e16);
+
+    if (ci.valid && ci.mat == MAT_GRASS) {
+      // World voxel coords for the grass cell (at column-top y)
+      let wx: i32 = origin_vox_i.x + lx;
+      let wy: i32 = origin_vox_i.y + i32(ci.y_vox);
+      let wz: i32 = origin_vox_i.z + lz;
+
+      let cell_bmin_m = vec3<f32>(f32(wx), f32(wy), f32(wz)) * vs;
+      let id_vox      = vec3<f32>(f32(wx), f32(wy), f32(wz));
+
+      // Tight per-column interval [t, tNext]
+      let gh = try_grass_slab_hit(
+        ro, rd,
+        t, tNext,
+        cell_bmin_m, id_vox,
+        vs, time_s, strength
+      );
+
+      if (gh.hit) { return gh; }
+    }
+
+    // Move to next column
+    if (tNext >= t1) { break; }
+
+    // Step across whichever boundary is hit first
+    if (tMaxX < tMaxZ) {
+      lx += stepX;
+      t = tMaxX + eps;
+      tMaxX += tDeltaX;
+    } else {
+      lz += stepZ;
+      t = tMaxZ + eps;
+      tMaxZ += tDeltaZ;
+    }
+
+    // Stop if we walked out of chunk xz bounds
+    if (lx < 0 || lx > 63 || lz < 0 || lz > 63) { break; }
+
+    p = ro + rd * t;
+  }
+
+  return GrassHit(false, BIG_F32, vec3<f32>(0.0));
+}
+
+
+
+// src/shaders/ray/clouds.wgsl
 // ---------------------------
-// src/render/state/buffers.rs
-//
-// Persistent GPU buffers and capacities.
+// src/shaders/ray/clouds.wgsl
+//// --------------------------------------------------------------------------
+//// Clouds
+//// --------------------------------------------------------------------------
 
-use crate::{
-    config,
-    render::gpu_types::{ChunkMetaGpu, ClipmapGpu, NodeGpu, NodeRopesGpu},
+fn cloud_coverage_at_xz(xz: vec2<f32>, time_s: f32) -> f32 {
+  var uv = xz * CLOUD_UV_SCALE + CLOUD_WIND * time_s;
+
+  let n  = fbm(uv);
+  let n2 = fbm(uv * 2.3 + vec2<f32>(13.2, 7.1));
+  let field = 0.65 * n + 0.35 * n2;
+
+  return smoothstep(CLOUD_COVERAGE, CLOUD_COVERAGE + CLOUD_SOFTNESS, field);
+}
+
+fn cloud_sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+  if (sun_dir.y <= 0.01) { return 1.0; }
+
+  let t = (CLOUD_H - p.y) / sun_dir.y;
+  if (t <= 0.0) { return 1.0; }
+
+  let time_s = cam.voxel_params.y;
+  let hit = p + sun_dir * t;
+  let cov = cloud_coverage_at_xz(hit.xz, time_s);
+  
+  let Tc = exp(-CLOUD_SHADOW_ABSORB * cov);
+  return mix(1.0, Tc, CLOUD_SHADOW_STRENGTH);
+}
+
+fn cloud_coverage_fast(xz: vec2<f32>, time_s: f32) -> f32 {
+  // 2 octaves only
+  var uv = xz * CLOUD_UV_SCALE + CLOUD_WIND * time_s;
+  let n0 = value_noise(uv);
+  let n1 = value_noise(uv * 2.1 + vec2<f32>(13.2, 7.1));
+  let field = 0.70 * n0 + 0.30 * n1;
+  return smoothstep(CLOUD_COVERAGE, CLOUD_COVERAGE + CLOUD_SOFTNESS, field);
+}
+
+fn cloud_sun_transmittance_fast(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+  if (sun_dir.y <= 0.01) { return 1.0; }
+  let t = (CLOUD_H - p.y) / sun_dir.y;
+  if (t <= 0.0) { return 1.0; }
+  let time_s = cam.voxel_params.y;
+  let hit = p + sun_dir * t;
+  let cov = cloud_coverage_fast(hit.xz, time_s);
+  return exp(-CLOUD_SHADOW_ABSORB * cov);
+}
+
+// src/shaders/ray/composite.wgsl
+// ------------------------------
+// src/shaders/ray/composite.wgsl
+//// --------------------------------------------------------------------------
+//// Composite helpers (godray upsample + tonemap)
+//// --------------------------------------------------------------------------
+
+fn bright_extract_hue(x: vec3<f32>, thresh: f32) -> vec3<f32> {
+  let lum_w = vec3<f32>(0.2126, 0.7152, 0.0722);
+  let l = dot(x, lum_w);
+
+  let over = max(l - thresh, 0.0);
+  let w = over / max(l, 1e-4);
+  return x * w;
+}
+
+fn gamma_encode(x: vec3<f32>) -> vec3<f32> {
+  return pow(x, vec3<f32>(1.0 / 2.2));
+}
+
+fn tonemap_aces_luma(hdr: vec3<f32>) -> vec3<f32> {
+  let w = vec3<f32>(0.2126, 0.7152, 0.0722);
+  let l_in = max(dot(hdr, w), 1e-6);
+
+  let a = 2.51;
+  let b = 0.03;
+  let c = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  let l_out = clamp((l_in*(a*l_in + b)) / (l_in*(c*l_in + d) + e), 0.0, 1.0);
+
+  return hdr * (l_out / l_in);
+}
+
+fn godray_sample_bilerp(
+  px_full: vec2<f32>,
+  godray_tex: texture_2d<f32>,
+  depth_full: texture_2d<f32>
+) -> vec3<f32> {
+  let q = px_full * 0.25;
+  let q0 = vec2<i32>(i32(floor(q.x)), i32(floor(q.y)));
+  let f  = fract(q);
+
+  let qdims = textureDimensions(godray_tex);
+  let x0 = clamp(q0.x, 0, i32(qdims.x) - 1);
+  let y0 = clamp(q0.y, 0, i32(qdims.y) - 1);
+  let x1 = min(x0 + 1, i32(qdims.x) - 1);
+  let y1 = min(y0 + 1, i32(qdims.y) - 1);
+
+  let c00 = textureLoad(godray_tex, vec2<i32>(x0, y0), 0).xyz;
+  let c10 = textureLoad(godray_tex, vec2<i32>(x1, y0), 0).xyz;
+  let c01 = textureLoad(godray_tex, vec2<i32>(x0, y1), 0).xyz;
+  let c11 = textureLoad(godray_tex, vec2<i32>(x1, y1), 0).xyz;
+
+  let ip = vec2<i32>(i32(floor(px_full.x)), i32(floor(px_full.y)));
+  let d0 = textureLoad(depth_full, ip, 0).x;
+
+  let df = textureDimensions(depth_full);
+  let p00 = vec2<i32>(clamp(x0 * 4, 0, i32(df.x) - 1), clamp(y0 * 4, 0, i32(df.y) - 1));
+  let p10 = vec2<i32>(clamp(x1 * 4, 0, i32(df.x) - 1), clamp(y0 * 4, 0, i32(df.y) - 1));
+  let p01 = vec2<i32>(clamp(x0 * 4, 0, i32(df.x) - 1), clamp(y1 * 4, 0, i32(df.y) - 1));
+  let p11 = vec2<i32>(clamp(x1 * 4, 0, i32(df.x) - 1), clamp(y1 * 4, 0, i32(df.y) - 1));
+
+  let d00 = textureLoad(depth_full, p00, 0).x;
+  let d10 = textureLoad(depth_full, p10, 0).x;
+  let d01 = textureLoad(depth_full, p01, 0).x;
+  let d11 = textureLoad(depth_full, p11, 0).x;
+
+  let tol = 0.02 + 0.06 * smoothstep(10.0, 80.0, d0);
+
+  let w00 = exp(-abs(d00 - d0) / tol);
+  let w10 = exp(-abs(d10 - d0) / tol);
+  let w01 = exp(-abs(d01 - d0) / tol);
+  let w11 = exp(-abs(d11 - d0) / tol);
+
+  let wf00 = w00 * (1.0 - f.x) * (1.0 - f.y);
+  let wf10 = w10 * (f.x)       * (1.0 - f.y);
+  let wf01 = w01 * (1.0 - f.x) * (f.y);
+  let wf11 = w11 * (f.x)       * (f.y);
+
+  let wsum = max(wf00 + wf10 + wf01 + wf11, 1e-4);
+  let c = (c00 * wf00 + c10 * wf10 + c01 * wf01 + c11 * wf11) / wsum;
+
+  // decompress back to linear energy (k must match quarter pass compression)
+  let k = 0.25;
+  let one = vec3<f32>(1.0);
+  let denom = max(one - c, vec3<f32>(1e-4));
+  return (k * c) / denom;
+}
+
+fn composite_pixel_mapped(
+  ip_render: vec2<i32>,
+  px_render: vec2<f32>,
+  color_tex: texture_2d<f32>,
+  godray_tex: texture_2d<f32>,
+  godray_samp: sampler,
+  depth_full: texture_2d<f32>
+) -> vec4<f32> {
+  // Render-space dims (NOT present/out_img dims)
+  let rdims_u = textureDimensions(color_tex);
+  let rdims_i = vec2<i32>(i32(rdims_u.x), i32(rdims_u.y));
+  let fd      = vec2<f32>(f32(rdims_u.x), f32(rdims_u.y));
+
+  // Clamp render ip defensively
+  let ip = vec2<i32>(
+    clamp(ip_render.x, 0, rdims_i.x - 1),
+    clamp(ip_render.y, 0, rdims_i.y - 1)
+  );
+
+  // Base color in render space
+  let base = textureLoad(color_tex, ip, 0).xyz;
+
+  // UV normalized in render space
+  let uv = px_render / fd;
+
+  // Godray taps in render-texel units (stable across dynamic res)
+  let du = vec2<f32>(1.0 / fd.x, 0.0);
+  let dv = vec2<f32>(0.0, 1.0 / fd.y);
+
+  let gC = godray_sample_linear(uv,        godray_tex, godray_samp);
+  let gE = godray_sample_linear(uv + du,   godray_tex, godray_samp);
+  let gW = godray_sample_linear(uv - du,   godray_tex, godray_samp);
+  let gN = godray_sample_linear(uv + dv,   godray_tex, godray_samp);
+  let gS = godray_sample_linear(uv - dv,   godray_tex, godray_samp);
+
+  // Depth edge weights (render-space integer taps)
+  let d0 = textureLoad(depth_full, ip, 0).x;
+
+  let ipE = vec2<i32>(min(ip.x + 1, rdims_i.x - 1), ip.y);
+  let ipW = vec2<i32>(max(ip.x - 1, 0),            ip.y);
+  let ipN = vec2<i32>(ip.x, min(ip.y + 1, rdims_i.y - 1));
+  let ipS = vec2<i32>(ip.x, max(ip.y - 1, 0));
+
+  let dE = textureLoad(depth_full, ipE, 0).x;
+  let dW = textureLoad(depth_full, ipW, 0).x;
+  let dN = textureLoad(depth_full, ipN, 0).x;
+  let dS = textureLoad(depth_full, ipS, 0).x;
+
+  // Similar tol shape as before, but no exp
+  let tol = 0.02 + 0.06 * smoothstep(10.0, 80.0, d0);
+
+  let wE = 1.0 - smoothstep(0.0, tol, abs(dE - d0));
+  let wW = 1.0 - smoothstep(0.0, tol, abs(dW - d0));
+  let wN = 1.0 - smoothstep(0.0, tol, abs(dN - d0));
+  let wS = 1.0 - smoothstep(0.0, tol, abs(dS - d0));
+
+  let wsum = max(wE + wW + wN + wS, 1e-4);
+  let blur = (gE * wE + gW * wW + gN * wN + gS * wS) / wsum;
+
+  // Unsharp (keeps your look, but now cheap)
+  var god_lin = max(gC + COMPOSITE_SHARPEN * (gC - blur), vec3<f32>(0.0));
+  god_lin = max(god_lin - vec3<f32>(GODRAY_BLACK_LEVEL), vec3<f32>(0.0));
+  god_lin = god_lin / (god_lin + vec3<f32>(GODRAY_KNEE_COMPOSITE));
+
+  let god_far   = smoothstep(GODRAY_FADE_NEAR, GODRAY_FADE_FAR, d0);
+  let god_scale = GODRAY_COMPOSITE_SCALE * mix(1.0, 0.25, god_far);
+
+  var hdr = max(base + god_scale * god_lin, vec3<f32>(0.0));
+
+  // Bloom (hue-preserving + distance-faded)
+  let bloom_thresh = 1.4;
+  let bloom_k      = 0.12;
+  let bloom_k_eff  = bloom_k * mix(1.0, 0.0, god_far);
+
+  let b0 = bright_extract_hue(hdr, bloom_thresh);
+
+  let ipx1 = vec2<i32>(clamp(ip.x + 2, 0, rdims_i.x - 1), ip.y);
+  let ipx0 = vec2<i32>(clamp(ip.x - 2, 0, rdims_i.x - 1), ip.y);
+  let ipy1 = vec2<i32>(ip.x, clamp(ip.y + 2, 0, rdims_i.y - 1));
+  let ipy0 = vec2<i32>(ip.x, clamp(ip.y - 2, 0, rdims_i.y - 1));
+
+  let hx1 = max(textureLoad(color_tex, ipx1, 0).xyz, vec3<f32>(0.0));
+  let hx0 = max(textureLoad(color_tex, ipx0, 0).xyz, vec3<f32>(0.0));
+  let hy1 = max(textureLoad(color_tex, ipy1, 0).xyz, vec3<f32>(0.0));
+  let hy0 = max(textureLoad(color_tex, ipy0, 0).xyz, vec3<f32>(0.0));
+
+  let bloom = (b0
+    + bright_extract_hue(hx1, bloom_thresh)
+    + bright_extract_hue(hx0, bloom_thresh)
+    + bright_extract_hue(hy1, bloom_thresh)
+    + bright_extract_hue(hy0, bloom_thresh)) / 5.0;
+
+  let bloom_max = 0.35 * max(hdr, vec3<f32>(0.0));
+  hdr += bloom_k_eff * min(bloom, bloom_max);
+
+  // Distance-safe saturation compensation (HDR)
+  let lum_w  = vec3<f32>(0.2126, 0.7152, 0.0722);
+  let l_hdr  = max(dot(hdr, lum_w), 1e-6);
+  let gray_h = vec3<f32>(l_hdr);
+
+  let t_sat = smoothstep(30.0, 100.0, d0);
+
+  var sat_boost = 1.00 + 0.55 * t_sat;
+
+  let hi = smoothstep(1.6, 6.0, l_hdr);
+  sat_boost = mix(sat_boost, 1.0, 0.55 * hi);
+
+  hdr = mix(gray_h, hdr, sat_boost);
+
+  // Tonemap (luma-preserving)
+  var c = tonemap_aces_luma(hdr * POST_EXPOSURE);
+  c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+  c = pow(c, vec3<f32>(0.98));
+
+  // Dither/grain before gamma
+  let fi = f32(cam.frame_index & 1023u);
+  let n  = hash12(px_render * 1.7 + vec2<f32>(fi, 0.0)) - 0.5;
+  c += vec3<f32>(n / 1024.0);
+
+  let ldr = gamma_encode(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
+  return vec4<f32>(ldr, 1.0);
+}
+
+// src/shaders/ray/fog.wgsl
+// ------------------------
+// src/shaders/ray/fog.wgsl
+//// --------------------------------------------------------------------------
+//// Fog
+//// --------------------------------------------------------------------------
+
+fn fog_color_from_sky(rd: vec3<f32>, sky: vec3<f32>) -> vec3<f32> {
+  let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+
+  // Keep your clamp behavior identical
+  let sky_clamped = min(sky, vec3<f32>(0.45));
+
+  return mix(FOG_COLOR_GROUND, sky_clamped, FOG_COLOR_SKY_BLEND * up);
+}
+
+
+fn fog_inscatter(rd: vec3<f32>, fogc: vec3<f32>) -> vec3<f32> {
+  let mu = clamp(dot(rd, SUN_DIR), 0.0, 1.0);
+  let sun_scatter = pow(mu, 8.0);
+  return fogc + 0.35 * sun_scatter * SUN_COLOR;
+}
+
+fn fog_density_primary() -> f32 {
+  return max(cam.voxel_params.w * FOG_PRIMARY_SCALE, 0.0);
+}
+
+fn fog_density_godray() -> f32 {
+  return max(cam.voxel_params.w * FOG_GODRAY_SCALE, 0.0);
+}
+
+fn fog_optical_depth_with_base(base: f32, ro: vec3<f32>, rd: vec3<f32>, t: f32) -> f32 {
+  if (base <= 0.0) { return 0.0; }
+
+  let k = FOG_HEIGHT_FALLOFF;
+  let y0 = ro.y;
+  let dy = rd.y;
+
+  if (abs(dy) < 1e-4) {
+    return base * exp(-k * y0) * t;
+  }
+
+  let a = exp(-k * y0);
+  let b = exp(-k * (y0 + dy * t));
+  return base * (a - b) / (k * dy);
+}
+
+fn fog_transmittance_primary(ro: vec3<f32>, rd: vec3<f32>, t: f32) -> f32 {
+  let od = max(fog_optical_depth_with_base(fog_density_primary(), ro, rd, t), 0.0);
+  return exp(-od);
+}
+
+fn fog_transmittance_godray(ro: vec3<f32>, rd: vec3<f32>, t: f32) -> f32 {
+  let od = max(fog_optical_depth_with_base(fog_density_godray(), ro, rd, t), 0.0);
+  return exp(-od);
+}
+
+fn apply_fog(
+  surface: vec3<f32>,
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_scene: f32,
+  sky: vec3<f32>
+) -> vec3<f32> {
+  let T    = fog_transmittance_primary(ro, rd, t_scene);
+  let fogc = fog_color_from_sky(rd, sky);
+  let ins  = fog_inscatter(rd, fogc);
+  return surface * T + ins * (1.0 - T);
+}
+
+
+// src/shaders/ray/godrays.wgsl
+// ----------------------------
+// src/shaders/ray/godrays.wgsl
+//// --------------------------------------------------------------------------
+//// Godrays: integration + quarter-res temporal pixel
+//// --------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// 5-tap collapsed godray integration
+// - One march out to t_end_max
+// - Per-tap lightweight LP state + accumulation
+// -----------------------------------------------------------------------------
+
+struct Godray5 {
+  g0: vec3<f32>,
+  g1: vec3<f32>,
+  g2: vec3<f32>,
+  g3: vec3<f32>,
+  g4: vec3<f32>,
 };
 
-pub struct Buffers {
-    // --- Uniforms ---
-    pub camera: wgpu::Buffer,
-    pub overlay: wgpu::Buffer,
+fn godray_integrate_5(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_end0: f32,
+  t_end1: f32,
+  t_end2: f32,
+  t_end3: f32,
+  t_end4: f32,
+  j0: f32,
+  j1: f32,
+  j2: f32,
+  j3: f32,
+  j4: f32
+) -> Godray5 {
+  let base = fog_density_godray();
+  if (base <= 0.0) {
+    return Godray5(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
+  }
 
-    /// Clipmap params (primary compute pass only).
-    pub clipmap: wgpu::Buffer,
+  // Enabled taps
+  let e0 = t_end0 > 0.0;
+  let e1 = t_end1 > 0.0;
+  let e2 = t_end2 > 0.0;
+  let e3 = t_end3 > 0.0;
+  let e4 = t_end4 > 0.0;
 
-    // --- Storage buffers ---
-    pub node: wgpu::Buffer,
-    pub chunk: wgpu::Buffer,
-    pub chunk_grid: wgpu::Buffer,
+  let t_end_max = max(max(max(t_end0, t_end1), max(t_end2, t_end3)), t_end4);
+  if (t_end_max <= 0.0) {
+    return Godray5(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
+  }
 
-    // --- Capacities ---
-    pub node_capacity: u32,
-    pub chunk_capacity: u32,
-    pub grid_capacity: u32,
+  let costh = dot(rd, SUN_DIR);
+  let phase = phase_blended(costh);
 
-    pub macro_occ: wgpu::Buffer,
-    pub macro_capacity_u32: u32,
+  // March spacing based on max distance (single loop)
+  let N  = f32(GODRAY_STEPS_FAST);
+  let dt = t_end_max / N;
 
-    pub node_ropes: wgpu::Buffer,
-    pub rope_capacity: u32, // in nodes
+  // LP coefficients (shared; per-tap state uses these but only updates when active)
+  let a_ts    = 1.0 - exp(-dt * 3.0);
+  let a_shaft = 1.0 - exp(-dt * 5.0);
 
-    pub colinfo: wgpu::Buffer,
-    pub colinfo_capacity_u32: u32,
+  // Per-tap running state
+  var ts0: f32 = 1.0; var sh0: f32 = 0.0; var sum0 = vec3<f32>(0.0);
+  var ts1: f32 = 1.0; var sh1: f32 = 0.0; var sum1 = vec3<f32>(0.0);
+  var ts2: f32 = 1.0; var sh2: f32 = 0.0; var sum2 = vec3<f32>(0.0);
+  var ts3: f32 = 1.0; var sh3: f32 = 0.0; var sum3 = vec3<f32>(0.0);
+  var ts4: f32 = 1.0; var sh4: f32 = 0.0; var sum4 = vec3<f32>(0.0);
 
-}
+  // Helper: "active" predicate with per-tap jitter affecting cutoff only (cheap).
+  // (We do not shift sample position per tap; that would require 5x p/Tv/Ts work again.)
+  // jitter is in [-0.1..0.1] range in your code; multiply by dt to make it step-sized.
+  for (var i: u32 = 0u; i < GODRAY_STEPS_FAST; i = i + 1u) {
+    let ti = (f32(i) + 0.5) * dt;
+    if (ti <= 0.0) { continue; }
 
-fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: std::mem::size_of::<T>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
+    // Shared expensive work at this ti
+    let p  = ro + rd * ti;
 
-fn make_storage_buffer(device: &wgpu::Device, label: &str, size_bytes: u64) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: size_bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
+    let Tv = fog_transmittance_godray(ro, rd, ti);
+    if (Tv < GODRAY_TV_CUTOFF) { break; }
 
-pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
-    let camera = make_uniform_buffer::<crate::render::gpu_types::CameraGpu>(device, "camera_buf");
-    let overlay = make_uniform_buffer::<crate::render::gpu_types::OverlayGpu>(device, "overlay_buf");
+    let Ts_geom = sun_transmittance_geom_only(p, SUN_DIR);
+    let Tc      = cloud_sun_transmittance_fast(p, SUN_DIR);
 
-    let clipmap = make_uniform_buffer::<ClipmapGpu>(device, "clipmap_buf");
+    let Tc_vol  = mix(1.0, Tc, CLOUD_GODRAY_W);
+    let Ts_soft = pow(clamp(Ts_geom, 0.0, 1.0), 0.75);
 
-    let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
+    // Height falloff + density at this ti (shared)
+    let haze_ramp = 1.0 - exp(-ti / GODRAY_HAZE_NEAR_FADE);
+    let hfall = GODRAY_SCATTER_HEIGHT_FALLOFF;
+    let hmin  = GODRAY_SCATTER_MIN_FRAC;
+    let height_term = max(exp(-hfall * p.y), hmin);
+    let dens = base * height_term;
 
-    let node = make_storage_buffer(
-        device,
-        "svo_nodes_arena",
-        (node_capacity as u64) * (std::mem::size_of::<NodeGpu>() as u64),
-    );
+    // Common factor excluding per-tap ts/shaft weighting
+    let common_factor = (SUN_COLOR * SUN_INTENSITY)
+      * (dens * dt) * Tv * phase
+      * Tc_vol
+      * 0.70;
 
-    let chunk_capacity =
-        (2 * config::KEEP_RADIUS + 1) as u32 * 4u32 * (2 * config::KEEP_RADIUS + 1) as u32;
+    // ---- Tap 0
+    if (e0) {
+      let tcut = ti + j0 * dt;
+      let a = (tcut <= t_end0);
+      let wa = select(0.0, 1.0, a);
 
-    let chunk = make_storage_buffer(
-        device,
-        "chunk_meta_persistent",
-        (chunk_capacity as u64) * (std::mem::size_of::<ChunkMetaGpu>() as u64),
-    );
+      if (wa > 0.0) {
+        let ts_prev = ts0;
+        ts0 = mix(ts0, Ts_soft, a_ts);
 
-    let grid_capacity = chunk_capacity;
+        let dTs = max(0.0, ts_prev - Ts_soft);
 
-    let chunk_grid = make_storage_buffer(
-        device,
-        "chunk_grid_buf",
-        (grid_capacity as u64) * (std::mem::size_of::<u32>() as u64),
-    );
+        var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
+        shaft *= (1.0 - Ts_soft);
+        shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
 
-    // ---- macro occupancy: 8^3 bits = 512 bits = 16 u32 words per chunk ----
-    const MACRO_WORDS_PER_CHUNK: u32 = 16;
-    let macro_capacity_u32 = chunk_capacity * MACRO_WORDS_PER_CHUNK;
-    let macro_occ = make_storage_buffer(
-        device,
-        "macro_occ_buf",
-        (macro_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
-    );
+        sh0 = mix(sh0, shaft, a_shaft);
+        shaft = sh0;
 
-    let rope_capacity = node_capacity;
-    let node_ropes = make_storage_buffer(
-        device,
-        "svo_node_ropes",
-        (rope_capacity as u64) * (std::mem::size_of::<NodeRopesGpu>() as u64),
-    );
+        let shaft_sun_gate = smoothstep(0.35, 0.80, ts0);
+        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts0, 2.0);
 
-    // ---- column info: 64*64 columns packed => 2048 u32 per chunk ----
-    const COLINFO_WORDS_PER_CHUNK: u32 = 2048;
-    let colinfo_capacity_u32 = chunk_capacity * COLINFO_WORDS_PER_CHUNK;
-    let colinfo = make_storage_buffer(
-        device,
-        "chunk_colinfo_buf",
-        (colinfo_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
-    );
+        let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
+        let w = clamp(w_raw, 0.0, 1.0);
 
-    Buffers {
-        camera,
-        overlay,
-        clipmap,
-        node,
-        chunk,
-        chunk_grid,
-        node_capacity,
-        chunk_capacity,
-        grid_capacity,
-        macro_occ,
-        macro_capacity_u32,
-        node_ropes,
-        rope_capacity,
-        colinfo,
-        colinfo_capacity_u32,
+        sum0 += common_factor * (ts0 * w);
+      }
     }
+
+    // ---- Tap 1
+    if (e1) {
+      let tcut = ti + j1 * dt;
+      let a = (tcut <= t_end1);
+      let wa = select(0.0, 1.0, a);
+
+      if (wa > 0.0) {
+        let ts_prev = ts1;
+        ts1 = mix(ts1, Ts_soft, a_ts);
+
+        let dTs = max(0.0, ts_prev - Ts_soft);
+
+        var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
+        shaft *= (1.0 - Ts_soft);
+        shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
+
+        sh1 = mix(sh1, shaft, a_shaft);
+        shaft = sh1;
+
+        let shaft_sun_gate = smoothstep(0.35, 0.80, ts1);
+        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts1, 2.0);
+
+        let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
+        let w = clamp(w_raw, 0.0, 1.0);
+
+        sum1 += common_factor * (ts1 * w);
+      }
+    }
+
+    // ---- Tap 2
+    if (e2) {
+      let tcut = ti + j2 * dt;
+      let a = (tcut <= t_end2);
+      let wa = select(0.0, 1.0, a);
+
+      if (wa > 0.0) {
+        let ts_prev = ts2;
+        ts2 = mix(ts2, Ts_soft, a_ts);
+
+        let dTs = max(0.0, ts_prev - Ts_soft);
+
+        var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
+        shaft *= (1.0 - Ts_soft);
+        shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
+
+        sh2 = mix(sh2, shaft, a_shaft);
+        shaft = sh2;
+
+        let shaft_sun_gate = smoothstep(0.35, 0.80, ts2);
+        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts2, 2.0);
+
+        let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
+        let w = clamp(w_raw, 0.0, 1.0);
+
+        sum2 += common_factor * (ts2 * w);
+      }
+    }
+
+    // ---- Tap 3
+    if (e3) {
+      let tcut = ti + j3 * dt;
+      let a = (tcut <= t_end3);
+      let wa = select(0.0, 1.0, a);
+
+      if (wa > 0.0) {
+        let ts_prev = ts3;
+        ts3 = mix(ts3, Ts_soft, a_ts);
+
+        let dTs = max(0.0, ts_prev - Ts_soft);
+
+        var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
+        shaft *= (1.0 - Ts_soft);
+        shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
+
+        sh3 = mix(sh3, shaft, a_shaft);
+        shaft = sh3;
+
+        let shaft_sun_gate = smoothstep(0.35, 0.80, ts3);
+        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts3, 2.0);
+
+        let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
+        let w = clamp(w_raw, 0.0, 1.0);
+
+        sum3 += common_factor * (ts3 * w);
+      }
+    }
+
+    // ---- Tap 4 (center)
+    if (e4) {
+      let tcut = ti + j4 * dt;
+      let a = (tcut <= t_end4);
+      let wa = select(0.0, 1.0, a);
+
+      if (wa > 0.0) {
+        let ts_prev = ts4;
+        ts4 = mix(ts4, Ts_soft, a_ts);
+
+        let dTs = max(0.0, ts_prev - Ts_soft);
+
+        var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
+        shaft *= (1.0 - Ts_soft);
+        shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
+
+        sh4 = mix(sh4, shaft, a_shaft);
+        shaft = sh4;
+
+        let shaft_sun_gate = smoothstep(0.35, 0.80, ts4);
+        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts4, 2.0);
+
+        let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
+        let w = clamp(w_raw, 0.0, 1.0);
+
+        sum4 += common_factor * (ts4 * w);
+      }
+    }
+  }
+
+  // Match your original post-integrate shaping per tap
+  var g0 = sum0 * GODRAY_ENERGY_BOOST;
+  var g1 = sum1 * GODRAY_ENERGY_BOOST;
+  var g2 = sum2 * GODRAY_ENERGY_BOOST;
+  var g3 = sum3 * GODRAY_ENERGY_BOOST;
+  var g4 = sum4 * GODRAY_ENERGY_BOOST;
+
+  g0 = g0 / (g0 + vec3<f32>(GODRAY_KNEE_INTEGRATE));
+  g1 = g1 / (g1 + vec3<f32>(GODRAY_KNEE_INTEGRATE));
+  g2 = g2 / (g2 + vec3<f32>(GODRAY_KNEE_INTEGRATE));
+  g3 = g3 / (g3 + vec3<f32>(GODRAY_KNEE_INTEGRATE));
+  g4 = g4 / (g4 + vec3<f32>(GODRAY_KNEE_INTEGRATE));
+
+  return Godray5(g0, g1, g2, g3, g4);
 }
 
-// src/render/state/layout.rs
+
+fn compute_godray_quarter_pixel(
+  gid: vec2<u32>,
+  depth_tex: texture_2d<f32>,
+  godray_hist_tex: texture_2d<f32>
+) -> vec3<f32> {
+  let fdims = textureDimensions(depth_tex);
+  let ro = cam.cam_pos.xyz;
+
+  let hip = vec2<i32>(i32(gid.x), i32(gid.y));
+  let qpx = vec2<f32>(f32(gid.x), f32(gid.y));
+
+  let base_x = i32(gid.x) * GODRAY_BLOCK_SIZE;
+  let base_y = i32(gid.y) * GODRAY_BLOCK_SIZE;
+
+  // 5 depth taps (same as before)
+  let fp0 = vec2<i32>(clamp(base_x + 1, 0, i32(fdims.x) - 1),
+                      clamp(base_y + 1, 0, i32(fdims.y) - 1));
+  let fp1 = vec2<i32>(clamp(base_x + 3, 0, i32(fdims.x) - 1),
+                      clamp(base_y + 1, 0, i32(fdims.y) - 1));
+  let fp2 = vec2<i32>(clamp(base_x + 1, 0, i32(fdims.x) - 1),
+                      clamp(base_y + 3, 0, i32(fdims.y) - 1));
+  let fp3 = vec2<i32>(clamp(base_x + 3, 0, i32(fdims.x) - 1),
+                      clamp(base_y + 3, 0, i32(fdims.y) - 1));
+  let fp4 = vec2<i32>(clamp(base_x + 2, 0, i32(fdims.x) - 1),
+                      clamp(base_y + 1, 0, i32(fdims.y) - 1));
+
+  // Jitter as before
+  let j0 = 0.20 * (hash12(qpx * J0_SCALE) - 0.5);
+  let j1 = 0.20 * (hash12(qpx * J1_SCALE + vec2<f32>(11.0, 3.0)) - 0.5);
+  let j2 = 0.20 * (hash12(qpx * J2_SCALE + vec2<f32>(5.0, 17.0)) - 0.5);
+  let j3 = 0.20 * (hash12(qpx * J3_SCALE + vec2<f32>(23.0, 29.0)) - 0.5);
+
+  // Load depths (same)
+  let t_scene0 = textureLoad(depth_tex, fp0, 0).x;
+  let t_scene1 = textureLoad(depth_tex, fp1, 0).x;
+  let t_scene2 = textureLoad(depth_tex, fp2, 0).x;
+  let t_scene3 = textureLoad(depth_tex, fp3, 0).x;
+  let t_scene4 = textureLoad(depth_tex, fp4, 0).x;
+
+  // Early-out: if no godray fog, just blend history toward 0 quickly
+  let fog_ok = fog_density_godray() > 0.0;
+
+  // Quantize end distances (same)
+  let qstep = 0.1;
+  let t_end0 = min(floor(t_scene0 / qstep) * qstep, GODRAY_MAX_DIST);
+  let t_end1 = min(floor(t_scene1 / qstep) * qstep, GODRAY_MAX_DIST);
+  let t_end2 = min(floor(t_scene2 / qstep) * qstep, GODRAY_MAX_DIST);
+  let t_end3 = min(floor(t_scene3 / qstep) * qstep, GODRAY_MAX_DIST);
+  let t_end4 = min(floor(t_scene4 / qstep) * qstep, GODRAY_MAX_DIST);
+
+  // -------------------------------------------------------------------------
+  // NEW: compute ray direction ONCE for the block center and reuse it
+  // Center of the 4x4 block (base + 2,2) in full-res pixel coords.
+  // -------------------------------------------------------------------------
+  let res_full = vec2<f32>(f32(fdims.x), f32(fdims.y));
+  let center_px = vec2<f32>(f32(base_x + 2) + 0.5, f32(base_y + 2) + 0.5);
+  let rd_center = ray_dir_from_pixel(center_px, res_full);
+  // -------------------------------------------------------------------------
+
+  var acc = vec3<f32>(0.0);
+  var wsum = 0.0;
+
+  if (fog_ok) {
+    let g5 = godray_integrate_5(
+      ro, rd_center,
+      t_end0, t_end1, t_end2, t_end3, t_end4,
+      j0, j1, j2, j3, 0.0
+    );
+
+    if (t_end0 > 0.0) { acc += g5.g0; wsum += 1.0; }
+    if (t_end1 > 0.0) { acc += g5.g1; wsum += 1.0; }
+    if (t_end2 > 0.0) { acc += g5.g2; wsum += 1.0; }
+    if (t_end3 > 0.0) { acc += g5.g3; wsum += 1.0; }
+    if (t_end4 > 0.0) { acc += g5.g4; wsum += 1.0; }
+  }
+
+  let cur_lin = max(select(vec3<f32>(0.0), acc / wsum, wsum > 0.0), vec3<f32>(0.0));
+
+  let cur     = cur_lin / (cur_lin + vec3<f32>(0.25)); // compress
+
+  let hist = textureLoad(godray_hist_tex, hip, 0).xyz;
+
+  let dmin = min(min(t_scene0, t_scene1), min(t_scene2, t_scene3));
+  let dmax = max(max(t_scene0, t_scene1), max(t_scene2, t_scene3));
+  let span = (dmax - dmin) / max(dmin, 1e-3);
+  let edge = smoothstep(0.06, 0.30, span);
+
+  let delta = length(cur - hist);
+  let react = smoothstep(0.03, 0.18, delta);
+
+  let stable = 1.0 - edge;
+
+  let clamp_scale = mix(1.25, 2.5, react);
+  let clamp_w = max(cur * clamp_scale, vec3<f32>(0.04));
+  let hist_clamped = clamp(hist, cur - clamp_w, cur + clamp_w);
+
+  let hist_w = clamp(0.28 + GODRAY_TS_LP_ALPHA * stable, 0.18, 0.94);
+  return mix(cur, hist_clamped, hist_w);
+}
+
+fn godray_decompress(cur: vec3<f32>) -> vec3<f32> {
+  // must match quarter pass compression
+  let k = 0.25;
+  let one = vec3<f32>(1.0);
+  let denom = max(one - cur, vec3<f32>(1e-4));
+  return (k * cur) / denom;
+}
+
+// Sample godray quarter-res texture in normalized UV, hardware bilinear
+fn godray_sample_linear(
+  uv: vec2<f32>,
+  godray_tex: texture_2d<f32>,
+  godray_samp: sampler
+) -> vec3<f32> {
+  let c = textureSampleLevel(godray_tex, godray_samp, uv, 0.0).xyz;
+  return godray_decompress(c);
+}
+
+// src/shaders/ray/grass.wgsl
 // --------------------------
-// src/render/state/layout.rs
-//
-// Bind group layouts and small helpers.
+// src/shaders/ray/grass.wgsl
+//// --------------------------------------------------------------------------
+//// Grass: SDF blades + tracing
+//// --------------------------------------------------------------------------
 
-pub struct Layouts {
-    pub primary: wgpu::BindGroupLayout,
-    pub scene: wgpu::BindGroupLayout,
-    pub godray: wgpu::BindGroupLayout,
-    pub composite: wgpu::BindGroupLayout,
-    pub empty: wgpu::BindGroupLayout,
-    pub blit: wgpu::BindGroupLayout,
-}
-
-fn bgl_sampler(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-        count: None,
-    }
-}
-
-
-fn bgl_uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn bgl_storage_ro(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn bgl_tex_sample_2d(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    sample_type: wgpu::TextureSampleType,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Texture {
-            sample_type,
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
-
-fn bgl_tex_sample_2d_array(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    sample_type: wgpu::TextureSampleType,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::Texture {
-            sample_type,
-            view_dimension: wgpu::TextureViewDimension::D2Array,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
-
-fn bgl_storage_tex_wo(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-    format: wgpu::TextureFormat,
-) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility,
-        ty: wgpu::BindingType::StorageTexture {
-            access: wgpu::StorageTextureAccess::WriteOnly,
-            format,
-            view_dimension: wgpu::TextureViewDimension::D2,
-        },
-        count: None,
-    }
-}
-
-pub fn create_layouts(device: &wgpu::Device) -> Layouts {
-    let cs_vis = wgpu::ShaderStages::COMPUTE;
-
-    let scene_entries: [wgpu::BindGroupLayoutEntry; 7] = [
-        bgl_uniform(0, cs_vis),
-        bgl_storage_ro(1, cs_vis),
-        bgl_storage_ro(2, cs_vis),
-        bgl_storage_ro(3, cs_vis),
-        bgl_storage_ro(8, cs_vis),
-        bgl_storage_ro(9, cs_vis),
-        bgl_storage_ro(10, cs_vis),
-    ];
-
-    let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("scene_bgl"),
-        entries: &scene_entries,
-    });
-
-    // PRIMARY: add clipmap uniform + clipmap height texture array
-    // bindings:
-    // 0 camera
-    // 1 chunks
-    // 2 nodes
-    // 3 chunk_grid
-    // 4 color storage
-    // 5 depth storage
-    // 6 clipmap uniform
-    // 7 clipmap height texture array (R32Float)
-    // 8 macro_occ
-    let mut primary_entries = Vec::with_capacity(8);
-    primary_entries.extend_from_slice(&scene_entries);
-
-    primary_entries.push(bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba16Float));
-    primary_entries.push(bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float));
-
-    primary_entries.push(bgl_uniform(6, cs_vis));
-    primary_entries.push(bgl_tex_sample_2d_array(
-        7,
-        cs_vis,
-        wgpu::TextureSampleType::Float { filterable: false },
-    ));
-
-    let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("primary_bgl"),
-        entries: &primary_entries,
-    });
-
-    let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("godray_bgl"),
-        entries: &[
-            bgl_tex_sample_2d(
-                0,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            bgl_tex_sample_2d(
-                1,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
-        ],
-    });
-
-    let composite = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("composite_bgl"),
-        entries: &[
-            bgl_tex_sample_2d(
-                0,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: true },
-            ),
-            bgl_tex_sample_2d(
-                1,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: true },
-            ),
-            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
-
-            // full-res depth for depth-aware upsample
-            bgl_tex_sample_2d(
-                3,
-                cs_vis,
-                wgpu::TextureSampleType::Float { filterable: false },
-            ),
-
-            // NEW: sampler for godray_tex (used by textureSampleLevel)
-            bgl_sampler(4, cs_vis),
-        ],
-    });
-
-    let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("empty_bgl"),
-        entries: &[],
-    });
-
-    let blit = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("blit_bgl"),
-        entries: &[
-            bgl_tex_sample_2d(
-                0,
-                wgpu::ShaderStages::FRAGMENT,
-                wgpu::TextureSampleType::Float { filterable: true },
-            ),
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            bgl_uniform(2, wgpu::ShaderStages::FRAGMENT),
-        ],
-    });
-
-    Layouts {
-        primary,
-        scene,
-        godray,
-        composite,
-        empty,
-        blit,
-    }
-}
-
-// src/render/state/mod.rs
-// -----------------------
-// src/render/state/mod.rs
-// -----------------------
-mod bindgroups;
-mod buffers;
-mod layout;
-mod pipelines;
-pub mod textures;
-
-use crate::{
-    config,
-    render::gpu_types::{CameraGpu, OverlayGpu},
-    streaming::ChunkUpload,
+struct GrassCell {
+  bmin_m : vec3<f32>,
+  id_vox : vec3<f32>,
 };
-use bytemuck::{Pod, bytes_of, cast_slice};
 
-use bindgroups::{create_bind_groups, BindGroups};
-use buffers::{create_persistent_buffers, Buffers};
-use layout::{create_layouts, Layouts};
-use pipelines::{create_pipelines, Pipelines};
-use textures::{create_textures, quarter_dim, TextureSet};
+fn pick_grass_cell_in_chunk(
+  hp_m: vec3<f32>,
+  rd: vec3<f32>,
+  root_bmin_m: vec3<f32>,
+  ch_origin_vox: vec3<i32>,
+  voxel_size_m: f32,
+  chunk_size_vox: i32
+) -> GrassCell {
+  let root_size_m = f32(chunk_size_vox) * voxel_size_m;
 
-pub struct Renderer {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+  let bias = 0.05 * voxel_size_m;
+  var local_xz = (hp_m - root_bmin_m) - rd * bias;
+  local_xz.x = clamp(local_xz.x, 0.0, root_size_m - 1e-6);
+  local_xz.z = clamp(local_xz.z, 0.0, root_size_m - 1e-6);
 
-    sampler: wgpu::Sampler,
+  let y_in = hp_m.y - 1e-4 * voxel_size_m;
+  var local_y = clamp(y_in - root_bmin_m.y, 0.0, root_size_m - 1e-6);
 
-    layouts: Layouts,
-    pipelines: Pipelines,
-    buffers: Buffers,
-    textures: TextureSet,
-    bind_groups: BindGroups,
+  var ix = i32(floor(local_xz.x / voxel_size_m));
+  var iy = i32(floor(local_y    / voxel_size_m));
+  var iz = i32(floor(local_xz.z / voxel_size_m));
 
-    ping: usize,
+  ix = clamp(ix, 0, chunk_size_vox - 1);
+  iy = clamp(iy, 0, chunk_size_vox - 1);
+  iz = clamp(iz, 0, chunk_size_vox - 1);
 
-    render_scale: f32,
-    internal_w: u32,
-    internal_h: u32,
+  let bmin_m = root_bmin_m + vec3<f32>(f32(ix), f32(iy), f32(iz)) * voxel_size_m;
+  let id_vox = vec3<f32>(
+    f32(ch_origin_vox.x + ix),
+    f32(ch_origin_vox.y + iy),
+    f32(ch_origin_vox.z + iz)
+  );
 
-    clip_scratch: Vec<u8>,
+  return GrassCell(bmin_m, id_vox);
 }
 
-#[derive(Clone)]
-struct Region {
-    off: u64,
-    data: Vec<u8>,
+fn sdf_box(p: vec3<f32>, c: vec3<f32>, b: vec3<f32>) -> f32 {
+  let q = abs(p - c) - b;
+  let outside = length(max(q, vec3<f32>(0.0)));
+  let inside  = min(max(q.x, max(q.y, q.z)), 0.0);
+  return outside + inside;
 }
 
-fn merge_adjacent(mut regions: Vec<Region>) -> Vec<Region> {
-    if regions.is_empty() { return regions; }
-    regions.sort_by_key(|r| r.off);
-
-    let mut out: Vec<Region> = Vec::with_capacity(regions.len());
-    out.push(regions.remove(0));
-
-    for r in regions {
-        let last = out.last_mut().unwrap();
-        let last_end = last.off + last.data.len() as u64;
-
-        if r.off == last_end {
-            last.data.extend_from_slice(&r.data);
-        } else {
-            out.push(r);
-        }
-    }
-    out
+fn grass_root_uv(cell_id_vox: vec3<f32>, i: u32) -> vec2<f32> {
+  let fi = f32(i);
+  let u = hash31(cell_id_vox + vec3<f32>(fi, 0.0, 0.0));
+  let v = hash31(cell_id_vox + vec3<f32>(0.0, fi, 0.0));
+  return vec2<f32>(u, v);
 }
 
-// T must be Pod so we can cast to bytes safely.
-fn push_typed_region<T: Pod>(regions: &mut Vec<Region>, off_elems: u32, stride: u64, slice: &[T]) {
-    if slice.is_empty() { return; }
-    let off = (off_elems as u64) * stride;
-    let bytes: &[u8] = bytemuck::cast_slice(slice);
-    regions.push(Region { off, data: bytes.to_vec() });
+fn grass_wind_xz(root_m: vec3<f32>, t: f32, strength: f32) -> vec2<f32> {
+  // wind_field returns vec3; we only use XZ for bending
+  let w = wind_field(root_m, t) * strength;
+  return vec2<f32>(w.x, w.z);
 }
 
 
-fn align_up(v: usize, a: usize) -> usize {
-    (v + (a - 1)) & !(a - 1)
+fn grass_sdf_lod(
+  p_m: vec3<f32>,
+  cell_bmin_m: vec3<f32>,
+  cell_id_vox: vec3<f32>,
+  time_s: f32,
+  strength: f32,
+  lod: u32
+) -> f32 {
+  let vs = cam.voxel_params.x;
+
+  let top_y   = cell_bmin_m.y + vs;
+  let layer_h = GRASS_LAYER_HEIGHT_VOX * vs;
+
+  // Quick vertical reject
+  let y01 = (p_m.y - top_y) / max(layer_h, 1e-6);
+  if (y01 < 0.0 || y01 > 1.0) { return BIG_F32; }
+
+  // Cheap horizontal reject
+  let over = GRASS_OVERHANG_VOX * vs;
+  if (p_m.x < cell_bmin_m.x - over || p_m.x > cell_bmin_m.x + vs + over ||
+      p_m.z < cell_bmin_m.z - over || p_m.z > cell_bmin_m.z + vs + over) {
+    return BIG_F32;
+  }
+
+  let blade_len = layer_h * (0.65 + 0.35 * hash31(cell_id_vox + vec3<f32>(9.1, 3.7, 5.2)));
+
+  // LOD selection (as before)
+  var blade_count: u32 = GRASS_BLADE_COUNT;
+  var segs: u32 = u32(max(3.0, floor(GRASS_VOXEL_SEGS)));
+  if (lod == 1u) {
+    blade_count = min(blade_count, GRASS_BLADE_COUNT_MID);
+    segs = min(segs, GRASS_SEGS_MID);
+  } else if (lod == 2u) {
+    blade_count = min(blade_count, GRASS_BLADE_COUNT_FAR);
+    segs = min(segs, GRASS_SEGS_FAR);
+  }
+
+  let half_xz = GRASS_VOXEL_THICKNESS_VOX * vs;
+  let inv_segs = 1.0 / max(f32(segs), 1.0);
+  let seg_h   = blade_len * inv_segs;
+  let half_y  = 0.5 * seg_h;
+
+  var dmin = BIG_F32;
+
+  // constants used every blade
+  let inset = 0.12;
+
+  for (var i: u32 = 0u; i < blade_count; i = i + 1u) {
+    // One hash => u,v,phase
+    let uvp = grass_blade_params(cell_id_vox, i);
+
+    let ux = mix(inset, 1.0 - inset, uvp.x);
+    let uz = mix(inset, 1.0 - inset, uvp.y);
+
+    let root = vec3<f32>(
+      cell_bmin_m.x + ux * vs,
+      top_y,
+      cell_bmin_m.z + uz * vs
+    );
+
+    // Phase as a small Y offset into the wind field (keeps variety)
+    let ph = uvp.z;
+
+    // Compute wind ONCE per blade (XZ only)
+    let w_xz = grass_wind_xz(root + vec3<f32>(0.0, ph, 0.0), time_s, strength);
+
+    // Segment loop: only cheap math + sdf_box
+    for (var s: u32 = 0u; s < segs; s = s + 1u) {
+      let t01 = (f32(s) + 0.5) * inv_segs;
+      let y   = t01 * blade_len;
+
+      // Same “shape” as before:
+      // - height factor: (0.55 + 0.45*t01)
+      // - then scaled by (blade_len * t01)
+      let height_factor = (0.55 + 0.45 * t01);
+      let bend_mag      = (blade_len * t01) * height_factor;
+
+      let off_xz = w_xz * bend_mag;
+
+      let c = root + vec3<f32>(off_xz.x, y, off_xz.y);
+
+      let taper = mix(1.0, GRASS_VOXEL_TAPER, t01);
+      let bxz = half_xz * taper;
+      let b = vec3<f32>(bxz, half_y, bxz);
+
+      dmin = min(dmin, sdf_box(p_m, c, b));
+    }
+  }
+
+  return dmin;
 }
 
-fn batch_write_meta(
-    queue: &wgpu::Queue,
-    dst: &wgpu::Buffer,
-    meta_stride: u64,
-    uploads: &[crate::streaming::ChunkUpload],
-    chunk_capacity: u32,
-) {
-    // Collect (slot, meta)
-    let mut items: Vec<(u32, crate::render::gpu_types::ChunkMetaGpu)> = Vec::with_capacity(uploads.len());
-    for u in uploads {
-        if u.slot < chunk_capacity {
-            items.push((u.slot, u.meta));
-        }
-    }
-    if items.is_empty() { return; }
 
-    // Sort by slot so we can find contiguous runs
-    items.sort_by_key(|(slot, _)| *slot);
+fn grass_blade_params(cell_id_vox: vec3<f32>, i: u32) -> vec3<f32> {
+  // returns (u, v, phase)
+  let fi = f32(i);
 
-    // Emit contiguous runs of slots as one write each
-    let mut i = 0usize;
-    while i < items.len() {
-        let start_slot = items[i].0;
-        let mut run_len = 1usize;
+  // One hash per blade
+  let h = hash31(cell_id_vox + vec3<f32>(fi * 7.3, 1.1, 2.9));
 
-        while i + run_len < items.len() && items[i + run_len].0 == start_slot + run_len as u32 {
-            run_len += 1;
-        }
-
-        // Build a contiguous vec of metas and write once
-        let mut run: Vec<crate::render::gpu_types::ChunkMetaGpu> = Vec::with_capacity(run_len);
-        for k in 0..run_len {
-            run.push(items[i + k].1);
-        }
-
-        let dst_off = (start_slot as u64) * meta_stride;
-        queue.write_buffer(dst, dst_off, cast_slice(&run));
-
-        i += run_len;
-    }
+  // Derive 3 decorrelated-ish values from h
+  let u = fract(h * 1.61803398875);  // golden ratio-ish
+  let v = fract(h * 2.41421356237);  // sqrt(2)+1-ish
+  let p = fract(h * 3.14159265359);  // pi-ish
+  return vec3<f32>(u, v, p);
 }
 
-impl Renderer {
-    pub async fn new(
-        adapter: &wgpu::Adapter,
-        surface_format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-    ) -> Self {
-        let adapter_limits = adapter.limits();
-        let required_limits = wgpu::Limits {
-            max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
-            max_buffer_size: adapter_limits.max_buffer_size,
-            ..wgpu::Limits::default()
-        };
+fn grass_sdf_normal_lod(
+  p_m: vec3<f32>,
+  cell_bmin_m: vec3<f32>,
+  cell_id_vox: vec3<f32>,
+  time_s: f32,
+  strength: f32,
+  lod: u32
+) -> vec3<f32> {
+  // Mid/far: cheap approximation is good enough visually
+  if (lod != 0u) {
+    return vec3<f32>(0.0, 1.0, 0.0);
+  }
 
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits,
-                },
-                None,
-            )
-            .await
-            .unwrap();
+  let e = 0.02 * cam.voxel_params.x;
 
-        let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ray_cs"),
-            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::ray_cs_wgsl().into()),
-        });
+  let dx =
+    grass_sdf_lod(p_m + vec3<f32>(e, 0.0, 0.0), cell_bmin_m, cell_id_vox, time_s, strength, lod) -
+    grass_sdf_lod(p_m - vec3<f32>(e, 0.0, 0.0), cell_bmin_m, cell_id_vox, time_s, strength, lod);
 
-        let fs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit"),
-            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::blit_wgsl().into()),
-        });
+  let dy =
+    grass_sdf_lod(p_m + vec3<f32>(0.0, e, 0.0), cell_bmin_m, cell_id_vox, time_s, strength, lod) -
+    grass_sdf_lod(p_m - vec3<f32>(0.0, e, 0.0), cell_bmin_m, cell_id_vox, time_s, strength, lod);
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("linear_clamp_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest, // level 0 anyway
-            ..Default::default()
-        });
+  let dz =
+    grass_sdf_lod(p_m + vec3<f32>(0.0, 0.0, e), cell_bmin_m, cell_id_vox, time_s, strength, lod) -
+    grass_sdf_lod(p_m - vec3<f32>(0.0, 0.0, e), cell_bmin_m, cell_id_vox, time_s, strength, lod);
 
-        let layouts = create_layouts(&device);
-        let buffers = create_persistent_buffers(&device);
+  return normalize(vec3<f32>(dx, dy, dz));
+}
 
-        let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
 
-        let render_scale = config::RENDER_SCALE;
-        let internal_w = ((width as f32) * render_scale).round() as u32;
-        let internal_h = ((height as f32) * render_scale).round() as u32;
-        
-        let textures = create_textures(&device, width, height, internal_w, internal_h);
-        let bind_groups = create_bind_groups(&device, &layouts, &buffers, &textures, &sampler);
+struct GrassHit {
+  hit: bool,
+  t: f32,
+  n: vec3<f32>,
+};
 
-        Self {
-            device,
-            queue,
-            sampler,
-            layouts,
-            pipelines,
-            buffers,
-            textures,
-            bind_groups,
-            ping: 0,
-            render_scale,
-            internal_w,
-            internal_h,
-            clip_scratch: Vec::new(),
-        }
+fn grass_layer_trace_lod(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_start: f32,
+  t_end: f32,
+  cell_bmin_m: vec3<f32>,
+  cell_id_vox: vec3<f32>,
+  time_s: f32,
+  strength: f32,
+  lod: u32
+) -> GrassHit {
+  let vs = cam.voxel_params.x;
+  var t = t_start;
+
+  var steps: u32 = GRASS_TRACE_STEPS;
+  if (lod == 1u) { steps = GRASS_TRACE_STEPS_MID; }
+  if (lod == 2u) { steps = GRASS_TRACE_STEPS_FAR; }
+
+  for (var i: u32 = 0u; i < steps; i = i + 1u) {
+    if (t > t_end) { break; }
+
+    let p = ro + rd * t;
+    let d = grass_sdf_lod(p, cell_bmin_m, cell_id_vox, time_s, strength, lod);
+
+    let hit_eps = GRASS_HIT_EPS_VOX * vs;
+    if (d < hit_eps) {
+      let n = grass_sdf_normal_lod(p, cell_bmin_m, cell_id_vox, time_s, strength, lod);
+      return GrassHit(true, t, n);
     }
 
-    pub fn device(&self) -> &wgpu::Device {
-        &self.device
+    let step_min = GRASS_STEP_MIN_VOX * vs;
+    t += max(d, step_min);
+  }
+
+  return GrassHit(false, BIG_F32, vec3<f32>(0.0));
+}
+
+
+fn try_grass_slab_hit(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_min: f32,
+  t_max: f32,
+  cell_bmin: vec3<f32>,
+  cell_id_vox: vec3<f32>,
+  vs: f32,
+  time_s: f32,
+  strength: f32
+) -> GrassHit {
+  let layer_h = GRASS_LAYER_HEIGHT_VOX * vs;
+  let over    = GRASS_OVERHANG_VOX * vs;
+
+  let slab_bmin = vec3<f32>(cell_bmin.x - over,      cell_bmin.y + vs,            cell_bmin.z - over);
+  let slab_bmax = vec3<f32>(cell_bmin.x + vs + over, cell_bmin.y + vs + layer_h,  cell_bmin.z + vs + over);
+
+  let rt_slab = intersect_aabb(ro, rd, slab_bmin, slab_bmax);
+
+  var t0 = max(rt_slab.x, t_min);
+  var t1 = min(rt_slab.y, t_max);
+
+  // clip by true solid voxel cube (avoid "inside voxel" artifacts)
+  let vox_bmin = cell_bmin;
+  let vox_bmax = cell_bmin + vec3<f32>(vs);
+  let rt_vox   = intersect_aabb(ro, rd, vox_bmin, vox_bmax);
+
+  let clip_eps = 0.01 * vs;
+  if (rt_vox.y > rt_vox.x) {
+    let t_enter_vox = rt_vox.x;
+    if (t_enter_vox > t0) {
+      t1 = min(t1, t_enter_vox - clip_eps);
     }
+  }
 
-    pub fn queue(&self) -> &wgpu::Queue {
-        &self.queue
-    }
+  if (t1 <= t0) {
+    return GrassHit(false, BIG_F32, vec3<f32>(0.0));
+  }
 
-    pub fn resize_output(&mut self, width: u32, height: u32) {
-        self.internal_w = ((width as f32) * self.render_scale).round() as u32;
-        self.internal_h = ((height as f32) * self.render_scale).round() as u32;
+  // ---- NEW: pick LOD based on distance along the ray
+  let lod = grass_lod_from_t(t0);
+  // -----------------------------------------------
 
-        self.textures = create_textures(&self.device, width, height, self.internal_w, self.internal_h);
+  return grass_layer_trace_lod(ro, rd, t0, t1, cell_bmin, cell_id_vox, time_s, strength, lod);
+}
 
-        self.bind_groups = create_bind_groups(
-            &self.device, &self.layouts, &self.buffers, &self.textures, &self.sampler,
-        );
+fn grass_lod_from_t(t: f32) -> u32 {
+  // 0 = near, 1 = mid, 2 = far
+  if (t >= GRASS_LOD_FAR_START) { return 2u; }
+  if (t >= GRASS_LOD_MID_START) { return 1u; }
+  return 0u;
+}
 
-        self.ping = 0;
-    }
+// src/shaders/ray/leaves.wgsl
+// ---------------------------
+// src/shaders/ray/leaves.wgsl
+//// --------------------------------------------------------------------------
+//// Leaves (displaced cube intersection)
+//// --------------------------------------------------------------------------
 
-    pub fn write_chunk_grid(&self, grid: &[u32]) {
-        let n = grid.len().min(self.buffers.grid_capacity as usize);
-        self.queue.write_buffer(
-            &self.buffers.chunk_grid,
-            0,
-            bytemuck::cast_slice(&grid[..n]),
-        );
-    }
+fn leaf_cube_offset(bmin: vec3<f32>, size: f32, time_s: f32, strength: f32) -> vec3<f32> {
+  let center = bmin + vec3<f32>(0.5 * size);
 
-    pub fn write_camera(&self, cam: &CameraGpu) {
-        self.queue
-            .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
-    }
+  // fade displacement with distance to camera
+  let d = length(center - cam.cam_pos.xyz);
+  let fade = smoothstep(LEAF_LOD_DISP_START, LEAF_LOD_DISP_END, d);
+  let strength_eff = strength * (1.0 - fade);
 
-    pub fn write_overlay(&self, ov: &OverlayGpu) {
-        self.queue
-            .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
-    }
+  var w = wind_field(center, time_s) * strength_eff;
+  w = vec3<f32>(w.x, LEAF_VERTICAL_REDUCE * w.y, w.z);
 
-    pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("primary_pass"),
-                timestamp_writes: None,
-            });
+  let amp = LEAF_OFFSET_AMP * size;
+  return clamp_len(w * amp, LEAF_OFFSET_MAX_FRAC * size);
+}
 
-            cpass.set_pipeline(&self.pipelines.primary);
-            cpass.set_bind_group(0, &self.bind_groups.primary, &[]);
+struct LeafCubeHit {
+  hit  : bool,
+  t    : f32,
+  n    : vec3<f32>,
+};
 
-            let gx = (self.internal_w + 7) / 8;
-            let gy = (self.internal_h + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
+fn leaf_displaced_cube_hit(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  bmin: vec3<f32>,
+  size: f32,
+  time_s: f32,
+  strength: f32,
+  t_min: f32,
+  t_max: f32
+) -> LeafCubeHit {
+  let off   = leaf_cube_offset(bmin, size, time_s, strength);
+  let bmin2 = bmin + off;
 
-        }
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let bh  = aabb_hit_normal_inv(ro, rd, inv, bmin2, size, t_min, t_max);
 
-        let ping = self.ping;
-        let pong = 1 - ping;
+  return LeafCubeHit(bh.hit, bh.t, bh.n);
+}
 
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("godray_pass"),
-                timestamp_writes: None,
-            });
+// src/shaders/ray/phase.wgsl
+// --------------------------
+// src/shaders/ray/phase.wgsl
+//// --------------------------------------------------------------------------
+//// Phase
+//// --------------------------------------------------------------------------
 
-            cpass.set_pipeline(&self.pipelines.godray);
-            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
-            cpass.set_bind_group(1, &self.bind_groups.godray[ping], &[]);
+fn phase_mie(costh: f32) -> f32 {
+  let g = PHASE_G;
+  let gg = g * g;
+  let denom = pow(1.0 + gg - 2.0 * g * costh, 1.5);
+  return INV_4PI * (1.0 - gg) / max(denom, 1e-3);
+}
 
-            let qw = quarter_dim(self.internal_w);
-            let qh = quarter_dim(self.internal_h);
+fn phase_blended(costh: f32) -> f32 {
+  let mie = phase_mie(costh);
+  return mix(INV_4PI, mie, PHASE_MIE_W);
+}
 
-            let gx = (qw + 7) / 8;
-            let gy = (qh + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
+// src/shaders/ray/shading.wgsl
+// ----------------------------
+// src/shaders/ray/shading.wgsl
+//// --------------------------------------------------------------------------
+//// Shading
+//// --------------------------------------------------------------------------
 
-        }
+fn color_for_material(m: u32) -> vec3<f32> {
+  if (m == MAT_AIR)   { return vec3<f32>(0.0); }
+  if (m == MAT_GRASS) { return vec3<f32>(0.18, 0.75, 0.18); }
+  if (m == MAT_DIRT)  { return vec3<f32>(0.45, 0.30, 0.15); }
+  if (m == MAT_STONE) { return vec3<f32>(0.50, 0.50, 0.55); }
+  if (m == MAT_WOOD)  { return vec3<f32>(0.38, 0.26, 0.14); }
+  if (m == MAT_LEAF)  { return vec3<f32>(0.10, 0.55, 0.12); }
+  return vec3<f32>(1.0, 0.0, 1.0);
+}
 
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("composite_pass"),
-                timestamp_writes: None,
-            });
+fn hemi_ambient(n: vec3<f32>, sky_up: vec3<f32>) -> vec3<f32> {
+  let upw = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+  let grd = FOG_COLOR_GROUND;
+  return mix(grd, sky_up, upw);
+}
 
-            cpass.set_pipeline(&self.pipelines.composite);
+fn material_variation(world_p: vec3<f32>, cell_size_m: f32) -> f32 {
+  let cell = floor(world_p / cell_size_m);
+  return (hash31(cell) - 0.5) * 2.0;
+}
 
-            // group(0) must match layouts.scene now
-            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
+fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f32> {
+  var c = base;
+  let v = material_variation(hp, 0.05);
 
-            // group(1) is still empty (or you can omit setting it)
-            cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
+  if (mat == MAT_GRASS) {
+    c += vec3<f32>(0.02 * v, 0.05 * v, 0.01 * v);
+    c *= (1.0 + 0.06 * v);
+  } else if (mat == MAT_DIRT) {
+    c += vec3<f32>(0.04 * v, 0.02 * v, 0.01 * v);
+    c *= (1.0 + 0.08 * v);
+  } else if (mat == MAT_STONE) {
+    c *= (1.0 + 0.10 * v);
+  } else if (mat == MAT_WOOD) {
+    c += vec3<f32>(0.05 * v, 0.02 * v, 0.00 * v);
+    c *= (1.0 + 0.07 * v);
+  } else if (mat == MAT_LEAF) {
+    c += vec3<f32>(0.00 * v, 0.03 * v, 0.00 * v);
+    c *= (1.0 + 0.04 * v);
+  }
 
-            // group(2) is your composite textures
-            cpass.set_bind_group(2, &self.bind_groups.composite[pong], &[]);
+  return clamp(c, vec3<f32>(0.0), vec3<f32>(1.5));
+}
 
-            let gx = (width + 7) / 8;
-            let gy = (height + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
+fn voxel_ao_local(
+  hp: vec3<f32>,
+  n: vec3<f32>,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  node_base: u32,
+  macro_base: u32
+) -> f32 {
+  let r = 0.75 * cam.voxel_params.x;
 
-        }
+  let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
+  let t = normalize(cross(up_ref, n));
+  let b = normalize(cross(n, t));
 
-        self.ping = pong;
-    }
+  var occ = 0.0;
 
-    pub fn encode_blit(&self, encoder: &mut wgpu::CommandEncoder, frame_view: &wgpu::TextureView) {
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("blit_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: frame_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
+  let q0 = query_leaf_at(hp + t * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q0.mat != MAT_AIR);
 
-        rpass.set_pipeline(&self.pipelines.blit);
-        rpass.set_bind_group(0, &self.bind_groups.blit, &[]);
-        rpass.draw(0..3, 0..1);
-    }
+  let q1 = query_leaf_at(hp - t * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q1.mat != MAT_AIR);
 
-    pub fn apply_chunk_uploads(&self, uploads: &[ChunkUpload]) {
-        let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
-        let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
-        let u32_stride  = std::mem::size_of::<u32>() as u64;
-        let rope_stride = std::mem::size_of::<crate::render::gpu_types::NodeRopesGpu>() as u64;
+  let q2 = query_leaf_at(hp + b * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q2.mat != MAT_AIR);
 
-        // 1) Meta in big runs
-        batch_write_meta(
-            self.queue(),
-            &self.buffers.chunk,
-            meta_stride,
-            uploads,
-            self.buffers.chunk_capacity,
-        );
+  let q3 = query_leaf_at(hp - b * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q3.mat != MAT_AIR);
 
-        // 2) Nodes / macro / ropes / colinfo as merged byte regions
-        let mut node_regions: Vec<Region> = Vec::new();
-        let mut macro_regions: Vec<Region> = Vec::new();
-        let mut rope_regions: Vec<Region> = Vec::new();
-        let mut colinfo_regions: Vec<Region> = Vec::new();
+  let h0 = normalize(n + 0.65 * t + 0.35 * b);
+  let q4 = query_leaf_at(hp + h0 * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q4.mat != MAT_AIR);
 
-        for u in uploads {
-            // nodes
-            if !u.nodes.is_empty() {
-                let needed = u.nodes.len() as u32;
-                if u.node_base + needed <= self.buffers.node_capacity {
-                    push_typed_region(&mut node_regions, u.node_base, node_stride, u.nodes.as_ref());
-                }
-            }
+  let h1 = normalize(n - 0.65 * t + 0.35 * b);
+  let q5 = query_leaf_at(hp + h1 * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q5.mat != MAT_AIR);
 
-            // macro occupancy (u32)
-            if !u.macro_words.is_empty() {
-                let needed = u.macro_words.len() as u32;
-                if u.meta.macro_base + needed <= self.buffers.macro_capacity_u32 {
-                    push_typed_region(&mut macro_regions, u.meta.macro_base, u32_stride, u.macro_words.as_ref());
-                }
-            }
+  let occ_n = occ * (1.0 / 6.0);
+  return clamp(1.0 - 0.70 * occ_n, 0.35, 1.0);
+}
 
-            // ropes
-            if !u.ropes.is_empty() {
-                let needed = u.ropes.len() as u32;
-                if u.node_base + needed <= self.buffers.rope_capacity {
-                    push_typed_region(&mut rope_regions, u.node_base, rope_stride, u.ropes.as_ref());
-                }
-            }
+fn fresnel_schlick(ndv: f32, f0: f32) -> f32 {
+  return f0 + (1.0 - f0) * pow(1.0 - clamp(ndv, 0.0, 1.0), 5.0);
+}
 
-            // colinfo (u32)
-            if !u.colinfo_words.is_empty() {
-                let needed = u.colinfo_words.len() as u32;
-                if u.meta.colinfo_base + needed <= self.buffers.colinfo_capacity_u32 {
-                    push_typed_region(&mut colinfo_regions, u.meta.colinfo_base, u32_stride, u.colinfo_words.as_ref());
-                }
-            }
-        }
+fn material_roughness(mat: u32) -> f32 {
+  if (mat == MAT_STONE) { return 0.45; }
+  if (mat == MAT_WOOD)  { return 0.70; }
+  if (mat == MAT_LEAF)  { return 0.80; }
+  if (mat == MAT_GRASS) { return 0.85; }
+  if (mat == MAT_DIRT)  { return 0.90; }
+  return 0.90;
+}
 
-        // Merge adjacent regions so we do far fewer write_buffer calls
-        for r in merge_adjacent(node_regions) {
-            self.queue.write_buffer(&self.buffers.node, r.off, &r.data);
-        }
-        for r in merge_adjacent(macro_regions) {
-            self.queue.write_buffer(&self.buffers.macro_occ, r.off, &r.data);
-        }
-        for r in merge_adjacent(rope_regions) {
-            self.queue.write_buffer(&self.buffers.node_ropes, r.off, &r.data);
-        }
-        for r in merge_adjacent(colinfo_regions) {
-            self.queue.write_buffer(&self.buffers.colinfo, r.off, &r.data);
-        }
-    }
+fn material_f0(mat: u32) -> f32 {
+  if (mat == MAT_STONE) { return 0.04; }
+  if (mat == MAT_WOOD)  { return 0.03; }
+  if (mat == MAT_LEAF)  { return 0.05; }
+  if (mat == MAT_GRASS) { return 0.04; }
+  if (mat == MAT_DIRT)  { return 0.02; }
+  return 0.02;
+}
 
+fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>) -> vec3<f32> {
+  let hp = ro + hg.t * rd;
 
+  var base = color_for_material(hg.mat);
+  base = apply_material_variation(base, hg.mat, hp);
 
-    pub fn write_clipmap_updates(
-        &mut self,
-        clip: &crate::render::gpu_types::ClipmapGpu,
-        uploads: &[crate::clipmap::ClipmapUpload],
-    ) {
-        let scratch = &mut self.clip_scratch;
+  if (hg.mat == MAT_GRASS) {
+    let vs = cam.voxel_params.x;
+    let tip = clamp(fract(hp.y / max(vs, 1e-6)), 0.0, 1.0);
 
-        // 1) texture patches
-        for u in uploads {
-            let w = u.w as usize;
-            let h = u.h as usize;
-            if w == 0 || h == 0 { continue; }
+    base = mix(base, base + vec3<f32>(0.10, 0.10, 0.02), 0.35 * tip);
 
-            let row_bytes = w * 2;                 // R16Float => 2 bytes/texel
-            let padded = align_up(row_bytes, 256); // required
-            let needed = padded * h;
+    let back = pow(clamp(dot(-SUN_DIR, hg.n), 0.0, 1.0), 2.0);
+    base += 0.18 * back * vec3<f32>(0.20, 0.35, 0.08);
+  }
 
-            scratch.clear();
-            scratch.resize(needed, 0);
+  let vs = cam.voxel_params.x;
+  let hp_shadow  = hp + hg.n * (0.75 * vs);
 
-            // copy row-by-row into padded scratch
-            let src: &[u8] = bytemuck::cast_slice(&u.data_f16);
-            for row in 0..h {
-                let s0 = row * row_bytes;
-                let d0 = row * padded;
-                scratch[d0..d0 + row_bytes].copy_from_slice(&src[s0..s0 + row_bytes]);
-            }
+  let Tc  = cloud_sun_transmittance(hp_shadow, SUN_DIR);
+  let vis_geom = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
 
-            self.queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &self.textures.clip_height.tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x: u.x, y: u.y, z: u.level },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &scratch,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded as u32),
-                    rows_per_image: Some(u.h),
-                },
-                wgpu::Extent3d { width: u.w, height: u.h, depth_or_array_layers: 1 },
+  let diff = max(dot(hg.n, SUN_DIR), 0.0);
+
+  let ao = select(1.0, voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base), hg.hit != 0u);
+
+  let amb_col      = hemi_ambient(hg.n, sky_up);
+  let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
+  let ambient      = amb_col * amb_strength * ao;
+
+  var dapple = 1.0;
+  if (hg.mat == MAT_LEAF) {
+    let time_s = cam.voxel_params.y;
+    let d0 = sin(dot(hp.xz, vec2<f32>(3.0, 2.2)) + time_s * 3.5);
+    let d1 = sin(dot(hp.xz, vec2<f32>(6.5, 4.1)) - time_s * 6.0);
+    dapple = 0.90 + 0.10 * (0.6 * d0 + 0.4 * d1);
+  }
+
+  let v = normalize(-rd);
+  let h = normalize(v + SUN_DIR);
+
+  let ndv = max(dot(hg.n, v), 0.0);
+  let ndh = max(dot(hg.n, h), 0.0);
+
+  let rough     = material_roughness(hg.mat);
+  let shininess = mix(8.0, 96.0, 1.0 - rough);
+  let spec      = pow(ndh, shininess);
+
+  let f0   = material_f0(hg.mat);
+  let fres = fresnel_schlick(ndv, f0);
+
+  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis_geom * Tc * dapple;
+  let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis_geom * Tc;
+
+  return base * (ambient + direct) + 0.20 * spec_col;
+}
+
+// src/shaders/ray/shadows.wgsl
+// ----------------------------
+// src/shaders/ray/shadows.wgsl
+//// --------------------------------------------------------------------------
+//// Sun transmittance (geometry-only + full with clouds)
+//// --------------------------------------------------------------------------
+fn trace_chunk_shadow_trans_interval(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  ch: ChunkMeta,
+  t_enter: f32,
+  t_exit: f32
+) -> f32 {
+  let voxel_size = cam.voxel_params.x;
+  let nudge_s = 0.20 * voxel_size;
+
+  let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
+  let root_bmin = root_bmin_vox * voxel_size;
+  let root_size = f32(cam.chunk_size) * voxel_size;
+
+  var tcur = max(t_enter, 0.0) + nudge_s;
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  var trans = 1.0;
+
+  for (var step_i: u32 = 0u; step_i < VSM_STEPS; step_i = step_i + 1u) {
+    if (tcur > t_exit) { break; }
+    if (trans < MIN_TRANS) { break; }
+
+    let p  = ro + tcur * rd;
+    let pq = p + rd * (1e-4 * cam.voxel_params.x);
+
+    let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base, ch.macro_base);
+
+    // slab once (for stepping)
+    let slab    = cube_slab_inv(ro, inv, q.bmin, q.size);
+    let t_leave = slab.t_exit;
+
+    if (q.mat != MAT_AIR) {
+      if (q.mat == MAT_LEAF) {
+        if (VOLUME_DISPLACED_LEAVES) {
+          // --- NEW: distance gate for displaced-leaf shadow test ---
+          // If far, skip expensive displaced intersection and just apply transmit.
+          let center = q.bmin + vec3<f32>(0.5 * q.size);
+          let d = length(center - cam.cam_pos.xyz);
+
+          if (d < LEAF_LOD_DISP_END) {
+            let time_s   = cam.voxel_params.y;
+            let strength = cam.voxel_params.z;
+
+            let h2 = leaf_displaced_cube_hit(
+              ro, rd,
+              q.bmin, q.size,
+              time_s, strength,
+              tcur - nudge_s, t_exit
             );
+            if (h2.hit) { trans *= LEAF_LIGHT_TRANSMIT; }
+          } else {
+            trans *= LEAF_LIGHT_TRANSMIT;
+          }
+          // --------------------------------------------------------
+
+          tcur = max(t_leave, tcur) + nudge_s;
+          continue;
         }
 
-        // 2) uniform
-        self.queue.write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
+        trans *= LEAF_LIGHT_TRANSMIT;
+        tcur = max(t_leave, tcur) + nudge_s;
+        continue;
+      }
+
+      if (q.mat == MAT_GRASS) {
+        trans *= GRASS_LIGHT_TRANSMIT;
+        tcur = max(t_leave, tcur) + nudge_s;
+        continue;
+      }
+
+      return 0.0;
     }
 
-    pub fn internal_dims(&self) -> (u32, u32) {
-        (self.internal_w.max(1), self.internal_h.max(1))
+    tcur = max(t_leave, tcur) + nudge_s;
+  }
+
+  return trans;
+}
+
+
+fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+  let voxel_size   = cam.voxel_params.x;
+  let nudge_s      = 0.18 * voxel_size;
+  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
+
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+
+  let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
+  let grid_bmax = grid_bmin + vec3<f32>(f32(gd.x), f32(gd.y), f32(gd.z)) * chunk_size_m;
+
+  let bias = max(SHADOW_BIAS, 0.50 * voxel_size);
+  let ro   = p + sun_dir * bias;
+  let rd   = sun_dir;
+
+  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  let t_enter = max(rtg.x, 0.0);
+  let t_exit  = rtg.y;
+  if (t_exit < t_enter) { return 1.0; }
+
+  let start_t = t_enter + nudge_s;
+  let p0 = ro + start_t * rd;
+
+  var t_local: f32 = 0.0;
+  let t_exit_local = max(t_exit - start_t, 0.0);
+
+  var c = chunk_coord_from_pos(p0, chunk_size_m);
+  var cx: i32 = c.x;
+  var cy: i32 = c.y;
+  var cz: i32 = c.z;
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  let step_x: i32 = select(-1, 1, rd.x > 0.0);
+  let step_y: i32 = select(-1, 1, rd.y > 0.0);
+  let step_z: i32 = select(-1, 1, rd.z > 0.0);
+
+  let bx = select(f32(cx) * chunk_size_m, f32(cx + 1) * chunk_size_m, rd.x > 0.0);
+  let by = select(f32(cy) * chunk_size_m, f32(cy + 1) * chunk_size_m, rd.y > 0.0);
+  let bz = select(f32(cz) * chunk_size_m, f32(cz + 1) * chunk_size_m, rd.z > 0.0);
+
+  var tMaxX: f32 = (bx - p0.x) * inv.x;
+  var tMaxY: f32 = (by - p0.y) * inv.y;
+  var tMaxZ: f32 = (bz - p0.z) * inv.z;
+
+  let tDeltaX: f32 = abs(chunk_size_m * inv.x);
+  let tDeltaY: f32 = abs(chunk_size_m * inv.y);
+  let tDeltaZ: f32 = abs(chunk_size_m * inv.z);
+
+  if (abs(rd.x) < EPS_INV) { tMaxX = BIG_F32; }
+  if (abs(rd.y) < EPS_INV) { tMaxY = BIG_F32; }
+  if (abs(rd.z) < EPS_INV) { tMaxZ = BIG_F32; }
+
+  var trans = 1.0;
+  let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 512u);
+
+  // ---- HOISTED: grid bounds for the DDA loop (was recomputed each step)
+  let ox: i32 = go.x;
+  let oy: i32 = go.y;
+  let oz: i32 = go.z;
+  let nx: i32 = i32(gd.x);
+  let ny: i32 = i32(gd.y);
+  let nz: i32 = i32(gd.z);
+  let gx0: i32 = ox;
+  let gy0: i32 = oy;
+  let gz0: i32 = oz;
+  let gx1: i32 = ox + nx;
+  let gy1: i32 = oy + ny;
+  let gz1: i32 = oz + nz;
+  // ---------------------------------------------------------------
+
+  for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
+    if (t_local > t_exit_local) { break; }
+    if (trans < MIN_TRANS) { break; }
+
+    let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
+    let slot = grid_lookup_slot(cx, cy, cz);
+
+    if (slot != INVALID_U32 && slot < cam.chunk_count) {
+      let ch2 = chunks[slot];
+
+      let cell_enter = start_t + t_local;
+      let cell_exit2 = start_t + min(tNextLocal, t_exit_local);
+
+      trans *= trace_chunk_shadow_trans_interval(ro, rd, ch2, cell_enter, cell_exit2);
+      if (trans < MIN_TRANS) { break; }
     }
 
-}
-
-// src/render/state/pipelines.rs
-// -----------------------------
-// src/render/state/pipelines.rs
-//
-// Pipeline creation.
-// This is intentionally isolated so the renderer logic (per-frame encoding) isn't
-// buried under wgpu setup boilerplate.
-//
-// Terminology:
-// - BindGroupLayout (BGL): describes what resources exist at @group/@binding.
-// - PipelineLayout (PL): ordered list of BGLs for group(0), group(1), ...
-// - Pipeline: compiled/validated shader entry point + fixed state + pipeline layout.
-//
-// Rule of thumb:
-// The order of BGLs in `bind_group_layouts` must match the group indices used in WGSL.
-// If a shader references @group(2), then the pipeline layout must include entries
-// for group(0) and group(1) as well (even if they're "empty" placeholders).
-
-use super::layout::Layouts;
-
-pub struct Pipelines {
-    /// Compute pipeline for the primary full-resolution pass (writes color/depth).
-    pub primary: wgpu::ComputePipeline,
-
-    /// Compute pipeline for the quarter-resolution godray pass (ping-pong temporal).
-    pub godray: wgpu::ComputePipeline,
-
-    /// Compute pipeline for the full-resolution composite pass (writes final output).
-    pub composite: wgpu::ComputePipeline,
-
-    /// Render pipeline for the final blit to the swapchain (fullscreen triangle).
-    pub blit: wgpu::RenderPipeline,
-}
-
-/// Helper to build a compute pipeline with a specific entry point and bind group layout list.
-///
-/// `bgls` order defines the pipeline layout's group indices:
-/// - bgls[0] => group(0)
-/// - bgls[1] => group(1)
-/// - ...
-fn make_compute_pipeline(
-    device: &wgpu::Device,
-    label: &str,
-    module: &wgpu::ShaderModule,
-    entry: &str,
-    bgls: &[&wgpu::BindGroupLayout],
-) -> wgpu::ComputePipeline {
-    // Create a pipeline layout named "{label}_pl" that fixes the bind group schema.
-    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(&format!("{label}_pl")),
-        bind_group_layouts: bgls,
-        // No push constants used by these shaders.
-        push_constant_ranges: &[],
-    });
-
-    // Create the compute pipeline referencing the WGSL entry point.
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(label),
-        layout: Some(&pl),
-        module,
-        entry_point: entry,
-        compilation_options: Default::default(),
-    })
-}
-
-/// Create all pipelines (compute + blit).
-///
-/// Inputs:
-/// - `cs_module`: WGSL module containing compute entry points.
-/// - `fs_module`: WGSL module containing vertex/fragment entry points for blit.
-/// - `surface_format`: swapchain format used for the final render target.
-pub fn create_pipelines(
-    device: &wgpu::Device,
-    layouts: &Layouts,
-    cs_module: &wgpu::ShaderModule,
-    fs_module: &wgpu::ShaderModule,
-    surface_format: wgpu::TextureFormat,
-) -> Pipelines {
-    // -------------------------------------------------------------------------
-    // Compute pipelines
-    // -------------------------------------------------------------------------
-
-    // Primary pass:
-    // Uses group(0) = layouts.primary, which includes:
-    // - camera + scene buffers
-    // - storage outputs for color/depth
-    let primary = make_compute_pipeline(
-        device,
-        "primary_pipeline",
-        cs_module,
-        "main_primary",
-        &[&layouts.primary],
-    );
-
-    // Godray pass:
-    // Uses:
-    //   group(0) = layouts.scene  (camera + scene buffers only)
-    //   group(1) = layouts.godray (depth sample + history sample + out storage)
-    let godray = make_compute_pipeline(
-        device,
-        "godray_pipeline",
-        cs_module,
-        "main_godray",
-        &[&layouts.scene, &layouts.godray],
-    );
-
-    // Composite pass:
-    // Shader reads from @group(2) (color + godray + output storage).
-    // wgpu requires the pipeline layout to include group(0) and group(1) slots too,
-    // so we provide empty placeholder layouts for those indices.
-    let composite = make_compute_pipeline(
-        device,
-        "composite_pipeline",
-        cs_module,
-        "main_composite",
-        // group(0)=scene (cam + buffers), group(1)=empty, group(2)=composite textures
-        &[&layouts.scene, &layouts.empty, &layouts.composite],
-    );
-
-    // -------------------------------------------------------------------------
-    // Render pipeline: blit
-    // -------------------------------------------------------------------------
-    //
-    // Full-screen triangle approach:
-    // - No vertex buffers.
-    // - Vertex shader generates positions from vertex_index.
-    // - Fragment shader samples the renderer output texture.
-
-    // Pipeline layout for blit uses a single bind group: group(0) = layouts.blit.
-    let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("blit_pl"),
-        bind_group_layouts: &[&layouts.blit],
-        push_constant_ranges: &[],
-    });
-
-    // Render pipeline state:
-    // - Targets the swapchain format.
-    // - Uses REPLACE blending (overwrite framebuffer).
-    // - Default primitive/multisample state is fine for a simple fullscreen draw.
-    let blit = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("blit_pipeline"),
-        layout: Some(&blit_pl),
-        vertex: wgpu::VertexState {
-            module: fs_module,
-            entry_point: "vs_main",
-            // No vertex buffers; vertices are synthesized in the vertex shader.
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: fs_module,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format: surface_format,
-                // Overwrite swapchain pixel with sampled color.
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        // Default triangle list, CCW front face, etc. (fullscreen triangle doesn't care much).
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-    });
-
-    Pipelines {
-        primary,
-        godray,
-        composite,
-        blit,
+    if (tMaxX < tMaxY) {
+      if (tMaxX < tMaxZ) { cx += step_x; t_local = tMaxX; tMaxX += tDeltaX; }
+      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
+    } else {
+      if (tMaxY < tMaxZ) { cy += step_y; t_local = tMaxY; tMaxY += tDeltaY; }
+      else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
     }
+
+    // bounds check (now uses hoisted constants)
+    if (cx < gx0 || cy < gy0 || cz < gz0 || cx >= gx1 || cy >= gy1 || cz >= gz1) { break; }
+  }
+
+  return trans;
 }
 
-// src/render/state/textures.rs
-// ----------------------------
-// src/render/state/textures.rs
-// ----------------------------
+fn sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
+  let Tc = cloud_sun_transmittance(p, sun_dir);
+  return Tc * sun_transmittance_geom_only(p, sun_dir);
+}
 
-use crate::{
-    config,
-    render::resources::{create_output_texture, OutputTex},
+// src/shaders/ray/sky.wgsl
+// ------------------------
+// src/shaders/ray/sky.wgsl
+//// --------------------------------------------------------------------------
+//// Sky
+//// --------------------------------------------------------------------------
+
+fn sky_color_base(rd: vec3<f32>) -> vec3<f32> {
+  // Base vertical gradient
+  let tsky = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
+  var col = mix(
+    vec3<f32>(0.05, 0.08, 0.12),
+    vec3<f32>(0.55, 0.75, 0.95),
+    tsky
+  );
+
+  // Horizon/zenith shaping
+  let y = clamp(rd.y, -0.2, 1.0);
+  let horizon = exp(-abs(y) * 8.0);
+  let zenith  = smoothstep(0.0, 1.0, y);
+  col += 0.12 * horizon * vec3<f32>(0.80, 0.75, 0.70);
+  col += 0.05 * zenith  * vec3<f32>(0.20, 0.35, 0.60);
+
+  col *= SKY_EXPOSURE;
+
+  // Sun term (NO acos)
+  let mu = clamp(dot(rd, SUN_DIR), -1.0, 1.0);
+
+  let SUN_DISC_ANGULAR_RADIUS : f32 = 0.009;
+  let SUN_DISC_SOFTNESS       : f32 = 0.004;
+
+  let mu_inner = cos(SUN_DISC_ANGULAR_RADIUS);
+  let mu_outer = cos(SUN_DISC_ANGULAR_RADIUS + SUN_DISC_SOFTNESS);
+
+  let disc = smoothstep(mu_outer, mu_inner, mu);
+
+  let k_halo = 9000.0;
+  let halo = 0.15 * exp(-k_halo * max(0.0, 1.0 - mu));
+
+  col += SUN_COLOR * SUN_INTENSITY * (disc + halo);
+  return col;
+}
+
+fn sky_color(rd: vec3<f32>) -> vec3<f32> {
+  var col = sky_color_base(rd);
+
+  // Clouds only affect the rendered sky (NOT the ambient driver anymore)
+  var cloud = 0.0;
+
+  if (rd.y > 0.01) {
+    let ro = cam.cam_pos.xyz;
+    let t = (CLOUD_H - ro.y) / rd.y;
+
+    if (t > 0.0) {
+      let hit = ro + rd * t;
+      let time_s = cam.voxel_params.y;
+
+      cloud = cloud_coverage_at_xz(hit.xz, time_s);
+
+      let horizon2 = clamp((rd.y - CLOUD_HORIZON_Y0) / CLOUD_HORIZON_Y1, 0.0, 1.0);
+      cloud *= horizon2;
+
+      col *= mix(1.0, CLOUD_SKY_DARKEN, cloud);
+
+      let toward_sun = clamp(dot(rd, SUN_DIR), 0.0, 1.0);
+      let silver = pow(toward_sun, CLOUD_SILVER_POW) * CLOUD_SILVER_STR;
+      let cloud_col = mix(CLOUD_BASE_COL, vec3<f32>(1.0), silver);
+
+      col = mix(col, cloud_col, cloud * CLOUD_BLEND);
+    }
+  }
+
+  // Optional: dim sun disc through clouds (keep your existing behavior)
+  if (CLOUD_DIM_SUN_DISC) {
+    let Tc_view = exp(-CLOUD_SHADOW_ABSORB * cloud * CLOUD_SUN_DISC_ABSORB_SCALE);
+    // This scales only the sun contribution already in col; easiest is to re-add sun separately,
+    // but keep it minimal: treat Tc_view as extra darkening for very bright sun spot:
+    col = mix(col, col * Tc_view, cloud);
+  }
+
+  return col;
+}
+
+// src/shaders/ray/svo_query.wgsl
+// ------------------------------
+// src/shaders/ray/svo_query.wgsl
+//// --------------------------------------------------------------------------
+//// SVO query (leaf query + convenience predicates)
+//// --------------------------------------------------------------------------
+
+struct LeafQuery {
+  bmin : vec3<f32>,
+  size : f32,
+  mat  : u32,
 };
 
-pub struct Tex2D {
-    pub view: wgpu::TextureView,
-}
+fn query_leaf_at(
+  p_in: vec3<f32>,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  node_base: u32,
+  macro_base: u32
+) -> LeafQuery {
+  var idx: u32 = node_base;
+  var bmin: vec3<f32> = root_bmin;
+  var size: f32 = root_size;
 
-pub struct Tex2DArray {
-    pub tex: wgpu::Texture,
-    pub view: wgpu::TextureView,
-}
+  // ------------------------------------------------------------------------
+  // Macro occupancy early-out (8x8x8). If the macro cell is empty => MAT_AIR.
+  // ------------------------------------------------------------------------
+  if (macro_base != INVALID_U32) {
+    let cell = macro_cell_size(root_size);
 
-pub struct TextureSet {
-    pub output: OutputTex,
-    pub color: Tex2D,
-    pub depth: Tex2D,
-    pub godray: [Tex2D; 2],
+    // local position in chunk (meters)
+    let lp = p_in - root_bmin;
 
-    pub clip_height: Tex2DArray,
-}
+    // macro coords 0..7
+    let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
+    let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
+    let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
 
-pub fn quarter_dim(x: u32) -> u32 {
-    (x + 3) / 4
-}
+    let bit = macro_bit_index(mx, my, mz);
 
-fn make_tex2d(
-    device: &wgpu::Device,
-    label: &str,
-    w: u32,
-    h: u32,
-    format: wgpu::TextureFormat,
-    usage: wgpu::TextureUsages,
-) -> Tex2D {
-    let w = w.max(1);
-    let h = h.max(1);
-
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage,
-        view_formats: &[],
-    });
-
-    let view = tex.create_view(&Default::default());
-    Tex2D { view }
-}
-
-fn make_tex2d_array(
-    device: &wgpu::Device,
-    label: &str,
-    w: u32,
-    h: u32,
-    layers: u32,
-    format: wgpu::TextureFormat,
-    usage: wgpu::TextureUsages,
-) -> Tex2DArray {
-    let w = w.max(1);
-    let h = h.max(1);
-    let layers = layers.max(1);
-
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: layers,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage,
-        view_formats: &[],
-    });
-
-    let view = tex.create_view(&wgpu::TextureViewDescriptor {
-        label: Some(&format!("{label}_view")),
-        format: Some(format),
-        dimension: Some(wgpu::TextureViewDimension::D2Array),
-        aspect: wgpu::TextureAspect::All,
-        base_mip_level: 0,
-        mip_level_count: Some(1),
-        base_array_layer: 0,
-        array_layer_count: Some(layers),
-    });
-
-    Tex2DArray { tex, view }
-}
-
-pub fn create_textures(
-    device: &wgpu::Device,
-    out_w: u32,
-    out_h: u32,
-    internal_w: u32,
-    internal_h: u32,
-) -> TextureSet {
-
-    let rw_tex_usage =
-        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
-
-    let output = create_output_texture(device, out_w, out_h);
-
-    let color = make_tex2d(
-        device,
-        "color_tex",
-        internal_w,
-        internal_h,
-        wgpu::TextureFormat::Rgba16Float,
-        rw_tex_usage,
-    );
-
-    let depth = make_tex2d(
-        device,
-        "depth_tex",
-        internal_w,
-        internal_h,
-        wgpu::TextureFormat::R32Float,
-        rw_tex_usage,
-    );
-
-    let qw = quarter_dim(internal_w);
-    let qh = quarter_dim(internal_h);
-
-    let godray = [
-        make_tex2d(device, "godray_a", qw, qh, wgpu::TextureFormat::Rgba16Float, rw_tex_usage),
-        make_tex2d(device, "godray_b", qw, qh, wgpu::TextureFormat::Rgba16Float, rw_tex_usage),
-    ];
-
-
-    // FP16 clipmap height: R16Float (half bandwidth vs R32Float)
-    let clip_height = make_tex2d_array(
-        device,
-        "clip_height",
-        config::CLIPMAP_RES,
-        config::CLIPMAP_RES,
-        config::CLIPMAP_LEVELS,
-        wgpu::TextureFormat::R16Float,
-        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-    );
-
-    TextureSet {
-        output,
-        color,
-        depth,
-        godray,
-        clip_height,
+    if (!macro_test(macro_base, bit)) {
+      let macro_bmin = root_bmin + vec3<f32>(
+        f32(mx) * cell,
+        f32(my) * cell,
+        f32(mz) * cell
+      );
+      return LeafQuery(macro_bmin, cell, MAT_AIR);
     }
+  }
+
+
+  let min_leaf: f32 = cam.voxel_params.x;
+  var p = p_in;
+
+  for (var d: u32 = 0u; d < 32u; d = d + 1u) {
+    let n = nodes[idx];
+
+    if (n.child_base == LEAF_U32) {
+      return LeafQuery(bmin, size, n.material);
+    }
+
+    let max_d = chunk_max_depth();
+    if (d >= max_d) {
+      // We are at voxel resolution; if the node still isn't a LEAF_U32, treat missing child as air,
+      // but DO NOT blanket-return air here earlier than max depth.
+      // The loop will keep descending until leaf/missing child; this is just a safety stop.
+      return LeafQuery(bmin, size, MAT_AIR);
+    }
+
+
+    let half = size * 0.5;
+    let mid  = bmin + vec3<f32>(half);
+
+    let e = 1e-6 * size;
+
+    let hx = select(0u, 1u, p.x > mid.x + e);
+    let hy = select(0u, 1u, p.y > mid.y + e);
+    let hz = select(0u, 1u, p.z > mid.z + e);
+    let ci = hx | (hy << 1u) | (hz << 2u);
+
+    let child_bmin = bmin + vec3<f32>(
+      select(0.0, half, hx != 0u),
+      select(0.0, half, hy != 0u),
+      select(0.0, half, hz != 0u)
+    );
+
+    let bit = 1u << ci;
+    if ((n.child_mask & bit) == 0u) {
+      return LeafQuery(child_bmin, half, MAT_AIR);
+    }
+
+    let rank = child_rank(n.child_mask, ci);
+    idx = node_base + (n.child_base + rank);
+
+    bmin = child_bmin;
+    size = half;
+  }
+
+  return LeafQuery(bmin, size, MAT_AIR);
+}
+
+// src/shaders/ray/wind.wgsl
+// -------------------------
+// src/shaders/ray/wind.wgsl
+//// --------------------------------------------------------------------------
+//// Wind + small helpers (shared by leaves/grass)
+//// --------------------------------------------------------------------------
+
+fn hash1(p: vec3<f32>) -> f32 {
+  let h = dot(p, vec3<f32>(127.1, 311.7, 74.7));
+  return fract(sin(h) * 43758.5453);
+}
+
+fn wind_field(pos_m: vec3<f32>, t: f32) -> vec3<f32> {
+  let cell = floor(pos_m * WIND_CELL_FREQ);
+
+  let ph0 = hash1(cell);
+  let ph1 = hash1(cell + WIND_PHASE_OFF_1);
+
+  let dir = normalize(WIND_DIR_XZ);
+
+  let h = clamp((pos_m.y - WIND_RAMP_Y0) / max(WIND_RAMP_Y1 - WIND_RAMP_Y0, 1e-3), 0.0, 1.0);
+
+  let gust = sin(
+    t * WIND_GUST_TIME_FREQ +
+    dot(pos_m.xz, WIND_GUST_XZ_FREQ) +
+    ph0 * TAU
+  );
+
+  let flutter = sin(
+    t * WIND_FLUTTER_TIME_FREQ +
+    dot(pos_m.xz, WIND_FLUTTER_XZ_FREQ) +
+    ph1 * TAU
+  );
+
+  let xz = dir * (WIND_GUST_WEIGHT * gust + WIND_FLUTTER_WEIGHT * flutter) * h;
+  let y  = WIND_VERTICAL_SCALE * flutter * h;
+
+  return vec3<f32>(xz.x, y, xz.y);
+}
+
+fn clamp_len(v: vec3<f32>, max_len: f32) -> vec3<f32> {
+  let l2 = dot(v, v);
+  if (l2 <= max_len * max_len) { return v; }
+  return v * (max_len / sqrt(l2));
+}
+
+// src/shaders/ray_main.wgsl
+// -------------------------
+// src/shaders/ray_main.wgsl
+//
+// Compute entrypoints + pass bindings only.
+// Depends on: common.wgsl + ray_core.wgsl + clipmap.wgsl
+
+@group(0) @binding(4) var color_img : texture_storage_2d<rgba16float, write>;
+@group(0) @binding(5) var depth_img : texture_storage_2d<r32float, write>;
+
+@group(1) @binding(0) var depth_tex       : texture_2d<f32>;
+@group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
+@group(1) @binding(2) var godray_out      : texture_storage_2d<rgba16float, write>;
+
+@group(2) @binding(0) var color_tex  : texture_2d<f32>;
+@group(2) @binding(1) var godray_tex : texture_2d<f32>;
+@group(2) @binding(2) var out_img    : texture_storage_2d<rgba16float, write>;
+@group(2) @binding(3) var depth_full : texture_2d<f32>;
+@group(2) @binding(4) var godray_samp: sampler;
+
+
+@compute @workgroup_size(8, 8, 1)
+fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let dims = textureDimensions(color_img);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+
+  let res = vec2<f32>(f32(dims.x), f32(dims.y));
+  let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+
+  let ro  = cam.cam_pos.xyz;
+  let rd  = ray_dir_from_pixel(px, res);
+  let sky = sky_color(rd);
+  let sky_up = sky_color_base(vec3<f32>(0.0, 1.0, 0.0));
+
+  let ip = vec2<i32>(i32(gid.x), i32(gid.y));
+
+  // If no SVO chunks, still render clipmap terrain.
+  if (cam.chunk_count == 0u) {
+    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+    let surface = select(sky, shade_clip_hit(ro, rd, hf, sky_up), hf.hit);
+    let t_scene = select(FOG_MAX_DIST, min(hf.t, FOG_MAX_DIST), hf.hit);
+
+    let col = apply_fog(surface, ro, rd, t_scene, sky);
+
+    textureStore(color_img, ip, vec4<f32>(col, 1.0));
+    textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+    return;
+  }
+
+  // Streamed voxel grid trace
+  let vt = trace_scene_voxels(ro, rd);
+
+  // Outside streamed grid => clipmap fallback.
+  if (!vt.in_grid) {
+    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+    let surface = select(sky, shade_clip_hit(ro, rd, hf, sky_up), hf.hit);
+    let t_scene = select(FOG_MAX_DIST, min(hf.t, FOG_MAX_DIST), hf.hit);
+
+    let col = apply_fog(surface, ro, rd, t_scene, sky);
+
+    textureStore(color_img, ip, vec4<f32>(col, 1.0));
+    textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+    return;
+  }
+
+  // If no voxel hit, try heightfield clipmap fallback.
+  let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+
+  let use_vox = (vt.best.hit != 0u);
+  let use_hf  = (!use_vox) && hf.hit;
+
+  let surface = select(
+    sky,
+    select(shade_clip_hit(ro, rd, hf, sky_up), shade_hit(ro, rd, vt.best, sky), use_vox),
+    (use_vox || use_hf)
+  );
+
+  let t_scene = select(
+    min(vt.t_exit, FOG_MAX_DIST),
+    select(min(hf.t, FOG_MAX_DIST), min(vt.best.t, FOG_MAX_DIST), use_vox),
+    (use_vox || use_hf)
+  );
+
+  let col = apply_fog(surface, ro, rd, t_scene, sky);
+
+  textureStore(color_img, ip, vec4<f32>(col, 1.0));
+  textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main_godray(@builtin(global_invocation_id) gid3: vec3<u32>) {
+  let qdims = textureDimensions(godray_out);
+  if (gid3.x >= qdims.x || gid3.y >= qdims.y) { return; }
+
+  let gid = vec2<u32>(gid3.x, gid3.y);
+  let hip = vec2<i32>(i32(gid.x), i32(gid.y));
+
+  let blended = compute_godray_quarter_pixel(gid, depth_tex, godray_hist_tex);
+  textureStore(godray_out, hip, vec4<f32>(blended, 1.0));
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let out_dims = textureDimensions(out_img);
+  if (gid.x >= out_dims.x || gid.y >= out_dims.y) { return; }
+
+  // present pixel center
+  let px_present = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+
+  // mapped render integer pixel
+  let ip_render = ip_render_from_present_px(px_present);
+
+  // mapped render pixel center (float)
+  let px_render = px_render_from_present_px(px_present);
+
+  let outc = composite_pixel_mapped(
+    ip_render, px_render,
+    color_tex, godray_tex, godray_samp,
+    depth_full
+  );
+
+  let ip_out = vec2<i32>(i32(gid.x), i32(gid.y));
+  textureStore(out_img, ip_out, outc);
 }
 

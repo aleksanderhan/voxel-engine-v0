@@ -148,40 +148,43 @@ struct ClipHit {
 };
 
 fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> ClipHit {
+  // Same behavior: only trace when ray points downward.
   if (rd.y >= -1e-4) {
     return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
   }
 
-  var t = max(t_min, 0.0);
-  var p = ro + rd * t;
+  let guard: i32 = 2;
+  let nlv: u32   = max(min(clip.levels, CLIP_LEVELS_MAX), 1u);
 
-  // Start with the finest level that contains the starting point.
-  // From here on, we only move to COARSER levels if/when we fall out of coverage.
-  var lvl: u32 = clip_best_level(p.xz, 2);
+  var t: f32 = max(t_min, 0.0);
 
-  var h = clip_height_at_level(p.xz, lvl);
-  var s_prev = p.y - h;
-  var t_prev = t;
+  // Start at finest level that covers start point; only ever move to coarser.
+  var p: vec3<f32> = ro + rd * t;
+  var lvl: u32     = clip_best_level(p.xz, guard);
+
+  // Initial signed height
+  var h0: f32   = clip_height_at_level(p.xz, lvl);
+  var s_prev: f32 = p.y - h0;
+  var t_prev: f32 = t;
 
   for (var i: u32 = 0u; i < HF_MAX_STEPS; i = i + 1u) {
     if (t > t_max) { break; }
 
     p = ro + rd * t;
 
-    // Coverage-only "LOD": ensure p is inside the chosen level window.
-    // IMPORTANT: this only ever increases lvl (coarser), never decreases.
-    lvl = clip_ensure_contains(p.xz, lvl, 2);
+    // Coverage-only "LOD": ensure p is inside chosen level window (coarsen only).
+    lvl = clip_ensure_contains(p.xz, lvl, guard);
 
-    h = clip_height_at_level(p.xz, lvl);
-    let s = p.y - h;
+    let h: f32 = clip_height_at_level(p.xz, lvl);
+    let s: f32 = p.y - h;
 
+    // Crossing from above -> below: refine with bisection at SAME lvl.
     if (s <= 0.0 && s_prev > 0.0) {
-      var a = t_prev;
-      var b = t;
+      var a: f32 = t_prev;
+      var b: f32 = t;
 
-      // Bisection against the SAME surface (same lvl), no level switching here.
       for (var k: u32 = 0u; k < HF_BISECT; k = k + 1u) {
-        let m = 0.5 * (a + b);
+        let m  = 0.5 * (a + b);
         let pm = ro + rd * m;
 
         let hm = clip_height_at_level(pm.xz, lvl);
@@ -192,26 +195,23 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
 
       let th = 0.5 * (a + b);
       let ph = ro + rd * th;
+      let n  = clip_normal_at_level_2tap(ph.xz, lvl);
 
-      let n = clip_normal_at_level_2tap(ph.xz, lvl);
       return ClipHit(true, th, n, MAT_GRASS);
     }
 
     s_prev = s;
     t_prev = t;
 
-    // Step control: vertical clearance + xz-texel travel limit
+    // Step control: vertical clearance + xz-texel travel limit (same policy).
     let vy = max(-rd.y, 0.12);
     let vh = max(length(rd.xz), 1e-4);
 
-    let dt_y = abs(s) / vy;
-
-    let cell = clip.level[lvl].z;
+    let dt_y  = abs(s) / vy;
+    let cell  = clip.level[lvl].z;
     let dt_xz = (2.0 * cell) / vh; // ~2 texels per step in xz
 
     var dt = min(dt_y, dt_xz);
-
-    // Keep your clamp policy (you can swap 0.25 back to HF_DT_MIN if you prefer)
     dt = clamp(dt, 0.25, HF_DT_MAX);
 
     t = t + dt;
@@ -219,6 +219,7 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
 
   return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
 }
+
 
 
 fn material_variation_clip(world_p: vec3<f32>, cell_size_m: f32, strength: f32) -> f32 {

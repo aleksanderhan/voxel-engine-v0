@@ -400,7 +400,7 @@ fn trace_chunk_rope_interval(
   // Macro DDA setup (valid==false if no macro data)
   var m = macro_dda_init(ro, rd, inv, tcur, root_bmin, root_size, ch.macro_base);
 
-  let MAX_ITERS: u32 = 4096u;
+let MAX_ITERS: u32 = 256u + cam.chunk_size * 8u;
 
   for (var it: u32 = 0u; it < MAX_ITERS; it = it + 1u) {
     if (tcur > t_exit) { break; }
@@ -656,12 +656,15 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
 
   // Ray vs grid AABB
   let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+
+  // Only trace as far as fog can contribute (huge perf win on big loaded grids)
   var t_enter = max(rtg.x, 0.0);
-  let t_exit  = rtg.y;
+  let t_exit  = min(rtg.y, FOG_MAX_DIST);
 
   if (t_exit < t_enter) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0);
   }
+
 
   // Nudge inside
   let nudge_p = PRIMARY_NUDGE_VOXEL_FRAC * voxel_size;
@@ -722,7 +725,7 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
 
   var best = miss_hitgeom();
 
-  let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 1024u);
+  let max_chunk_steps = min((gd.x + gd.y + gd.z) * 4u + 8u, 512u);
 
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }

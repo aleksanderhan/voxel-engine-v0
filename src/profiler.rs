@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 use crate::streaming::types::StreamStats;
+use crate::render::state::GpuTimingsMs;
 
 pub struct FrameProf {
     pub frame: u64,
@@ -28,7 +29,6 @@ pub struct FrameProf {
 
     pub t_poll_wait: f64,
 
-    pub t_acq_gpu_wait: f64,
     pub t_acq_swapchain: f64,
 
 }
@@ -62,7 +62,6 @@ impl FrameProf {
 
             t_poll_wait: 0.0,
 
-            t_acq_gpu_wait: 0.0,
             t_acq_swapchain: 0.0,
 
         }
@@ -96,7 +95,7 @@ impl FrameProf {
         self.chunk_uploads += n as u64;
     }
 
-    pub fn end_frame(&mut self, frame_ms: f64, stream: Option<StreamStats>) {
+    pub fn end_frame(&mut self, frame_ms: f64, stream: Option<StreamStats>, gpu: Option<GpuTimingsMs>) {
         self.frame += 1;
         self.n_frames += 1;
         self.max_frame_ms = self.max_frame_ms.max(frame_ms);
@@ -107,7 +106,7 @@ impl FrameProf {
 
             let avg_frame = avg(
                 self.t_cam + self.t_stream + self.t_clipmap_update + self.t_cam_write + self.t_overlay
-                    + self.t_chunk_uploads + self.t_acq_gpu_wait + self.t_acq_swapchain + self.t_encode_clipmap + self.t_encode_compute
+                    + self.t_chunk_uploads + self.t_acq_swapchain + self.t_encode_clipmap + self.t_encode_compute
                     + self.t_encode_blit + self.t_submit + self.t_poll + self.t_poll_wait + self.t_present
             );
 
@@ -115,7 +114,7 @@ impl FrameProf {
                 concat!(
                     "\n[prof] frames={} avg_frame={:.2}ms max_frame={:.2}ms\n",
                     "  cam={:.2} stream={:.2} clip_update={:.2} cam_write={:.2} overlay={:.2}\n",
-                    "  chunk_up={:.2} acq_gpu={:.2} acq_sc={:.2} enc_clip={:.2} enc_comp={:.2} enc_blit={:.2}\n",
+                    "  chunk_up={:.2} acq_sc={:.2} enc_clip={:.2} enc_comp={:.2} enc_blit={:.2}\n",
                     "  submit={:.2} poll={:.2} poll_wait={:.2} present={:.2}\n",
                     "  clip_uploads/frame={:.1} clip_kb/frame={:.1} chunk_uploads/frame={:.1}\n"
                 ),
@@ -128,7 +127,6 @@ impl FrameProf {
                 avg(self.t_cam_write),
                 avg(self.t_overlay),
                 avg(self.t_chunk_uploads),
-                avg(self.t_acq_gpu_wait),
                 avg(self.t_acq_swapchain),
                 avg(self.t_encode_clipmap),
                 avg(self.t_encode_compute),
@@ -162,7 +160,6 @@ impl FrameProf {
             self.clip_bytes = 0;
             self.chunk_uploads = 0;
             self.max_frame_ms = 0.0;
-            self.t_acq_gpu_wait = 0.0;
             self.t_acq_swapchain = 0.0;
 
         }
@@ -187,6 +184,14 @@ impl FrameProf {
 
         }
 
+        if let Some(g) = gpu {
+            println!(
+                "  [gpu] primary={:.2}ms godray={:.2}ms composite={:.2}ms blit={:.2}ms total={:.2}ms",
+                g.primary, g.godray, g.composite, g.blit, g.total
+            );
+        }
+
+
         
 
     }
@@ -196,8 +201,11 @@ impl FrameProf {
         self.t_poll_wait += ms;
     }
 
-    #[inline] pub fn acq_gpu_wait(&mut self, ms: f64) { self.t_acq_gpu_wait += ms; }
     #[inline] pub fn acq_swapchain(&mut self, ms: f64) { self.t_acq_swapchain += ms; }
+
+    pub fn should_print(&self) -> bool {
+        self.last_print.elapsed() >= self.print_every
+    }
 
 
 }

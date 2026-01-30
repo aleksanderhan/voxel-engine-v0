@@ -1236,7 +1236,7 @@ impl ChunkManager {
         q.insert(pos, u);
     }
 
-    pub fn stats(&self) -> StreamStats {
+    pub fn stats(&self) -> Option<StreamStats> {
         let mut s = StreamStats::default();
 
         if let Some(c) = self.last_center {
@@ -1282,7 +1282,7 @@ impl ChunkManager {
         s.orphan_queued = orphan;
 
 
-        s
+        Some(s)
     }
 
 

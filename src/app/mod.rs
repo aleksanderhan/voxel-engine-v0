@@ -72,8 +72,6 @@ pub struct App {
     frame_index: u32,
 
     profiler: crate::profiler::FrameProf,
-    last_submit: Option<wgpu::SubmissionIndex>,
-
 }
 
 impl App {
@@ -150,7 +148,6 @@ impl App {
             fps_last: Instant::now(),
             frame_index: 0,
             profiler: crate::profiler::FrameProf::new(),
-            last_submit: None,
         }
     }
 
@@ -296,16 +293,7 @@ impl App {
 
         self.profiler.chunk_up(crate::profiler::FrameProf::mark_ms(t0));
 
-        // 7a) wait for previous GPU submission (if any)
-        let t0 = Instant::now();
-        if let Some(si) = self.last_submit.as_ref() {
-            self.renderer
-                .device()
-                .poll(wgpu::Maintain::WaitForSubmissionIndex(si.clone()));
-        }
-        self.profiler.acq_gpu_wait(crate::profiler::FrameProf::mark_ms(t0));
-
-        // 7b) swapchain acquire
+        // 7) swapchain acquire
         let t0 = Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -347,10 +335,11 @@ impl App {
         self.renderer.encode_blit(&mut encoder, &frame_view);
         self.profiler.enc_blit(crate::profiler::FrameProf::mark_ms(t0));
 
+        self.renderer.encode_timestamp_resolve(&mut encoder); // recommended helper
+
         // 9) submit
         let t0 = Instant::now();
-        let si = self.renderer.queue().submit(Some(encoder.finish()));
-        self.last_submit = Some(si);
+        self.renderer.queue().submit(Some(encoder.finish()));
         self.profiler.submit(crate::profiler::FrameProf::mark_ms(t0));
 
         // 10) poll
@@ -364,9 +353,22 @@ impl App {
         self.profiler.present(crate::profiler::FrameProf::mark_ms(t0));
 
         // 12) end-of-frame
+        let gpu = if self.profiler.should_print() {
+            self.renderer.read_gpu_timings_ms_blocking()
+        } else {
+            None
+        };
+
+        let ss = if self.profiler.should_print() {
+            self.chunks.stats()
+        } else {
+            None
+        };
+
+
         let frame_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
-        let ss = self.chunks.stats();
-        self.profiler.end_frame(frame_ms, Some(ss));
+        self.profiler.end_frame(frame_ms, ss, gpu);
+
 
     }
 
