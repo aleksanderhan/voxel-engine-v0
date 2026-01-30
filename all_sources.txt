@@ -1,3 +1,1637 @@
+// src/render/gpu_types.rs
+// -----------------------
+// src/render/gpu_types.rs
+// -----------------------
+//
+// Fix: ClipLevelParams now has `packed_offsets`, but we keep its existing
+// `inv_cell_size_m` field on CPU side.
+// GPU uniform uses vec4 per level with packed offsets in .w.
+
+use bytemuck::{Pod, Zeroable};
+use crate::config;
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct NodeGpu {
+    pub child_base: u32,
+    pub child_mask: u32,
+    pub material: u32,
+    pub key: u32, // packed spatial key: level + coord at that level
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct NodeRopesGpu {
+    pub px: u32,
+    pub nx: u32,
+    pub py: u32,
+    pub ny: u32,
+    pub pz: u32,
+    pub nz: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct ChunkMetaGpu {
+    pub origin: [i32; 4],
+    pub node_base: u32,
+    pub node_count: u32,
+    pub macro_base: u32,
+    pub colinfo_base: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct CameraGpu {
+    pub view_inv: [[f32; 4]; 4],
+    pub proj_inv: [[f32; 4]; 4],
+    pub cam_pos: [f32; 4],
+
+    pub chunk_size: u32,
+    pub chunk_count: u32,
+    pub max_steps: u32,
+    pub frame_index: u32,
+
+    pub voxel_params: [f32; 4],
+
+    pub grid_origin_chunk: [i32; 4],
+    pub grid_dims: [u32; 4],
+
+    pub render_present_px: [u32; 4],
+}
+
+/// Clipmap uniform payload.
+///
+/// Matches `shaders/clipmap.wgsl`.
+///
+/// Per level vec4<f32>:
+///   x = origin_x_m
+///   y = origin_z_m
+///   z = cell_size_m
+///   w = unused (0)
+///
+/// Per level vec4<u32>:
+///   x = off_x (toroidal offset in texels)
+///   y = off_z
+///   z/w unused (0)
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct ClipmapGpu {
+    pub levels: u32,
+    pub res: u32,
+    pub base_cell_m: f32,
+    pub _pad0: f32,
+
+    pub level:  [[f32; 4]; config::CLIPMAP_LEVELS_USIZE],
+    pub offset: [[u32; 4]; config::CLIPMAP_LEVELS_USIZE],
+}
+
+impl ClipmapGpu {
+    pub fn from_cpu(cpu: &crate::clipmap::ClipmapParamsCpu) -> Self {
+        let mut level  = [[0.0f32; 4]; config::CLIPMAP_LEVELS_USIZE];
+        let mut offset = [[0u32; 4]; config::CLIPMAP_LEVELS_USIZE];
+
+        for i in 0..config::CLIPMAP_LEVELS_USIZE {
+            let p = cpu.level[i];
+
+            level[i] = [p.origin_x_m, p.origin_z_m, p.cell_size_m, 0.0];
+
+            // NOTE: these fields change on CPU side in the next patch (ClipLevelParams)
+            offset[i] = [p.off_x, p.off_z, 0, 0];
+        }
+
+        Self {
+            levels: cpu.levels,
+            res: cpu.res,
+            base_cell_m: cpu.base_cell_m,
+            _pad0: 0.0,
+            level,
+            offset,
+        }
+    }
+}
+
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct OverlayGpu {
+    // packed digits: d0 | d1<<8 | d2<<16 | d3<<24 (d0=ones, d3=thousands)
+    pub digits_packed: u32,
+
+    // HUD rectangle in framebuffer pixel coords (top-left origin)
+    pub origin_x: u32,
+    pub origin_y: u32,
+    pub total_w:  u32,
+
+    pub digit_h:  u32,
+    pub scale:    u32,
+    pub stride:   u32, // digit_w + gap
+    pub _pad0:    u32, // explicit padding to 32 bytes
+}
+
+impl OverlayGpu {
+    pub fn from_fps_and_dims(fps: u32, width: u32, _height: u32, scale: u32) -> Self {
+        // digits
+        let mut v = fps.min(9999);
+        let d0 = (v % 10) as u32; v /= 10;
+        let d1 = (v % 10) as u32; v /= 10;
+        let d2 = (v % 10) as u32; v /= 10;
+        let d3 = (v % 10) as u32;
+
+        let digits_packed = d0 | (d1 << 8) | (d2 << 16) | (d3 << 24);
+
+        // layout
+        let margin: u32 = 12;
+        let digit_w = 3 * scale;
+        let digit_h = 5 * scale;
+        let gap     = 1 * scale;
+        let stride  = digit_w + gap;
+        let total_w = 4 * digit_w + 3 * gap;
+
+        let ox_i = width as i32 - margin as i32 - total_w as i32;
+        let oy_i = margin as i32;
+
+        let origin_x = ox_i.max(0) as u32;
+        let origin_y = oy_i.max(0) as u32;
+
+        Self {
+            digits_packed,
+            origin_x,
+            origin_y,
+            total_w,
+            digit_h,
+            scale,
+            stride,
+            _pad0: 0,
+        }
+    }
+}
+
+// src/render/mod.rs
+// -----------------
+// src/render/mod.rs
+
+pub mod gpu_types;
+pub mod resources;
+pub mod shaders;
+pub mod state;
+
+pub use gpu_types::*;
+pub use state::Renderer;
+
+// src/render/resources.rs
+// -----------------------
+// src/render/resources.rs
+//
+// Small GPU resource helpers that don't fit cleanly into the renderer "state" modules.
+//
+// Right now this file provides the final full-resolution output texture:
+// - written as a STORAGE texture by the composite compute pass
+// - sampled as a regular texture by the final blit render pass
+//
+// Keeping this as a tiny helper makes the main texture set code a bit cleaner.
+
+/// Wrapper for the renderer's final output texture view.
+///
+/// The renderer stores only the TextureView; the view keeps the underlying texture alive
+/// for as long as it exists (wgpu uses ref-counted internal ownership).
+pub struct OutputTex {
+    /// Texture view bound in bind groups (storage write in compute, sampled in blit).
+    pub view: wgpu::TextureView,
+}
+
+/// Create the final output texture (full resolution).
+///
+/// Properties:
+/// - Format: RGBA16F (high dynamic range, good for post-processing)
+/// - Usage:
+///   - STORAGE_BINDING: composite pass writes into it as a storage texture
+///   - TEXTURE_BINDING: blit pass samples it in the fragment shader
+///
+/// Notes:
+/// - wgpu forbids zero-sized textures, so we clamp `w`/`h` to at least 1.
+pub fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> OutputTex {
+    // Avoid creating zero-sized textures (can happen during minimize/resizes).
+    let w = w.max(1);
+    let h = h.max(1);
+
+    // Allocate the GPU texture backing store.
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("output_tex"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        // Must support both compute writes and render sampling.
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+
+    // Default view covers the whole texture.
+    let view = tex.create_view(&Default::default());
+
+    OutputTex { view }
+}
+
+// src/render/shaders.rs
+// ---------------------
+// src/render/shaders.rs
+//
+// Centralized shader sources. WGSL has no native include mechanism in wgpu,
+// so we concatenate multiple WGSL files into a single source string.
+
+pub const RAY_CS_WGSL: &str = concat!(
+    include_str!("../shaders/common.wgsl"),
+    "\n",
+
+    // ray_core split into concern-specific modules (order matters)
+    include_str!("../shaders/ray/clouds.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/phase.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/sky.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/fog.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/aabb.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/wind.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/svo_query.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/leaves.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/grass.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/chunk_trace.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/shadows.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/shading.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/godrays.wgsl"),
+    "\n",
+    include_str!("../shaders/ray/composite.wgsl"),
+    "\n",
+
+    include_str!("../shaders/clipmap.wgsl"),
+    "\n",
+    include_str!("../shaders/ray_main.wgsl"),
+    "\n",
+);
+
+pub const BLIT_WGSL: &str = include_str!("../shaders/blit.wgsl");
+
+#[inline]
+pub fn ray_cs_wgsl() -> &'static str {
+    RAY_CS_WGSL
+}
+
+#[inline]
+pub fn blit_wgsl() -> &'static str {
+    BLIT_WGSL
+}
+
+// src/render/state/bindgroups.rs
+// ------------------------------
+// src/render/state/bindgroups.rs
+//
+// Bind group creation.
+
+use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
+
+pub struct BindGroups {
+    pub primary: wgpu::BindGroup,
+    pub scene: wgpu::BindGroup,
+    pub godray: [wgpu::BindGroup; 2],
+    pub composite: [wgpu::BindGroup; 2],
+    pub empty: wgpu::BindGroup,
+    pub blit: wgpu::BindGroup,
+}
+
+fn make_primary_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffers: &Buffers,
+    textures: &TextureSet,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("primary_bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffers.camera.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: buffers.chunk.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buffers.node.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: buffers.chunk_grid.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&textures.color.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&textures.depth.view),
+            },
+            // Clipmap params uniform
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: buffers.clipmap.as_entire_binding(),
+            },
+            // Clipmap height texture array
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: buffers.macro_occ.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: buffers.node_ropes.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: buffers.colinfo.as_entire_binding(),
+            },
+
+        ],
+    })
+}
+
+fn make_scene_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffers: &Buffers,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("scene_bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffers.camera.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: buffers.chunk.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buffers.node.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: buffers.chunk_grid.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry { 
+                binding: 8, 
+                resource: buffers.macro_occ.as_entire_binding() 
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: buffers.node_ropes.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: buffers.colinfo.as_entire_binding(),
+            },
+
+        ],
+    })
+}
+
+fn make_godray_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    depth_view: &wgpu::TextureView,
+    hist_view: &wgpu::TextureView,
+    out_view: &wgpu::TextureView,
+    label: &str,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(hist_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(out_view),
+            },
+        ],
+    })
+}
+
+fn make_composite_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    color_view: &wgpu::TextureView,
+    godray_view: &wgpu::TextureView,
+    output_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
+    godray_sampler: &wgpu::Sampler,
+    label: &str,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(color_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(godray_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(output_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(godray_sampler) },
+        ],
+    })
+}
+
+
+
+fn make_blit_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    output_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    overlay_buf: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("blit_bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(output_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: overlay_buf.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+pub fn create_bind_groups(
+    device: &wgpu::Device,
+    layouts: &Layouts,
+    buffers: &Buffers,
+    textures: &TextureSet,
+    sampler: &wgpu::Sampler,
+) -> BindGroups {
+    let primary = make_primary_bg(device, &layouts.primary, buffers, textures);
+    let scene = make_scene_bg(device, &layouts.scene, buffers);
+
+    let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("empty_bg"),
+        layout: &layouts.empty,
+        entries: &[],
+    });
+
+    let godray = [
+        make_godray_bg(
+            device,
+            &layouts.godray,
+            &textures.depth.view,
+            &textures.godray[0].view,
+            &textures.godray[1].view,
+            "godray_bg_a_to_b",
+        ),
+        make_godray_bg(
+            device,
+            &layouts.godray,
+            &textures.depth.view,
+            &textures.godray[1].view,
+            &textures.godray[0].view,
+            "godray_bg_b_to_a",
+        ),
+    ];
+
+    let composite = [
+        make_composite_bg(
+            device,
+            &layouts.composite,
+            &textures.color.view,
+            &textures.godray[0].view,
+            &textures.output.view,
+            &textures.depth.view,
+            sampler,
+            "composite_bg_read_a",
+        ),
+        make_composite_bg(
+            device,
+            &layouts.composite,
+            &textures.color.view,
+            &textures.godray[1].view,
+            &textures.output.view,
+            &textures.depth.view,
+            sampler,
+            "composite_bg_read_b",
+        ),
+    ];
+
+    let blit = make_blit_bg(
+        device,
+        &layouts.blit,
+        &textures.output.view,
+        sampler,
+        &buffers.overlay,
+    );
+
+    BindGroups {
+        primary,
+        scene,
+        godray,
+        composite,
+        empty,
+        blit,
+    }
+}
+
+// src/render/state/buffers.rs
+// ---------------------------
+// src/render/state/buffers.rs
+//
+// Persistent GPU buffers and capacities.
+
+use crate::{
+    config,
+    render::gpu_types::{ChunkMetaGpu, ClipmapGpu, NodeGpu, NodeRopesGpu},
+};
+
+pub struct Buffers {
+    // --- Uniforms ---
+    pub camera: wgpu::Buffer,
+    pub overlay: wgpu::Buffer,
+
+    /// Clipmap params (primary compute pass only).
+    pub clipmap: wgpu::Buffer,
+
+    // --- Storage buffers ---
+    pub node: wgpu::Buffer,
+    pub chunk: wgpu::Buffer,
+    pub chunk_grid: wgpu::Buffer,
+
+    // --- Capacities ---
+    pub node_capacity: u32,
+    pub chunk_capacity: u32,
+    pub grid_capacity: u32,
+
+    pub macro_occ: wgpu::Buffer,
+    pub macro_capacity_u32: u32,
+
+    pub node_ropes: wgpu::Buffer,
+    pub rope_capacity: u32, // in nodes
+
+    pub colinfo: wgpu::Buffer,
+    pub colinfo_capacity_u32: u32,
+
+}
+
+fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: std::mem::size_of::<T>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn make_storage_buffer(device: &wgpu::Device, label: &str, size_bytes: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
+    let camera = make_uniform_buffer::<crate::render::gpu_types::CameraGpu>(device, "camera_buf");
+    let overlay = make_uniform_buffer::<crate::render::gpu_types::OverlayGpu>(device, "overlay_buf");
+
+    let clipmap = make_uniform_buffer::<ClipmapGpu>(device, "clipmap_buf");
+
+    let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
+
+    let node = make_storage_buffer(
+        device,
+        "svo_nodes_arena",
+        (node_capacity as u64) * (std::mem::size_of::<NodeGpu>() as u64),
+    );
+
+    let chunk_capacity =
+        (2 * config::KEEP_RADIUS + 1) as u32 * 4u32 * (2 * config::KEEP_RADIUS + 1) as u32;
+
+    let chunk = make_storage_buffer(
+        device,
+        "chunk_meta_persistent",
+        (chunk_capacity as u64) * (std::mem::size_of::<ChunkMetaGpu>() as u64),
+    );
+
+    let grid_capacity = chunk_capacity;
+
+    let chunk_grid = make_storage_buffer(
+        device,
+        "chunk_grid_buf",
+        (grid_capacity as u64) * (std::mem::size_of::<u32>() as u64),
+    );
+
+    // ---- macro occupancy: 8^3 bits = 512 bits = 16 u32 words per chunk ----
+    const MACRO_WORDS_PER_CHUNK: u32 = 16;
+    let macro_capacity_u32 = chunk_capacity * MACRO_WORDS_PER_CHUNK;
+    let macro_occ = make_storage_buffer(
+        device,
+        "macro_occ_buf",
+        (macro_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
+    );
+
+    let rope_capacity = node_capacity;
+    let node_ropes = make_storage_buffer(
+        device,
+        "svo_node_ropes",
+        (rope_capacity as u64) * (std::mem::size_of::<NodeRopesGpu>() as u64),
+    );
+
+    // ---- column info: 64*64 columns packed => 2048 u32 per chunk ----
+    const COLINFO_WORDS_PER_CHUNK: u32 = 2048;
+    let colinfo_capacity_u32 = chunk_capacity * COLINFO_WORDS_PER_CHUNK;
+    let colinfo = make_storage_buffer(
+        device,
+        "chunk_colinfo_buf",
+        (colinfo_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
+    );
+
+    Buffers {
+        camera,
+        overlay,
+        clipmap,
+        node,
+        chunk,
+        chunk_grid,
+        node_capacity,
+        chunk_capacity,
+        grid_capacity,
+        macro_occ,
+        macro_capacity_u32,
+        node_ropes,
+        rope_capacity,
+        colinfo,
+        colinfo_capacity_u32,
+    }
+}
+
+// src/render/state/layout.rs
+// --------------------------
+// src/render/state/layout.rs
+//
+// Bind group layouts and small helpers.
+
+pub struct Layouts {
+    pub primary: wgpu::BindGroupLayout,
+    pub scene: wgpu::BindGroupLayout,
+    pub godray: wgpu::BindGroupLayout,
+    pub composite: wgpu::BindGroupLayout,
+    pub empty: wgpu::BindGroupLayout,
+    pub blit: wgpu::BindGroupLayout,
+}
+
+fn bgl_sampler(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
+
+fn bgl_uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn bgl_storage_ro(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn bgl_tex_sample_2d(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+    sample_type: wgpu::TextureSampleType,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn bgl_tex_sample_2d_array(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+    sample_type: wgpu::TextureSampleType,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn bgl_storage_tex_wo(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+    format: wgpu::TextureFormat,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
+    }
+}
+
+pub fn create_layouts(device: &wgpu::Device) -> Layouts {
+    let cs_vis = wgpu::ShaderStages::COMPUTE;
+
+    let scene_entries: [wgpu::BindGroupLayoutEntry; 7] = [
+        bgl_uniform(0, cs_vis),
+        bgl_storage_ro(1, cs_vis),
+        bgl_storage_ro(2, cs_vis),
+        bgl_storage_ro(3, cs_vis),
+        bgl_storage_ro(8, cs_vis),
+        bgl_storage_ro(9, cs_vis),
+        bgl_storage_ro(10, cs_vis),
+    ];
+
+    let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("scene_bgl"),
+        entries: &scene_entries,
+    });
+
+    // PRIMARY: add clipmap uniform + clipmap height texture array
+    // bindings:
+    // 0 camera
+    // 1 chunks
+    // 2 nodes
+    // 3 chunk_grid
+    // 4 color storage
+    // 5 depth storage
+    // 6 clipmap uniform
+    // 7 clipmap height texture array (R32Float)
+    // 8 macro_occ
+    let mut primary_entries = Vec::with_capacity(8);
+    primary_entries.extend_from_slice(&scene_entries);
+
+    primary_entries.push(bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba16Float));
+    primary_entries.push(bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float));
+
+    primary_entries.push(bgl_uniform(6, cs_vis));
+    primary_entries.push(bgl_tex_sample_2d_array(
+        7,
+        cs_vis,
+        wgpu::TextureSampleType::Float { filterable: false },
+    ));
+
+    let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("primary_bgl"),
+        entries: &primary_entries,
+    });
+
+    let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("godray_bgl"),
+        entries: &[
+            bgl_tex_sample_2d(
+                0,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_tex_sample_2d(
+                1,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
+        ],
+    });
+
+    let composite = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("composite_bgl"),
+        entries: &[
+            bgl_tex_sample_2d(
+                0,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: true },
+            ),
+            bgl_tex_sample_2d(
+                1,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: true },
+            ),
+            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
+
+            // full-res depth for depth-aware upsample
+            bgl_tex_sample_2d(
+                3,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+
+            // NEW: sampler for godray_tex (used by textureSampleLevel)
+            bgl_sampler(4, cs_vis),
+        ],
+    });
+
+    let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("empty_bgl"),
+        entries: &[],
+    });
+
+    let blit = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("blit_bgl"),
+        entries: &[
+            bgl_tex_sample_2d(
+                0,
+                wgpu::ShaderStages::FRAGMENT,
+                wgpu::TextureSampleType::Float { filterable: true },
+            ),
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            bgl_uniform(2, wgpu::ShaderStages::FRAGMENT),
+        ],
+    });
+
+    Layouts {
+        primary,
+        scene,
+        godray,
+        composite,
+        empty,
+        blit,
+    }
+}
+
+// src/render/state/mod.rs
+// -----------------------
+// src/render/state/mod.rs
+// -----------------------
+mod bindgroups;
+mod buffers;
+mod layout;
+mod pipelines;
+pub mod textures;
+
+use crate::{
+    config,
+    render::gpu_types::{CameraGpu, OverlayGpu},
+    streaming::ChunkUpload,
+};
+
+use bindgroups::{create_bind_groups, BindGroups};
+use buffers::{create_persistent_buffers, Buffers};
+use layout::{create_layouts, Layouts};
+use pipelines::{create_pipelines, Pipelines};
+use textures::{create_textures, quarter_dim, TextureSet};
+
+pub struct Renderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+
+    sampler: wgpu::Sampler,
+
+    layouts: Layouts,
+    pipelines: Pipelines,
+    buffers: Buffers,
+    textures: TextureSet,
+    bind_groups: BindGroups,
+
+    ping: usize,
+
+    render_scale: f32,
+    internal_w: u32,
+    internal_h: u32,
+
+    clip_scratch: Vec<u8>,
+}
+
+fn align_up(v: usize, a: usize) -> usize {
+    (v + (a - 1)) & !(a - 1)
+}
+
+impl Renderer {
+    pub async fn new(
+        adapter: &wgpu::Adapter,
+        surface_format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let adapter_limits = adapter.limits();
+        let required_limits = wgpu::Limits {
+            max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+            max_buffer_size: adapter_limits.max_buffer_size,
+            ..wgpu::Limits::default()
+        };
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ray_cs"),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::ray_cs_wgsl().into()),
+        });
+
+        let fs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit"),
+            source: wgpu::ShaderSource::Wgsl(crate::render::shaders::blit_wgsl().into()),
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("linear_clamp_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest, // level 0 anyway
+            ..Default::default()
+        });
+
+        let layouts = create_layouts(&device);
+        let buffers = create_persistent_buffers(&device);
+
+        let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
+
+        let render_scale = config::RENDER_SCALE;
+        let internal_w = ((width as f32) * render_scale).round() as u32;
+        let internal_h = ((height as f32) * render_scale).round() as u32;
+        
+        let textures = create_textures(&device, width, height, internal_w, internal_h);
+        let bind_groups = create_bind_groups(&device, &layouts, &buffers, &textures, &sampler);
+
+        Self {
+            device,
+            queue,
+            sampler,
+            layouts,
+            pipelines,
+            buffers,
+            textures,
+            bind_groups,
+            ping: 0,
+            render_scale,
+            internal_w,
+            internal_h,
+            clip_scratch: Vec::new(),
+        }
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    pub fn resize_output(&mut self, width: u32, height: u32) {
+        self.internal_w = ((width as f32) * self.render_scale).round() as u32;
+        self.internal_h = ((height as f32) * self.render_scale).round() as u32;
+
+        self.textures = create_textures(&self.device, width, height, self.internal_w, self.internal_h);
+
+        self.bind_groups = create_bind_groups(
+            &self.device, &self.layouts, &self.buffers, &self.textures, &self.sampler,
+        );
+
+        self.ping = 0;
+    }
+
+    pub fn write_chunk_grid(&self, grid: &[u32]) {
+        let n = grid.len().min(self.buffers.grid_capacity as usize);
+        self.queue.write_buffer(
+            &self.buffers.chunk_grid,
+            0,
+            bytemuck::cast_slice(&grid[..n]),
+        );
+    }
+
+    pub fn write_camera(&self, cam: &CameraGpu) {
+        self.queue
+            .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
+    }
+
+    pub fn write_overlay(&self, ov: &OverlayGpu) {
+        self.queue
+            .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
+    }
+
+    pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("primary_pass"),
+                timestamp_writes: None,
+            });
+
+            cpass.set_pipeline(&self.pipelines.primary);
+            cpass.set_bind_group(0, &self.bind_groups.primary, &[]);
+
+            let gx = (self.internal_w + 7) / 8;
+            let gy = (self.internal_h + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+
+        }
+
+        let ping = self.ping;
+        let pong = 1 - ping;
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("godray_pass"),
+                timestamp_writes: None,
+            });
+
+            cpass.set_pipeline(&self.pipelines.godray);
+            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
+            cpass.set_bind_group(1, &self.bind_groups.godray[ping], &[]);
+
+            let qw = quarter_dim(self.internal_w);
+            let qh = quarter_dim(self.internal_h);
+
+            let gx = (qw + 7) / 8;
+            let gy = (qh + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+
+        }
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("composite_pass"),
+                timestamp_writes: None,
+            });
+
+            cpass.set_pipeline(&self.pipelines.composite);
+
+            // group(0) must match layouts.scene now
+            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
+
+            // group(1) is still empty (or you can omit setting it)
+            cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
+
+            // group(2) is your composite textures
+            cpass.set_bind_group(2, &self.bind_groups.composite[pong], &[]);
+
+            let gx = (width + 7) / 8;
+            let gy = (height + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+
+        }
+
+        self.ping = pong;
+    }
+
+    pub fn encode_blit(&self, encoder: &mut wgpu::CommandEncoder, frame_view: &wgpu::TextureView) {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("blit_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: frame_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        rpass.set_pipeline(&self.pipelines.blit);
+        rpass.set_bind_group(0, &self.bind_groups.blit, &[]);
+        rpass.draw(0..3, 0..1);
+    }
+
+    pub fn apply_chunk_uploads(&self, uploads: Vec<ChunkUpload>) {
+        let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
+        let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
+        let u32_stride  = std::mem::size_of::<u32>() as u64;
+        let rope_stride = std::mem::size_of::<crate::render::gpu_types::NodeRopesGpu>() as u64;
+
+        for u in uploads {
+            // meta
+            if u.slot < self.buffers.chunk_capacity {
+                let meta_off = (u.slot as u64) * meta_stride;
+                self.queue.write_buffer(&self.buffers.chunk, meta_off, bytemuck::bytes_of(&u.meta));
+            }
+
+            // nodes
+            if !u.nodes.is_empty() {
+                let needed = u.nodes.len() as u32;
+                if u.node_base + needed <= self.buffers.node_capacity {
+                    let node_off = (u.node_base as u64) * node_stride;
+                    self.queue.write_buffer(&self.buffers.node, node_off, bytemuck::cast_slice(u.nodes.as_ref()));
+                }
+            }
+
+            // macro occupancy
+            if !u.macro_words.is_empty() {
+                let needed = u.macro_words.len() as u32;
+                if u.meta.macro_base + needed <= self.buffers.macro_capacity_u32 {
+                    let off = (u.meta.macro_base as u64) * u32_stride;
+                    self.queue.write_buffer(&self.buffers.macro_occ, off, bytemuck::cast_slice(u.macro_words.as_ref()));
+                }
+            }
+
+            if !u.ropes.is_empty() {
+                let needed = u.ropes.len() as u32;
+                if u.node_base + needed <= self.buffers.rope_capacity {
+                    let rope_off = (u.node_base as u64) * rope_stride;
+                    self.queue.write_buffer(&self.buffers.node_ropes, rope_off, bytemuck::cast_slice(u.ropes.as_ref()));
+                }
+            }
+
+            // colinfo (64*64 columns packed => 2048 u32 per chunk)
+            if !u.colinfo_words.is_empty() {
+                let needed = u.colinfo_words.len() as u32;
+                if u.meta.colinfo_base + needed <= self.buffers.colinfo_capacity_u32 {
+                    let off = (u.meta.colinfo_base as u64) * u32_stride;
+                    self.queue.write_buffer(
+                        &self.buffers.colinfo,
+                        off,
+                        bytemuck::cast_slice(u.colinfo_words.as_ref()),
+                    );
+                }
+            }
+
+        }
+    }
+
+    pub fn write_clipmap_updates(
+        &mut self,
+        clip: &crate::render::gpu_types::ClipmapGpu,
+        uploads: &[crate::clipmap::ClipmapUpload],
+    ) {
+        let scratch = &mut self.clip_scratch;
+
+        // 1) texture patches
+        for u in uploads {
+            let w = u.w as usize;
+            let h = u.h as usize;
+            if w == 0 || h == 0 { continue; }
+
+            let row_bytes = w * 2;                 // R16Float => 2 bytes/texel
+            let padded = align_up(row_bytes, 256); // required
+            let needed = padded * h;
+
+            scratch.clear();
+            scratch.resize(needed, 0);
+
+            // copy row-by-row into padded scratch
+            let src: &[u8] = bytemuck::cast_slice(&u.data_f16);
+            for row in 0..h {
+                let s0 = row * row_bytes;
+                let d0 = row * padded;
+                scratch[d0..d0 + row_bytes].copy_from_slice(&src[s0..s0 + row_bytes]);
+            }
+
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.textures.clip_height.tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: u.x, y: u.y, z: u.level },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &scratch,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(u.h),
+                },
+                wgpu::Extent3d { width: u.w, height: u.h, depth_or_array_layers: 1 },
+            );
+        }
+
+        // 2) uniform
+        self.queue.write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
+    }
+
+    pub fn internal_dims(&self) -> (u32, u32) {
+        (self.internal_w.max(1), self.internal_h.max(1))
+    }
+
+}
+
+// src/render/state/pipelines.rs
+// -----------------------------
+// src/render/state/pipelines.rs
+//
+// Pipeline creation.
+// This is intentionally isolated so the renderer logic (per-frame encoding) isn't
+// buried under wgpu setup boilerplate.
+//
+// Terminology:
+// - BindGroupLayout (BGL): describes what resources exist at @group/@binding.
+// - PipelineLayout (PL): ordered list of BGLs for group(0), group(1), ...
+// - Pipeline: compiled/validated shader entry point + fixed state + pipeline layout.
+//
+// Rule of thumb:
+// The order of BGLs in `bind_group_layouts` must match the group indices used in WGSL.
+// If a shader references @group(2), then the pipeline layout must include entries
+// for group(0) and group(1) as well (even if they're "empty" placeholders).
+
+use super::layout::Layouts;
+
+pub struct Pipelines {
+    /// Compute pipeline for the primary full-resolution pass (writes color/depth).
+    pub primary: wgpu::ComputePipeline,
+
+    /// Compute pipeline for the quarter-resolution godray pass (ping-pong temporal).
+    pub godray: wgpu::ComputePipeline,
+
+    /// Compute pipeline for the full-resolution composite pass (writes final output).
+    pub composite: wgpu::ComputePipeline,
+
+    /// Render pipeline for the final blit to the swapchain (fullscreen triangle).
+    pub blit: wgpu::RenderPipeline,
+}
+
+/// Helper to build a compute pipeline with a specific entry point and bind group layout list.
+///
+/// `bgls` order defines the pipeline layout's group indices:
+/// - bgls[0] => group(0)
+/// - bgls[1] => group(1)
+/// - ...
+fn make_compute_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    module: &wgpu::ShaderModule,
+    entry: &str,
+    bgls: &[&wgpu::BindGroupLayout],
+) -> wgpu::ComputePipeline {
+    // Create a pipeline layout named "{label}_pl" that fixes the bind group schema.
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&format!("{label}_pl")),
+        bind_group_layouts: bgls,
+        // No push constants used by these shaders.
+        push_constant_ranges: &[],
+    });
+
+    // Create the compute pipeline referencing the WGSL entry point.
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&pl),
+        module,
+        entry_point: entry,
+        compilation_options: Default::default(),
+    })
+}
+
+/// Create all pipelines (compute + blit).
+///
+/// Inputs:
+/// - `cs_module`: WGSL module containing compute entry points.
+/// - `fs_module`: WGSL module containing vertex/fragment entry points for blit.
+/// - `surface_format`: swapchain format used for the final render target.
+pub fn create_pipelines(
+    device: &wgpu::Device,
+    layouts: &Layouts,
+    cs_module: &wgpu::ShaderModule,
+    fs_module: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+) -> Pipelines {
+    // -------------------------------------------------------------------------
+    // Compute pipelines
+    // -------------------------------------------------------------------------
+
+    // Primary pass:
+    // Uses group(0) = layouts.primary, which includes:
+    // - camera + scene buffers
+    // - storage outputs for color/depth
+    let primary = make_compute_pipeline(
+        device,
+        "primary_pipeline",
+        cs_module,
+        "main_primary",
+        &[&layouts.primary],
+    );
+
+    // Godray pass:
+    // Uses:
+    //   group(0) = layouts.scene  (camera + scene buffers only)
+    //   group(1) = layouts.godray (depth sample + history sample + out storage)
+    let godray = make_compute_pipeline(
+        device,
+        "godray_pipeline",
+        cs_module,
+        "main_godray",
+        &[&layouts.scene, &layouts.godray],
+    );
+
+    // Composite pass:
+    // Shader reads from @group(2) (color + godray + output storage).
+    // wgpu requires the pipeline layout to include group(0) and group(1) slots too,
+    // so we provide empty placeholder layouts for those indices.
+    let composite = make_compute_pipeline(
+        device,
+        "composite_pipeline",
+        cs_module,
+        "main_composite",
+        // group(0)=scene (cam + buffers), group(1)=empty, group(2)=composite textures
+        &[&layouts.scene, &layouts.empty, &layouts.composite],
+    );
+
+    // -------------------------------------------------------------------------
+    // Render pipeline: blit
+    // -------------------------------------------------------------------------
+    //
+    // Full-screen triangle approach:
+    // - No vertex buffers.
+    // - Vertex shader generates positions from vertex_index.
+    // - Fragment shader samples the renderer output texture.
+
+    // Pipeline layout for blit uses a single bind group: group(0) = layouts.blit.
+    let blit_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("blit_pl"),
+        bind_group_layouts: &[&layouts.blit],
+        push_constant_ranges: &[],
+    });
+
+    // Render pipeline state:
+    // - Targets the swapchain format.
+    // - Uses REPLACE blending (overwrite framebuffer).
+    // - Default primitive/multisample state is fine for a simple fullscreen draw.
+    let blit = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("blit_pipeline"),
+        layout: Some(&blit_pl),
+        vertex: wgpu::VertexState {
+            module: fs_module,
+            entry_point: "vs_main",
+            // No vertex buffers; vertices are synthesized in the vertex shader.
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: fs_module,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                // Overwrite swapchain pixel with sampled color.
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        // Default triangle list, CCW front face, etc. (fullscreen triangle doesn't care much).
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+
+    Pipelines {
+        primary,
+        godray,
+        composite,
+        blit,
+    }
+}
+
+// src/render/state/textures.rs
+// ----------------------------
+// src/render/state/textures.rs
+// ----------------------------
+
+use crate::{
+    config,
+    render::resources::{create_output_texture, OutputTex},
+};
+
+pub struct Tex2D {
+    pub view: wgpu::TextureView,
+}
+
+pub struct Tex2DArray {
+    pub tex: wgpu::Texture,
+    pub view: wgpu::TextureView,
+}
+
+pub struct TextureSet {
+    pub output: OutputTex,
+    pub color: Tex2D,
+    pub depth: Tex2D,
+    pub godray: [Tex2D; 2],
+
+    pub clip_height: Tex2DArray,
+}
+
+pub fn quarter_dim(x: u32) -> u32 {
+    (x + 3) / 4
+}
+
+fn make_tex2d(
+    device: &wgpu::Device,
+    label: &str,
+    w: u32,
+    h: u32,
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+) -> Tex2D {
+    let w = w.max(1);
+    let h = h.max(1);
+
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    });
+
+    let view = tex.create_view(&Default::default());
+    Tex2D { view }
+}
+
+fn make_tex2d_array(
+    device: &wgpu::Device,
+    label: &str,
+    w: u32,
+    h: u32,
+    layers: u32,
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+) -> Tex2DArray {
+    let w = w.max(1);
+    let h = h.max(1);
+    let layers = layers.max(1);
+
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: layers,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    });
+
+    let view = tex.create_view(&wgpu::TextureViewDescriptor {
+        label: Some(&format!("{label}_view")),
+        format: Some(format),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        aspect: wgpu::TextureAspect::All,
+        base_mip_level: 0,
+        mip_level_count: Some(1),
+        base_array_layer: 0,
+        array_layer_count: Some(layers),
+    });
+
+    Tex2DArray { tex, view }
+}
+
+pub fn create_textures(
+    device: &wgpu::Device,
+    out_w: u32,
+    out_h: u32,
+    internal_w: u32,
+    internal_h: u32,
+) -> TextureSet {
+
+    let rw_tex_usage =
+        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
+
+    let output = create_output_texture(device, out_w, out_h);
+
+    let color = make_tex2d(
+        device,
+        "color_tex",
+        internal_w,
+        internal_h,
+        wgpu::TextureFormat::Rgba16Float,
+        rw_tex_usage,
+    );
+
+    let depth = make_tex2d(
+        device,
+        "depth_tex",
+        internal_w,
+        internal_h,
+        wgpu::TextureFormat::R32Float,
+        rw_tex_usage,
+    );
+
+    let qw = quarter_dim(internal_w);
+    let qh = quarter_dim(internal_h);
+
+    let godray = [
+        make_tex2d(device, "godray_a", qw, qh, wgpu::TextureFormat::Rgba16Float, rw_tex_usage),
+        make_tex2d(device, "godray_b", qw, qh, wgpu::TextureFormat::Rgba16Float, rw_tex_usage),
+    ];
+
+
+    // FP16 clipmap height: R16Float (half bandwidth vs R32Float)
+    let clip_height = make_tex2d_array(
+        device,
+        "clip_height",
+        config::CLIPMAP_RES,
+        config::CLIPMAP_RES,
+        config::CLIPMAP_LEVELS,
+        wgpu::TextureFormat::R16Float,
+        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+    );
+
+    TextureSet {
+        output,
+        color,
+        depth,
+        godray,
+        clip_height,
+    }
+}
+
 // src/streaming/cache.rs
 // ----------------------
 // src/streaming/cache.rs
@@ -976,9 +2610,17 @@ impl ChunkManager {
         let mut out = Vec::new();
         let mut bytes = 0usize;
 
-        // Helper: pop next upload in priority order (rewrites -> active -> other)
+        let mut rewrites_taken = 0usize;
+        let rewrite_cap = 4; // tune: 2..8
+
         let mut pop_next = |mgr: &mut ChunkManager| -> Option<(u8, ChunkUpload)> {
-            if let Some(u) = mgr.uploads_rewrite.pop_front() { return Some((0, u)); }
+            // only take a few rewrites per frame; then prioritize ACTIVE residency uploads
+            if rewrites_taken < rewrite_cap {
+                if let Some(u) = mgr.uploads_rewrite.pop_front() {
+                    rewrites_taken += 1;
+                    return Some((0, u));
+                }
+            }
             if let Some(u) = mgr.uploads_active.pop_front()  { return Some((1, u)); }
             if let Some(u) = mgr.uploads_other.pop_front()   { return Some((2, u)); }
             None
@@ -1034,11 +2676,10 @@ impl ChunkManager {
         dx.abs() + dz.abs() + 2.0 * dy.abs()
     }
 
-
-
     pub fn commit_uploads_applied(&mut self, applied: &[ChunkUpload]) -> bool {
         let mut any_promoted = false;
 
+        // Mark uploads as applied.
         for u in applied {
             if !u.completes_residency { continue; }
             if let Some(ChunkState::Uploading(up)) = self.chunks.get_mut(&u.key) {
@@ -1046,9 +2687,74 @@ impl ChunkManager {
             }
         }
 
+        // We’ll score candidates by distance to current center; ACTIVE gets a big bonus.
+        let center_opt = self.last_center;
+
         loop {
             if self.resident_slots >= self.slot_to_key.len() { break; }
 
+            // If the next slot is ready, promote it directly.
+            let next_key = self.slot_to_key[self.resident_slots];
+            let next_ready = matches!(
+                self.chunks.get(&next_key),
+                Some(ChunkState::Uploading(Uploading { uploaded: true, .. }))
+            );
+
+            if !next_ready {
+                // Find the best READY uploading chunk in [resident_slots..].
+                let mut best: Option<(f32, usize)> = None;
+
+                for s in self.resident_slots..self.slot_to_key.len() {
+                    let k = self.slot_to_key[s];
+
+                    let Some(ChunkState::Uploading(up)) = self.chunks.get(&k) else { continue; };
+                    if !up.uploaded { continue; }
+
+                    let mut score = if let Some(c) = center_opt {
+                        Self::upload_dist_score(k, c)
+                    } else {
+                        s as f32
+                    };
+
+                    if let Some(c) = center_opt {
+                        if self.in_active_xz(c, k) {
+                            score -= 10_000.0; // huge preference for ACTIVE
+                        }
+                    }
+
+                    if best.map_or(true, |(bs, _)| score < bs) {
+                        best = Some((score, s));
+                    }
+                }
+
+                let Some((_, best_slot)) = best else {
+                    // No ready uploads to promote this frame.
+                    break;
+                };
+
+                if best_slot != self.resident_slots {
+                    // Swap the ready chunk into the promotion frontier slot.
+                    self.swap_slots(best_slot, self.resident_slots);
+
+                    // IMPORTANT:
+                    // The chunk we swapped in was already uploaded, but its slot changed,
+                    // so macro/colinfo/meta bases changed => rewrite this slot ASAP.
+                    self.enqueue_slot_rewrite(self.resident_slots);
+
+                    // If the chunk swapped out was ALSO already uploaded, it now lives at best_slot
+                    // and needs a rewrite too (avoid visual corruption).
+                    let swapped_out_key = self.slot_to_key[best_slot];
+                    let swapped_out_uploaded = matches!(
+                        self.chunks.get(&swapped_out_key),
+                        Some(ChunkState::Uploading(Uploading { uploaded: true, .. }))
+                    );
+                    if swapped_out_uploaded {
+                        self.enqueue_slot_rewrite(best_slot);
+                    }
+                }
+            }
+
+            // Now the frontier slot should be ready; promote it.
             let slot = self.resident_slots;
             let key = self.slot_to_key[slot];
 
@@ -1063,9 +2769,7 @@ impl ChunkManager {
                     let slot_u32 = up.slot;
                     let node_base = up.node_base;
                     let node_count = up.node_count;
-
                     *st = ChunkState::Resident(Resident { slot: slot_u32, node_base, node_count });
-
                     self.resident_slots += 1;
                     any_promoted = true;
                     continue;
@@ -1086,6 +2790,7 @@ impl ChunkManager {
 
         false
     }
+
 
     #[inline]
     fn compute_ground_cy_at_column(&self, world: &WorldGen, cx: i32, cz: i32) -> i32 {
@@ -1214,23 +2919,24 @@ impl ChunkManager {
     #[inline]
     fn enqueue_upload(&mut self, u: ChunkUpload) {
         if !u.completes_residency {
-            // rewrites should be ASAP; preserve old behavior (push_front)
             self.uploads_rewrite.push_front(u);
             return;
         }
 
-        // If we don't know center yet, treat as "other"
         let Some(center) = self.last_center else {
             self.uploads_other.push_back(u);
             return;
         };
 
         if self.in_active_xz(center, u.key) {
-            self.uploads_active.push_back(u);
+            // was: push_back
+            Self::insert_upload_sorted_by_center(&mut self.uploads_active, u, center);
         } else {
+            // keep other FIFO or also sort if you want
             self.uploads_other.push_back(u);
         }
     }
+
 
     /// When the center changes, ACTIVE membership changes too.
     /// Rebucket only active/other; rewrites remain rewrites.
@@ -1260,6 +2966,22 @@ impl ChunkManager {
         self.uploads_other  = new_other;
     }
 
+    #[inline]
+    fn insert_upload_sorted_by_center(
+        q: &mut std::collections::VecDeque<ChunkUpload>,
+        u: ChunkUpload,
+        center: ChunkKey,
+    ) {
+        let us = ChunkManager::upload_dist_score(u.key, center);
+
+        // Insert before the first element that has a worse (larger) score.
+        let pos = q
+            .iter()
+            .position(|e| ChunkManager::upload_dist_score(e.key, center) > us)
+            .unwrap_or(q.len());
+
+        q.insert(pos, u);
+    }
 
 
 

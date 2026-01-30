@@ -842,9 +842,17 @@ impl ChunkManager {
         let mut out = Vec::new();
         let mut bytes = 0usize;
 
-        // Helper: pop next upload in priority order (rewrites -> active -> other)
+        let mut rewrites_taken = 0usize;
+        let rewrite_cap = 4; // tune: 2..8
+
         let mut pop_next = |mgr: &mut ChunkManager| -> Option<(u8, ChunkUpload)> {
-            if let Some(u) = mgr.uploads_rewrite.pop_front() { return Some((0, u)); }
+            // only take a few rewrites per frame; then prioritize ACTIVE residency uploads
+            if rewrites_taken < rewrite_cap {
+                if let Some(u) = mgr.uploads_rewrite.pop_front() {
+                    rewrites_taken += 1;
+                    return Some((0, u));
+                }
+            }
             if let Some(u) = mgr.uploads_active.pop_front()  { return Some((1, u)); }
             if let Some(u) = mgr.uploads_other.pop_front()   { return Some((2, u)); }
             None
@@ -900,16 +908,18 @@ impl ChunkManager {
         dx.abs() + dz.abs() + 2.0 * dy.abs()
     }
 
-
-
     pub fn commit_uploads_applied(&mut self, applied: &[ChunkUpload]) -> bool {
         let mut any_promoted = false;
+        let mut any_uploaded_flip = false;
 
-        // Mark uploads as applied.
+        // Mark uploads as applied; detect first-time flip.
         for u in applied {
             if !u.completes_residency { continue; }
             if let Some(ChunkState::Uploading(up)) = self.chunks.get_mut(&u.key) {
-                up.uploaded = true;
+                if !up.uploaded {
+                    up.uploaded = true;
+                    any_uploaded_flip = true;
+                }
             }
         }
 
@@ -1014,7 +1024,17 @@ impl ChunkManager {
             return true;
         }
 
-        false
+        let grid_changed = any_uploaded_flip || any_promoted;
+        if grid_changed {
+            self.grid_dirty = true;
+
+            if let Some(center) = self.last_center {
+                self.rebuild_grid(center);
+                self.grid_dirty = false;
+            }
+        }
+
+        grid_changed
     }
 
 
@@ -1145,23 +1165,24 @@ impl ChunkManager {
     #[inline]
     fn enqueue_upload(&mut self, u: ChunkUpload) {
         if !u.completes_residency {
-            // rewrites should be ASAP; preserve old behavior (push_front)
             self.uploads_rewrite.push_front(u);
             return;
         }
 
-        // If we don't know center yet, treat as "other"
         let Some(center) = self.last_center else {
             self.uploads_other.push_back(u);
             return;
         };
 
         if self.in_active_xz(center, u.key) {
-            self.uploads_active.push_back(u);
+            // was: push_back
+            Self::insert_upload_sorted_by_center(&mut self.uploads_active, u, center);
         } else {
+            // keep other FIFO or also sort if you want
             self.uploads_other.push_back(u);
         }
     }
+
 
     /// When the center changes, ACTIVE membership changes too.
     /// Rebucket only active/other; rewrites remain rewrites.
@@ -1191,6 +1212,22 @@ impl ChunkManager {
         self.uploads_other  = new_other;
     }
 
+    #[inline]
+    fn insert_upload_sorted_by_center(
+        q: &mut std::collections::VecDeque<ChunkUpload>,
+        u: ChunkUpload,
+        center: ChunkKey,
+    ) {
+        let us = ChunkManager::upload_dist_score(u.key, center);
+
+        // Insert before the first element that has a worse (larger) score.
+        let pos = q
+            .iter()
+            .position(|e| ChunkManager::upload_dist_score(e.key, center) > us)
+            .unwrap_or(q.len());
+
+        q.insert(pos, u);
+    }
 
 
 
