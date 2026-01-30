@@ -28,26 +28,21 @@ use crate::{
 pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
     let mut app = App::new(window).await;
 
-    event_loop
-        .run(move |event, elwt| {
-            elwt.set_control_flow(ControlFlow::Wait);
+    event_loop.run(move |event, elwt| {
+        elwt.set_control_flow(ControlFlow::Poll); // use Poll while profiling
 
-            match &event {
-                Event::AboutToWait => {
-                    app.window.request_redraw();
-                }
-                Event::WindowEvent {
-                    event: WindowEvent::RedrawRequested,
-                    ..
-                } => {
-                    app.frame(elwt);
-                }
-                _ => {
-                    app.handle_event(event, elwt);
-                }
+        match &event {
+            Event::AboutToWait => {
+                app.window.request_redraw(); // schedule next frame
             }
-        })
-        .unwrap();
+            Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
+                app.frame(elwt); // render here only
+            }
+            _ => {
+                app.handle_event(event, elwt);
+            }
+        }
+    }).unwrap();
 }
 
 pub struct App {
@@ -75,6 +70,8 @@ pub struct App {
     fps_last: Instant,
 
     frame_index: u32,
+
+    profiler: crate::profiler::FrameProf,
 }
 
 impl App {
@@ -97,12 +94,23 @@ impl App {
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps.formats[0];
 
+        let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+            wgpu::PresentMode::Fifo
+        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+            wgpu::PresentMode::Immediate
+        } else {
+            surface_caps.present_modes[0]
+        };
+
+
         let config_sc = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: surface_caps.present_modes[0],
+            present_mode: present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -139,6 +147,7 @@ impl App {
             fps_frames: 0,
             fps_last: Instant::now(),
             frame_index: 0,
+            profiler: crate::profiler::FrameProf::new(),
         }
     }
 
@@ -174,36 +183,51 @@ impl App {
                 }
             }
 
-            Event::AboutToWait => self.frame(elwt),
-
             _ => {}
         }
     }
 
     fn frame(&mut self, elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
+        let frame_t0 = Instant::now();
+
         // 1) camera integrate
+        let t0 = Instant::now();
         self.camera.integrate_input(&mut self.input);
         self.frame_index = self.frame_index.wrapping_add(1);
+        self.profiler.cam(crate::profiler::FrameProf::mark_ms(t0));
 
         // 2) streaming update
+        let t0 = Instant::now();
         let cam_pos = self.camera.position();
         let cam_fwd = self.camera.forward();
         let grid_changed = self.chunks.update(&self.world, cam_pos, cam_fwd);
         if grid_changed {
             self.renderer.write_chunk_grid(self.chunks.chunk_grid());
         }
+        self.profiler.stream(crate::profiler::FrameProf::mark_ms(t0));
 
-        // 3) clipmap update (CPU only; DO NOT write to GPU here)
+        // 3) clipmap update (CPU only)
+        let t0 = Instant::now();
         let t = self.start_time.elapsed().as_secs_f32();
         let (clip_params_cpu, clip_uploads) = self.clipmap.update(self.world.as_ref(), cam_pos, t);
         let clip_gpu = ClipmapGpu::from_cpu(&clip_params_cpu);
+        self.profiler
+            .clip_update(crate::profiler::FrameProf::mark_ms(t0));
 
-        // 4) camera matrices -> CameraGpu
+        // count clip uploads + bytes (R16 => 2 bytes/texel)
+        let clip_bytes: usize = clip_uploads
+            .iter()
+            .map(|u| (u.w as usize) * (u.h as usize) * 2)
+            .sum();
+        self.profiler
+            .add_clip_uploads(clip_uploads.len(), clip_bytes);
+
+        // 4) camera matrices -> CameraGpu + write
+        let t0 = Instant::now();
         let aspect = self.config.width as f32 / self.config.height as f32;
         let cf = self.camera.frame_matrices(aspect);
 
         let max_steps = (config::CHUNK_SIZE * 2).clamp(64, 256);
-
         let (rw, rh) = self.renderer.internal_dims();
 
         let cam_gpu = CameraGpu {
@@ -234,8 +258,10 @@ impl App {
         };
 
         self.renderer.write_camera(&cam_gpu);
+        self.profiler.cam_write(crate::profiler::FrameProf::mark_ms(t0));
 
         // 5) fps overlay
+        let t0 = Instant::now();
         self.fps_frames += 1;
         let dt = self.fps_last.elapsed().as_secs_f32();
         if dt >= 0.25 {
@@ -245,36 +271,46 @@ impl App {
             self.fps_last = Instant::now();
         }
 
-        let overlay = OverlayGpu::from_fps_and_dims(
-            self.fps_value,
-            self.config.width,
-            self.config.height,
-            8, // scale
-        );
+        let overlay = OverlayGpu::from_fps_and_dims(self.fps_value, self.config.width, self.config.height, 8);
         self.renderer.write_overlay(&overlay);
+        self.profiler.overlay(crate::profiler::FrameProf::mark_ms(t0));
 
-        // 6) update scene buffers if changed
-        self.renderer.apply_chunk_uploads(self.chunks.take_uploads());
+        // 6) scene uploads if changed
+        let t0 = Instant::now();
+        let chunk_uploads = self.chunks.take_uploads_budgeted();
+        self.profiler.add_chunk_uploads(chunk_uploads.len());
 
-        // 7) acquire frame + encode passes
+        // commit uses a slice, so borrow before moving
+        let grid_changed2 = self.chunks.commit_uploads_applied(&chunk_uploads);
+
+        self.renderer.apply_chunk_uploads(chunk_uploads);
+
+        if grid_changed2 {
+            self.renderer.write_chunk_grid(self.chunks.chunk_grid());
+        }
+
+        self.profiler.chunk_up(crate::profiler::FrameProf::mark_ms(t0));
+
+
+        // 7) acquire frame
+        let t0 = Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
-
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface.configure(self.renderer.device(), &self.config);
                 return;
             }
-
             Err(wgpu::SurfaceError::Timeout) => return,
-
             Err(wgpu::SurfaceError::OutOfMemory) => {
                 elwt.exit();
                 return;
             }
         };
+        self.profiler.acquire(crate::profiler::FrameProf::mark_ms(t0));
 
         let frame_view = frame.texture.create_view(&Default::default());
 
+        // 8) encode passes
         let mut encoder = self
             .renderer
             .device()
@@ -282,18 +318,40 @@ impl App {
                 label: Some("encoder"),
             });
 
-        // BEFORE encode_compute:
-        self.renderer.write_clipmap_updates(&clip_gpu, &clip_uploads);
+        // IMPORTANT: if you're still on the encoder-based clipmap updates:
+        let t0 = Instant::now();
+        self.renderer
+            .write_clipmap_updates(&clip_gpu, &clip_uploads);
+        self.profiler.enc_clip(crate::profiler::FrameProf::mark_ms(t0));
 
+        let t0 = Instant::now();
         self.renderer
             .encode_compute(&mut encoder, self.config.width, self.config.height);
+        self.profiler.enc_comp(crate::profiler::FrameProf::mark_ms(t0));
 
+        let t0 = Instant::now();
         self.renderer.encode_blit(&mut encoder, &frame_view);
+        self.profiler.enc_blit(crate::profiler::FrameProf::mark_ms(t0));
 
+        // 9) submit
+        let t0 = Instant::now();
         self.renderer.queue().submit(Some(encoder.finish()));
-        
-        self.renderer.device().poll(wgpu::Maintain::Poll);
+        self.profiler.submit(crate::profiler::FrameProf::mark_ms(t0));
 
+        // 10) poll
+        let t0 = Instant::now();
+        self.renderer.device().poll(wgpu::Maintain::Poll);
+        self.profiler.poll_wait(crate::profiler::FrameProf::mark_ms(t0));
+
+        // 11) present
+        let t0 = Instant::now();
         frame.present();
+        self.profiler.present(crate::profiler::FrameProf::mark_ms(t0));
+
+        // 12) end-of-frame
+        let frame_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
+        self.profiler.end_frame(frame_ms);
     }
+
+
 }

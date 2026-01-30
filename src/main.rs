@@ -8,6 +8,7 @@ mod render;
 mod streaming;
 mod svo;
 mod world;
+pub mod profiler;
 
 use std::sync::Arc;
 use winit::{

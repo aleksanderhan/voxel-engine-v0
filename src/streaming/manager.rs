@@ -39,6 +39,9 @@ const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
 const COLINFO_WORDS_PER_CHUNK: u32 = 2048;
 const COLINFO_WORDS_PER_CHUNK_USIZE: usize = 2048;
 
+const MAX_UPLOADS_PER_FRAME: usize = 8;            // start 6–12
+const MAX_UPLOAD_BYTES_PER_FRAME: usize = 4 << 20; // start 2–8 MB
+
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 struct ChunkKey {
@@ -50,8 +53,17 @@ struct ChunkKey {
 enum ChunkState {
     Queued,
     Building,
+    Uploading(Uploading),
     Resident(Resident),
 }
+
+#[derive(Clone, Debug)]
+struct Uploading {
+    slot: u32,
+    node_base: u32,
+    node_count: u32,
+}
+
 
 #[derive(Clone, Debug)]
 struct Resident {
@@ -88,6 +100,8 @@ pub struct ChunkUpload {
     pub ropes: Arc<[NodeRopesGpu]>,
 
     pub colinfo_words: Arc<[u32]>,
+
+    pub completes_residency: bool,
 }
 
 // -----------------------------
@@ -218,7 +232,7 @@ pub struct ChunkManager {
 
     slot_to_key: Vec<ChunkKey>,
     chunk_meta: Vec<ChunkMetaGpu>,
-    uploads: Vec<ChunkUpload>,
+    uploads: VecDeque<ChunkUpload>,
 
     changed: bool,
     grid_dirty: bool,
@@ -239,6 +253,8 @@ pub struct ChunkManager {
 
     slot_macro: Vec<Arc<[u32]>>,
     slot_colinfo: Vec<Arc<[u32]>>,
+
+    resident_slots: usize,
 }
 
 impl ChunkManager {
@@ -269,7 +285,7 @@ impl ChunkManager {
 
             slot_to_key: Vec::new(),
             chunk_meta: Vec::new(),
-            uploads: Vec::new(),
+            uploads: VecDeque::new(),
 
             changed: false,
             grid_dirty: true,
@@ -290,6 +306,9 @@ impl ChunkManager {
 
             slot_macro: Vec::new(),
             slot_colinfo: Vec::new(),
+
+            resident_slots: 0,
+
         }
     }
 
@@ -347,8 +366,6 @@ impl ChunkManager {
     }
 
     pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
-        self.uploads.clear();
-
         let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
         let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
 
@@ -385,7 +402,13 @@ impl ChunkManager {
 
 
             match self.chunks.get(&k) {
-                Some(ChunkState::Resident(_)) | Some(ChunkState::Queued) | Some(ChunkState::Building) => {}
+                Some(ChunkState::Resident(_))
+                | Some(ChunkState::Uploading(_))
+                | Some(ChunkState::Queued)
+                | Some(ChunkState::Building) => {
+                    // already exists / in progress, do nothing
+                }
+
                 None => {
                     if self.cache.get(&k).is_some() {
                         let _ = self.try_promote_from_cache(center, k);
@@ -402,6 +425,7 @@ impl ChunkManager {
                     }
                 }
             }
+
         }
 
         // Unload outside KEEP
@@ -614,7 +638,7 @@ impl ChunkManager {
     // Resident creation / promotion
     // -------------------------------
 
-    fn try_make_resident(
+    fn try_make_uploading(
         &mut self,
         center: ChunkKey,
         key: ChunkKey,
@@ -691,14 +715,10 @@ impl ChunkManager {
 
         self.chunks.insert(
             key,
-            ChunkState::Resident(Resident {
-                slot,
-                node_base,
-                node_count: need,
-            }),
+            ChunkState::Uploading(Uploading { slot, node_base, node_count: need }),
         );
 
-        self.uploads.push(ChunkUpload {
+        self.uploads.push_back(ChunkUpload {
             slot,
             meta,
             node_base,
@@ -706,10 +726,8 @@ impl ChunkManager {
             macro_words,
             ropes,
             colinfo_words,
+            completes_residency: true,
         });
-
-        self.grid_dirty = true;
-        self.changed = true;
 
         true
     }
@@ -725,7 +743,7 @@ impl ChunkManager {
         };
 
         self.cache_touch(key);
-        self.try_make_resident(center, key, nodes, macro_words, ropes, colinfo_words)
+        self.try_make_uploading(center, key, nodes, macro_words, ropes, colinfo_words)
     }
 
     fn on_build_done(
@@ -755,10 +773,90 @@ impl ChunkManager {
             return;
         }
 
-        let ok = self.try_make_resident(center, key, nodes_arc, macro_arc, ropes_arc, colinfo_arc);
+        let ok = self.try_make_uploading(center, key, nodes_arc, macro_arc, ropes_arc, colinfo_arc);
         if !ok {
             self.chunks.remove(&key);
         }
+    }
+
+    #[inline]
+    fn enqueue_slot_rewrite(&mut self, slot: usize) {
+        // Rewrite meta + per-slot macro/colinfo at the NEW slot offsets.
+        // High priority: push_front so budgeting doesn't delay correctness-critical remaps.
+        let slot_u32 = slot as u32;
+
+        self.uploads.push_front(ChunkUpload {
+            slot: slot_u32,
+            meta: self.chunk_meta[slot],
+            node_base: 0,
+            nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
+            macro_words: self.slot_macro[slot].clone(),
+            ropes: Arc::<[NodeRopesGpu]>::from(Vec::<NodeRopesGpu>::new()),
+            colinfo_words: self.slot_colinfo[slot].clone(),
+            completes_residency: false,
+        });
+    }
+
+    #[inline]
+    fn swap_pending_upload_slots(&mut self, a: u32, b: u32) {
+        if a == b {
+            return;
+        }
+
+        // Any queued uploads targeting old slot indices must follow the chunk
+        // after we swap the slot contents.
+        for u in self.uploads.iter_mut() {
+            if u.slot == a {
+                u.slot = b;
+                u.meta.macro_base = b * MACRO_WORDS_PER_CHUNK;
+                u.meta.colinfo_base = b * COLINFO_WORDS_PER_CHUNK;
+            } else if u.slot == b {
+                u.slot = a;
+                u.meta.macro_base = a * MACRO_WORDS_PER_CHUNK;
+                u.meta.colinfo_base = a * COLINFO_WORDS_PER_CHUNK;
+            }
+        }
+    }
+
+    #[inline]
+    fn swap_slots(&mut self, a: usize, b: usize) {
+        if a == b {
+            return;
+        }
+
+        let ka = self.slot_to_key[a];
+        let kb = self.slot_to_key[b];
+
+        // Swap CPU slot ownership
+        self.slot_to_key.swap(a, b);
+        self.chunk_meta.swap(a, b);
+        self.slot_macro.swap(a, b);
+        self.slot_colinfo.swap(a, b);
+
+        // Fix per-slot bases in meta for BOTH slots
+        self.chunk_meta[a].macro_base = (a as u32) * MACRO_WORDS_PER_CHUNK;
+        self.chunk_meta[a].colinfo_base = (a as u32) * COLINFO_WORDS_PER_CHUNK;
+        self.chunk_meta[b].macro_base = (b as u32) * MACRO_WORDS_PER_CHUNK;
+        self.chunk_meta[b].colinfo_base = (b as u32) * COLINFO_WORDS_PER_CHUNK;
+
+        // Update state.slot for BOTH chunks
+        if let Some(st) = self.chunks.get_mut(&ka) {
+            match st {
+                ChunkState::Resident(r) => r.slot = b as u32,
+                ChunkState::Uploading(u) => u.slot = b as u32,
+                _ => {}
+            }
+        }
+        if let Some(st) = self.chunks.get_mut(&kb) {
+            match st {
+                ChunkState::Resident(r) => r.slot = a as u32,
+                ChunkState::Uploading(u) => u.slot = a as u32,
+                _ => {}
+            }
+        }
+
+        // Retarget any queued uploads that referenced these slot indices
+        self.swap_pending_upload_slots(a as u32, b as u32);
     }
 
     fn unload_chunk(&mut self, key: ChunkKey) {
@@ -766,52 +864,66 @@ impl ChunkManager {
 
         match state {
             ChunkState::Resident(res) => {
+                // Free node arena allocation
                 self.arena.free(res.node_base, res.node_count);
 
-                let dead_slot = res.slot as usize;
+                let dead = res.slot as usize;
+
+                // --- Step 1: keep resident prefix dense ---
+                // Swap dead resident slot with last resident slot.
+                let last_res = self.resident_slots.saturating_sub(1);
+                debug_assert!(dead < self.resident_slots, "resident slot out of prefix");
+
+                if dead != last_res {
+                    self.swap_slots(dead, last_res);
+
+                    // dead now holds a DIFFERENT resident chunk; rewrite it immediately
+                    self.enqueue_slot_rewrite(dead);
+                }
+
+                // Removed resident is now sitting at `last_res` (which is about to become uploading boundary)
+                self.resident_slots = last_res;
+
+                // --- Step 2: remove physical slot entry (compact arrays) ---
+                let remove_idx = last_res;
                 let last_slot = self.slot_to_key.len().saturating_sub(1);
 
-                if dead_slot != last_slot {
-                    let moved_key = self.slot_to_key[last_slot];
-                    self.slot_to_key[dead_slot] = moved_key;
+                if remove_idx != last_slot {
+                    // This may swap with an Uploading slot. That's OK because swap_slots()
+                    // also retargets any pending uploads.
+                    self.swap_slots(remove_idx, last_slot);
 
-                    let mut moved_meta = self.chunk_meta[last_slot];
-                    moved_meta.macro_base = (dead_slot as u32) * MACRO_WORDS_PER_CHUNK;
-                    moved_meta.colinfo_base = (dead_slot as u32) * COLINFO_WORDS_PER_CHUNK;
-                    self.chunk_meta[dead_slot] = moved_meta;
+                    // remove_idx now holds the moved chunk (resident or uploading); if it's resident, it
+                    // must be correct immediately; if it's uploading, rewrite is still fine (and cheap).
+                    self.enqueue_slot_rewrite(remove_idx);
+                }
 
-                    self.slot_macro.swap(dead_slot, last_slot);
-                    self.slot_colinfo.swap(dead_slot, last_slot);
+                // Drop the last slot
+                self.slot_to_key.pop();
+                self.chunk_meta.pop();
+                self.slot_macro.pop();
+                self.slot_colinfo.pop();
 
-                    if let Some(st) = self.chunks.get_mut(&moved_key) {
-                        if let ChunkState::Resident(mr) = st {
-                            mr.slot = dead_slot as u32;
-                        }
-                    }
+                self.grid_dirty = true;
+                self.changed = true;
+            }
 
-                    let moved_macro = self
-                        .cache
-                        .get(&moved_key)
-                        .map(|e| e.macro_words.clone())
-                        .unwrap_or_else(|| Arc::<[u32]>::from(vec![0u32; MACRO_WORDS_PER_CHUNK_USIZE]));
+            ChunkState::Uploading(up) => {
+                // Uploading chunks also allocated arena + slots. They may still have pending uploads.
+                self.arena.free(up.node_base, up.node_count);
 
-                    let moved_colinfo = self
-                        .cache
-                        .get(&moved_key)
-                        .map(|e| e.colinfo_words.clone())
-                        .unwrap_or_else(|| Arc::<[u32]>::from(vec![0u32; COLINFO_WORDS_PER_CHUNK_USIZE]));
+                let dead = up.slot as usize;
 
-                    // Meta rewrite for moved slot (nodes/ropes unchanged on GPU; only macro_base changes)
-                    self.uploads.push(ChunkUpload {
-                        slot: dead_slot as u32,
-                        meta: self.chunk_meta[dead_slot],
-                        node_base: 0,
-                        nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
-                        macro_words: self.slot_macro[dead_slot].clone(),
-                        ropes: Arc::<[NodeRopesGpu]>::from(Vec::<NodeRopesGpu>::new()),
-                        colinfo_words: self.slot_colinfo[dead_slot].clone(),
-                    });
+                // Uploading slots should be outside the resident prefix
+                debug_assert!(dead >= self.resident_slots, "uploading slot inside resident prefix");
 
+                let last_slot = self.slot_to_key.len().saturating_sub(1);
+
+                if dead != last_slot {
+                    self.swap_slots(dead, last_slot);
+
+                    // dead now holds moved uploading chunk; keep its slot data consistent
+                    self.enqueue_slot_rewrite(dead);
                 }
 
                 self.slot_to_key.pop();
@@ -819,7 +931,7 @@ impl ChunkManager {
                 self.slot_macro.pop();
                 self.slot_colinfo.pop();
 
-                self.grid_dirty = true;
+                // grid/chunk_count exclude uploading, so typically no grid change
                 self.changed = true;
             }
 
@@ -832,6 +944,7 @@ impl ChunkManager {
             }
         }
     }
+
 
     #[inline]
     fn keep_origin_for(&self, center: ChunkKey) -> [i32; 3] {
@@ -855,7 +968,10 @@ impl ChunkManager {
         }
         self.chunk_grid.fill(INVALID_U32);
 
-        for (slot, &k) in self.slot_to_key.iter().enumerate() {
+        // IMPORTANT: only residents live in [0 .. resident_slots)
+        let n = self.resident_slots.min(self.slot_to_key.len());
+        for slot in 0..n {
+            let k = self.slot_to_key[slot];
             if let Some(idx) = self.grid_index_for_chunk(k) {
                 self.chunk_grid[idx] = slot as u32;
             }
@@ -892,7 +1008,7 @@ impl ChunkManager {
     // -------------------------------------------------------------------------
 
     pub fn chunk_count(&self) -> u32 {
-        self.slot_to_key.len() as u32
+        self.resident_slots as u32
     }
 
     pub fn grid_origin(&self) -> [i32; 3] {
@@ -907,7 +1023,105 @@ impl ChunkManager {
         &self.chunk_grid
     }
 
-    pub fn take_uploads(&mut self) -> Vec<ChunkUpload> {
-        std::mem::take(&mut self.uploads)
+    #[inline]
+    fn upload_bytes(u: &ChunkUpload) -> usize {
+        // meta always written (one struct)
+        let mut b = size_of::<ChunkMetaGpu>();
+
+        b += u.nodes.len() * size_of::<NodeGpu>();
+        b += u.macro_words.len() * size_of::<u32>();
+        b += u.ropes.len() * size_of::<NodeRopesGpu>();
+        b += u.colinfo_words.len() * size_of::<u32>();
+        b
     }
+
+    pub fn take_uploads(&mut self) -> Vec<ChunkUpload> {
+        // drain everything (old behavior, but VecDeque-compatible)
+        self.uploads.drain(..).collect()
+    }
+
+    pub fn take_uploads_budgeted(&mut self) -> Vec<ChunkUpload> {
+        const MAX_UPLOADS_PER_FRAME: usize = 8;            // tune: 4–12
+        const MAX_UPLOAD_BYTES_PER_FRAME: usize = 4 << 20; // tune: 2–8 MB
+
+        #[inline]
+        fn upload_bytes(u: &ChunkUpload) -> usize {
+            use std::mem::size_of;
+            size_of::<ChunkMetaGpu>()
+                + u.nodes.len() * size_of::<NodeGpu>()
+                + u.macro_words.len() * size_of::<u32>()
+                + u.ropes.len() * size_of::<NodeRopesGpu>()
+                + u.colinfo_words.len() * size_of::<u32>()
+        }
+
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+
+        while let Some(u) = self.uploads.front() {
+            if out.len() >= MAX_UPLOADS_PER_FRAME {
+                break;
+            }
+
+            let ub = upload_bytes(u);
+            if bytes + ub > MAX_UPLOAD_BYTES_PER_FRAME && !out.is_empty() {
+                break;
+            }
+
+            bytes += ub;
+            out.push(self.uploads.pop_front().unwrap());
+        }
+
+        out
+    }
+
+    pub fn commit_uploads_applied(&mut self, applied: &[ChunkUpload]) -> bool {
+    let mut any_promoted = false;
+
+    for u in applied {
+        if !u.completes_residency {
+            continue;
+        }
+
+        let slot = u.slot as usize;
+
+        // With FIFO uploads, this should always be true.
+        if slot != self.resident_slots {
+            // If this ever triggers, you have out-of-order promotion.
+            // For now: skip promotion to keep invariants safe.
+            continue;
+        }
+
+        let key = self.slot_to_key[slot];
+
+        if let Some(st) = self.chunks.get_mut(&key) {
+            if let ChunkState::Uploading(up) = st {
+                *st = ChunkState::Resident(Resident {
+                    slot: up.slot,
+                    node_base: up.node_base,
+                    node_count: up.node_count,
+                });
+
+                self.resident_slots += 1;
+                any_promoted = true;
+            }
+        }
+    }
+
+    if any_promoted {
+        self.grid_dirty = true;
+        self.changed = true;
+
+        // Rebuild now (we have last_center from update)
+        if let Some(center) = self.last_center {
+            self.rebuild_grid(center);
+            self.grid_dirty = false;
+        }
+
+        return true; // grid changed
+    }
+
+    false
+}
+
+
 }
