@@ -71,6 +71,10 @@ pub struct ChunkManager {
 
     active_offsets: Vec<(i32, i32, i32)>,
     to_unload: Vec<ChunkKey>,
+
+    uploads_rewrite: VecDeque<ChunkUpload>, // slot rewrites (completes_residency=false)
+    uploads_active:  VecDeque<ChunkUpload>, // completes residency, inside ACTIVE xz
+    uploads_other:   VecDeque<ChunkUpload>, // completes residency, outside ACTIVE xz
 }
 
 impl ChunkManager {
@@ -123,6 +127,10 @@ impl ChunkManager {
 
             active_offsets,
             to_unload: Vec::new(),
+            
+            uploads_rewrite: VecDeque::new(),
+            uploads_active:  VecDeque::new(),
+            uploads_other:   VecDeque::new(),
         }
     }
 
@@ -212,10 +220,18 @@ impl ChunkManager {
         let origin_changed = self.col_ground_cy.is_empty() || new_origin != self.grid_origin_chunk;
 
         if origin_changed {
-            self.grid_origin_chunk = new_origin; // bounds used by ground_cy_for_column()
-            self.rebuild_column_ground(world.as_ref(), center);
-            self.grid_dirty = true; // keep-origin move implies grid needs rebuild
+            let old_origin = self.grid_origin_chunk;
+
+            // Publish new origin first so ground_cy_for_column() indexes using new origin…
+            self.grid_origin_chunk = new_origin;
+
+            // …but slide using the explicit old_origin -> new_origin transform.
+            self.update_column_ground_cache(world.as_ref(), old_origin, new_origin);
+
+            self.grid_dirty = true;
         }
+
+
 
         // --- ACTIVE: enqueue/restore chunks around camera ---
         let n_active = self.active_offsets.len();
@@ -224,9 +240,12 @@ impl ChunkManager {
             let x = center.x + dx;
             let z = center.z + dz;
 
-            let ground_cy_col = self.ground_cy_for_column(x, z).unwrap_or(center.y);
-
+            let Some(ground_cy_col) = self.ground_cy_for_column(x, z) else {
+                // If the column cache can’t answer, skip this offset for now.
+                continue;
+            };
             let k = ChunkKey { x, y: ground_cy_col + dy, z };
+
 
             match self.chunks.get(&k) {
                 Some(ChunkState::Resident(_))
@@ -254,6 +273,11 @@ impl ChunkManager {
         // --- Unload outside KEEP ---
         self.to_unload.clear();
         for &k in self.chunks.keys() {
+            // Pin active area: do not unload these (prevents pop-thrash).
+            if self.in_active_xz(center, k) {
+                continue;
+            }
+
             if !self.in_keep(center, k) {
                 self.to_unload.push(k);
             }
@@ -268,6 +292,36 @@ impl ChunkManager {
         let center_changed = self.last_center.map_or(true, |c| c != center);
         if center_changed {
             self.last_center = Some(center);
+            self.rebucket_uploads_for_center(center);
+
+            // CANCEL stale builds: worker threads are still finishing jobs from the old center.
+            // If they're not in/near ACTIVE now, stop them so CPU time goes to new nearby chunks.
+            let mut stale_building = Vec::new();
+            for (&k, st) in self.chunks.iter() {
+                if matches!(st, ChunkState::Building) && !self.in_active_xz(center, k) {
+                    stale_building.push(k);
+                }
+            }
+            for k in stale_building {
+                self.cancel_token(k).store(true, Ordering::Relaxed);
+                // Keep state as Building for now; when the canceled completion arrives,
+                // your harvest loop will drop it and remove it from self.chunks.
+            }
+            // Also cancel queued items that are already outside KEEP for the new center.
+            // (They won't be dispatched, but this keeps tokens consistent and avoids waste.)
+            let mut stale_queued = Vec::new();
+            for (&k, st) in self.chunks.iter() {
+                if matches!(st, ChunkState::Queued) && !self.in_keep(center, k) {
+                    stale_queued.push(k);
+                }
+            }
+            for k in stale_queued {
+                self.cancel_token(k).store(true, Ordering::Relaxed);
+                self.chunks.remove(&k);
+                self.queued_set.remove(&k);
+                // build_queue cleanup happens below via retain()
+            }
+
 
             // retain only queued + still in keep, but do it safely (no panics)
             let origin = self.grid_origin_chunk;
@@ -336,10 +390,11 @@ impl ChunkManager {
         }
 
         // --- Harvest done builds (bounded per frame) ---
-        const MAX_DONE_PER_FRAME: usize = 16;
+        let done_backlog = self.rx_done.len(); // crossbeam_channel Receiver::len() works for bounded channels
+        let max_done = (16 + done_backlog / 2).clamp(16, 64);
 
         let mut done_count = 0usize;
-        while done_count < MAX_DONE_PER_FRAME {
+        while done_count < max_done {
             let Ok(done) = self.rx_done.try_recv() else { break; };
             done_count += 1;
 
@@ -378,28 +433,52 @@ impl ChunkManager {
             return false;
         }
 
-        let mut best: Option<(f32, ChunkKey)> = None;
+        // Pass 1: evict farthest chunk that is OUTSIDE active xz.
+        let mut best_outside: Option<(f32, ChunkKey)> = None;
+
+        for &k in &self.slot_to_key {
+            if k == protect { continue; }
+            if self.in_active_xz(center, k) { continue; }
+
+            let dx = (k.x - center.x) as f32;
+            let dz = (k.z - center.z) as f32;
+            let dy = (k.y - center.y) as f32;
+            let d = dx * dx + dz * dz + 4.0 * dy * dy;
+
+            if best_outside.map_or(true, |(bd, _)| d > bd) {
+                best_outside = Some((d, k));
+            }
+        }
+
+        if let Some((_, k)) = best_outside {
+            self.unload_chunk(k);
+            return true;
+        }
+
+        // Pass 2: if everything is inside ACTIVE, evict farthest overall (last resort).
+        let mut best_any: Option<(f32, ChunkKey)> = None;
+
         for &k in &self.slot_to_key {
             if k == protect { continue; }
 
             let dx = (k.x - center.x) as f32;
             let dz = (k.z - center.z) as f32;
             let dy = (k.y - center.y) as f32;
-
             let d = dx * dx + dz * dz + 4.0 * dy * dy;
 
-            if best.map_or(true, |(bd, _)| d > bd) {
-                best = Some((d, k));
+            if best_any.map_or(true, |(bd, _)| d > bd) {
+                best_any = Some((d, k));
             }
         }
 
-        if let Some((_, k)) = best {
+        if let Some((_, k)) = best_any {
             self.unload_chunk(k);
             return true;
         }
 
         false
     }
+
 
     fn try_promote_from_cache(&mut self, center: ChunkKey, key: ChunkKey) -> bool {
         let Some(e) = self.cache.get(&key) else { return false; };
@@ -509,7 +588,7 @@ impl ChunkManager {
             ChunkState::Uploading(Uploading { slot, node_base, node_count: need, uploaded: false }),
         );
 
-        self.uploads.push_back(ChunkUpload {
+        self.enqueue_upload(ChunkUpload {
             key,
             slot,
             meta,
@@ -521,6 +600,7 @@ impl ChunkManager {
             completes_residency: true,
         });
 
+
         true
     }
 
@@ -529,7 +609,7 @@ impl ChunkManager {
         let key = self.slot_to_key[slot];
         let slot_u32 = slot as u32;
 
-        self.uploads.push_front(ChunkUpload {
+        self.enqueue_upload(ChunkUpload {
             key,
             slot: slot_u32,
             meta: self.chunk_meta[slot],
@@ -540,6 +620,7 @@ impl ChunkManager {
             colinfo_words: self.slot_colinfo[slot].clone(),
             completes_residency: false,
         });
+
     }
 
     #[inline]
@@ -635,7 +716,6 @@ impl ChunkManager {
         }
 
         self.cancels.remove(&key);
-        self.cache.remove(&key);
     }
 
     fn rebuild_grid(&mut self, center: ChunkKey) {
@@ -652,14 +732,24 @@ impl ChunkManager {
         }
         self.chunk_grid.fill(INVALID_U32);
 
-        let n = self.resident_slots.min(self.slot_to_key.len());
-        for slot in 0..n {
+        // IMPORTANT: include any slot that is actually usable by the GPU.
+        for slot in 0..self.slot_to_key.len() {
             let k = self.slot_to_key[slot];
+
+            let ready = match self.chunks.get(&k) {
+                Some(ChunkState::Resident(_)) => true,
+                Some(ChunkState::Uploading(up)) => up.uploaded, // uploaded => meta + macro/colinfo + nodes are on GPU
+                _ => false,
+            };
+
+            if !ready { continue; }
+
             if let Some(idx) = self.grid_index_for_chunk(k) {
                 self.chunk_grid[idx] = slot as u32;
             }
         }
     }
+
 
     #[inline]
     fn grid_index_for_chunk(&self, k: ChunkKey) -> Option<usize> {
@@ -742,19 +832,44 @@ impl ChunkManager {
     }
 
     pub fn take_uploads_budgeted(&mut self) -> Vec<ChunkUpload> {
+        let backlog = self.uploads_len_total();
+
+        let max_uploads =
+            (MAX_UPLOADS_PER_FRAME + backlog / 4).clamp(MAX_UPLOADS_PER_FRAME, 32);
+        let max_bytes =
+            (MAX_UPLOAD_BYTES_PER_FRAME + backlog * (256 << 10)).clamp(MAX_UPLOAD_BYTES_PER_FRAME, 16 << 20);
+
         let mut out = Vec::new();
         let mut bytes = 0usize;
 
-        while let Some(mut u) = self.uploads.pop_front() {
-            if out.len() >= MAX_UPLOADS_PER_FRAME {
-                self.uploads.push_front(u);
+        // Helper: pop next upload in priority order (rewrites -> active -> other)
+        let mut pop_next = |mgr: &mut ChunkManager| -> Option<(u8, ChunkUpload)> {
+            if let Some(u) = mgr.uploads_rewrite.pop_front() { return Some((0, u)); }
+            if let Some(u) = mgr.uploads_active.pop_front()  { return Some((1, u)); }
+            if let Some(u) = mgr.uploads_other.pop_front()   { return Some((2, u)); }
+            None
+        };
+
+        // Helper: push back to the front of the same queue we popped from (so we don't reorder)
+        let mut push_front_same = |mgr: &mut ChunkManager, which: u8, u: ChunkUpload| {
+            match which {
+                0 => mgr.uploads_rewrite.push_front(u),
+                1 => mgr.uploads_active.push_front(u),
+                _ => mgr.uploads_other.push_front(u),
+            }
+        };
+
+        while let Some((which, mut u)) = pop_next(self) {
+            if out.len() >= max_uploads {
+                push_front_same(self, which, u);
                 break;
             }
 
+            // Validate slot + update meta bases (same behavior as before)
             let slot = match self.chunks.get(&u.key) {
                 Some(ChunkState::Resident(r)) => r.slot,
                 Some(ChunkState::Uploading(up)) => up.slot,
-                _ => continue,
+                _ => continue, // stale
             };
 
             u.slot = slot;
@@ -762,8 +877,10 @@ impl ChunkManager {
             u.meta.colinfo_base = slot * COLINFO_WORDS_PER_CHUNK;
 
             let ub = Self::upload_bytes(&u);
-            if bytes + ub > MAX_UPLOAD_BYTES_PER_FRAME && !out.is_empty() {
-                self.uploads.push_front(u);
+
+            // Respect byte budget: if adding this would exceed and we already have something, stop.
+            if bytes + ub > max_bytes && !out.is_empty() {
+                push_front_same(self, which, u);
                 break;
             }
 
@@ -774,9 +891,21 @@ impl ChunkManager {
         out
     }
 
+
+    #[inline(always)]
+    fn upload_dist_score(k: ChunkKey, c: ChunkKey) -> f32 {
+        let dx = (k.x - c.x) as f32;
+        let dz = (k.z - c.z) as f32;
+        let dy = (k.y - c.y) as f32;
+        dx.abs() + dz.abs() + 2.0 * dy.abs()
+    }
+
+
+
     pub fn commit_uploads_applied(&mut self, applied: &[ChunkUpload]) -> bool {
         let mut any_promoted = false;
 
+        // Mark uploads as applied.
         for u in applied {
             if !u.completes_residency { continue; }
             if let Some(ChunkState::Uploading(up)) = self.chunks.get_mut(&u.key) {
@@ -784,9 +913,74 @@ impl ChunkManager {
             }
         }
 
+        // We’ll score candidates by distance to current center; ACTIVE gets a big bonus.
+        let center_opt = self.last_center;
+
         loop {
             if self.resident_slots >= self.slot_to_key.len() { break; }
 
+            // If the next slot is ready, promote it directly.
+            let next_key = self.slot_to_key[self.resident_slots];
+            let next_ready = matches!(
+                self.chunks.get(&next_key),
+                Some(ChunkState::Uploading(Uploading { uploaded: true, .. }))
+            );
+
+            if !next_ready {
+                // Find the best READY uploading chunk in [resident_slots..].
+                let mut best: Option<(f32, usize)> = None;
+
+                for s in self.resident_slots..self.slot_to_key.len() {
+                    let k = self.slot_to_key[s];
+
+                    let Some(ChunkState::Uploading(up)) = self.chunks.get(&k) else { continue; };
+                    if !up.uploaded { continue; }
+
+                    let mut score = if let Some(c) = center_opt {
+                        Self::upload_dist_score(k, c)
+                    } else {
+                        s as f32
+                    };
+
+                    if let Some(c) = center_opt {
+                        if self.in_active_xz(c, k) {
+                            score -= 10_000.0; // huge preference for ACTIVE
+                        }
+                    }
+
+                    if best.map_or(true, |(bs, _)| score < bs) {
+                        best = Some((score, s));
+                    }
+                }
+
+                let Some((_, best_slot)) = best else {
+                    // No ready uploads to promote this frame.
+                    break;
+                };
+
+                if best_slot != self.resident_slots {
+                    // Swap the ready chunk into the promotion frontier slot.
+                    self.swap_slots(best_slot, self.resident_slots);
+
+                    // IMPORTANT:
+                    // The chunk we swapped in was already uploaded, but its slot changed,
+                    // so macro/colinfo/meta bases changed => rewrite this slot ASAP.
+                    self.enqueue_slot_rewrite(self.resident_slots);
+
+                    // If the chunk swapped out was ALSO already uploaded, it now lives at best_slot
+                    // and needs a rewrite too (avoid visual corruption).
+                    let swapped_out_key = self.slot_to_key[best_slot];
+                    let swapped_out_uploaded = matches!(
+                        self.chunks.get(&swapped_out_key),
+                        Some(ChunkState::Uploading(Uploading { uploaded: true, .. }))
+                    );
+                    if swapped_out_uploaded {
+                        self.enqueue_slot_rewrite(best_slot);
+                    }
+                }
+            }
+
+            // Now the frontier slot should be ready; promote it.
             let slot = self.resident_slots;
             let key = self.slot_to_key[slot];
 
@@ -801,9 +995,7 @@ impl ChunkManager {
                     let slot_u32 = up.slot;
                     let node_base = up.node_base;
                     let node_count = up.node_count;
-
                     *st = ChunkState::Resident(Resident { slot: slot_u32, node_base, node_count });
-
                     self.resident_slots += 1;
                     any_promoted = true;
                     continue;
@@ -824,4 +1016,183 @@ impl ChunkManager {
 
         false
     }
+
+
+    #[inline]
+    fn compute_ground_cy_at_column(&self, world: &WorldGen, cx: i32, cz: i32) -> i32 {
+        let cs = config::CHUNK_SIZE as i32;
+        let half = cs / 2;
+        let wx = cx * cs + half;
+        let wz = cz * cs + half;
+        let ground_y_vox = world.ground_height(wx, wz);
+        ground_y_vox.div_euclid(cs)
+    }
+
+    fn update_column_ground_cache(
+        &mut self,
+        world: &WorldGen,
+        old_origin: [i32; 3],
+        new_origin: [i32; 3],
+    ) {
+        let nx = (2 * config::KEEP_RADIUS + 1) as i32;
+        let nz = nx;
+        let len = (nx * nz) as usize;
+
+        // First-time or size mismatch => full rebuild.
+        if self.col_ground_cy.len() != len || self.col_ground_cy.is_empty() {
+            self.col_ground_cy.resize(len, 0);
+            let ox = new_origin[0];
+            let oz = new_origin[2];
+            for dz in 0..nz {
+                for dx in 0..nx {
+                    let cx = ox + dx;
+                    let cz = oz + dz;
+                    self.col_ground_cy[(dz * nx + dx) as usize] =
+                        self.compute_ground_cy_at_column(world, cx, cz);
+                }
+            }
+            return;
+        }
+
+        let dx_chunks = new_origin[0] - old_origin[0];
+        let dz_chunks = new_origin[2] - old_origin[2];
+
+        if dx_chunks == 0 && dz_chunks == 0 {
+            return;
+        }
+
+        // Teleport / huge jump => full rebuild.
+        if dx_chunks.abs() >= nx || dz_chunks.abs() >= nz {
+            let ox = new_origin[0];
+            let oz = new_origin[2];
+            for dz in 0..nz {
+                for dx in 0..nx {
+                    let cx = ox + dx;
+                    let cz = oz + dz;
+                    self.col_ground_cy[(dz * nx + dx) as usize] =
+                        self.compute_ground_cy_at_column(world, cx, cz);
+                }
+            }
+            return;
+        }
+
+        let old = std::mem::take(&mut self.col_ground_cy);
+        let mut newv = vec![0i32; len];
+
+        let ox_new = new_origin[0];
+        let oz_new = new_origin[2];
+
+        for iz in 0..nz {
+            for ix in 0..nx {
+                // old index = new index minus movement
+                let sx = ix - dx_chunks;
+                let sz = iz - dz_chunks;
+
+                let dst_idx = (iz * nx + ix) as usize;
+
+                if sx >= 0 && sx < nx && sz >= 0 && sz < nz {
+                    let src_idx = (sz * nx + sx) as usize;
+                    newv[dst_idx] = old[src_idx];
+                } else {
+                    let cx = ox_new + ix;
+                    let cz = oz_new + iz;
+                    newv[dst_idx] = self.compute_ground_cy_at_column(world, cx, cz);
+                }
+            }
+        }
+
+        self.col_ground_cy = newv;
+    }
+
+    #[inline]
+    fn prioritize_residency_frontier_uploads(&mut self, window: usize) {
+        if self.resident_slots >= self.slot_to_key.len() {
+            return;
+        }
+
+        let end = (self.resident_slots + window).min(self.slot_to_key.len());
+
+        // For each upcoming slot, ensure its upload (if any) is near the front.
+        for s in self.resident_slots..end {
+            let key = self.slot_to_key[s];
+
+            // Find first pending upload for that key.
+            if let Some(pos) = self.uploads.iter().position(|u| u.key == key) {
+                // Already front-ish? keep it simple.
+                if pos == 0 {
+                    continue;
+                }
+
+                // Rotate so that the found element moves to the front, preserving relative order.
+                // (VecDeque has rotate_left / rotate_right stable in std.)
+                self.uploads.rotate_left(pos);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn in_active_xz(&self, center: ChunkKey, k: ChunkKey) -> bool {
+        let dx = (k.x - center.x).abs();
+        let dz = (k.z - center.z).abs();
+        dx <= config::ACTIVE_RADIUS && dz <= config::ACTIVE_RADIUS
+    }
+
+    #[inline]
+    fn uploads_len_total(&self) -> usize {
+        self.uploads_rewrite.len() + self.uploads_active.len() + self.uploads_other.len()
+    }
+
+    #[inline]
+    fn enqueue_upload(&mut self, u: ChunkUpload) {
+        if !u.completes_residency {
+            // rewrites should be ASAP; preserve old behavior (push_front)
+            self.uploads_rewrite.push_front(u);
+            return;
+        }
+
+        // If we don't know center yet, treat as "other"
+        let Some(center) = self.last_center else {
+            self.uploads_other.push_back(u);
+            return;
+        };
+
+        if self.in_active_xz(center, u.key) {
+            self.uploads_active.push_back(u);
+        } else {
+            self.uploads_other.push_back(u);
+        }
+    }
+
+    /// When the center changes, ACTIVE membership changes too.
+    /// Rebucket only active/other; rewrites remain rewrites.
+    fn rebucket_uploads_for_center(&mut self, center: ChunkKey) {
+        let mut new_active = VecDeque::with_capacity(self.uploads_active.len());
+        let mut new_other  = VecDeque::with_capacity(self.uploads_other.len());
+
+        let ar = config::ACTIVE_RADIUS;
+
+        let mut is_active = |k: ChunkKey| {
+            let dx = (k.x - center.x).abs();
+            let dz = (k.z - center.z).abs();
+            dx <= ar && dz <= ar
+        };
+
+        for u in self.uploads_active.drain(..) {
+            if is_active(u.key) { new_active.push_back(u); }
+            else { new_other.push_back(u); }
+        }
+
+        for u in self.uploads_other.drain(..) {
+            if is_active(u.key) { new_active.push_back(u); }
+            else { new_other.push_back(u); }
+        }
+
+        self.uploads_active = new_active;
+        self.uploads_other  = new_other;
+    }
+
+
+
+
+
 }

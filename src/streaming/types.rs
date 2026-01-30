@@ -19,8 +19,8 @@ pub const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
 pub const COLINFO_WORDS_PER_CHUNK: u32 = 2048;
 pub const COLINFO_WORDS_PER_CHUNK_USIZE: usize = 2048;
 
-pub const MAX_UPLOADS_PER_FRAME: usize = 8;            // start 6–12
-pub const MAX_UPLOAD_BYTES_PER_FRAME: usize = 4 << 20; // start 2–8 MB
+pub const MAX_UPLOADS_PER_FRAME: usize = 24;            // start 6–12
+pub const MAX_UPLOAD_BYTES_PER_FRAME: usize = 16 << 20; // start 2–8 MB
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 pub struct ChunkKey {
