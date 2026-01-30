@@ -69,7 +69,7 @@ const GODRAY_KNEE_COMPOSITE : f32 = 0.25;
 //// --------------------------------------------------------------------------
 
 const FOG_HEIGHT_FALLOFF : f32 = 0.18;
-const FOG_MAX_DIST       : f32 = 100.0;
+const FOG_MAX_DIST       : f32 = 120.0;
 
 const FOG_PRIMARY_SCALE : f32 = 0.02;
 const FOG_GODRAY_SCALE  : f32 = 1.0;

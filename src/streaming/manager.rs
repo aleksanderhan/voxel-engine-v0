@@ -205,15 +205,20 @@ impl ChunkManager {
     }
 
     pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
-        // --- camera -> chunk center (x,z) and ground-based center.y ---
         let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
         let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
 
-        let ccx = cam_vx.div_euclid(config::CHUNK_SIZE as i32);
-        let ccz = cam_vz.div_euclid(config::CHUNK_SIZE as i32);
+        let cs = config::CHUNK_SIZE as i32;
+        let half = cs / 2;
 
-        let ground_y_vox = world.ground_height(cam_vx, cam_vz);
-        let ground_cy = ground_y_vox.div_euclid(config::CHUNK_SIZE as i32);
+        let ccx = cam_vx.div_euclid(cs);
+        let ccz = cam_vz.div_euclid(cs);
+
+        // IMPORTANT: sample ground at the chunk center, consistent with column cache
+        let wx = ccx * cs + half;
+        let wz = ccz * cs + half;
+        let ground_y_vox = world.ground_height(wx, wz);
+        let ground_cy = ground_y_vox.div_euclid(cs);
 
         let center = ChunkKey { x: ccx, y: ground_cy, z: ccz };
 
@@ -233,7 +238,12 @@ impl ChunkManager {
             self.grid_dirty = true;
         }
 
-
+        // --- publish new center BEFORE any enqueues so enqueue_upload() buckets correctly ---
+        let center_changed_early = self.last_center.map_or(true, |c| c != center);
+        if center_changed_early {
+            self.last_center = Some(center);
+            self.rebucket_uploads_for_center(center);
+        }
 
         // --- ACTIVE: enqueue/restore chunks around camera ---
         let n_active = self.active_offsets.len();
@@ -291,11 +301,8 @@ impl ChunkManager {
         }
 
         // --- handle center change (queue cleanup + resort) ---
-        let center_changed = self.last_center.map_or(true, |c| c != center);
+        let center_changed = center_changed_early;
         if center_changed {
-            self.last_center = Some(center);
-            self.rebucket_uploads_for_center(center);
-
             // CANCEL stale builds: worker threads are still finishing jobs from the old center.
             // If they're not in/near ACTIVE now, stop them so CPU time goes to new nearby chunks.
             let mut stale_building = Vec::new();
