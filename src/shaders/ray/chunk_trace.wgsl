@@ -97,6 +97,16 @@ fn macro_cell_query(
   return MacroCell(macro_bmin, cell, empty);
 }
 
+fn macro_refresh_empty(m: MacroDDA, macro_base: u32) -> bool {
+  if (!m.valid) { return false; }
+  let mxu = u32(m.mx);
+  let myu = u32(m.my);
+  let mzu = u32(m.mz);
+  let bit = macro_bit_index(mxu, myu, mzu);
+  return !macro_test(macro_base, bit);
+}
+
+
 
 // --------------------------------------------------------------------------
 // Key decoding -> cube
@@ -329,8 +339,12 @@ fn macro_dda_exit_t(m: MacroDDA, t_exit: f32) -> f32 {
   return min(t_exit, min(m.tMaxX, min(m.tMaxY, m.tMaxZ)));
 }
 
-fn macro_dda_step(m: ptr<function, MacroDDA>) {
-  // step to next macro cell along smallest tMax axis
+fn macro_dda_step_and_refresh(
+  m: ptr<function, MacroDDA>,
+  macro_base: u32,
+  macro_empty: ptr<function, bool>
+) {
+  // --- step to next macro cell along smallest tMax axis
   if ((*m).tMaxX < (*m).tMaxY) {
     if ((*m).tMaxX < (*m).tMaxZ) {
       (*m).mx += (*m).stepX;
@@ -349,22 +363,23 @@ fn macro_dda_step(m: ptr<function, MacroDDA>) {
     }
   }
 
-  // if we stepped outside the macro grid, mark invalid so we stop using it
+  // --- bounds check
   let md = i32(MACRO_DIM) - 1;
   if ((*m).mx < 0 || (*m).my < 0 || (*m).mz < 0 ||
       (*m).mx > md || (*m).my > md || (*m).mz > md) {
     (*m).valid = false;
+    (*macro_empty) = false;
+    return;
   }
+
+  // --- refresh cached emptiness for the new cell
+  let mxu = u32((*m).mx);
+  let myu = u32((*m).my);
+  let mzu = u32((*m).mz);
+  let bit = macro_bit_index(mxu, myu, mzu);
+  (*macro_empty) = !macro_test(macro_base, bit);
 }
 
-fn macro_dda_is_empty(m: MacroDDA, macro_base: u32) -> bool {
-  // m.valid must be true to call this
-  let mxu = u32(m.mx);
-  let myu = u32(m.my);
-  let mzu = u32(m.mz);
-  let bit = macro_bit_index(mxu, myu, mzu);
-  return !macro_test(macro_base, bit);
-}
 
 // --------------------------------------------------------------------------
 // Rewritten traversal (macro DDA + leaf/rope traversal)
@@ -399,8 +414,13 @@ fn trace_chunk_rope_interval(
 
   // Macro DDA setup (valid==false if no macro data)
   var m = macro_dda_init(ro, rd, inv, tcur, root_bmin, root_size, ch.macro_base);
+  var macro_empty: bool = false;
+  if (m.valid) {
+    let bit = macro_bit_index(u32(m.mx), u32(m.my), u32(m.mz));
+    macro_empty = !macro_test(ch.macro_base, bit);
+  }
 
-let MAX_ITERS: u32 = 256u + cam.chunk_size * 8u;
+  let MAX_ITERS: u32 = 256u + cam.chunk_size * 8u;
 
   for (var it: u32 = 0u; it < MAX_ITERS; it = it + 1u) {
     if (tcur > t_exit) { break; }
@@ -413,15 +433,15 @@ let MAX_ITERS: u32 = 256u + cam.chunk_size * 8u;
     if (m.valid) {
       t_macro_exit = macro_dda_exit_t(m, t_exit);
 
-      if (macro_dda_is_empty(m, ch.macro_base)) {
+      if (macro_empty) {
         // Jump across empty macro cell
         tcur = max(t_macro_exit, tcur) + eps_step;
         have_leaf = false;
 
         if (tcur > t_exit) { break; }
 
-        // Advance macro DDA to next macro cell
-        macro_dda_step(&m);
+        // Enter next macro cell
+        macro_dda_step_and_refresh(&m, ch.macro_base, &macro_empty);
         continue;
       }
     }
@@ -447,7 +467,7 @@ let MAX_ITERS: u32 = 256u + cam.chunk_size * 8u;
 
       if (tcur > t_exit) { break; }
 
-      macro_dda_step(&m);
+      macro_dda_step_and_refresh(&m, ch.macro_base, &macro_empty);
       // leaf can straddle macro boundaries; keep cache
       continue;
     }
@@ -473,7 +493,7 @@ let MAX_ITERS: u32 = 256u + cam.chunk_size * 8u;
 
         if (t1_probe >= t0_probe) {
           let gh = probe_grass_columns_xz_dda(
-            ro, rd,
+            ro, rd, inv,
             t0_probe, t1_probe,
             root_bmin,
             origin_vox_i,
@@ -820,6 +840,7 @@ fn colinfo_decode(e16: u32) -> ColInfo {
 fn probe_grass_columns_xz_dda(
   ro: vec3<f32>,
   rd: vec3<f32>,
+  inv: vec3<f32>,
   t0_in: f32,
   t1_in: f32,
   root_bmin: vec3<f32>,
@@ -865,8 +886,8 @@ fn probe_grass_columns_xz_dda(
   if (abs(rd.x) >= EPS_INV) {
     // Next voxel boundary in meters
     let nextX = root_bmin.x + f32(select(lx, lx + 1, stepX > 0)) * vs;
-    tMaxX   = t + (nextX - p.x) / rd.x;
-    tDeltaX = vs / abs(rd.x);
+    tMaxX   = t + (nextX - p.x) * inv.x;
+    tDeltaX = vs * abs(inv.x);
   }
 
   // Setup Z boundary crossing times
@@ -874,8 +895,8 @@ fn probe_grass_columns_xz_dda(
   var tDeltaZ: f32 = BIG_F32;
   if (abs(rd.z) >= EPS_INV) {
     let nextZ = root_bmin.z + f32(select(lz, lz + 1, stepZ > 0)) * vs;
-    tMaxZ   = t + (nextZ - p.z) / rd.z;
-    tDeltaZ = vs / abs(rd.z);
+    tMaxZ   = t + (nextZ - p.z) * inv.z;
+    tDeltaZ = vs * abs(inv.z);
   }
 
   // Safety cap: max columns crossed within a tiny leaf is small.
