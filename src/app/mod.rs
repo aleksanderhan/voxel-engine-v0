@@ -81,6 +81,10 @@ pub struct App {
     last_stream_update: Instant,
     stream_period: std::time::Duration,
 
+    physics: crate::physics::Physics,
+    physics_player: crate::physics::CharacterState,
+    physics_ctrl: crate::physics::CharacterController,
+    free_cam: bool,
 }
 
 impl App {
@@ -138,6 +142,22 @@ impl App {
 
         let clipmap = Clipmap::new();
 
+        let start_pos = glam::Vec3::new(
+            (config::CHUNK_SIZE as f32 * config::VOXEL_SIZE_M_F32) * 0.5,
+            50.0,
+            -20.0,
+        );
+        let physics = crate::physics::Physics::new(start_pos);
+
+        let player_pos = camera.position(); // start where camera starts
+        let physics_player = crate::physics::CharacterState {
+            pos: player_pos,
+            vel: glam::Vec3::ZERO,
+            on_ground: false,
+        };
+        let physics_ctrl = crate::physics::CharacterController::default();
+
+
         Self {
             window,
             start_time,
@@ -162,6 +182,10 @@ impl App {
             has_prev_vp: false,
             last_stream_update: Instant::now(),
             stream_period: std::time::Duration::from_millis(33), // 30 Hz
+            physics,
+            physics_player,
+            physics_ctrl,
+            free_cam: false,
         }
     }
 
@@ -212,13 +236,63 @@ impl App {
         self.last_frame = now;
         dt = dt.clamp(0.0, 0.05);
 
-        // 1) camera integrate
+        // ---------------------------------------------------------------------
+        // 0) input -> camera look (mouse), but NO camera translation here
+        // ---------------------------------------------------------------------
+        // We want physics to own position. Camera only owns yaw/pitch.
+        // integrate_input() currently does BOTH look + movement, so we call it with dt=0
+        // (it still consumes mouse delta and updates yaw/pitch).
+        self.camera.integrate_input(&mut self.input, 0.0);
+
+        // ---------------------------------------------------------------------
+        // 1) camera mode toggle + physics step + camera update
+        // ---------------------------------------------------------------------
         let t0 = Instant::now();
-        self.camera.integrate_input(&mut self.input, dt);
+
+        // Toggle free camera on C (edge-trigger)
+        if self.input.take_c_pressed() {
+            self.free_cam = !self.free_cam;
+
+            if self.free_cam {
+                // entering freecam: start freecam from player eye + current view
+                let eye = self.physics.player.pos + self.physics.eye_offset;
+                self.camera.set_position(eye);
+                self.camera.set_yaw_pitch(self.physics.yaw, self.physics.pitch);
+            } else {
+                // leaving freecam: adopt camera view back into physics so it doesn't snap
+                let (yaw, pitch) = self.camera.yaw_pitch();
+                self.physics.yaw = yaw;
+                self.physics.pitch = pitch;
+            }
+        }
+
+        // World query adapter (as you had)
+        let q = crate::physics::ChunkManagerQuery {
+            mgr: &self.chunks,                // or &self.chunks depending on your field name
+            world: Some(self.world.as_ref()),    // &WorldGen
+        };
+
+        if self.free_cam {
+            // 1) advance player physics WITHOUT consuming mouse/WASD
+            self.physics.step_frame_player_only(dt, &q);
+
+            // 2) free camera consumes mouse + WASD
+            self.camera.integrate_input(&mut self.input, dt);
+        } else {
+            // Follow mode: physics consumes mouse/WASD and outputs view + eye
+            let eye = self.physics.step_frame(&mut self.input, dt, &q);
+
+            self.camera.set_position(eye);
+            self.camera.set_yaw_pitch(self.physics.yaw, self.physics.pitch);
+        }
+
         self.frame_index = self.frame_index.wrapping_add(1);
         self.profiler.cam(crate::profiler::FrameProf::mark_ms(t0));
 
+
+        // ---------------------------------------------------------------------
         // 2) streaming update (THROTTLED)
+        // ---------------------------------------------------------------------
         let t0 = Instant::now();
 
         // always cheap maintenance each frame
@@ -239,8 +313,9 @@ impl App {
 
         self.profiler.stream(crate::profiler::FrameProf::mark_ms(t0));
 
-
+        // ---------------------------------------------------------------------
         // 3) clipmap update (CPU only)
+        // ---------------------------------------------------------------------
         let t0 = Instant::now();
         let t = self.start_time.elapsed().as_secs_f32();
         let cam_pos = self.camera.position();
@@ -255,7 +330,9 @@ impl App {
             .sum();
         self.profiler.add_clip_uploads(clip_uploads.len(), clip_bytes);
 
+        // ---------------------------------------------------------------------
         // 4) camera matrices -> CameraGpu + write
+        // ---------------------------------------------------------------------
         let t0 = Instant::now();
         let aspect = self.config.width as f32 / self.config.height as f32;
         let cf = self.camera.frame_matrices(aspect);
@@ -303,12 +380,14 @@ impl App {
         self.renderer.write_camera(&cam_gpu);
         self.profiler.cam_write(crate::profiler::FrameProf::mark_ms(t0));
 
+        // ---------------------------------------------------------------------
         // 5) fps overlay
+        // ---------------------------------------------------------------------
         let t0 = Instant::now();
         self.fps_frames += 1;
-        let dt = self.fps_last.elapsed().as_secs_f32();
-        if dt >= 0.25 {
-            let fps = (self.fps_frames as f32) / dt;
+        let dt_fps = self.fps_last.elapsed().as_secs_f32();
+        if dt_fps >= 0.25 {
+            let fps = (self.fps_frames as f32) / dt_fps;
             self.fps_value = fps.round() as u32;
             self.fps_frames = 0;
             self.fps_last = Instant::now();
@@ -323,7 +402,9 @@ impl App {
         self.renderer.write_overlay(&overlay);
         self.profiler.overlay(crate::profiler::FrameProf::mark_ms(t0));
 
+        // ---------------------------------------------------------------------
         // 6) scene uploads if changed
+        // ---------------------------------------------------------------------
         let t0 = Instant::now();
         let chunk_uploads = self.chunks.take_uploads_budgeted();
         self.profiler.add_chunk_uploads(chunk_uploads.len());
@@ -337,7 +418,9 @@ impl App {
 
         self.profiler.chunk_up(crate::profiler::FrameProf::mark_ms(t0));
 
+        // ---------------------------------------------------------------------
         // 7) encode passes (NO swapchain acquire yet)
+        // ---------------------------------------------------------------------
         let mut encoder = self
             .renderer
             .device()
@@ -415,6 +498,8 @@ impl App {
         let frame_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
         self.profiler.end_frame(frame_ms, ss, gpu);
     }
+
+
 
 
 }
