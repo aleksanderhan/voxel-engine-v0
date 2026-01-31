@@ -242,6 +242,10 @@ struct NodeRopes {
 struct Camera {
   view_inv    : mat4x4<f32>,
   proj_inv    : mat4x4<f32>,
+
+  view_proj: mat4x4<f32>,
+  prev_view_proj: mat4x4<f32>,
+  
   cam_pos     : vec4<f32>,
 
   chunk_size  : u32,

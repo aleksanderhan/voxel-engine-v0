@@ -284,7 +284,7 @@ fn compute_godray_quarter_pixel(
   gid: vec2<u32>,
   depth_tex: texture_2d<f32>,
   godray_hist_tex: texture_2d<f32>
-) -> vec3<f32> {
+) -> vec4<f32> {
   let fdims = textureDimensions(depth_tex);
   let ro = cam.cam_pos.xyz;
 
@@ -338,7 +338,7 @@ fn compute_godray_quarter_pixel(
 
 
   // -------------------------------------------------------------------------
-  // NEW: compute ray direction ONCE for the block center and reuse it
+  // compute ray direction ONCE for the block center and reuse it
   // Center of the 4x4 block (base + 2,2) in full-res pixel coords.
   // -------------------------------------------------------------------------
   let res_full = vec2<f32>(f32(fdims.x), f32(fdims.y));
@@ -373,42 +373,70 @@ fn compute_godray_quarter_pixel(
 
   let cur_lin = max(select(vec3<f32>(0.0), acc / wsum, wsum > 0.0), vec3<f32>(0.0));
 
-  // Load history (stored compressed), convert to linear
-  let hist_c   = textureLoad(godray_hist_tex, hip, 0).xyz;
-  let hist_lin = godray_decompress(hist_c);
-
-  // --- Your existing edge detector (keep it)
+    // --- Depth span / stability (must be computed before using dmin)
   let dmin = min(min(t_scene0, t_scene1), min(t_scene2, t_scene3));
   let dmax = max(max(t_scene0, t_scene1), max(t_scene2, t_scene3));
   let span = (dmax - dmin) / max(dmin, 1e-3);
   let edge = smoothstep(0.06, 0.30, span);
   let stable = 1.0 - edge;
 
-  // --- NEW: reactive mask in LINEAR space (prevents ghosting)
-  // Think of this as "how different is current from history?"
+  // --- Reproject history ---
+  // Use nearest surface depth in the block to reduce bleeding across edges
+  let t_hist = dmin;
+  let p_ws   = ro + rd_center * t_hist;
+
+  // Project into previous frame
+  let uv_prev = prev_uv_from_world(p_ws);
+
+  // Default: no history
+  var hist_lin = cur_lin;
+  var hist_valid = 0.0;
+
+  // current half-res uv (for velocity in pixels)
+  let hd  = textureDimensions(godray_hist_tex);
+  let hdf = vec2<f32>(f32(hd.x), f32(hd.y));
+  let uv_cur = (vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5)) / hdf;
+
+  if (in_unit_square(uv_prev)) {
+    // history sample (RGBA16F): xyz = compressed godray, w = stored depth proxy
+    let h = load_hist_bilinear(godray_hist_tex, uv_prev);
+
+    let hist_depth = h.w;
+    hist_lin = godray_decompress(h.xyz);
+
+    // --- depth rejection (disocclusion killer)
+    let depth_cur = dmin;
+    let rel = abs(hist_depth - depth_cur) / max(depth_cur, 1e-3);
+    let depth_ok = 1.0 - smoothstep(0.08, 0.20, rel);     // tighten if needed
+    let depth_sane = select(0.0, 1.0, hist_depth > 1e-3);
+
+    // --- motion rejection (fast pans)
+    let vel_px = length((uv_prev - uv_cur) * hdf);
+    let motion_ok = 1.0 - smoothstep(0.75, 2.50, vel_px);
+
+    hist_valid = depth_ok * depth_sane * motion_ok;
+  }
+
+  // --- Reactive mask in LINEAR space (prevents ghosting)
   let delta_lin = length(cur_lin - hist_lin);
+  let energy = max(length(cur_lin), 1e-3);
+  let delta_rel = delta_lin / (0.05 + energy);   // 0.05 is a soft floor
+  let react = smoothstep(0.10, 0.45, delta_rel);
 
-  // Tune these thresholds to your godray energy range.
-  // Start here; adjust after you see it.
-  let react = smoothstep(0.08, 0.45, delta_lin);
 
-  // --- NEW: clamp history around current in LINEAR space
-  // Tight clamp when stable (kills shimmer), looser when unstable edges.
-  let clamp_scale = mix(0.55, 0.18, stable);        // stable -> tighter
-  let clamp_min   = vec3<f32>(0.015);               // absolute minimum window
+  // --- Clamp history around current in LINEAR space
+  let clamp_scale = mix(0.55, 0.18, stable);
+  let clamp_min   = vec3<f32>(0.015);
   let clamp_w     = max(cur_lin * clamp_scale, clamp_min);
   let hist_lin_clamped = clamp(hist_lin, cur_lin - clamp_w, cur_lin + clamp_w);
 
-  // --- NEW: adaptive history weight (fast response when react is high)
-  // Base history: high when stable, low at edges.
-  // Then crush it when react triggers (prevents trailing/ghosting).
-  let hist_w_base = mix(0.35, 0.95, stable);        // stable -> more history
-  let hist_w      = mix(hist_w_base, 0.05, react);  // react -> almost no history
+  // --- Adaptive history weight
+  let hist_w_base = mix(0.25, 0.92, stable);      // slightly less max history helps ghosting
+  let hist_w      = mix(hist_w_base, 0.03, react) * hist_valid;
+  let out_lin     = mix(cur_lin, hist_lin_clamped, hist_w);
 
-  let out_lin = mix(cur_lin, hist_lin_clamped, hist_w);
-
-  // Store back compressed
-  return godray_compress(max(out_lin, vec3<f32>(0.0)));
+  let out_c = godray_compress(max(out_lin, vec3<f32>(0.0)));
+  return vec4<f32>(out_c, dmin);
 }
 
 fn godray_decompress(cur: vec3<f32>) -> vec3<f32> {
@@ -431,4 +459,39 @@ fn godray_sample_linear(
 ) -> vec3<f32> {
   let c = textureSampleLevel(godray_tex, godray_samp, uv, 0.0).xyz;
   return godray_decompress(c);
+}
+
+fn prev_uv_from_world(p_ws: vec3<f32>) -> vec2<f32> {
+  let clip = cam.prev_view_proj * vec4<f32>(p_ws, 1.0);
+  let invw = 1.0 / max(clip.w, 1e-6);
+  let ndc  = clip.xy * invw;          // -1..+1
+  return ndc * 0.5 + vec2<f32>(0.5);  // 0..1
+}
+
+fn in_unit_square(uv: vec2<f32>) -> bool {
+  return all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
+}
+
+fn load_hist_bilinear(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
+  let dim = textureDimensions(tex);
+  let dimf = vec2<f32>(f32(dim.x), f32(dim.y));
+
+  // texel space with pixel center convention
+  let p = uv * dimf - vec2<f32>(0.5);
+  let i0 = vec2<i32>(i32(floor(p.x)), i32(floor(p.y)));
+  let f  = fract(p);
+
+  let x0 = clamp(i0.x, 0, i32(dim.x) - 1);
+  let y0 = clamp(i0.y, 0, i32(dim.y) - 1);
+  let x1 = clamp(i0.x + 1, 0, i32(dim.x) - 1);
+  let y1 = clamp(i0.y + 1, 0, i32(dim.y) - 1);
+
+  let s00 = textureLoad(tex, vec2<i32>(x0, y0), 0);
+  let s10 = textureLoad(tex, vec2<i32>(x1, y0), 0);
+  let s01 = textureLoad(tex, vec2<i32>(x0, y1), 0);
+  let s11 = textureLoad(tex, vec2<i32>(x1, y1), 0);
+
+  let sx0 = mix(s00, s10, f.x);
+  let sx1 = mix(s01, s11, f.x);
+  return mix(sx0, sx1, f.y);
 }

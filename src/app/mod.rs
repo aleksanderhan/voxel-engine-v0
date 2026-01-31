@@ -74,6 +74,9 @@ pub struct App {
     profiler: crate::profiler::FrameProf,
 
     last_frame: Instant,
+
+    prev_view_proj: glam::Mat4,
+    has_prev_vp: bool,
 }
 
 impl App {
@@ -151,6 +154,8 @@ impl App {
             frame_index: 0,
             profiler: crate::profiler::FrameProf::new(),
             last_frame: Instant::now(),
+            prev_view_proj: glam::Mat4::IDENTITY,
+            has_prev_vp: false,
         }
     }
 
@@ -180,6 +185,8 @@ impl App {
 
                         // IMPORTANT: the resize recreated clip_height, so force reupload next frame
                         self.clipmap.invalidate_all();
+
+                        self.has_prev_vp = false;
                     }
 
                     _ => {}
@@ -238,12 +245,23 @@ impl App {
         let aspect = self.config.width as f32 / self.config.height as f32;
         let cf = self.camera.frame_matrices(aspect);
 
+        let view = cf.view_inv.inverse();
+        let proj = cf.proj_inv.inverse();
+        let vp   = proj * view;
+
+        let prev_vp = if self.has_prev_vp { self.prev_view_proj } else { vp };
+
         let max_steps = (config::CHUNK_SIZE * 2).clamp(64, 256);
         let (rw, rh) = self.renderer.internal_dims();
+
 
         let cam_gpu = CameraGpu {
             view_inv: cf.view_inv.to_cols_array_2d(),
             proj_inv: cf.proj_inv.to_cols_array_2d(),
+
+            view_proj: vp.to_cols_array_2d(),
+            prev_view_proj: prev_vp.to_cols_array_2d(),
+
             cam_pos: [cf.pos.x, cf.pos.y, cf.pos.z, 1.0],
 
             chunk_size: config::CHUNK_SIZE,
@@ -362,6 +380,9 @@ impl App {
         let t0 = Instant::now();
         frame.present();
         self.profiler.present(crate::profiler::FrameProf::mark_ms(t0));
+
+        self.prev_view_proj = vp;
+        self.has_prev_vp = true;
 
         // 12) end-of-frame
         let gpu = if self.profiler.should_print() {

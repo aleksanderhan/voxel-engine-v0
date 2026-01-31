@@ -93,9 +93,10 @@ fn main_godray(@builtin(global_invocation_id) gid3: vec3<u32>) {
   let gid = vec2<u32>(gid3.x, gid3.y);
   let hip = vec2<i32>(i32(gid.x), i32(gid.y));
 
-  let blended = compute_godray_quarter_pixel(gid, depth_tex, godray_hist_tex);
-  textureStore(godray_out, hip, vec4<f32>(blended, 1.0));
+  let out_rgba = compute_godray_quarter_pixel(gid, depth_tex, godray_hist_tex);
+  textureStore(godray_out, hip, out_rgba);
 }
+
 
 @compute @workgroup_size(8, 8, 1)
 fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
