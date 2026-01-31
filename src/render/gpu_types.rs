@@ -6,7 +6,7 @@
 // GPU uniform uses vec4 per level with packed offsets in .w.
 
 use bytemuck::{Pod, Zeroable};
-use crate::config;
+use crate::app::config;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]

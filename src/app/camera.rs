@@ -1,7 +1,6 @@
-// src/camera.rs
 use glam::{Mat4, Vec3};
 
-use crate::{config, input::InputState};
+use super::{config, input::InputState};
 
 pub struct Camera {
     pos: Vec3,
@@ -26,7 +25,11 @@ impl Camera {
     pub fn new(aspect: f32) -> Self {
         let _ = aspect; // kept for future (if you want aspect-dependent params)
         Self {
-            pos: Vec3::new((config::CHUNK_SIZE as f32 * config::VOXEL_SIZE_M_F32) * 0.5, 20.0, -20.0),
+            pos: Vec3::new(
+                (config::CHUNK_SIZE as f32 * config::VOXEL_SIZE_M_F32) * 0.5,
+                20.0,
+                -20.0,
+            ),
             yaw: 0.0,
             pitch: 0.15,
             fovy_rad: 60.0_f32.to_radians(),
@@ -34,7 +37,7 @@ impl Camera {
             z_far: 1000.0,
             speed_mps: 2.5,
             mouse_sens: 0.0025,
-            sprint_mul: 3.0
+            sprint_mul: 3.0,
         }
     }
 
@@ -87,9 +90,7 @@ impl Camera {
             let speed = if k.shift { self.speed_mps * self.sprint_mul } else { self.speed_mps };
             self.pos += vel.normalize() * (speed * dt);
         }
-
     }
-
 
     pub fn frame_matrices(&self, aspect: f32) -> CameraFrame {
         let forward = Vec3::new(
@@ -111,7 +112,5 @@ impl Camera {
 
     pub fn set_position(&mut self, p: glam::Vec3) { self.pos = p; }
     pub fn set_yaw_pitch(&mut self, yaw: f32, pitch: f32) { self.yaw = yaw; self.pitch = pitch; }
-    pub fn yaw_pitch(&self) -> (f32, f32) {
-        (self.yaw, self.pitch)
-    }
+    pub fn yaw_pitch(&self) -> (f32, f32) { (self.yaw, self.pitch) }
 }

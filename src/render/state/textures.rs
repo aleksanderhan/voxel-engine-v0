@@ -1,8 +1,8 @@
 // src/render/state/textures.rs
 // ----------------------------
 
+use crate::app::config;
 use crate::{
-    config,
     render::resources::{create_output_texture, OutputTex},
 };
 

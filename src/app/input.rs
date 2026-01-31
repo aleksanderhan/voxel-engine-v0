@@ -1,4 +1,3 @@
-// src/input.rs
 use winit::{
     event::{DeviceEvent, ElementState, KeyEvent, WindowEvent, MouseButton},
     keyboard::{KeyCode, PhysicalKey},
@@ -15,7 +14,6 @@ pub struct KeyState {
     pub alt: bool,
     pub shift: bool,
     pub c: bool,
-    
 }
 
 impl KeyState {
@@ -88,7 +86,7 @@ impl InputState {
                     self.lmb_down = down;
                 }
                 false
-            }   
+            }
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if let KeyEvent {

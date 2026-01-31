@@ -1,5 +1,3 @@
-// src/config.rs
-// -------------
 // Global config knobs for the voxel/SVO renderer + streaming.
 
 pub const CHUNK_SIZE: u32 = 64;
@@ -22,20 +20,11 @@ pub const MAX_IN_FLIGHT: usize = 16;
 pub const NODE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
 
 // CPU chunk cache budget (SVO nodes stored on CPU so we don't rebuild chunks).
-// This is the *total* bytes of cached NodeGpu arrays across all cached chunks.
 pub const CHUNK_CACHE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1024 MB
 
 // -----------------------------------------------------------------------------
 // Clipmap (far terrain fallback)
 // -----------------------------------------------------------------------------
-//
-// A set of nested 2D height textures around the camera (CPU updated).
-// The primary compute shader samples this when the SVO grid doesn't cover the ray
-// (or when no voxel hit occurs).
-//
-// Height units: meters (f32).
-//
-// NOTE: These constants MUST match shader-side constants in `shaders/clipmap.wgsl`.
 
 pub const CLIPMAP_LEVELS: u32 = 16;
 pub const CLIPMAP_LEVELS_USIZE: usize = CLIPMAP_LEVELS as usize;
@@ -47,9 +36,7 @@ pub const CLIPMAP_RES: u32 = 256;
 pub const CLIPMAP_BASE_CELL_M: f32 = 1.0;
 
 // How often we allow a full refresh per level at most (seconds).
-// (Prevents thrashing if you ever tie updates to very tiny camera jitter.)
 pub const CLIPMAP_MIN_UPDATE_INTERVAL_S: f32 = 0.0;
-
 
 // Ball radius in *voxels*
 pub const BALL_RADIUS: i32 = 3;
@@ -64,6 +51,5 @@ pub const BALL_SPEED_MPS: f32 = 55.0;
 
 // Optional: lifetime (seconds)
 pub const BALL_LIFETIME_S: f32 = 6.0;
-
 
 pub const MAX_BALLS: u32 = 256;

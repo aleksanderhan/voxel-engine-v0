@@ -1,9 +1,9 @@
 // src/physics/world_query.rs
 use crate::{
-    config,
     streaming::{types::ChunkKey, ChunkManager},
     world::WorldGen,
 };
+use crate::app::config;
 
 use super::collision::WorldQuery;
 

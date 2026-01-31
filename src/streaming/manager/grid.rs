@@ -1,4 +1,5 @@
-use crate::{config, streaming::types::*};
+use crate::{streaming::types::*};
+use crate::app::config;
 
 use super::ChunkManager;
 

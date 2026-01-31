@@ -6,8 +6,8 @@ mod layout;
 mod pipelines;
 pub mod textures;
 
+use crate::app::config;
 use crate::{
-    config,
     render::gpu_types::{CameraGpu, OverlayGpu},
     streaming::ChunkUpload,
 };

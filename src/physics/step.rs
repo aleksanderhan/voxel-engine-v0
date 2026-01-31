@@ -1,8 +1,9 @@
 // src/physics/step.rs
 use glam::Vec3;
 
-use crate::input::InputState;
+use crate::app::InputState;
 
+use crate::app::config;
 use super::{
     collision::{sphere_voxels::resolve_sphere_vs_voxels, WorldQuery},
     player::{PlayerBody, PlayerTuning},
@@ -272,12 +273,12 @@ impl Physics {
     pub fn spawn_ball(&mut self, eye: Vec3, forward: Vec3) {
         let f = if forward.length_squared() > 1e-6 { forward.normalize() } else { Vec3::Z };
 
-        let r = crate::config::BALL_RADIUS as f32 * crate::config::VOXEL_SIZE_M_F32;
+        let r = config::BALL_RADIUS as f32 * config::VOXEL_SIZE_M_F32;
 
-        let pos = eye + f * (r + crate::config::BALL_SPAWN_NUDGE_M);
+        let pos = eye + f * (r + config::BALL_SPAWN_NUDGE_M);
 
-        self.ball_tuning.speed_mps = crate::config::BALL_SPEED_MPS;
-        self.ball_tuning.lifetime_s = crate::config::BALL_LIFETIME_S;
+        self.ball_tuning.speed_mps = config::BALL_SPEED_MPS;
+        self.ball_tuning.lifetime_s = config::BALL_LIFETIME_S;
 
         self.balls.push(Ball {
             pos,

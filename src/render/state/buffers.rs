@@ -3,9 +3,10 @@
 // Persistent GPU buffers and capacities.
 
 use crate::{
-    config,
     render::gpu_types::{ChunkMetaGpu, ClipmapGpu, NodeGpu, NodeRopesGpu},
 };
+use crate::app::config;
+
 
 pub struct Buffers {
     // --- Uniforms ---
@@ -112,7 +113,7 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         (colinfo_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
     );
 
-    let balls_capacity: u32 = crate::config::MAX_BALLS;
+    let balls_capacity: u32 = config::MAX_BALLS;
     let balls = make_storage_buffer(
         device,
         "balls_buf",

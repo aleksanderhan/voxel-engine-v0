@@ -1,15 +1,11 @@
 // src/main.rs
 mod app;
-mod camera;
 mod clipmap;
-mod config;
-mod input;
 mod render;
 mod streaming;
 mod svo;
 mod world;
 mod physics;
-pub mod profiler;
 
 use std::sync::Arc;
 use winit::{

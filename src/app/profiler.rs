@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
-use crate::streaming::types::StreamStats;
+
 use crate::render::state::GpuTimingsMs;
+use crate::streaming::types::StreamStats;
 
 pub struct FrameProf {
     pub frame: u64,
@@ -28,9 +29,7 @@ pub struct FrameProf {
     pub max_frame_ms: f64,
 
     pub t_poll_wait: f64,
-
     pub t_acq_swapchain: f64,
-
 }
 
 impl FrameProf {
@@ -61,9 +60,7 @@ impl FrameProf {
             max_frame_ms: 0.0,
 
             t_poll_wait: 0.0,
-
             t_acq_swapchain: 0.0,
-
         }
     }
 
@@ -161,7 +158,6 @@ impl FrameProf {
             self.chunk_uploads = 0;
             self.max_frame_ms = 0.0;
             self.t_acq_swapchain = 0.0;
-
         }
 
         if let Some(s) = stream {
@@ -181,7 +177,6 @@ impl FrameProf {
                 s.cache_entries, s.cache_lru,
                 s.build_queue_len, s.queued_set_len, s.cancels_len, s.orphan_queued
             );
-
         }
 
         if let Some(g) = gpu {
@@ -190,22 +185,15 @@ impl FrameProf {
                 g.primary, g.godray, g.composite, g.blit, g.total
             );
         }
-
-
-        
-
     }
 
     #[inline]
-    pub fn poll_wait(&mut self, ms: f64) {
-        self.t_poll_wait += ms;
-    }
+    pub fn poll_wait(&mut self, ms: f64) { self.t_poll_wait += ms; }
 
-    #[inline] pub fn acq_swapchain(&mut self, ms: f64) { self.t_acq_swapchain += ms; }
+    #[inline]
+    pub fn acq_swapchain(&mut self, ms: f64) { self.t_acq_swapchain += ms; }
 
     pub fn should_print(&self) -> bool {
         self.last_print.elapsed() >= self.print_every
     }
-
-
 }

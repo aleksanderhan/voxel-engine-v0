@@ -23,8 +23,8 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use glam::Vec3;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+use crate::app::config;
 use crate::{
-    config,
     render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu},
     world::WorldGen,
     streaming::types::StreamStats,

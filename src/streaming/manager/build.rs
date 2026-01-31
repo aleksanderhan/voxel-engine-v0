@@ -10,7 +10,8 @@ use glam::Vec3;
 
 use crate::streaming::priority::priority_score;
 use crate::streaming::types::*;
-use crate::{config, render::gpu_types::{NodeGpu, NodeRopesGpu}};
+use crate::{render::gpu_types::{NodeGpu, NodeRopesGpu}};
+use crate::app::config;
 
 use super::{ground, keep, slots};
 use super::ChunkManager;

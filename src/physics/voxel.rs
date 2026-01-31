@@ -1,6 +1,7 @@
 use glam::Vec3;
 
-use crate::{config, streaming::{ChunkManager, types::{ChunkKey, ChunkState}}, world::WorldGen};
+use crate::{streaming::{ChunkManager, types::{ChunkKey, ChunkState}}, world::WorldGen};
+use crate::app::config;
 
 /// VoxelQuery: minimal interface physics needs.
 /// Positions are in meters (same as your camera).

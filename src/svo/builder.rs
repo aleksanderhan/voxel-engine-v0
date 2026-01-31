@@ -2,8 +2,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::app::config;
 use crate::{
-    config,
     render::gpu_types::{NodeGpu, NodeRopesGpu},
     world::{
         materials::{AIR, DIRT, GRASS, STONE, WOOD},

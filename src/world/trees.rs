@@ -1,5 +1,5 @@
 // src/world/trees.rs
-use crate::config;
+use crate::app::config;
 
 use super::{
     generator::WorldGen,
