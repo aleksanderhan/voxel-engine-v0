@@ -265,7 +265,11 @@ pub fn try_make_uploading(
     }
 
     let Some(node_base) = node_base else {
-        mgr.build.chunks.remove(&key);
+        // Defer rather than drop on the floor.
+        mgr.build.chunks.insert(key, ChunkState::Queued);
+        if mgr.build.queued_set.insert(key) {
+            mgr.build.build_queue.push_back(key);
+        }
         return false;
     };
 
@@ -481,6 +485,7 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
         if in_priority_box(mgr, center, k) {
             continue;
         }
+        if keep::in_active_xz(center, k) { continue; }
 
         let dx = (k.x - center.x) as f32;
         let dz = (k.z - center.z) as f32;
