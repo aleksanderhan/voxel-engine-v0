@@ -77,7 +77,7 @@ const FOG_GODRAY_SCALE  : f32 = 1.0;
 const FOG_COLOR_GROUND    : vec3<f32> = vec3<f32>(0.40, 0.42, 0.45);
 const FOG_COLOR_SKY_BLEND : f32       = 0.10;
 
-const GODRAY_MAX_DIST : f32 = 80.0;
+const GODRAY_MAX_DIST : f32 = 50.0;
 
 const GODRAY_SCATTER_HEIGHT_FALLOFF : f32 = 0.04;
 const GODRAY_SCATTER_MIN_FRAC       : f32 = 0.35;

@@ -97,9 +97,13 @@ fn composite_pixel_mapped(
   // UV normalized in render space
   let uv = px_render / fd;
 
-  // Godray taps in render-texel units (stable across dynamic res)
-  let du = vec2<f32>(1.0 / fd.x, 0.0);
-  let dv = vec2<f32>(0.0, 1.0 / fd.y);
+  // Godray taps in GODRAY texel units (correct for quarter/half res)
+  let gdims_u = textureDimensions(godray_tex);
+  let gfd = vec2<f32>(f32(gdims_u.x), f32(gdims_u.y));
+
+  let du = vec2<f32>(1.0 / gfd.x, 0.0);
+  let dv = vec2<f32>(0.0, 1.0 / gfd.y);
+
 
   let gC = godray_sample_linear(uv,        godray_tex, godray_samp);
   let gE = godray_sample_linear(uv + du,   godray_tex, godray_samp);

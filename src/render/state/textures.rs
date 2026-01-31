@@ -28,6 +28,11 @@ pub fn quarter_dim(x: u32) -> u32 {
     (x + 3) / 4
 }
 
+pub fn half_dim(x: u32) -> u32 {
+    (x + 1) / 2
+}
+
+
 fn make_tex2d(
     device: &wgpu::Device,
     label: &str,
@@ -131,8 +136,8 @@ pub fn create_textures(
         rw_tex_usage,
     );
 
-    let qw = quarter_dim(internal_w);
-    let qh = quarter_dim(internal_h);
+    let qw = half_dim(internal_w);
+    let qh = half_dim(internal_h);
 
     let godray = [
         make_tex2d(device, "godray_a", qw, qh, wgpu::TextureFormat::Rgba16Float, rw_tex_usage),

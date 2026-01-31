@@ -17,7 +17,7 @@ use bindgroups::{create_bind_groups, BindGroups};
 use buffers::{create_persistent_buffers, Buffers};
 use layout::{create_layouts, Layouts};
 use pipelines::{create_pipelines, Pipelines};
-use textures::{create_textures, quarter_dim, TextureSet};
+use textures::{create_textures, half_dim, TextureSet};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuTimingsMs {
@@ -343,8 +343,8 @@ impl Renderer {
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
             cpass.set_bind_group(1, &self.bind_groups.godray[ping], &[]);
 
-            let qw = quarter_dim(self.internal_w);
-            let qh = quarter_dim(self.internal_h);
+            let qw = half_dim(self.internal_w);
+            let qh = half_dim(self.internal_h);
 
             let gx = (qw + 7) / 8;
             let gy = (qh + 7) / 8;
