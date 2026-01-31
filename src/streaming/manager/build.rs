@@ -54,9 +54,12 @@ fn queue_build_front(mgr: &mut ChunkManager, k: ChunkKey) {
 }
 
 pub fn ensure_priority_box(mgr: &mut ChunkManager, center: ChunkKey) {
-    let offsets = mgr.offsets.priority_offsets.clone();
+    let n = mgr.offsets.priority_offsets.len();
 
-    for (dx, dy, dz) in offsets {
+    for i in 0..n {
+        // copy the tuple out; immutable borrow ends right here
+        let (dx, dy, dz) = mgr.offsets.priority_offsets[i];
+
         let x = center.x + dx;
         let z = center.z + dz;
 
@@ -85,6 +88,7 @@ pub fn ensure_priority_box(mgr: &mut ChunkManager, center: ChunkKey) {
         }
     }
 }
+
 
 pub fn enqueue_active_ring(mgr: &mut ChunkManager, center: ChunkKey) {
     let n_active = mgr.offsets.active_offsets.len();
@@ -124,17 +128,16 @@ pub fn enqueue_active_ring(mgr: &mut ChunkManager, center: ChunkKey) {
 pub fn unload_outside_keep(mgr: &mut ChunkManager, center: ChunkKey) {
     mgr.build.to_unload.clear();
 
-    // gather keys first (avoid borrow issues)
-    let keys: Vec<ChunkKey> = mgr.build.chunks.keys().copied().collect();
+    for &k in mgr.build.chunks.keys() {
+        if slots::in_priority_box(mgr, center, k) { continue; }
 
-    for k in keys {
-        if slots::in_priority_box(mgr, center, k) {
-            continue;
-        }
-        // Pin active area: do not unload these (prevents pop-thrash).
         if keep::in_active_xz(center, k) {
-            continue;
+            match mgr.build.chunks.get(&k) {
+                Some(ChunkState::Resident(_)) | Some(ChunkState::Uploading(_)) => continue,
+                _ => {}
+            }
         }
+
         if !in_keep(mgr, center, k) {
             mgr.build.to_unload.push(k);
         }
@@ -144,35 +147,58 @@ pub fn unload_outside_keep(mgr: &mut ChunkManager, center: ChunkKey) {
     for k in unload {
         slots::unload_chunk(mgr, center, k);
     }
+
 }
 
 /// This is safe to run every frame; it just keeps the queue sane + near-sorted.
 /// (Your old “center changed” special-case becomes “always maintain invariants”.)
 pub fn on_center_change_resort(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec3) {
-    // Retain only queued + still in keep (safe, no panics).
     let origin = mgr.grid.grid_origin_chunk;
     let nx = (2 * config::KEEP_RADIUS + 1) as i32;
 
+    let mut drop_keys: Vec<ChunkKey> = Vec::new();
+
     mgr.build.build_queue.retain(|k| {
-        if !matches!(mgr.build.chunks.get(k), Some(ChunkState::Queued)) {
-            return false;
+        let keep_it =
+            matches!(mgr.build.chunks.get(k), Some(ChunkState::Queued)) &&
+            {
+                let dx = k.x - center.x;
+                let dz = k.z - center.z;
+                !(dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS ||
+                  dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS)
+            } &&
+            {
+                let ix = k.x - origin[0];
+                let iz = k.z - origin[2];
+                !(ix < 0 || iz < 0 || ix >= nx || iz >= nx)
+            } &&
+            {
+                let idx = ((k.z - origin[2]) * nx + (k.x - origin[0])) as usize;
+                mgr.ground.col_ground_cy.get(idx).is_some()
+            } &&
+            {
+                let idx = ((k.z - origin[2]) * nx + (k.x - origin[0])) as usize;
+                let ground_cy = mgr.ground.col_ground_cy[idx];
+                let dy = k.y - ground_cy;
+                dy >= y_band_min() && dy <= y_band_max()
+            };
+
+        if !keep_it {
+            drop_keys.push(*k);
         }
-
-        let dx = k.x - center.x;
-        let dz = k.z - center.z;
-        if dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS { return false; }
-        if dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS { return false; }
-
-        let ix = k.x - origin[0];
-        let iz = k.z - origin[2];
-        if ix < 0 || iz < 0 || ix >= nx || iz >= nx { return false; }
-
-        let idx = (iz * nx + ix) as usize;
-        let Some(ground_cy) = mgr.ground.col_ground_cy.get(idx).copied() else { return false; };
-
-        let dy = k.y - ground_cy;
-        dy >= y_band_min() && dy <= y_band_max()
+        keep_it
     });
+
+    // remove dropped queued entries from state (prevents orphanQ explosion)
+    for k in drop_keys {
+        // mark cancel + remove state + remove cancel token
+        if let Some(c) = mgr.build.cancels.get(&k) {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        mgr.build.chunks.remove(&k);
+        mgr.build.cancels.remove(&k);
+        mgr.build.queued_set.remove(&k);
+    }
 
     mgr.build.queued_set.clear();
     mgr.build.queued_set.extend(mgr.build.build_queue.iter().copied());

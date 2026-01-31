@@ -160,16 +160,31 @@ impl ChunkManager {
 
     /// Main frame update (same logic as before; now calls into submodules).
     pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
-        // 1) compute center
-        let center = keep::compute_center(world.as_ref(), cam_pos_m);
+        // 1) compute 
+        let center = {
+            let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
+            let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
 
+            let cs = config::CHUNK_SIZE as i32;
+            let half = cs / 2;
+
+            let ccx = cam_vx.div_euclid(cs);
+            let ccz = cam_vz.div_euclid(cs);
+
+            // Fast path: use cached column ground if available
+            if let Some(ground_cy) = ground::ground_cy_for_column(self, ccx, ccz) {
+                ChunkKey { x: ccx, y: ground_cy, z: ccz }
+            } else {
+                // Slow fallback (only when outside cache / first frame)
+                keep::compute_center( world.as_ref(), cam_pos_m)
+            }
+        };
+        
         // 2) ensure ground cache + publish origin
         ground::ensure_column_cache(self, world.as_ref(), center);
 
         // 3) publish center (rebucket uploads on center change)
-        if keep::publish_center_and_rebucket(self, center) {
-            // keep::publish_center_and_rebucket already rebuckets uploads
-        }
+        let center_changed = keep::publish_center_and_rebucket(self, center);
 
         // 4) ensure priority box builds/promotions
         build::ensure_priority_box(self, center);
@@ -181,7 +196,9 @@ impl ChunkManager {
         build::unload_outside_keep(self, center);
 
         // 7) handle center-change cleanup/sort
-        build::on_center_change_resort(self, center, cam_fwd);
+        if center_changed {
+            build::on_center_change_resort(self, center, cam_fwd);
+        }
 
         // 8) dispatch builds
         build::dispatch_builds(self, center);
@@ -192,6 +209,7 @@ impl ChunkManager {
         // 10) rebuild grid if dirty
         grid::rebuild_if_dirty(self, center)
     }
+
 
     // --- Public API (same signatures; implemented in submodules via impl blocks) ---
 
