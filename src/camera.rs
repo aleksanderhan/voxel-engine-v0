@@ -11,8 +11,9 @@ pub struct Camera {
     z_near: f32,
     z_far: f32,
     // movement tuning
-    speed_per_frame: f32,
+    speed_mps: f32,
     mouse_sens: f32,
+    sprint_mul: f32,
 }
 
 pub struct CameraFrame {
@@ -31,8 +32,9 @@ impl Camera {
             fovy_rad: 60.0_f32.to_radians(),
             z_near: 0.1,
             z_far: 1000.0,
-            speed_per_frame: 0.35,
+            speed_mps: 2.5,
             mouse_sens: 0.0025,
+            sprint_mul: 3.0
         }
     }
 
@@ -50,14 +52,13 @@ impl Camera {
         .normalize()
     }
 
-    pub fn integrate_input(&mut self, input: &mut InputState) {
+    pub fn integrate_input(&mut self, input: &mut InputState, dt: f32) {
         // mouse look
         if input.focused {
             let (dx, dy) = input.take_mouse_delta();
             self.yaw -= dx * self.mouse_sens;
             self.pitch = (self.pitch - dy * self.mouse_sens).clamp(-1.55, 1.55);
         } else {
-            // still clear deltas
             let _ = input.take_mouse_delta();
         }
 
@@ -72,7 +73,7 @@ impl Camera {
         let right = forward.cross(Vec3::Y).normalize();
         let up = right.cross(forward).normalize();
 
-        // movement (per-frame like your original)
+        // movement intent
         let k = input.keys;
         let mut vel = Vec3::ZERO;
         if k.w { vel += forward; }
@@ -83,9 +84,12 @@ impl Camera {
         if k.alt { vel -= up; }
 
         if vel.length_squared() > 0.0 {
-            self.pos += vel.normalize() * self.speed_per_frame;
+            let speed = if k.shift { self.speed_mps * self.sprint_mul } else { self.speed_mps };
+            self.pos += vel.normalize() * (speed * dt);
         }
+
     }
+
 
     pub fn frame_matrices(&self, aspect: f32) -> CameraFrame {
         let forward = Vec3::new(

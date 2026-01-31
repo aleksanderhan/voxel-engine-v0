@@ -13,6 +13,7 @@ pub struct KeyState {
     pub d: bool,
     pub space: bool,
     pub alt: bool,
+    pub shift: bool,
 }
 
 impl KeyState {
@@ -24,6 +25,7 @@ impl KeyState {
             KeyCode::KeyD => self.d = down,
             KeyCode::Space => self.space = down,
             KeyCode::AltLeft | KeyCode::AltRight => self.alt = down,
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.shift = down,
             _ => {}
         }
     }

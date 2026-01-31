@@ -72,6 +72,8 @@ pub struct App {
     frame_index: u32,
 
     profiler: crate::profiler::FrameProf,
+
+    last_frame: Instant,
 }
 
 impl App {
@@ -148,6 +150,7 @@ impl App {
             fps_last: Instant::now(),
             frame_index: 0,
             profiler: crate::profiler::FrameProf::new(),
+            last_frame: Instant::now(),
         }
     }
 
@@ -190,9 +193,17 @@ impl App {
     fn frame(&mut self, elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
         let frame_t0 = Instant::now();
 
+        // dt (seconds)
+        let now = Instant::now();
+        let mut dt = (now - self.last_frame).as_secs_f32();
+        self.last_frame = now;
+
+        // clamp to avoid huge jumps after a pause/breakpoint
+        dt = dt.clamp(0.0, 0.05);
+
         // 1) camera integrate
         let t0 = Instant::now();
-        self.camera.integrate_input(&mut self.input);
+        self.camera.integrate_input(&mut self.input, dt);
         self.frame_index = self.frame_index.wrapping_add(1);
         self.profiler.cam(crate::profiler::FrameProf::mark_ms(t0));
 
