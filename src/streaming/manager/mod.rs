@@ -163,7 +163,7 @@ impl ChunkManager {
 
     /// Main frame update (same logic as before; now calls into submodules).
     pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
-        // 1) compute 
+        // 1) compute center
         let center = {
             let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
             let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
@@ -183,38 +183,28 @@ impl ChunkManager {
             }
         };
         
-        // 2) ensure ground cache + publish origin
+        // 2) ensure ground cache (only does real work when origin changes)
         ground::ensure_column_cache(self, world.as_ref(), center);
 
-        // 3) publish center (rebucket uploads on center change)
+        // 3) publish center (rebuckets uploads only if changed)
         let center_changed = keep::publish_center_and_rebucket(self, center);
 
-        // 4) ensure priority box builds/promotions
+        // Always do cheap “keep things moving”
         build::ensure_priority_box(self, center);
-
-        // 5) enqueue active offsets
-        build::enqueue_active_ring(self, center);
-
-        // 6) unload outside keep
-        build::unload_outside_keep(self, center);
-        #[cfg(debug_assertions)]
-        slots::assert_slot_invariants(self);
-
-        // 7) handle center-change cleanup/sort
-        build::rebuild_build_heap(self, center, cam_fwd);
-
-        // 8) dispatch builds
+        build::harvest_done_builds(self, center);
         build::dispatch_builds(self, center);
 
-        // 9) harvest completions (can call on_build_done -> try_make_uploading)
-        build::harvest_done_builds(self, center);
-        #[cfg(debug_assertions)]
-        slots::assert_slot_invariants(self);
+        // Only do the expensive global planning when the center changes
+        if center_changed {
+            build::enqueue_active_ring(self, center);
+            build::unload_outside_keep(self, center);
 
-        // 10) rebuild grid if dirty
+            // heap rebuild is expensive; only do it on center change
+            build::rebuild_build_heap(self, center, cam_fwd);
+        }
+
         let changed = grid::rebuild_if_dirty(self, center);
 
-        // DEBUG: verify slot/chunk invariants every frame
         #[cfg(debug_assertions)]
         slots::assert_slot_invariants(self);
 
@@ -243,5 +233,32 @@ impl ChunkManager {
 
     pub fn stats(&self) -> Option<StreamStats> {
         stats::stats(self)
+    }
+
+    /// Cheap per-frame maintenance. MUST NOT do expensive planning.
+    /// - harvest worker completions
+    /// - keep workers fed using the existing build_heap
+    /// - rebuild grid if dirty
+    pub fn pump_completed(&mut self) -> bool {
+        let Some(center) = self.build.last_center else {
+            // No center published yet => nothing meaningful to pump.
+            return false;
+        };
+
+        // 1) Drain completed builds (non-blocking)
+        build::harvest_done_builds(self, center);
+        #[cfg(debug_assertions)]
+        slots::assert_slot_invariants(self);
+
+        // 2) Keep workers busy (uses existing heap; no heap rebuild here)
+        build::dispatch_builds(self, center);
+
+        // 3) Rebuild grid if something changed (dirty flag set by slot ops)
+        let changed = grid::rebuild_if_dirty(self, center);
+
+        #[cfg(debug_assertions)]
+        slots::assert_slot_invariants(self);
+
+        changed
     }
 }

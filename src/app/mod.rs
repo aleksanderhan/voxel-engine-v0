@@ -77,6 +77,10 @@ pub struct App {
 
     prev_view_proj: glam::Mat4,
     has_prev_vp: bool,
+
+    last_stream_update: Instant,
+    stream_period: std::time::Duration,
+
 }
 
 impl App {
@@ -156,6 +160,8 @@ impl App {
             last_frame: Instant::now(),
             prev_view_proj: glam::Mat4::IDENTITY,
             has_prev_vp: false,
+            last_stream_update: Instant::now(),
+            stream_period: std::time::Duration::from_millis(33), // 30 Hz
         }
     }
 
@@ -204,8 +210,6 @@ impl App {
         let now = Instant::now();
         let mut dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
-
-        // clamp to avoid huge jumps after a pause/breakpoint
         dt = dt.clamp(0.0, 0.05);
 
         // 1) camera integrate
@@ -214,19 +218,32 @@ impl App {
         self.frame_index = self.frame_index.wrapping_add(1);
         self.profiler.cam(crate::profiler::FrameProf::mark_ms(t0));
 
-        // 2) streaming update
+        // 2) streaming update (THROTTLED)
         let t0 = Instant::now();
-        let cam_pos = self.camera.position();
-        let cam_fwd = self.camera.forward();
-        let grid_changed = self.chunks.update(&self.world, cam_pos, cam_fwd);
+
+        // always cheap maintenance each frame
+        let grid_changed_pump = self.chunks.pump_completed();
+
+        // only expensive planning at fixed rate
+        let mut grid_changed = grid_changed_pump;
+        if self.last_stream_update.elapsed() >= self.stream_period {
+            let cam_pos = self.camera.position();
+            let cam_fwd = self.camera.forward();
+            grid_changed |= self.chunks.update(&self.world, cam_pos, cam_fwd);
+            self.last_stream_update = Instant::now();
+        }
+
         if grid_changed {
             self.renderer.write_chunk_grid(self.chunks.chunk_grid());
         }
+
         self.profiler.stream(crate::profiler::FrameProf::mark_ms(t0));
+
 
         // 3) clipmap update (CPU only)
         let t0 = Instant::now();
         let t = self.start_time.elapsed().as_secs_f32();
+        let cam_pos = self.camera.position();
         let (clip_params_cpu, clip_uploads) = self.clipmap.update(self.world.as_ref(), cam_pos, t);
         let clip_gpu = ClipmapGpu::from_cpu(&clip_params_cpu);
         self.profiler.clip_update(crate::profiler::FrameProf::mark_ms(t0));
@@ -245,7 +262,7 @@ impl App {
 
         let view = cf.view_inv.inverse();
         let proj = cf.proj_inv.inverse();
-        let vp   = proj * view;
+        let vp = proj * view;
 
         let prev_vp = if self.has_prev_vp { self.prev_view_proj } else { vp };
 
@@ -311,13 +328,9 @@ impl App {
         let chunk_uploads = self.chunks.take_uploads_budgeted();
         self.profiler.add_chunk_uploads(chunk_uploads.len());
 
-        // 1) apply to GPU
         self.renderer.apply_chunk_uploads(&chunk_uploads);
 
-        // 2) commit (may rebuild grid / residency state)
         let grid_changed2 = self.chunks.commit_uploads_applied(&chunk_uploads);
-
-        // 3) write grid if needed
         if grid_changed2 {
             self.renderer.write_chunk_grid(self.chunks.chunk_grid());
         }
@@ -332,7 +345,7 @@ impl App {
                 label: Some("encoder"),
             });
 
-        // Clipmap uploads + uniform update (queue writes). Kept timed as enc_clip for continuity.
+        // Clipmap uploads + uniform update
         let t0 = Instant::now();
         self.renderer.write_clipmap_updates(&clip_gpu, &clip_uploads);
         self.profiler.enc_clip(crate::profiler::FrameProf::mark_ms(t0));
@@ -343,7 +356,7 @@ impl App {
             .encode_compute(&mut encoder, self.config.width, self.config.height);
         self.profiler.enc_comp(crate::profiler::FrameProf::mark_ms(t0));
 
-        // Acquire swapchain AS LATE AS POSSIBLE (right before blit)
+        // Acquire swapchain as late as possible
         let t0 = Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -361,25 +374,24 @@ impl App {
 
         let frame_view = frame.texture.create_view(&Default::default());
 
-        // Blit pass (now that we have the swapchain view)
+        // Blit pass
         let t0 = Instant::now();
         self.renderer.encode_blit(&mut encoder, &frame_view);
         self.profiler.enc_blit(crate::profiler::FrameProf::mark_ms(t0));
 
-        // Timestamp resolve (copy queries -> readback)
         self.renderer.encode_timestamp_resolve(&mut encoder);
 
-        // 9) submit
+        // submit
         let t0 = Instant::now();
         self.renderer.queue().submit(Some(encoder.finish()));
         self.profiler.submit(crate::profiler::FrameProf::mark_ms(t0));
 
-        // 10) poll (as you had it)
+        // poll
         let t0 = Instant::now();
         self.renderer.device().poll(wgpu::Maintain::Poll);
         self.profiler.poll_wait(crate::profiler::FrameProf::mark_ms(t0));
 
-        // 11) present
+        // present
         let t0 = Instant::now();
         frame.present();
         self.profiler.present(crate::profiler::FrameProf::mark_ms(t0));
@@ -387,7 +399,7 @@ impl App {
         self.prev_view_proj = vp;
         self.has_prev_vp = true;
 
-        // 12) end-of-frame
+        // end-of-frame
         let gpu = if self.profiler.should_print() {
             self.renderer.read_gpu_timings_ms_blocking()
         } else {
@@ -403,5 +415,6 @@ impl App {
         let frame_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
         self.profiler.end_frame(frame_ms, ss, gpu);
     }
+
 
 }
