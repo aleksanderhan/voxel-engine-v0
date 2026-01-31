@@ -1,12 +1,14 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
     Arc,
 };
 
 use crossbeam_channel::TrySendError;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use glam::Vec3;
 
-use crate::streaming::priority::sort_queue_near_first;
+use crate::streaming::priority::priority_score;
 use crate::streaming::types::*;
 use crate::{config, render::gpu_types::{NodeGpu, NodeRopesGpu}};
 
@@ -82,7 +84,7 @@ pub fn ensure_priority_box(mgr: &mut ChunkManager, center: ChunkKey) {
                 }
 
                 let c = cancel_token(mgr, k);
-                c.store(false, Ordering::Relaxed);
+                c.store(false, AtomicOrdering::Relaxed);
                 queue_build_front(mgr, k);
             }
         }
@@ -114,7 +116,7 @@ pub fn enqueue_active_ring(mgr: &mut ChunkManager, center: ChunkKey) {
                 }
 
                 let c = cancel_token(mgr, k);
-                c.store(false, Ordering::Relaxed);
+                c.store(false, AtomicOrdering::Relaxed);
 
                 mgr.build.chunks.insert(k, ChunkState::Queued);
                 if mgr.build.queued_set.insert(k) {
@@ -147,92 +149,21 @@ pub fn unload_outside_keep(mgr: &mut ChunkManager, center: ChunkKey) {
     for k in unload {
         slots::unload_chunk(mgr, center, k);
     }
-
-}
-
-/// This is safe to run every frame; it just keeps the queue sane + near-sorted.
-/// (Your old “center changed” special-case becomes “always maintain invariants”.)
-pub fn on_center_change_resort(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec3) {
-    let origin = mgr.grid.grid_origin_chunk;
-    let nx = (2 * config::KEEP_RADIUS + 1) as i32;
-
-    let mut drop_keys: Vec<ChunkKey> = Vec::new();
-
-    mgr.build.build_queue.retain(|k| {
-        let keep_it =
-            matches!(mgr.build.chunks.get(k), Some(ChunkState::Queued)) &&
-            {
-                let dx = k.x - center.x;
-                let dz = k.z - center.z;
-                !(dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS ||
-                  dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS)
-            } &&
-            {
-                let ix = k.x - origin[0];
-                let iz = k.z - origin[2];
-                !(ix < 0 || iz < 0 || ix >= nx || iz >= nx)
-            } &&
-            {
-                let idx = ((k.z - origin[2]) * nx + (k.x - origin[0])) as usize;
-                mgr.ground.col_ground_cy.get(idx).is_some()
-            } &&
-            {
-                let idx = ((k.z - origin[2]) * nx + (k.x - origin[0])) as usize;
-                let ground_cy = mgr.ground.col_ground_cy[idx];
-                let dy = k.y - ground_cy;
-                dy >= y_band_min() && dy <= y_band_max()
-            };
-
-        if !keep_it {
-            drop_keys.push(*k);
-        }
-        keep_it
-    });
-
-    // remove dropped queued entries from state (prevents orphanQ explosion)
-    for k in drop_keys {
-        // mark cancel + remove state + remove cancel token
-        if let Some(c) = mgr.build.cancels.get(&k) {
-            c.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        mgr.build.chunks.remove(&k);
-        mgr.build.cancels.remove(&k);
-        mgr.build.queued_set.remove(&k);
-    }
-
-    mgr.build.queued_set.clear();
-    mgr.build.queued_set.extend(mgr.build.build_queue.iter().copied());
-
-    // Priority box always first, then sort the rest near-first.
-    let mut pri = std::collections::VecDeque::new();
-    let mut rest = std::collections::VecDeque::new();
-
-    while let Some(k) = mgr.build.build_queue.pop_front() {
-        if slots::in_priority_box(mgr, center, k) {
-            pri.push_back(k);
-        } else {
-            rest.push_back(k);
-        }
-    }
-
-    sort_queue_near_first(&mut rest, center, cam_fwd);
-
-    mgr.build.build_queue = pri;
-    mgr.build.build_queue.extend(rest);
 }
 
 pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
     let mut attempts = 0usize;
-    let max_attempts = mgr.build.build_queue.len().max(1);
+    let max_attempts = mgr.build.build_heap.len().max(1);
 
     while mgr.build.in_flight < config::MAX_IN_FLIGHT && attempts < max_attempts {
         attempts += 1;
 
-        let Some(k) = mgr.build.build_queue.pop_front() else { break; };
+        let Some(item) = mgr.build.build_heap.pop() else { break; };
+        let k = item.key;
         mgr.build.queued_set.remove(&k);
 
         if !in_keep(mgr, center, k) {
-            cancel_token(mgr, k).store(true, Ordering::Relaxed);
+            cancel_token(mgr, k).store(true, AtomicOrdering::Relaxed);
             mgr.build.chunks.remove(&k);
             mgr.build.cancels.remove(&k);
             continue;
@@ -249,7 +180,7 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
             mgr.build.chunks.insert(k, ChunkState::Building);
 
             let cancel = cancel_token(mgr, k);
-            cancel.store(false, Ordering::Relaxed);
+            cancel.store(false, AtomicOrdering::Relaxed);
 
             match mgr.build.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone() }) {
                 Ok(()) => mgr.build.in_flight += 1,
@@ -281,14 +212,14 @@ pub fn harvest_done_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         let Some(cur_cancel) = mgr.build.cancels.get(&done.key) else { continue; };
         if !Arc::ptr_eq(cur_cancel, &done.cancel) { continue; }
 
-        if done.canceled || done.cancel.load(Ordering::Relaxed) {
+        if done.canceled || done.cancel.load(AtomicOrdering::Relaxed) {
             mgr.build.chunks.remove(&done.key);
             mgr.build.cancels.remove(&done.key);
             continue;
         }
 
         if !in_keep(mgr, center, done.key) {
-            cancel_token(mgr, done.key).store(true, Ordering::Relaxed);
+            cancel_token(mgr, done.key).store(true, AtomicOrdering::Relaxed);
             mgr.build.chunks.remove(&done.key);
             continue;
         }
@@ -336,7 +267,7 @@ fn on_build_done(
     colinfo_words: Vec<u32>,
 ) {
     if let Some(c) = mgr.build.cancels.get(&key) {
-        if c.load(Ordering::Relaxed) {
+        if c.load(AtomicOrdering::Relaxed) {
             mgr.build.chunks.remove(&key);
             return;
         }
@@ -366,4 +297,116 @@ fn on_build_done(
     if !ok {
         mgr.build.chunks.remove(&key);
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct HeapItem {
+    // Larger is better (because BinaryHeap pops max)
+    pub prio: u32,
+    pub tie: u32,
+    pub key: ChunkKey,
+}
+
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.prio.cmp(&other.prio).then_with(|| self.tie.cmp(&other.tie))
+    }
+}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool { self.prio == other.prio && self.tie == other.tie && self.key == other.key }
+}
+impl Eq for HeapItem {}
+
+#[inline]
+fn float_to_ordered_u32(x: f32) -> u32 {
+    // Total order trick for IEEE floats (excluding NaN oddities):
+    // negative => flip all bits, positive => flip sign bit
+    let b = x.to_bits();
+    if (b & 0x8000_0000) != 0 { !b } else { b ^ 0x8000_0000 }
+}
+
+#[inline]
+fn make_prio(score: f32) -> u32 {
+    // Want smaller score => higher priority in a max-heap
+    let ord = if score.is_nan() { u32::MAX } else { float_to_ordered_u32(score) };
+    u32::MAX - ord
+}
+
+pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec3) {
+    // 1) Gather all queued keys: existing heap + staged build_queue
+    let mut keys: Vec<ChunkKey> = Vec::with_capacity(mgr.build.build_heap.len() + mgr.build.build_queue.len());
+
+    keys.extend(mgr.build.build_heap.iter().map(|it| it.key));
+    keys.extend(mgr.build.build_queue.drain(..)); // staging consumed
+
+    mgr.build.build_heap.clear();
+
+    // 2) Filter invalid keys (copying your keep/sanity checks)
+    let origin = mgr.grid.grid_origin_chunk;
+    let nx = (2 * config::KEEP_RADIUS + 1) as i32;
+
+    let mut kept: Vec<ChunkKey> = Vec::with_capacity(keys.len());
+    let mut drop_keys: Vec<ChunkKey> = Vec::new();
+
+    for k in keys {
+        let keep_it =
+            matches!(mgr.build.chunks.get(&k), Some(ChunkState::Queued)) &&
+            {
+                let dx = k.x - center.x;
+                let dz = k.z - center.z;
+                !(dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS ||
+                  dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS)
+            } &&
+            {
+                let ix = k.x - origin[0];
+                let iz = k.z - origin[2];
+                !(ix < 0 || iz < 0 || ix >= nx || iz >= nx)
+            } &&
+            {
+                let idx = ((k.z - origin[2]) * nx + (k.x - origin[0])) as usize;
+                mgr.ground.col_ground_cy.get(idx).is_some()
+            } &&
+            {
+                let idx = ((k.z - origin[2]) * nx + (k.x - origin[0])) as usize;
+                let ground_cy = mgr.ground.col_ground_cy[idx];
+                let dy = k.y - ground_cy;
+                dy >= y_band_min() && dy <= y_band_max()
+            };
+
+        if keep_it { kept.push(k); } else { drop_keys.push(k); }
+    }
+
+    // 3) Clean state for dropped keys (prevents orphan growth)
+    for k in drop_keys {
+        if let Some(c) = mgr.build.cancels.get(&k) {
+            c.store(true, AtomicOrdering::Relaxed);
+        }
+        mgr.build.chunks.remove(&k);
+        mgr.build.cancels.remove(&k);
+        mgr.build.queued_set.remove(&k);
+    }
+
+    // 4) Rebuild queued_set to match kept
+    mgr.build.queued_set.clear();
+    mgr.build.queued_set.extend(kept.iter().copied());
+
+    // 5) Score + heapify
+    let mut items: Vec<HeapItem> = Vec::with_capacity(kept.len());
+    for (i, k) in kept.into_iter().enumerate() {
+        let mut s = priority_score(k, center, cam_fwd);
+
+        // Preserve your “priority box first” behavior without special-casing structure:
+        if super::slots::in_priority_box(mgr, center, k) {
+            s -= 20_000.0;
+        } else if super::keep::in_active_xz(center, k) {
+            s -= 10_000.0;
+        }
+
+        items.push(HeapItem { prio: make_prio(s), tie: i as u32, key: k });
+    }
+
+    mgr.build.build_heap = BinaryHeap::from(items);
 }

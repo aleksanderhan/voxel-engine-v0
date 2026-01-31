@@ -195,7 +195,7 @@ pub fn commit_uploads_applied(mgr: &mut ChunkManager, applied: &[ChunkUpload]) -
 
         if let Some(st) = mgr.build.chunks.get_mut(&key) {
             if let ChunkState::Uploading(up) = st {
-                let slot_u32 = up.slot;
+                let slot_u32 = slot as u32;
                 let node_base = up.node_base;
                 let node_count = up.node_count;
                 *st = ChunkState::Resident(Resident { slot: slot_u32, node_base, node_count });
@@ -504,3 +504,4 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
 
     false
 }
+

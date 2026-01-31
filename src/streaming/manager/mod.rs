@@ -8,9 +8,8 @@ mod ground;
 mod keep;
 mod uploads;
 
-
 use std::{
-    collections::VecDeque,
+    collections::{VecDeque, BinaryHeap},
     mem::size_of,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -32,7 +31,6 @@ use crate::{
 use crate::streaming::{
     NodeArena,
     cache::ChunkCache,
-    priority::sort_queue_near_first,
     types::*,
     workers::spawn_workers,
 };
@@ -42,6 +40,7 @@ pub(crate) struct BuildState {
     pub chunks: HashMap<ChunkKey, ChunkState>,
 
     pub build_queue: VecDeque<ChunkKey>,
+    pub build_heap: BinaryHeap<build::HeapItem>,
     pub queued_set: HashSet<ChunkKey>,
     pub cancels: HashMap<ChunkKey, Arc<AtomicBool>>,
 
@@ -51,6 +50,7 @@ pub(crate) struct BuildState {
 
     pub last_center: Option<ChunkKey>,
     pub to_unload: Vec<ChunkKey>,
+
 }
 
 /// Slot-residency bucket.
@@ -124,6 +124,7 @@ impl ChunkManager {
             build: BuildState {
                 chunks: HashMap::default(),
                 build_queue: VecDeque::new(),
+                build_heap: BinaryHeap::new(),
                 queued_set: HashSet::default(),
                 cancels: HashMap::default(),
                 tx_job,
@@ -196,9 +197,7 @@ impl ChunkManager {
         build::unload_outside_keep(self, center);
 
         // 7) handle center-change cleanup/sort
-        if center_changed {
-            build::on_center_change_resort(self, center, cam_fwd);
-        }
+        build::rebuild_build_heap(self, center, cam_fwd);
 
         // 8) dispatch builds
         build::dispatch_builds(self, center);
