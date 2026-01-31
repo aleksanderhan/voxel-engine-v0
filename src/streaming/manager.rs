@@ -29,7 +29,7 @@ use super::{
     types::{
         BuildDone, BuildJob, ChunkKey, ChunkState, ChunkUpload, Resident, Uploading,
         COLINFO_WORDS_PER_CHUNK, COLINFO_WORDS_PER_CHUNK_USIZE,
-        EVICT_ATTEMPTS, GRID_Y_COUNT, GRID_Y_MIN_DY,
+        EVICT_ATTEMPTS, GRID_Y_COUNT, GRID_Y_MIN_DY, PRIORITY_RADIUS,
         INVALID_U32,
         MACRO_WORDS_PER_CHUNK, MACRO_WORDS_PER_CHUNK_USIZE,
         MAX_UPLOAD_BYTES_PER_FRAME, MAX_UPLOADS_PER_FRAME,
@@ -72,6 +72,7 @@ pub struct ChunkManager {
     cache: ChunkCache,
 
     active_offsets: Vec<(i32, i32, i32)>,
+    priority_offsets: Vec<(i32, i32, i32)>,
     to_unload: Vec<ChunkKey>,
 
     uploads_rewrite: VecDeque<ChunkUpload>, // slot rewrites (completes_residency=false)
@@ -96,6 +97,7 @@ impl ChunkManager {
 
         let grid_len = (nx * ny * nz) as usize;
         let active_offsets = Self::build_offsets(config::ACTIVE_RADIUS);
+        let priority_offsets = Self::build_offsets(PRIORITY_RADIUS);
 
         Self {
             chunks: HashMap::default(),
@@ -128,6 +130,7 @@ impl ChunkManager {
             cache: ChunkCache::new(),
 
             active_offsets,
+            priority_offsets,
             to_unload: Vec::new(),
             
             uploads_rewrite: VecDeque::new(),
@@ -153,6 +156,41 @@ impl ChunkManager {
             }
         }
         v
+    }
+
+    #[inline(always)]
+    fn in_priority_xz(&self, center: ChunkKey, k: ChunkKey) -> bool {
+        let dx = (k.x - center.x).abs();
+        let dz = (k.z - center.z).abs();
+        dx <= PRIORITY_RADIUS && dz <= PRIORITY_RADIUS
+    }
+
+    #[inline(always)]
+    fn in_priority_box(&self, center: ChunkKey, k: ChunkKey) -> bool {
+        if !self.in_priority_xz(center, k) {
+            return false;
+        }
+        let Some(ground_cy) = self.ground_cy_for_column(k.x, k.z) else {
+            return false;
+        };
+        let dy = k.y - ground_cy;
+        dy >= GRID_Y_MIN_DY && dy <= (GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1)
+    }
+
+    #[inline]
+    fn queue_build_front(&mut self, k: ChunkKey) {
+        // If already queued, move it to the front.
+        if self.queued_set.contains(&k) {
+            if let Some(pos) = self.build_queue.iter().position(|x| *x == k) {
+                self.build_queue.remove(pos);
+                self.build_queue.push_front(k);
+            }
+            return;
+        }
+
+        self.chunks.insert(k, ChunkState::Queued);
+        self.queued_set.insert(k);
+        self.build_queue.push_front(k);
     }
 
     #[inline]
@@ -204,23 +242,61 @@ impl ChunkManager {
         dy >= y_band_min() && dy <= y_band_max()
     }
 
+    fn ensure_priority_box(&mut self, center: ChunkKey) {
+        let offsets = self.priority_offsets.clone();
+        for (dx, dy, dz) in offsets {
+            let x = center.x + dx;
+            let z = center.z + dz;
+
+            let Some(ground_cy_col) = self.ground_cy_for_column(x, z) else { continue; };
+            let k = ChunkKey { x, y: ground_cy_col + dy, z };
+
+            match self.chunks.get(&k) {
+                Some(ChunkState::Resident(_))
+                | Some(ChunkState::Uploading(_))
+                | Some(ChunkState::Queued)
+                | Some(ChunkState::Building) => {
+                    // If it's already queued but not front-loaded, queue_build_front will move it.
+                    if matches!(self.chunks.get(&k), Some(ChunkState::Queued)) {
+                        self.queue_build_front(k);
+                    }
+                }
+                None => {
+                    // Cache hit? Promote immediately (still counts as priority)
+                    if self.cache.get(&k).is_some() {
+                        let _ = self.try_promote_from_cache(center, k);
+                        continue;
+                    }
+
+                    let c = self.cancel_token(k);
+                    c.store(false, Ordering::Relaxed);
+
+                    self.queue_build_front(k);
+                }
+            }
+        }
+    }
+
+
     pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
+        
         let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
         let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
-
+        
         let cs = config::CHUNK_SIZE as i32;
         let half = cs / 2;
-
+        
         let ccx = cam_vx.div_euclid(cs);
         let ccz = cam_vz.div_euclid(cs);
-
+        
         // IMPORTANT: sample ground at the chunk center, consistent with column cache
         let wx = ccx * cs + half;
         let wz = ccz * cs + half;
         let ground_y_vox = world.ground_height(wx, wz);
         let ground_cy = ground_y_vox.div_euclid(cs);
-
+        
         let center = ChunkKey { x: ccx, y: ground_cy, z: ccz };
+        let priority_ready = self.priority_box_ready(center);
 
         // --- ensure column-height cache is built BEFORE anyone indexes it ---
         let new_origin = self.keep_origin_for(center);
@@ -244,6 +320,9 @@ impl ChunkManager {
             self.last_center = Some(center);
             self.rebucket_uploads_for_center(center);
         }
+
+        // --- PRIORITY: force 5x5x5 around player first ---
+        self.ensure_priority_box(center);   
 
         // --- ACTIVE: enqueue/restore chunks around camera ---
         let n_active = self.active_offsets.len();
@@ -285,6 +364,9 @@ impl ChunkManager {
         // --- Unload outside KEEP ---
         self.to_unload.clear();
         for &k in self.chunks.keys() {
+            if self.in_priority_box(center, k) {
+                continue;
+            }
             // Pin active area: do not unload these (prevents pop-thrash).
             if self.in_active_xz(center, k) {
                 continue;
@@ -361,11 +443,29 @@ impl ChunkManager {
             self.queued_set.clear();
             self.queued_set.extend(self.build_queue.iter().copied());
 
-            sort_queue_near_first(&mut self.build_queue, center, cam_fwd);
+            // Priority box always first, then sort the rest near-first.
+            let mut pri = VecDeque::new();
+            let mut rest = VecDeque::new();
+
+            while let Some(k) = self.build_queue.pop_front() {
+                if self.in_priority_box(center, k) { pri.push_back(k); }
+                else { rest.push_back(k); }
+            }
+
+            sort_queue_near_first(&mut rest, center, cam_fwd);
+
+            self.build_queue = pri;
+            self.build_queue.extend(rest);
+
         }
 
         // --- Dispatch builds ---
-        while self.in_flight < config::MAX_IN_FLIGHT {
+        let mut attempts = 0usize;
+        let max_attempts = self.build_queue.len().max(1); // prevent infinite looping
+
+        while self.in_flight < config::MAX_IN_FLIGHT && attempts < max_attempts {
+            attempts += 1;
+
             let Some(k) = self.build_queue.pop_front() else { break; };
             self.queued_set.remove(&k);
 
@@ -399,8 +499,8 @@ impl ChunkManager {
                     }
                 }
             }
-
         }
+
 
         // --- Harvest done builds (bounded per frame) ---
         let done_backlog = self.rx_done.len(); // crossbeam_channel Receiver::len() works for bounded channels
@@ -452,6 +552,7 @@ impl ChunkManager {
 
         for &k in &self.slot_to_key {
             if k == protect { continue; }
+            if self.in_priority_box(center, k) { continue; }    
             if self.in_active_xz(center, k) { continue; }
 
             let dx = (k.x - center.x) as f32;
@@ -474,6 +575,7 @@ impl ChunkManager {
 
         for &k in &self.slot_to_key {
             if k == protect { continue; }
+            if self.in_priority_box(center, k) { continue; }
 
             let dx = (k.x - center.x) as f32;
             let dz = (k.z - center.z) as f32;
@@ -495,6 +597,15 @@ impl ChunkManager {
 
 
     fn try_promote_from_cache(&mut self, center: ChunkKey, key: ChunkKey) -> bool {
+        // If priority box isn't ready, defer non-priority promotions.
+        if !self.priority_box_ready(center) && !self.in_priority_box(center, key) {
+            self.chunks.insert(key, ChunkState::Queued);
+            if self.queued_set.insert(key) {
+                self.build_queue.push_back(key);
+            }
+            return false;
+        }
+
         let Some(e) = self.cache.get(&key) else { return false; };
 
         let nodes = e.nodes.clone();
@@ -505,6 +616,8 @@ impl ChunkManager {
         self.cache.touch(key);
         self.try_make_uploading(center, key, nodes, macro_words, ropes, colinfo_words)
     }
+
+
 
     fn on_build_done(
         &mut self,
@@ -530,6 +643,16 @@ impl ChunkManager {
         self.cache.put(key, nodes_arc.clone(), macro_arc.clone(), ropes_arc.clone(), colinfo_arc.clone());
 
         if matches!(self.chunks.get(&key), Some(ChunkState::Resident(_))) {
+            return;
+        }
+
+        // Defer GPU upload for non-priority until priority box is GPU-ready.
+        // Keep it cached and re-queue the key so later we can promote from cache.
+        if !self.priority_box_ready(center) && !self.in_priority_box(center, key) {
+            self.chunks.insert(key, ChunkState::Queued);
+            if self.queued_set.insert(key) {
+                self.build_queue.push_back(key);
+            }
             return;
         }
 
@@ -887,6 +1010,19 @@ impl ChunkManager {
                 break;
             }
 
+            // -------- PRIORITY GATE (Step 6) --------
+            // While the 5x5x5 is not GPU-ready, don't spend upload bandwidth on non-priority
+            // residency uploads. (Rewrites are allowed.)
+            if u.completes_residency {
+                if let Some(center) = self.last_center {
+                    if !self.priority_box_ready(center) && !self.in_priority_box(center, u.key) {
+                        push_front_same(self, which, u);
+                        break; // stop this frame so we don't spin
+                    }
+                }
+            }
+            // ----------------------------------------
+
             // Validate slot + update meta bases (same behavior as before)
             let slot = match self.chunks.get(&u.key) {
                 Some(ChunkState::Resident(r)) => r.slot,
@@ -926,6 +1062,7 @@ impl ChunkManager {
         let mut any_promoted = false;
         let mut any_uploaded_flip = false;
 
+
         // Mark uploads as applied; detect first-time flip.
         for u in applied {
             if !u.completes_residency { continue; }
@@ -939,6 +1076,10 @@ impl ChunkManager {
 
         // We’ll score candidates by distance to current center; ACTIVE gets a big bonus.
         let center_opt = self.last_center;
+        let priority_gate = center_opt
+            .map(|c| !self.priority_box_ready(c))
+            .unwrap_or(false);
+
 
         loop {
             if self.resident_slots >= self.slot_to_key.len() { break; }
@@ -956,6 +1097,13 @@ impl ChunkManager {
 
                 for s in self.resident_slots..self.slot_to_key.len() {
                     let k = self.slot_to_key[s];
+                    if priority_gate {
+                        let c = center_opt.unwrap();
+                        if !self.in_priority_box(c, k) {
+                            continue;
+                        }
+                    }
+
 
                     let Some(ChunkState::Uploading(up)) = self.chunks.get(&k) else { continue; };
                     if !up.uploaded { continue; }
@@ -967,10 +1115,13 @@ impl ChunkManager {
                     };
 
                     if let Some(c) = center_opt {
-                        if self.in_active_xz(c, k) {
-                            score -= 10_000.0; // huge preference for ACTIVE
-                        }
+                    if self.in_active_xz(c, k) {
+                        score -= 10_000.0;
                     }
+                    if self.in_priority_box(c, k) {
+                        score -= 20_000.0;
+                    }
+                }
 
                     if best.map_or(true, |(bs, _)| score < bs) {
                         best = Some((score, s));
@@ -1007,6 +1158,14 @@ impl ChunkManager {
             // Now the frontier slot should be ready; promote it.
             let slot = self.resident_slots;
             let key = self.slot_to_key[slot];
+
+            if priority_gate {
+                let c = center_opt.unwrap();
+                if !self.in_priority_box(c, key) {
+                    break; // do not promote outside priority box yet
+                }
+            }
+
 
             let ready = matches!(
                 self.chunks.get(&key),
@@ -1168,7 +1327,9 @@ impl ChunkManager {
     fn in_active_xz(&self, center: ChunkKey, k: ChunkKey) -> bool {
         let dx = (k.x - center.x).abs();
         let dz = (k.z - center.z).abs();
-        dx <= config::ACTIVE_RADIUS && dz <= config::ACTIVE_RADIUS
+
+        dx <= config::ACTIVE_RADIUS.max(PRIORITY_RADIUS)
+            && dz <= config::ACTIVE_RADIUS.max(PRIORITY_RADIUS)
     }
 
     #[inline]
@@ -1204,13 +1365,14 @@ impl ChunkManager {
         let mut new_active = VecDeque::with_capacity(self.uploads_active.len());
         let mut new_other  = VecDeque::with_capacity(self.uploads_other.len());
 
-        let ar = config::ACTIVE_RADIUS;
+        let ar = config::ACTIVE_RADIUS.max(PRIORITY_RADIUS);
 
         let mut is_active = |k: ChunkKey| {
             let dx = (k.x - center.x).abs();
             let dz = (k.z - center.z).abs();
             dx <= ar && dz <= ar
         };
+
 
         for u in self.uploads_active.drain(..) {
             if is_active(u.key) { new_active.push_back(u); }
@@ -1290,6 +1452,31 @@ impl ChunkManager {
 
 
         Some(s)
+    }
+
+    #[inline(always)]
+    fn is_gpu_ready(&self, k: ChunkKey) -> bool {
+        match self.chunks.get(&k) {
+            Some(ChunkState::Resident(_)) => true,
+            Some(ChunkState::Uploading(up)) => up.uploaded,
+            _ => false,
+        }
+    }
+
+    fn priority_box_ready(&self, center: ChunkKey) -> bool {
+        // If the column cache can’t answer, don’t stall the world forever—treat that column as “not required yet”.
+        for &(dx, dy, dz) in &self.priority_offsets {
+            let x = center.x + dx;
+            let z = center.z + dz;
+
+            let Some(ground_cy) = self.ground_cy_for_column(x, z) else { continue; };
+            let k = ChunkKey { x, y: ground_cy + dy, z };
+
+            if !self.is_gpu_ready(k) {
+                return false;
+            }
+        }
+        true
     }
 
 

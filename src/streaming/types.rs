@@ -6,8 +6,8 @@ use crate::render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu};
 pub const INVALID_U32: u32 = 0xFFFF_FFFF;
 
 // Vertical band dy in [-1..=2]
-pub const GRID_Y_MIN_DY: i32 = -1;
-pub const GRID_Y_COUNT: u32 = 4;
+pub const GRID_Y_MIN_DY: i32 = -2;
+pub const GRID_Y_COUNT: u32 = 5;
 
 pub const EVICT_ATTEMPTS: usize = 8;
 
@@ -21,6 +21,9 @@ pub const COLINFO_WORDS_PER_CHUNK_USIZE: usize = 2048;
 
 pub const MAX_UPLOADS_PER_FRAME: usize = 24;            // start 6–12
 pub const MAX_UPLOAD_BYTES_PER_FRAME: usize = 16 << 20; // start 2–8 MB
+
+pub const PRIORITY_RADIUS: i32 = 2; // => 5x5 in XZ, and with GRID_Y_* => 5 in Y
+
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 pub struct ChunkKey {
