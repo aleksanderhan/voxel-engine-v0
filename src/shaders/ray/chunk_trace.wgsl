@@ -370,6 +370,19 @@ fn macro_dda_step_and_refresh(
   (*macro_empty) = !macro_test(macro_base, bit);
 }
 
+fn macro_chunk_is_empty(macro_base: u32) -> bool {
+  // If there's no macro data, we can't prove emptiness.
+  if (macro_base == INVALID_U32) { return false; }
+
+  // 16 u32 words = 512 bits (8*8*8)
+  var any: u32 = 0u;
+  for (var i: u32 = 0u; i < MACRO_WORDS_PER_CHUNK; i = i + 1u) {
+    any |= macro_occ[macro_base + i];
+  }
+  return any == 0u;
+}
+
+
 
 // --------------------------------------------------------------------------
 // Rewritten traversal (macro DDA + leaf/rope traversal)
@@ -775,12 +788,16 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
     if (slot != INVALID_U32 && slot < cam.chunk_count) {
       let ch = chunks[slot];
 
-      let cell_enter = start_t + t_local;
-      let cell_exit  = start_t + min(tNextLocal, t_exit_local);
+      // Skip trivially empty chunks (macro occupancy says "no bits set")
+      if (!macro_chunk_is_empty(ch.macro_base)) {
+        let cell_enter = start_t + t_local;
+        let cell_exit  = start_t + min(tNextLocal, t_exit_local);
 
-      let h = trace_chunk_rope_interval(ro, rd, ch, cell_enter, cell_exit);
-      if (h.hit != 0u && h.t < best.t) { best = h; }
+        let h = trace_chunk_rope_interval(ro, rd, ch, cell_enter, cell_exit);
+        if (h.hit != 0u && h.t < best.t) { best = h; }
+      }
     }
+
 
     // Advance DDA
     if (tMaxX < tMaxY) {
