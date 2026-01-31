@@ -9,13 +9,13 @@
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
 @group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
 @group(1) @binding(2) var godray_out      : texture_storage_2d<rgba16float, write>;
+@group(1) @binding(3) var godray_hist_samp: sampler;
 
 @group(2) @binding(0) var color_tex  : texture_2d<f32>;
 @group(2) @binding(1) var godray_tex : texture_2d<f32>;
 @group(2) @binding(2) var out_img    : texture_storage_2d<rgba16float, write>;
 @group(2) @binding(3) var depth_full : texture_2d<f32>;
 @group(2) @binding(4) var godray_samp: sampler;
-
 
 @compute @workgroup_size(8, 8, 1)
 fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -93,7 +93,7 @@ fn main_godray(@builtin(global_invocation_id) gid3: vec3<u32>) {
   let gid = vec2<u32>(gid3.x, gid3.y);
   let hip = vec2<i32>(i32(gid.x), i32(gid.y));
 
-  let out_rgba = compute_godray_quarter_pixel(gid, depth_tex, godray_hist_tex);
+  let out_rgba = compute_godray_pixel(gid, depth_tex, godray_hist_tex, godray_hist_samp);
   textureStore(godray_out, hip, out_rgba);
 }
 

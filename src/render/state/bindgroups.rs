@@ -122,6 +122,7 @@ fn make_godray_bg(
     depth_view: &wgpu::TextureView,
     hist_view: &wgpu::TextureView,
     out_view: &wgpu::TextureView,
+    hist_sampler: &wgpu::Sampler,   // NEW
     label: &str,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -140,9 +141,14 @@ fn make_godray_bg(
                 binding: 2,
                 resource: wgpu::BindingResource::TextureView(out_view),
             },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(hist_sampler),
+            },
         ],
     })
 }
+
 
 fn make_composite_bg(
     device: &wgpu::Device,
@@ -219,6 +225,7 @@ pub fn create_bind_groups(
             &textures.depth.view,
             &textures.godray[0].view,
             &textures.godray[1].view,
+            sampler,
             "godray_bg_a_to_b",
         ),
         make_godray_bg(
@@ -227,6 +234,7 @@ pub fn create_bind_groups(
             &textures.depth.view,
             &textures.godray[1].view,
             &textures.godray[0].view,
+            sampler,
             "godray_bg_b_to_a",
         ),
     ];

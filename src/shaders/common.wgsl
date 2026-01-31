@@ -93,7 +93,8 @@ const GODRAY_HAZE_NEAR_FADE  : f32 = 18.0;
 const CLOUD_GODRAY_W         : f32 = 0.50;
 
 const GODRAY_TV_CUTOFF   : f32 = 0.02;
-const GODRAY_STEPS_FAST  : u32 = 16u;
+const GODRAY_STEPS_FAST  : u32 = 24u;
+const GODRAY_STEPS_PER_METER = 1.0;
 
 const GODRAY_SHAFT_GAIN: f32 = 3.0;
 
@@ -177,14 +178,12 @@ const TAU             : f32        = 6.28318530718;
 
 const PRIMARY_NUDGE_VOXEL_FRAC : f32 = 1e-4;
 
-const GODRAY_BLOCK_SIZE : i32 = 2;
-
 const J0_SCALE : f32 = 1.31;
 const J1_SCALE : f32 = 2.11;
 const J2_SCALE : f32 = 3.01;
 const J3_SCALE : f32 = 4.19;
 
-const COMPOSITE_SHARPEN : f32 = 0.15;
+const COMPOSITE_SHARPEN : f32 = 0.1;
 
 const POST_EXPOSURE : f32 = 0.15;
 

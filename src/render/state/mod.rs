@@ -343,13 +343,9 @@ impl Renderer {
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
             cpass.set_bind_group(1, &self.bind_groups.godray[ping], &[]);
 
-            let qw = half_dim(self.internal_w);
-            let qh = half_dim(self.internal_h);
-
-            let gx = (qw + 7) / 8;
-            let gy = (qh + 7) / 8;
+            let gx = (self.internal_w + 7) / 8;
+            let gy = (self.internal_h + 7) / 8;
             cpass.dispatch_workgroups(gx, gy, 1);
-
         }
 
         {

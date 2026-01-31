@@ -1,77 +1,60 @@
 // src/shaders/ray/godrays.wgsl
-//// --------------------------------------------------------------------------
-//// Godrays: integration + half-res temporal pixel
-//// --------------------------------------------------------------------------
-
 // -----------------------------------------------------------------------------
-// 5-tap collapsed godray integration
-// - One march out to t_end_max
-// - Per-tap lightweight LP state + accumulation
+// Godrays (full-res):
+// - Single-pass raymarch integration
+// - Full-res temporal accumulation (history is full-res ping-pong texture)
+// - Stores: RGB = compressed godray, A = depth proxy (nearest depth)
 // -----------------------------------------------------------------------------
+fn approx_pow_0p75(x: f32) -> f32 {
+  // x^(3/4) = x^(1/2) * x^(1/4) = sqrt(x) * sqrt(sqrt(x))
+  let y = clamp(x, 0.0, 1.0);
+  return sqrt(y) * sqrt(sqrt(y));
+}
 
-struct Godray5 {
-  g0: vec3<f32>,
-  g1: vec3<f32>,
-  g2: vec3<f32>,
-  g3: vec3<f32>,
-  g4: vec3<f32>,
-};
 
-fn godray_integrate_5(
+fn approx_pow_0p55(x: f32) -> f32 {
+  // cheap visual approximation for x^0.55
+  let y  = clamp(x, 0.0, 1.0);
+  let sy = sqrt(y);
+  // close enough for shafts; tweak 0.10..0.25 if you want
+  return mix(sy, y, 0.12);
+}
+
+
+fn godray_integrate_1(
   ro: vec3<f32>,
   rd: vec3<f32>,
-  t_end0: f32,
-  t_end1: f32,
-  t_end2: f32,
-  t_end3: f32,
-  t_end4: f32,
-  j0: f32,
-  j1: f32,
-  j2: f32,
-  j3: f32,
-  j4: f32,
+  t_end: f32,
+  j: f32,
   j_phase: f32
-) -> Godray5 {
+) -> vec3<f32> {
   let base = fog_density_godray();
-  if (base <= 0.0) {
-    return Godray5(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
-  }
+  if (base <= 0.0 || t_end <= 0.0) { return vec3<f32>(0.0); }
 
-  // Enabled taps
-  let e0 = t_end0 > 0.0;
-  let e1 = t_end1 > 0.0;
-  let e2 = t_end2 > 0.0;
-  let e3 = t_end3 > 0.0;
-  let e4 = t_end4 > 0.0;
+  let phase = phase_blended(dot(rd, SUN_DIR));
+  let mu = dot(rd, SUN_DIR);
+  let view_gate = 0.10 + 0.90 * smoothstep(0.0, 0.20, mu);
 
-  let t_end_max = max(max(max(t_end0, t_end1), max(t_end2, t_end3)), t_end4);
-  if (t_end_max <= 0.0) {
-    return Godray5(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
-  }
+  let Nmax = GODRAY_STEPS_FAST;
 
-  let costh = dot(rd, SUN_DIR);
-  let phase = phase_blended(costh);
+  // Optional: dynamic early cut (see section 3)
+  let steps_f = clamp(ceil(t_end * GODRAY_STEPS_PER_METER), 6.0, f32(Nmax));
+  let steps: u32 = u32(steps_f);
 
-  // March spacing based on max distance (single loop)
-  let N  = f32(GODRAY_STEPS_FAST);
-  let dt = t_end_max / N;
-
-  // LP coefficients
+  let dt = t_end / f32(steps);
   let a_ts    = 1.0 - exp(-dt * 3.0);
   let a_shaft = 1.0 - exp(-dt * 5.0);
 
-  // Per-tap running state
-  var ts0: f32 = 1.0; var sh0: f32 = 0.0; var sum0 = vec3<f32>(0.0);
-  var ts1: f32 = 1.0; var sh1: f32 = 0.0; var sum1 = vec3<f32>(0.0);
-  var ts2: f32 = 1.0; var sh2: f32 = 0.0; var sum2 = vec3<f32>(0.0);
-  var ts3: f32 = 1.0; var sh3: f32 = 0.0; var sum3 = vec3<f32>(0.0);
-  var ts4: f32 = 1.0; var sh4: f32 = 0.0; var sum4 = vec3<f32>(0.0);
+  var ts: f32 = 1.0;
+  var sh: f32 = 0.0;
+  var sum = vec3<f32>(0.0);
 
-  for (var i: u32 = 0u; i < GODRAY_STEPS_FAST; i = i + 1u) {
-    let ti = max((f32(i) + 0.5 + j_phase) * dt, 0.0);
-    if (ti <= 0.0) { continue; }
+  // (Section 5) optional recurrence for haze_ramp
+  // var exp_haze = exp(-((0.5 + j_phase) * dt) / GODRAY_HAZE_NEAR_FADE);
+  // let haze_decay = exp(-dt / GODRAY_HAZE_NEAR_FADE);
 
-    // Shared expensive work at this ti
+  for (var i: u32 = 0u; i < steps; i = i + 1u) {
+    let ti = (f32(i) + 0.5 + j_phase) * dt;
     let p  = ro + rd * ti;
 
     let Tv = fog_transmittance_godray(ro, rd, ti);
@@ -81,13 +64,16 @@ fn godray_integrate_5(
     let Tc      = cloud_sun_transmittance_fast(p, SUN_DIR);
 
     let Tc_vol  = mix(1.0, Tc, CLOUD_GODRAY_W);
-    let Ts_soft = pow(clamp(Ts_geom, 0.0, 1.0), 0.75);
 
-    // Height falloff + density at this ti
+    // Replace pow(x, 0.75) with cheaper ops (section 4)
+    let Ts_clamped = clamp(Ts_geom, 0.0, 1.0);
+    let Ts_soft = approx_pow_0p75(Ts_clamped);
+
+    // haze_ramp: either keep exp(), or use recurrence (section 5)
     let haze_ramp = 1.0 - exp(-ti / GODRAY_HAZE_NEAR_FADE);
-    let hfall = GODRAY_SCATTER_HEIGHT_FALLOFF;
-    let hmin  = GODRAY_SCATTER_MIN_FRAC;
-    let height_term = max(exp(-hfall * p.y), hmin);
+    // let haze_ramp = 1.0 - exp_haze; exp_haze *= haze_decay;
+
+    let height_term = max(exp(-GODRAY_SCATTER_HEIGHT_FALLOFF * p.y), GODRAY_SCATTER_MIN_FRAC);
     let dens = base * height_term;
 
     let common_factor = (SUN_COLOR * SUN_INTENSITY)
@@ -95,372 +81,56 @@ fn godray_integrate_5(
       * Tc_vol
       * 0.70;
 
-    let mu = dot(rd, SUN_DIR);
-    let view_gate = 0.10 + 0.90 * smoothstep(0.0, 0.20, mu);
+    // Tap body (your tap4 logic)
+    let ts_prev = ts;
+    ts = mix(ts, Ts_soft, a_ts);
 
-    // ---- Tap 0
-    if (e0) {
-      let tcut = ti + j0 * dt;
-      let a = (tcut <= t_end0);
-      let wa = select(0.0, 1.0, a);
+    let dTs = max(0.0, ts_prev - Ts_soft);
 
-      if (wa > 0.0) {
-        let ts_prev = ts0;
-        ts0 = mix(ts0, Ts_soft, a_ts);
+    var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
+    shaft *= (1.0 - Ts_soft);
+    shaft = approx_pow_0p55(clamp(shaft, 0.0, 1.0));
 
-        let dTs = max(0.0, ts_prev - Ts_soft);
+    sh = mix(sh, shaft, a_shaft);
+    shaft = sh;
 
-        var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
-        shaft *= (1.0 - Ts_soft);
-        shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
+    let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
 
-        sh0 = mix(sh0, shaft, a_shaft);
-        shaft = sh0;
+    let shaft_sun_gate = smoothstep(0.35, 0.80, ts);
+    let haze = GODRAY_BASE_HAZE * haze_ramp * (ts * ts); // was pow(ts,2)
 
-        // ---- NEW: edge-only energy boost (uses low-passed shaft)
-        let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
-
-        let shaft_sun_gate = smoothstep(0.35, 0.80, ts0);
-
-        // (keeping your current tap0 w-shaping)
-        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts0, 3.5);
-        let haze_cap = 0.08;
-        let haze_floor = min(haze, haze_cap);
-
-        let shaft_gain = GODRAY_SHAFT_GAIN;
-        let shaft_term = clamp(shaft * shaft_sun_gate * shaft_gain, 0.0, 1.0);
-
-        let w = clamp(haze_floor + (1.0 - haze_floor) * shaft_term, 0.0, 1.0);
-
-        sum0 += common_factor * view_gate * edge_boost * (ts0 * w);
-      }
-    }
-
-    // ---- Tap 1
-    if (e1) {
-      let tcut = ti + j1 * dt;
-      let a = (tcut <= t_end1);
-      let wa = select(0.0, 1.0, a);
-
-      if (wa > 0.0) {
-        let ts_prev = ts1;
-        ts1 = mix(ts1, Ts_soft, a_ts);
-
-        let dTs = max(0.0, ts_prev - Ts_soft);
-
-        var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
-        shaft *= (1.0 - Ts_soft);
-        shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
-
-        sh1 = mix(sh1, shaft, a_shaft);
-        shaft = sh1;
-
-        // ---- NEW
-        let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
-
-        let shaft_sun_gate = smoothstep(0.35, 0.80, ts1);
-        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts1, 2.0);
-
-        let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
-        let w = clamp(w_raw, 0.0, 1.0);
-
-        sum1 += common_factor * edge_boost * (ts1 * w);
-      }
-    }
-
-    // ---- Tap 2
-    if (e2) {
-      let tcut = ti + j2 * dt;
-      let a = (tcut <= t_end2);
-      let wa = select(0.0, 1.0, a);
-
-      if (wa > 0.0) {
-        let ts_prev = ts2;
-        ts2 = mix(ts2, Ts_soft, a_ts);
-
-        let dTs = max(0.0, ts_prev - Ts_soft);
-
-        var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
-        shaft *= (1.0 - Ts_soft);
-        shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
-
-        sh2 = mix(sh2, shaft, a_shaft);
-        shaft = sh2;
-
-        // ---- NEW
-        let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
-
-        let shaft_sun_gate = smoothstep(0.35, 0.80, ts2);
-        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts2, 2.0);
-
-        let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
-        let w = clamp(w_raw, 0.0, 1.0);
-
-        sum2 += common_factor * edge_boost * (ts2 * w);
-      }
-    }
-
-    // ---- Tap 3
-    if (e3) {
-      let tcut = ti + j3 * dt;
-      let a = (tcut <= t_end3);
-      let wa = select(0.0, 1.0, a);
-
-      if (wa > 0.0) {
-        let ts_prev = ts3;
-        ts3 = mix(ts3, Ts_soft, a_ts);
-
-        let dTs = max(0.0, ts_prev - Ts_soft);
-
-        var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
-        shaft *= (1.0 - Ts_soft);
-        shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
-
-        sh3 = mix(sh3, shaft, a_shaft);
-        shaft = sh3;
-
-        // ---- NEW
-        let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
-
-        let shaft_sun_gate = smoothstep(0.35, 0.80, ts3);
-        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts3, 2.0);
-
-        let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
-        let w = clamp(w_raw, 0.0, 1.0);
-
-        sum3 += common_factor * edge_boost * (ts3 * w);
-      }
-    }
-
-    // ---- Tap 4 (center)
-    if (e4) {
-      let tcut = ti + j4 * dt;
-      let a = (tcut <= t_end4);
-      let wa = select(0.0, 1.0, a);
-
-      if (wa > 0.0) {
-        let ts_prev = ts4;
-        ts4 = mix(ts4, Ts_soft, a_ts);
-
-        let dTs = max(0.0, ts_prev - Ts_soft);
-
-        var shaft = smoothstep(GODRAY_EDGE0, GODRAY_EDGE1, dTs);
-        shaft *= (1.0 - Ts_soft);
-        shaft = pow(clamp(shaft, 0.0, 1.0), 0.55);
-
-        sh4 = mix(sh4, shaft, a_shaft);
-        shaft = sh4;
-
-        // ---- NEW
-        let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
-
-        let shaft_sun_gate = smoothstep(0.35, 0.80, ts4);
-        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts4, 2.0);
-
-        let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
-        let w = clamp(w_raw, 0.0, 1.0);
-
-        sum4 += common_factor * edge_boost * (ts4 * w);
-      }
-    }
+    let w = clamp(haze + (1.0 - haze) * (shaft * shaft_sun_gate), 0.0, 1.0);
+    sum += common_factor * view_gate * edge_boost * (ts * w);
   }
 
-  var g0 = sum0 * GODRAY_ENERGY_BOOST;
-  var g1 = sum1 * GODRAY_ENERGY_BOOST;
-  var g2 = sum2 * GODRAY_ENERGY_BOOST;
-  var g3 = sum3 * GODRAY_ENERGY_BOOST;
-  var g4 = sum4 * GODRAY_ENERGY_BOOST;
-
-  g0 = g0 / (g0 + vec3<f32>(GODRAY_KNEE_INTEGRATE));
-  g1 = g1 / (g1 + vec3<f32>(GODRAY_KNEE_INTEGRATE));
-  g2 = g2 / (g2 + vec3<f32>(GODRAY_KNEE_INTEGRATE));
-  g3 = g3 / (g3 + vec3<f32>(GODRAY_KNEE_INTEGRATE));
-  g4 = g4 / (g4 + vec3<f32>(GODRAY_KNEE_INTEGRATE));
-
-  return Godray5(g0, g1, g2, g3, g4);
+  var g = sum * GODRAY_ENERGY_BOOST;
+  let knee = vec3<f32>(GODRAY_KNEE_INTEGRATE);
+  g = g / (g + knee);
+  return g;
 }
 
-fn compute_godray_quarter_pixel(
-  gid: vec2<u32>,
-  depth_tex: texture_2d<f32>,
-  godray_hist_tex: texture_2d<f32>
-) -> vec4<f32> {
-  let fdims = textureDimensions(depth_tex);
-  let ro = cam.cam_pos.xyz;
-
-  let hip = vec2<i32>(i32(gid.x), i32(gid.y));
-  let qpx = vec2<f32>(f32(gid.x), f32(gid.y));
-
-  let base_x = i32(gid.x) * GODRAY_BLOCK_SIZE;
-  let base_y = i32(gid.y) * GODRAY_BLOCK_SIZE;
-
-  // For half-res (2x2 block): sample the 4 corners
-  let bs = GODRAY_BLOCK_SIZE;
-  let fp0 = vec2<i32>(clamp(base_x + 0,      0, i32(fdims.x) - 1),
-                      clamp(base_y + 0,      0, i32(fdims.y) - 1));
-  let fp1 = vec2<i32>(clamp(base_x + bs - 1, 0, i32(fdims.x) - 1),
-                      clamp(base_y + 0,      0, i32(fdims.y) - 1));
-  let fp2 = vec2<i32>(clamp(base_x + 0,      0, i32(fdims.x) - 1),
-                      clamp(base_y + bs - 1, 0, i32(fdims.y) - 1));
-  let fp3 = vec2<i32>(clamp(base_x + bs - 1, 0, i32(fdims.x) - 1),
-                      clamp(base_y + bs - 1, 0, i32(fdims.y) - 1));
 
 
-  // Jitter as before
-  let j0 = 0.20 * (hash12(qpx * J0_SCALE) - 0.5);
-  let j1 = 0.20 * (hash12(qpx * J1_SCALE + vec2<f32>(11.0, 3.0)) - 0.5);
-  let j2 = 0.20 * (hash12(qpx * J2_SCALE + vec2<f32>(5.0, 17.0)) - 0.5);
-  let j3 = 0.20 * (hash12(qpx * J3_SCALE + vec2<f32>(23.0, 29.0)) - 0.5);
-
-  // Phase jitter for raymarch sample positions (NOT cutoff jitter).
-  // In [-0.5 .. +0.5]. Keep it small and stable-ish.
-  let jf = f32(cam.frame_index & 255u);
-
-  let j_phase = hash12(qpx * 0.91 + vec2<f32>(31.7, 12.3)) - 0.5;
-
-  // Load depths (same)
-  let t_scene0 = textureLoad(depth_tex, fp0, 0).x;
-  let t_scene1 = textureLoad(depth_tex, fp1, 0).x;
-  let t_scene2 = textureLoad(depth_tex, fp2, 0).x;
-  let t_scene3 = textureLoad(depth_tex, fp3, 0).x;
-
-  // Early-out: if no godray fog, just blend history toward 0 quickly
-  let fog_ok = fog_density_godray() > 0.0;
-
-  // Quantize end distances (same)
-  let qstep = 0.03;
-  let dq = (hash12(qpx * 1.37 + vec2<f32>(9.2, 1.1)) - 0.5) * qstep;
-
-  let t_end0 = min(floor((t_scene0 + dq) / qstep) * qstep, GODRAY_MAX_DIST);
-  let t_end1 = min(floor((t_scene1 + dq) / qstep) * qstep, GODRAY_MAX_DIST);
-  let t_end2 = min(floor((t_scene2 + dq) / qstep) * qstep, GODRAY_MAX_DIST);
-  let t_end3 = min(floor((t_scene3 + dq) / qstep) * qstep, GODRAY_MAX_DIST);
-
-
-  // -------------------------------------------------------------------------
-  // compute ray direction ONCE for the block center and reuse it
-  // Center of the 4x4 block (base + 2,2) in full-res pixel coords.
-  // -------------------------------------------------------------------------
-  let res_full = vec2<f32>(f32(fdims.x), f32(fdims.y));
-  
-  // ~sub-texel in full-res pixels
-  let j_rd = vec2<f32>(
-    hash12(qpx + vec2<f32>(1.7, 9.2)) - 0.5,
-    hash12(qpx + vec2<f32>(8.3, 2.1)) - 0.5
-  );
-  let center_off = 0.5 * f32(bs - 1);
-  let center_px = vec2<f32>(f32(base_x) + center_off, f32(base_y) + center_off) + 0.35 * j_rd;
-  let rd_center = ray_dir_from_pixel(center_px, res_full);
-
-  // -------------------------------------------------------------------------
-
-  var acc = vec3<f32>(0.0);
-  var wsum = 0.0;
-
-  if (fog_ok) {
-    let g5 = godray_integrate_5(
-      ro, rd_center,
-      t_end0, t_end1, t_end2, t_end3, 0.0,
-      j0, j1, j2, j3, 0.0,
-      j_phase
-    );
-
-    if (t_end0 > 0.0) { acc += g5.g0; wsum += 1.0; }
-    if (t_end1 > 0.0) { acc += g5.g1; wsum += 1.0; }
-    if (t_end2 > 0.0) { acc += g5.g2; wsum += 1.0; }
-    if (t_end3 > 0.0) { acc += g5.g3; wsum += 1.0; }
-  }
-
-  let cur_lin = max(select(vec3<f32>(0.0), acc / wsum, wsum > 0.0), vec3<f32>(0.0));
-
-    // --- Depth span / stability (must be computed before using dmin)
-  let dmin = min(min(t_scene0, t_scene1), min(t_scene2, t_scene3));
-  let dmax = max(max(t_scene0, t_scene1), max(t_scene2, t_scene3));
-  let span = (dmax - dmin) / max(dmin, 1e-3);
-  let edge = smoothstep(0.06, 0.30, span);
-  let stable = 1.0 - edge;
-
-  // --- Reproject history ---
-  // Use nearest surface depth in the block to reduce bleeding across edges
-  let t_hist = dmin;
-  let p_ws   = ro + rd_center * t_hist;
-
-  // Project into previous frame
-  let uv_prev = prev_uv_from_world(p_ws);
-
-  // Default: no history
-  var hist_lin = cur_lin;
-  var hist_valid = 0.0;
-
-  // current half-res uv (for velocity in pixels)
-  let hd  = textureDimensions(godray_hist_tex);
-  let hdf = vec2<f32>(f32(hd.x), f32(hd.y));
-  let uv_cur = (vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5)) / hdf;
-
-  if (in_unit_square(uv_prev)) {
-    // history sample (RGBA16F): xyz = compressed godray, w = stored depth proxy
-    let h = load_hist_bilinear(godray_hist_tex, uv_prev);
-
-    let hist_depth = h.w;
-    hist_lin = godray_decompress(h.xyz);
-
-    // --- depth rejection (disocclusion killer)
-    let depth_cur = dmin;
-    let rel = abs(hist_depth - depth_cur) / max(depth_cur, 1e-3);
-    let depth_ok = 1.0 - smoothstep(0.08, 0.20, rel);     // tighten if needed
-    let depth_sane = select(0.0, 1.0, hist_depth > 1e-3);
-
-    // --- motion rejection (fast pans)
-    let vel_px = length((uv_prev - uv_cur) * hdf);
-    let motion_ok = 1.0 - smoothstep(0.75, 2.50, vel_px);
-
-    hist_valid = depth_ok * depth_sane * motion_ok;
-  }
-
-  // --- Reactive mask in LINEAR space (prevents ghosting)
-  let delta_lin = length(cur_lin - hist_lin);
-  let energy = max(length(cur_lin), 1e-3);
-  let delta_rel = delta_lin / (0.05 + energy);   // 0.05 is a soft floor
-  let react = smoothstep(0.10, 0.45, delta_rel);
-
-
-  // --- Clamp history around current in LINEAR space
-  let clamp_scale = mix(0.55, 0.18, stable);
-  let clamp_min   = vec3<f32>(0.015);
-  let clamp_w     = max(cur_lin * clamp_scale, clamp_min);
-  let hist_lin_clamped = clamp(hist_lin, cur_lin - clamp_w, cur_lin + clamp_w);
-
-  // --- Adaptive history weight
-  let hist_w_base = mix(0.25, 0.92, stable);      // slightly less max history helps ghosting
-  let hist_w      = mix(hist_w_base, 0.03, react) * hist_valid;
-  let out_lin     = mix(cur_lin, hist_lin_clamped, hist_w);
-
-  let out_c = godray_compress(max(out_lin, vec3<f32>(0.0)));
-  return vec4<f32>(out_c, dmin);
-}
-
-fn godray_decompress(cur: vec3<f32>) -> vec3<f32> {
+// -----------------------------------------------------------------------------
+// Compression helpers (history stores compressed RGB in [0..1]).
+// -----------------------------------------------------------------------------
+fn godray_decompress(c: vec3<f32>) -> vec3<f32> {
+  // lin = (k*c)/(1-c)
   let k = 0.25;
-  let one = vec3<f32>(1.0);
-  let denom = max(one - cur, vec3<f32>(1e-4));
-  return (k * cur) / denom;
+  let denom = max(vec3<f32>(1.0) - c, vec3<f32>(1e-4));
+  return (k * c) / denom;
 }
 
 fn godray_compress(lin: vec3<f32>) -> vec3<f32> {
-  // Invert decompress: lin = (k*c)/(1-c)  =>  c = lin/(lin+k)
+  // c = lin / (lin + k)
   let k = 0.25;
   return lin / (lin + vec3<f32>(k));
 }
 
-fn godray_sample_linear(
-  uv: vec2<f32>,
-  godray_tex: texture_2d<f32>,
-  godray_samp: sampler
-) -> vec3<f32> {
-  let c = textureSampleLevel(godray_tex, godray_samp, uv, 0.0).xyz;
-  return godray_decompress(c);
-}
 
+// -----------------------------------------------------------------------------
+// History reprojection utilities.
+// -----------------------------------------------------------------------------
 fn prev_uv_from_world(p_ws: vec3<f32>) -> vec2<f32> {
   let clip = cam.prev_view_proj * vec4<f32>(p_ws, 1.0);
   let invw = 1.0 / max(clip.w, 1e-6);
@@ -472,26 +142,132 @@ fn in_unit_square(uv: vec2<f32>) -> bool {
   return all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
 }
 
-fn load_hist_bilinear(tex: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
-  let dim = textureDimensions(tex);
-  let dimf = vec2<f32>(f32(dim.x), f32(dim.y));
+// -----------------------------------------------------------------------------
+// Full-res godray pixel: integrate + temporal accumulate.
+// Returns RGBA: rgb = compressed, a = depth proxy.
+// -----------------------------------------------------------------------------
+fn compute_godray_pixel(
+  gid: vec2<u32>,
+  depth_tex: texture_2d<f32>,
+  godray_hist_tex: texture_2d<f32>,
+  godray_hist_samp: sampler
+) -> vec4<f32> {
+  let fdims_u = textureDimensions(depth_tex);
+  let fdims_i = vec2<i32>(i32(fdims_u.x), i32(fdims_u.y));
+  let res_full = vec2<f32>(f32(fdims_u.x), f32(fdims_u.y));
 
-  // texel space with pixel center convention
-  let p = uv * dimf - vec2<f32>(0.5);
-  let i0 = vec2<i32>(i32(floor(p.x)), i32(floor(p.y)));
-  let f  = fract(p);
+  let ro = cam.cam_pos.xyz;
 
-  let x0 = clamp(i0.x, 0, i32(dim.x) - 1);
-  let y0 = clamp(i0.y, 0, i32(dim.y) - 1);
-  let x1 = clamp(i0.x + 1, 0, i32(dim.x) - 1);
-  let y1 = clamp(i0.y + 1, 0, i32(dim.y) - 1);
+  let ip = vec2<i32>(i32(gid.x), i32(gid.y));
+  let qpx = vec2<f32>(f32(gid.x), f32(gid.y));
 
-  let s00 = textureLoad(tex, vec2<i32>(x0, y0), 0);
-  let s10 = textureLoad(tex, vec2<i32>(x1, y0), 0);
-  let s01 = textureLoad(tex, vec2<i32>(x0, y1), 0);
-  let s11 = textureLoad(tex, vec2<i32>(x1, y1), 0);
+  // Frame-varying jitter seed (so temporal accumulation converges)
+  let fi = f32(cam.frame_index & 1023u);
+  let fj = vec2<f32>(fi, fi * 1.371);
 
-  let sx0 = mix(s00, s10, f.x);
-  let sx1 = mix(s01, s11, f.x);
-  return mix(sx0, sx1, f.y);
+  // Depth neighborhood (for stability + depth proxy)
+  let ip_l = vec2<i32>(clamp(ip.x - 1, 0, fdims_i.x - 1), ip.y);
+  let ip_r = vec2<i32>(clamp(ip.x + 1, 0, fdims_i.x - 1), ip.y);
+  let ip_u = vec2<i32>(ip.x, clamp(ip.y - 1, 0, fdims_i.y - 1));
+  let ip_d = vec2<i32>(ip.x, clamp(ip.y + 1, 0, fdims_i.y - 1));
+
+  let t_c = textureLoad(depth_tex, ip,   0).x;
+  let t_l = textureLoad(depth_tex, ip_l, 0).x;
+  let t_r = textureLoad(depth_tex, ip_r, 0).x;
+  let t_u = textureLoad(depth_tex, ip_u, 0).x;
+  let t_d = textureLoad(depth_tex, ip_d, 0).x;
+
+  let dmin = min(t_c, min(min(t_l, t_r), min(t_u, t_d)));
+  let dmax = max(t_c, max(max(t_l, t_r), max(t_u, t_d)));
+
+  let span   = (dmax - dmin) / max(dmin, 1e-3);
+  let stable = 1.0 - smoothstep(0.06, 0.30, span);
+
+  let t_hist = dmin;
+
+  // Jitters (frame-varying)
+  let j4      = 0.20 * (hash12(qpx * J0_SCALE + fj) - 0.5);
+  let j_phase =        (hash12(qpx * 0.91 + fj * 0.73 + vec2<f32>(31.7, 12.3)) - 0.5);
+
+  // Quantized end distance (frame-varying)
+  let qstep = 0.03;
+  let dq = (hash12(qpx * 1.37 + fj * 1.19 + vec2<f32>(9.2, 1.1)) - 0.5) * qstep;
+
+  // Ray dir jitter (frame-varying)
+  let j_rd = vec2<f32>(
+    hash12(qpx + fj + vec2<f32>(1.7, 9.2)) - 0.5,
+    hash12(qpx + fj * 1.13 + vec2<f32>(8.3, 2.1)) - 0.5
+  );
+
+  // Quantized end distance
+  let t_end = min(floor((t_c + dq) / qstep) * qstep, GODRAY_MAX_DIST);
+
+  let fog_ok = fog_density_godray() > 0.0;
+
+  // Ray dir for this pixel (with small sub-texel jitter)
+  let px_center = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5) + 0.35 * j_rd;
+  let rd = ray_dir_from_pixel(px_center, res_full);
+
+  // Current (linear)
+  var cur_lin = vec3<f32>(0.0);
+  if (fog_ok && t_end > 0.0) {
+    cur_lin = godray_integrate_1(ro, rd, t_end, j4, j_phase);
+  }
+
+  // Reproject history
+  let p_ws    = ro + rd * t_hist;
+  let uv_prev = prev_uv_from_world(p_ws);
+
+  var hist_lin   = cur_lin;
+  var hist_valid = 0.0;
+
+  let hd_u = textureDimensions(godray_hist_tex);
+  let hdf  = vec2<f32>(f32(hd_u.x), f32(hd_u.y));
+  let uv_cur = (vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5)) / hdf;
+
+  if (in_unit_square(uv_prev)) {
+    let h = textureSampleLevel(godray_hist_tex, godray_hist_samp, uv_prev, 0.0);
+
+    let hist_depth = h.w;
+    hist_lin = godray_decompress(h.xyz);
+
+    let rel = abs(hist_depth - t_hist) / max(t_hist, 1e-3);
+    let depth_ok   = 1.0 - smoothstep(0.08, 0.20, rel);
+    let depth_sane = select(0.0, 1.0, hist_depth > 1e-3);
+
+    let vel_px = length((uv_prev - uv_cur) * hdf);
+    let motion_ok = 1.0 - smoothstep(0.75, 2.50, vel_px);
+
+    hist_valid = depth_ok * depth_sane * motion_ok;
+  }
+
+  // Reactive mask
+  let delta_lin = length(cur_lin - hist_lin);
+  let energy    = max(length(cur_lin), 1e-3);
+  let delta_rel = delta_lin / (0.05 + energy);
+  let react     = smoothstep(0.10, 0.45, delta_rel);
+
+  // Clamp history around current
+  let clamp_scale = mix(0.55, 0.18, stable);
+  let clamp_w     = max(cur_lin * clamp_scale, vec3<f32>(0.015));
+  let hist_clamped = clamp(hist_lin, cur_lin - clamp_w, cur_lin + clamp_w);
+
+  // History weight
+  let hist_w_base = mix(0.25, 0.92, stable);
+  let hist_w      = mix(hist_w_base, 0.03, react) * hist_valid;
+
+  let out_lin = mix(cur_lin, hist_clamped, hist_w);
+
+  let out_c = godray_compress(max(out_lin, vec3<f32>(0.0)));
+  return vec4<f32>(out_c, t_hist);
+}
+
+fn godray_sample_linear(
+  uv: vec2<f32>,
+  godray_tex: texture_2d<f32>,
+  godray_samp: sampler
+) -> vec3<f32> {
+  // history/current godray textures store *compressed* RGB in [0..1]
+  let c = textureSampleLevel(godray_tex, godray_samp, uv, 0.0).xyz;
+  return godray_decompress(c);
 }

@@ -136,14 +136,24 @@ pub fn create_textures(
         rw_tex_usage,
     );
 
-    let qw = half_dim(internal_w);
-    let qh = half_dim(internal_h);
-
     let godray = [
-        make_tex2d(device, "godray_a", qw, qh, wgpu::TextureFormat::Rgba16Float, rw_tex_usage),
-        make_tex2d(device, "godray_b", qw, qh, wgpu::TextureFormat::Rgba16Float, rw_tex_usage),
+        make_tex2d(
+            device,
+            "godray_a",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::Rgba16Float,
+            rw_tex_usage,
+        ),
+        make_tex2d(
+            device,
+            "godray_b",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::Rgba16Float,
+            rw_tex_usage,
+        ),
     ];
-
 
     // FP16 clipmap height: R16Float (half bandwidth vs R32Float)
     let clip_height = make_tex2d_array(
