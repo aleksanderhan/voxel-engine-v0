@@ -58,10 +58,7 @@ fn godray_integrate_1(
   var sh: f32 = 0.0;
   var sum = vec3<f32>(0.0);
 
-  // (Section 5) optional recurrence for haze_ramp
-  // var exp_haze = exp(-((0.5 + j_phase) * dt) / GODRAY_HAZE_NEAR_FADE);
-  // let haze_decay = exp(-dt / GODRAY_HAZE_NEAR_FADE);
-
+  var Ts_geom: f32 = 1.0;
   for (var i: u32 = 0u; i < steps; i = i + 1u) {
     let ti = (f32(i) + 0.5 + j_phase) * dt;
 
@@ -73,7 +70,9 @@ fn godray_integrate_1(
     let Tv = fog_transmittance_godray(ro, rd, ti);
     if (Tv < GODRAY_TV_CUTOFF) { break; }
 
-    let Ts_geom = sun_transmittance_geom_only(p, SUN_DIR);
+    if ((i & 3u) == 0u) {           // every 4 steps
+      Ts_geom = sun_transmittance_geom_only(p, SUN_DIR);
+    }
     let Tc      = cloud_sun_transmittance_fast(p, SUN_DIR);
 
     let Tc_vol  = mix(1.0, Tc, CLOUD_GODRAY_W);
