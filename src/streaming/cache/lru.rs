@@ -1,11 +1,8 @@
-// src/streaming/cache.rs
 use std::{collections::VecDeque, mem::size_of, sync::Arc};
-
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{config, render::gpu_types::{NodeGpu, NodeRopesGpu}};
-
-use super::types::ChunkKey;
+use crate::streaming::types::ChunkKey;
 
 #[derive(Clone)]
 pub struct CachedChunk {
@@ -26,21 +23,14 @@ pub struct ChunkCache {
 
 impl ChunkCache {
     pub fn new() -> Self {
-        Self {
-            map: HashMap::default(),
-            lru: VecDeque::default(),
-            stamp: 1,
-            bytes: 0,
-        }
+        Self { map: HashMap::default(), lru: VecDeque::default(), stamp: 1, bytes: 0 }
     }
 
     pub fn stats(&self) -> (usize, usize, usize) {
         (self.bytes, self.map.len(), self.lru.len())
     }
 
-    pub fn get(&self, key: &ChunkKey) -> Option<&CachedChunk> {
-        self.map.get(key)
-    }
+    pub fn get(&self, key: &ChunkKey) -> Option<&CachedChunk> { self.map.get(key) }
 
     pub fn touch(&mut self, key: ChunkKey) {
         if let Some(e) = self.map.get_mut(&key) {
@@ -74,19 +64,11 @@ impl ChunkCache {
 
         self.map.insert(
             key,
-            CachedChunk {
-                nodes,
-                ropes,
-                macro_words,
-                colinfo_words,
-                bytes,
-                stamp,
-            },
+            CachedChunk { nodes, ropes, macro_words, colinfo_words, bytes, stamp },
         );
 
         self.bytes = self.bytes.saturating_add(bytes);
         self.lru.push_back((key, stamp));
-
         self.evict_as_needed();
     }
 
@@ -98,19 +80,11 @@ impl ChunkCache {
 
     fn evict_as_needed(&mut self) {
         let budget = config::CHUNK_CACHE_BUDGET_BYTES;
-
         while self.bytes > budget {
             let Some((k, stamp)) = self.lru.pop_front() else { break; };
 
-            let should_evict = self
-                .map
-                .get(&k)
-                .map(|e| e.stamp == stamp)
-                .unwrap_or(false);
-
-            if !should_evict {
-                continue;
-            }
+            let should_evict = self.map.get(&k).map(|e| e.stamp == stamp).unwrap_or(false);
+            if !should_evict { continue; }
 
             if let Some(ev) = self.map.remove(&k) {
                 self.bytes = self.bytes.saturating_sub(ev.bytes);
@@ -120,9 +94,7 @@ impl ChunkCache {
 
     fn maybe_compact_lru(&mut self) {
         let max = self.map.len().saturating_mul(8).max(1024);
-        if self.lru.len() <= max {
-            return;
-        }
+        if self.lru.len() <= max { return; }
 
         let mut new = VecDeque::with_capacity(self.map.len());
         for (k, e) in self.map.iter() {

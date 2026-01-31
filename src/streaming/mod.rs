@@ -1,13 +1,10 @@
-// src/streaming/mod.rs
-// Chunk streaming + node arena + uploads.
-
-pub mod manager;
-pub mod node_arena;
-
 pub mod types;
-mod priority;
-mod workers;
-mod cache;
+pub mod node_arena;
+pub mod priority;
+pub mod workers;
+
+pub mod cache;
+pub mod manager;
 
 pub use manager::ChunkManager;
 pub use types::{StreamStats, ChunkUpload};
