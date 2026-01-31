@@ -100,6 +100,10 @@ pub struct BuildScratch {
     ground_min_levels: Vec<Vec<i32>>,
     ground_max_levels: Vec<Vec<i32>>,
     tree_levels: Vec<Vec<i32>>,
+
+    // per-column top-most non-air (y, mat)
+    col_top_y: Vec<u8>,   // 255 = empty
+    col_top_mat: Vec<u8>, // low 8 bits of material id
 }
 
 impl BuildScratch {
@@ -115,8 +119,23 @@ impl BuildScratch {
             ground_min_levels: Vec::new(),
             ground_max_levels: Vec::new(),
             tree_levels: Vec::new(),
+            col_top_y: Vec::new(),
+            col_top_mat: Vec::new(),
         }
     }
+
+    #[inline]
+    fn ensure_coltop(col_top_y: &mut Vec<u8>, col_top_mat: &mut Vec<u8>, side: usize) {
+        let need = side * side;
+        if col_top_y.len() != need {
+            col_top_y.resize(need, 255);
+            col_top_mat.resize(need, 0);
+        } else {
+            col_top_y.fill(255);
+            col_top_mat.fill(0);
+        }
+    }
+
 
     #[inline]
     fn ensure_height_cache(&mut self, w: usize, h: usize) {
@@ -189,10 +208,21 @@ fn ropes_invalid() -> NodeRopesGpu {
 fn child_idx(nodes: &[NodeGpu], parent_idx: u32, ci: u32) -> u32 {
     let p = &nodes[parent_idx as usize];
     debug_assert!(!is_leaf(p));
-    // We enforce internal nodes to have all 8 children => child_mask should be 0xFF.
-    debug_assert_eq!(p.child_mask, 0xFF);
-    p.child_base + ci
+
+    let mask = p.child_mask;
+    let bit = 1u32 << ci;
+
+    if (mask & bit) == 0 {
+        return INVALID_U32;
+    }
+
+    // number of children before ci in the packed array
+    let before = mask & (bit - 1);
+    let rank = before.count_ones() as u32;
+
+    p.child_base + rank
 }
+
 
 #[inline]
 fn descend_one(nodes: &[NodeGpu], nei: u32, hx: u32, hy: u32, hz: u32) -> u32 {
@@ -207,84 +237,99 @@ fn descend_one(nodes: &[NodeGpu], nei: u32, hx: u32, hy: u32, hz: u32) -> u32 {
     child_idx(nodes, nei, ci)
 }
 
+
 fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
     if is_leaf(&nodes[idx as usize]) {
         return;
     }
 
-    let base = nodes[idx as usize].child_base;
-
-    // Parent ropes already filled in ropes[idx]
+    let p = &nodes[idx as usize];
     let pr = ropes[idx as usize];
+    let mask = p.child_mask;
 
+    // For each *existing* child, compute its ropes.
     for ci in 0u32..8u32 {
+        if (mask & (1u32 << ci)) == 0 {
+            continue;
+        }
+
         let hx = ci & 1;
         let hy = (ci >> 1) & 1;
         let hz = (ci >> 2) & 1;
 
-        let self_child = base + ci;
+        let self_child = child_idx(nodes, idx, ci);
+        debug_assert_ne!(self_child, INVALID_U32);
 
-        // Sibling links inside the same parent
         let sib_x = ci ^ 1;
         let sib_y = ci ^ 2;
         let sib_z = ci ^ 4;
 
+        // helper: sibling root if it exists
+        let sib = |sci: u32| -> u32 {
+            if (mask & (1u32 << sci)) != 0 {
+                child_idx(nodes, idx, sci)
+            } else {
+                INVALID_U32
+            }
+        };
+
         // +X / -X
         let px = if hx == 0 {
-            base + sib_x
+            let s = sib(sib_x);
+            if s != INVALID_U32 { s } else { descend_one(nodes, pr.px, 0, hy, hz) }
         } else {
-            // across parent's +X, we enter neighbor on its -X side => hx=0
             descend_one(nodes, pr.px, 0, hy, hz)
         };
 
         let nx = if hx == 1 {
-            base + sib_x
+            let s = sib(sib_x);
+            if s != INVALID_U32 { s } else { descend_one(nodes, pr.nx, 1, hy, hz) }
         } else {
-            // across parent's -X, we enter neighbor on its +X side => hx=1
             descend_one(nodes, pr.nx, 1, hy, hz)
         };
 
         // +Y / -Y
         let py = if hy == 0 {
-            base + sib_y
+            let s = sib(sib_y);
+            if s != INVALID_U32 { s } else { descend_one(nodes, pr.py, hx, 0, hz) }
         } else {
-            descend_one(nodes, pr.py, hx, 0, hz) // enter on -Y => hy=0
+            descend_one(nodes, pr.py, hx, 0, hz)
         };
 
         let ny = if hy == 1 {
-            base + sib_y
+            let s = sib(sib_y);
+            if s != INVALID_U32 { s } else { descend_one(nodes, pr.ny, hx, 1, hz) }
         } else {
-            descend_one(nodes, pr.ny, hx, 1, hz) // enter on +Y => hy=1
+            descend_one(nodes, pr.ny, hx, 1, hz)
         };
 
         // +Z / -Z
         let pz = if hz == 0 {
-            base + sib_z
+            let s = sib(sib_z);
+            if s != INVALID_U32 { s } else { descend_one(nodes, pr.pz, hx, hy, 0) }
         } else {
-            descend_one(nodes, pr.pz, hx, hy, 0) // enter on -Z => hz=0
+            descend_one(nodes, pr.pz, hx, hy, 0)
         };
 
         let nz = if hz == 1 {
-            base + sib_z
+            let s = sib(sib_z);
+            if s != INVALID_U32 { s } else { descend_one(nodes, pr.nz, hx, hy, 1) }
         } else {
-            descend_one(nodes, pr.nz, hx, hy, 1) // enter on +Z => hz=1
+            descend_one(nodes, pr.nz, hx, hy, 1)
         };
 
-        ropes[self_child as usize] = NodeRopesGpu {
-            px,
-            nx,
-            py,
-            ny,
-            pz,
-            nz,
-            _pad0: 0,
-            _pad1: 0,
-        };
+        ropes[self_child as usize] = NodeRopesGpu { px, nx, py, ny, pz, nz, _pad0: 0, _pad1: 0 };
     }
 
-    // Recurse
+    // Recurse into existing children
     for ci in 0u32..8u32 {
-        build_ropes_rec(nodes, ropes, base + ci);
+        if (mask & (1u32 << ci)) == 0 {
+            continue;
+        }
+        let c = child_idx(nodes, idx, ci);
+        if c != INVALID_U32 {
+            build_ropes_rec(nodes, ropes, c);
+        }
     }
 }
 
@@ -466,6 +511,9 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     // -------------------------------------------------------------------------
     BuildScratch::ensure_3d_u32(&mut scratch.material, side, AIR);
 
+    BuildScratch::ensure_coltop(&mut scratch.col_top_y, &mut scratch.col_top_mat, side);
+
+
     let dirt_depth = 3 * vpm;
 
     for ly in 0..cs_i {
@@ -492,6 +540,12 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
                 let i3 = idx3(side, lx as usize, ly as usize, lz as usize);
                 scratch.material[i3] = m;
+
+                //track top-most non-air for this (x,z) column
+                if m != AIR {
+                    scratch.col_top_y[col] = ly as u8;            // last non-air wins => highest y
+                    scratch.col_top_mat[col] = (m & 0xFF) as u8;  // pack only low 8 bits
+                }
             }
         }
     }
@@ -508,23 +562,16 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     for lz in 0..64usize {
         for lx in 0..64usize {
-            let mut y8: u32 = 255;
-            let mut mat8: u32 = 0;
+            let col = idx2(64, lx, lz);
 
-            // scan from top down
-            for ly in (0..64usize).rev() {
-                let m = scratch.material[idx3(64, lx, ly, lz)];
-                if m != AIR {
-                    y8 = ly as u32;
-                    mat8 = m & 0xFF;
-                    break;
-                }
-            }
+            // computed during material fill
+            let y8: u32 = scratch.col_top_y[col] as u32;      // 255 means empty
+            let mat8: u32 = scratch.col_top_mat[col] as u32;  // 0 means empty
 
             let entry16: u32 = (y8 & 0xFF) | ((mat8 & 0xFF) << 8);
 
-            let idx = (lz * 64 + lx) as u32;      // 0..4095
-            let w = (idx >> 1) as usize;          // 0..2047
+            let idx = (lz * 64 + lx) as u32; // 0..4095
+            let w = (idx >> 1) as usize;     // 0..2047
             let hi = (idx & 1) != 0;
 
             if !hi {
@@ -534,6 +581,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
             }
         }
     }
+
 
     // -------------------------------------------------------------------------
     // Prefix sum over solid occupancy
@@ -657,13 +705,14 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
             return make_leaf(chunk_size, ox, oy, oz, size, m);
         }
 
-        // Mixed node => build all 8 children (INCLUDING AIR LEAVES).
-        // This is the critical invariant needed for rope correctness.
         let half = size / 2;
-        let mut child_roots: [NodeGpu; 8] = [make_leaf(chunk_size, 0, 0, 0, 1, AIR); 8];
 
-        for ci in 0..8 {
-            if (ci & 3) == 0 && should_cancel(cancel) {
+        // Collect child roots without pushing them yet (so they end up contiguous)
+        let mut child_roots: [Option<NodeGpu>; 8] = [None; 8];
+        let mut mask: u32 = 0;
+
+        for ci in 0u32..8u32 {
+            if ((ci as i32) & 3) == 0 && should_cancel(cancel) {
                 return make_leaf(chunk_size, ox, oy, oz, size, AIR);
             }
 
@@ -671,7 +720,16 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
             let dy = if (ci & 2) != 0 { half } else { 0 };
             let dz = if (ci & 4) != 0 { half } else { 0 };
 
-            child_roots[ci] = build_node(
+            let csx = (ox + dx) as usize;
+            let csy = (oy + dy) as usize;
+            let csz = (oz + dz) as usize;
+
+            // fast empty test for the child region
+            if prefix_sum_cube(prefix, side, csx, csy, csz, half as usize) == 0 {
+                continue;
+            }
+
+            let child = build_node(
                 nodes,
                 chunk_size,
                 ox + dx,
@@ -687,21 +745,31 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
                 dirt_depth,
                 cancel,
             );
+
+            child_roots[ci as usize] = Some(child);
+            mask |= 1u32 << ci;
         }
 
-        let base = nodes.len() as u32;
+        if mask == 0 {
+            return make_leaf(chunk_size, ox, oy, oz, size, AIR);
+        }
 
-        // Push ALL 8 children in ci order.
+        // NOW push roots contiguously
+        let base = nodes.len() as u32;
         for ci in 0..8 {
-            nodes.push(child_roots[ci]);
+            if let Some(ch) = child_roots[ci] {
+                nodes.push(ch);
+            }
         }
 
         NodeGpu {
             child_base: base,
-            child_mask: 0xFF, // all 8 children exist
+            child_mask: mask,
             material: 0,
             key: pack_key(chunk_size, ox, oy, oz, size),
         }
+
+
     }
 
     // Root must be at index 0 for GPU.

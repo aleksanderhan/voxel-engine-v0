@@ -746,7 +746,24 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
 
   var best = miss_hitgeom();
 
-  let max_chunk_steps = min((gd.x + gd.y + gd.z) * 4u + 8u, 512u);
+  // Tight cap: how many chunk boundaries can this ray possibly cross?
+  // (visited cells <= boundary_crossings + 1)
+  var rem_x: i32 = 0;
+  var rem_y: i32 = 0;
+  var rem_z: i32 = 0;
+
+  if (abs(rd.x) >= EPS_INV) {
+    rem_x = select(lcx, (nx - 1 - lcx), step_x > 0);
+  }
+  if (abs(rd.y) >= EPS_INV) {
+    rem_y = select(lcy, (ny - 1 - lcy), step_y > 0);
+  }
+  if (abs(rd.z) >= EPS_INV) {
+    rem_z = select(lcz, (nz - 1 - lcz), step_z > 0);
+  }
+
+  let max_chunk_steps = min(u32(rem_x + rem_y + rem_z) + 1u, 512u);
+
 
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }
