@@ -80,51 +80,63 @@ fn composite_pixel_mapped(
   godray_samp: sampler,
   depth_full: texture_2d<f32>
 ) -> vec4<f32> {
-  // Render-space dims (NOT present/out_img dims)
-  let rdims_u = textureDimensions(color_tex);
-  let rdims_i = vec2<i32>(i32(rdims_u.x), i32(rdims_u.y));
-  let fd      = vec2<f32>(f32(rdims_u.x), f32(rdims_u.y));
+  // --- render dims (color buffer) ---
+  let rd_u = textureDimensions(color_tex);
+  let rd_i = vec2<i32>(i32(rd_u.x), i32(rd_u.y));
+  let rd_f = vec2<f32>(f32(rd_u.x), f32(rd_u.y));
 
-  // Clamp render ip defensively
-  let ip = vec2<i32>(
-    clamp(ip_render.x, 0, rdims_i.x - 1),
-    clamp(ip_render.y, 0, rdims_i.y - 1)
+  // Clamp render ip
+  let ip_r = vec2<i32>(
+    clamp(ip_render.x, 0, rd_i.x - 1),
+    clamp(ip_render.y, 0, rd_i.y - 1)
   );
 
   // Base color in render space
-  let base = textureLoad(color_tex, ip, 0).xyz;
+  let base = textureLoad(color_tex, ip_r, 0).xyz;
 
-  // UV normalized in render space
-  let uv = px_render / fd;
+  // --- full dims (depth buffer) ---
+  let fd_u = textureDimensions(depth_full);
+  let fd_i = vec2<i32>(i32(fd_u.x), i32(fd_u.y));
+  let fd_f = vec2<f32>(f32(fd_u.x), f32(fd_u.y));
 
-  // Godray taps in GODRAY texel units (correct for quarter/half res)
-  let gdims_u = textureDimensions(godray_tex);
-  let gfd = vec2<f32>(f32(gdims_u.x), f32(gdims_u.y));
+  // Map render pixel -> full pixel (important!)
+  // px_render is in render pixel coords; convert to full pixel coords.
+  let px_full = px_render * (fd_f / rd_f);
 
-  let du = vec2<f32>(1.0 / gfd.x, 0.0);
-  let dv = vec2<f32>(0.0, 1.0 / gfd.y);
+  let ip_f = vec2<i32>(
+    clamp(i32(floor(px_full.x)), 0, fd_i.x - 1),
+    clamp(i32(floor(px_full.y)), 0, fd_i.y - 1)
+  );
 
+  // UV for godray sampling MUST match the full-res screen mapping
+  let uv_full = (px_full + vec2<f32>(0.5)) / fd_f;
 
-  let gC = godray_sample_linear(uv,        godray_tex, godray_samp);
-  let gE = godray_sample_linear(uv + du,   godray_tex, godray_samp);
-  let gW = godray_sample_linear(uv - du,   godray_tex, godray_samp);
-  let gN = godray_sample_linear(uv + dv,   godray_tex, godray_samp);
-  let gS = godray_sample_linear(uv - dv,   godray_tex, godray_samp);
+  // Godray taps in godray texel units
+  let gd_u = textureDimensions(godray_tex);
+  let gd_f = vec2<f32>(f32(gd_u.x), f32(gd_u.y));
+  let du = vec2<f32>(1.0 / gd_f.x, 0.0);
+  let dv = vec2<f32>(0.0, 1.0 / gd_f.y);
 
-  // Depth edge weights (render-space integer taps)
-  let d0 = textureLoad(depth_full, ip, 0).x;
+  // Sample godrays in the correct UV space
+  let gC = godray_sample_linear(uv_full,       godray_tex, godray_samp);
+  let gE = godray_sample_linear(uv_full + du,  godray_tex, godray_samp);
+  let gW = godray_sample_linear(uv_full - du,  godray_tex, godray_samp);
+  let gN = godray_sample_linear(uv_full + dv,  godray_tex, godray_samp);
+  let gS = godray_sample_linear(uv_full - dv,  godray_tex, godray_samp);
 
-  let ipE = vec2<i32>(min(ip.x + 1, rdims_i.x - 1), ip.y);
-  let ipW = vec2<i32>(max(ip.x - 1, 0),            ip.y);
-  let ipN = vec2<i32>(ip.x, min(ip.y + 1, rdims_i.y - 1));
-  let ipS = vec2<i32>(ip.x, max(ip.y - 1, 0));
+  // Depth edge weights MUST be full-res taps too
+  let d0 = textureLoad(depth_full, ip_f, 0).x;
+
+  let ipE = vec2<i32>(min(ip_f.x + 1, fd_i.x - 1), ip_f.y);
+  let ipW = vec2<i32>(max(ip_f.x - 1, 0),          ip_f.y);
+  let ipN = vec2<i32>(ip_f.x, min(ip_f.y + 1, fd_i.y - 1));
+  let ipS = vec2<i32>(ip_f.x, max(ip_f.y - 1, 0));
 
   let dE = textureLoad(depth_full, ipE, 0).x;
   let dW = textureLoad(depth_full, ipW, 0).x;
   let dN = textureLoad(depth_full, ipN, 0).x;
   let dS = textureLoad(depth_full, ipS, 0).x;
 
-  // Similar tol shape as before, but no exp
   let tol = 0.02 + 0.06 * smoothstep(10.0, 80.0, d0);
 
   let wE = 1.0 - smoothstep(0.0, tol, abs(dE - d0));
@@ -135,7 +147,6 @@ fn composite_pixel_mapped(
   let wsum = max(wE + wW + wN + wS, 1e-4);
   let blur = (gE * wE + gW * wW + gN * wN + gS * wS) / wsum;
 
-  // Unsharp (keeps your look, but now cheap)
   var god_lin = max(gC + COMPOSITE_SHARPEN * (gC - blur), vec3<f32>(0.0));
   god_lin = max(god_lin - vec3<f32>(GODRAY_BLACK_LEVEL), vec3<f32>(0.0));
   god_lin = god_lin / (god_lin + vec3<f32>(GODRAY_KNEE_COMPOSITE));
@@ -152,10 +163,11 @@ fn composite_pixel_mapped(
 
   let b0 = bright_extract_hue(hdr, bloom_thresh);
 
-  let ipx1 = vec2<i32>(clamp(ip.x + 2, 0, rdims_i.x - 1), ip.y);
-  let ipx0 = vec2<i32>(clamp(ip.x - 2, 0, rdims_i.x - 1), ip.y);
-  let ipy1 = vec2<i32>(ip.x, clamp(ip.y + 2, 0, rdims_i.y - 1));
-  let ipy0 = vec2<i32>(ip.x, clamp(ip.y - 2, 0, rdims_i.y - 1));
+  let ipx1 = vec2<i32>(clamp(ip_r.x + 2, 0, rd_i.x - 1), ip_r.y);
+  let ipx0 = vec2<i32>(clamp(ip_r.x - 2, 0, rd_i.x - 1), ip_r.y);
+  let ipy1 = vec2<i32>(ip_r.x, clamp(ip_r.y + 2, 0, rd_i.y - 1));
+  let ipy0 = vec2<i32>(ip_r.x, clamp(ip_r.y - 2, 0, rd_i.y - 1));
+
 
   let hx1 = max(textureLoad(color_tex, ipx1, 0).xyz, vec3<f32>(0.0));
   let hx0 = max(textureLoad(color_tex, ipx0, 0).xyz, vec3<f32>(0.0));

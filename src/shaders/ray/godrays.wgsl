@@ -316,8 +316,7 @@ fn compute_godray_quarter_pixel(
   // In [-0.5 .. +0.5]. Keep it small and stable-ish.
   let jf = f32(cam.frame_index & 255u);
 
-  // slowly varying with time/frame (kills banding more, relies on TAA):
-  let j_phase = hash12(qpx * 0.91 + vec2<f32>(31.7, 12.3) + vec2<f32>(jf * 0.07, jf * 0.03)) - 0.5;
+  let j_phase = hash12(qpx * 0.91 + vec2<f32>(31.7, 12.3)) - 0.5;
 
   // Load depths (same)
   let t_scene0 = textureLoad(depth_tex, fp0, 0).x;
@@ -353,7 +352,6 @@ fn compute_godray_quarter_pixel(
   let center_px = vec2<f32>(f32(base_x) + center_off, f32(base_y) + center_off) + 0.35 * j_rd;
   let rd_center = ray_dir_from_pixel(center_px, res_full);
 
-
   // -------------------------------------------------------------------------
 
   var acc = vec3<f32>(0.0);
@@ -375,26 +373,42 @@ fn compute_godray_quarter_pixel(
 
   let cur_lin = max(select(vec3<f32>(0.0), acc / wsum, wsum > 0.0), vec3<f32>(0.0));
 
-  let cur     = cur_lin / (cur_lin + vec3<f32>(0.25)); // compress
+  // Load history (stored compressed), convert to linear
+  let hist_c   = textureLoad(godray_hist_tex, hip, 0).xyz;
+  let hist_lin = godray_decompress(hist_c);
 
-  let hist = textureLoad(godray_hist_tex, hip, 0).xyz;
-
+  // --- Your existing edge detector (keep it)
   let dmin = min(min(t_scene0, t_scene1), min(t_scene2, t_scene3));
   let dmax = max(max(t_scene0, t_scene1), max(t_scene2, t_scene3));
   let span = (dmax - dmin) / max(dmin, 1e-3);
   let edge = smoothstep(0.06, 0.30, span);
-
-  let delta = length(cur - hist);
-  let react = smoothstep(0.03, 0.18, delta);
-
   let stable = 1.0 - edge;
 
-  let clamp_scale = mix(1.25, 2.5, react);
-  let clamp_w = max(cur * clamp_scale, vec3<f32>(0.04));
-  let hist_clamped = clamp(hist, cur - clamp_w, cur + clamp_w);
+  // --- NEW: reactive mask in LINEAR space (prevents ghosting)
+  // Think of this as "how different is current from history?"
+  let delta_lin = length(cur_lin - hist_lin);
 
-  let hist_w = clamp(0.28 + GODRAY_TS_LP_ALPHA * stable, 0.18, 0.94);
-  return mix(cur, hist_clamped, hist_w);
+  // Tune these thresholds to your godray energy range.
+  // Start here; adjust after you see it.
+  let react = smoothstep(0.08, 0.45, delta_lin);
+
+  // --- NEW: clamp history around current in LINEAR space
+  // Tight clamp when stable (kills shimmer), looser when unstable edges.
+  let clamp_scale = mix(0.55, 0.18, stable);        // stable -> tighter
+  let clamp_min   = vec3<f32>(0.015);               // absolute minimum window
+  let clamp_w     = max(cur_lin * clamp_scale, clamp_min);
+  let hist_lin_clamped = clamp(hist_lin, cur_lin - clamp_w, cur_lin + clamp_w);
+
+  // --- NEW: adaptive history weight (fast response when react is high)
+  // Base history: high when stable, low at edges.
+  // Then crush it when react triggers (prevents trailing/ghosting).
+  let hist_w_base = mix(0.35, 0.95, stable);        // stable -> more history
+  let hist_w      = mix(hist_w_base, 0.05, react);  // react -> almost no history
+
+  let out_lin = mix(cur_lin, hist_lin_clamped, hist_w);
+
+  // Store back compressed
+  return godray_compress(max(out_lin, vec3<f32>(0.0)));
 }
 
 fn godray_decompress(cur: vec3<f32>) -> vec3<f32> {
@@ -402,6 +416,12 @@ fn godray_decompress(cur: vec3<f32>) -> vec3<f32> {
   let one = vec3<f32>(1.0);
   let denom = max(one - cur, vec3<f32>(1e-4));
   return (k * cur) / denom;
+}
+
+fn godray_compress(lin: vec3<f32>) -> vec3<f32> {
+  // Invert decompress: lin = (k*c)/(1-c)  =>  c = lin/(lin+k)
+  let k = 0.25;
+  return lin / (lin + vec3<f32>(k));
 }
 
 fn godray_sample_linear(
