@@ -6,20 +6,33 @@
 // - Stores: RGB = compressed godray, A = depth proxy (nearest depth)
 // -----------------------------------------------------------------------------
 fn approx_pow_0p75(x: f32) -> f32 {
-  // x^(3/4) = x^(1/2) * x^(1/4) = sqrt(x) * sqrt(sqrt(x))
   let y = clamp(x, 0.0, 1.0);
-  return sqrt(y) * sqrt(sqrt(y));
+  // x^0.75 is between x^1 and x^0.5; blend is a decent cheap approximation
+  return mix(y, sqrt(y), 0.5);
 }
-
 
 fn approx_pow_0p55(x: f32) -> f32 {
-  // cheap visual approximation for x^0.55
-  let y  = clamp(x, 0.0, 1.0);
-  let sy = sqrt(y);
-  // close enough for shafts; tweak 0.10..0.25 if you want
-  return mix(sy, y, 0.12);
+  let y = clamp(x, 0.0, 1.0);
+  let s = sqrt(y);          // y^0.5
+  // 0.55 is close to 0.5; bias slightly toward linear to mimic 0.55
+  return mix(s, y, 0.20);
 }
 
+
+fn godray_steps_for_tend(t_end: f32) -> u32 {
+  // raw desired steps
+  let raw_f = ceil(t_end * GODRAY_STEPS_PER_METER);
+
+  // clamp to [min..max]
+  var s: u32 = u32(clamp(raw_f, f32(GODRAY_MIN_STEPS), f32(GODRAY_STEPS_FAST)));
+
+  // quantize to multiples of GODRAY_STEP_Q to reduce shimmer
+  // round up so we don't lose quality
+  s = ((s + (GODRAY_STEP_Q - 1u)) / GODRAY_STEP_Q) * GODRAY_STEP_Q;
+
+  // final clamp in case rounding pushed above max
+  return min(s, GODRAY_STEPS_FAST);
+}
 
 fn godray_integrate_1(
   ro: vec3<f32>,
@@ -35,13 +48,9 @@ fn godray_integrate_1(
   let mu = dot(rd, SUN_DIR);
   let view_gate = 0.10 + 0.90 * smoothstep(0.0, 0.20, mu);
 
-  let Nmax = GODRAY_STEPS_FAST;
-
-  // Optional: dynamic early cut (see section 3)
-  let steps_f = clamp(ceil(t_end * GODRAY_STEPS_PER_METER), 6.0, f32(Nmax));
-  let steps: u32 = u32(steps_f);
-
+  let steps: u32 = godray_steps_for_tend(t_end);
   let dt = t_end / f32(steps);
+
   let a_ts    = 1.0 - exp(-dt * 3.0);
   let a_shaft = 1.0 - exp(-dt * 5.0);
 
@@ -55,6 +64,10 @@ fn godray_integrate_1(
 
   for (var i: u32 = 0u; i < steps; i = i + 1u) {
     let ti = (f32(i) + 0.5 + j_phase) * dt;
+
+    // keep the original "tcut" idea
+    if (ti + j * dt > t_end) { break; }
+
     let p  = ro + rd * ti;
 
     let Tv = fog_transmittance_godray(ro, rd, ti);

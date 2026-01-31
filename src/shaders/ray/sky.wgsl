@@ -54,39 +54,46 @@ fn sky_color_base(rd: vec3<f32>) -> vec3<f32> {
 fn sky_color(rd: vec3<f32>) -> vec3<f32> {
   var col = sky_color_base(rd);
 
-  // Clouds only affect the rendered sky (NOT the ambient driver anymore)
-  var cloud = 0.0;
+  // cloud coverage along view ray (at fixed cloud plane height)
+  var cloud: f32 = 0.0;
 
   if (rd.y > 0.01) {
     let ro = cam.cam_pos.xyz;
-    let t = (CLOUD_H - ro.y) / rd.y;
+    let t  = (CLOUD_H - ro.y) / rd.y;
 
     if (t > 0.0) {
-      let hit = ro + rd * t;
+      let hit    = ro + rd * t;
       let time_s = cam.voxel_params.y;
 
       cloud = cloud_coverage_at_xz(hit.xz, time_s);
 
+      // fade clouds out near horizon
       let horizon2 = clamp((rd.y - CLOUD_HORIZON_Y0) / CLOUD_HORIZON_Y1, 0.0, 1.0);
       cloud *= horizon2;
 
-      col *= mix(1.0, CLOUD_SKY_DARKEN, cloud);
-
+      // silver lining toward sun
       let toward_sun = clamp(dot(rd, SUN_DIR), 0.0, 1.0);
       let silver = pow(toward_sun, CLOUD_SILVER_POW) * CLOUD_SILVER_STR;
       let cloud_col = mix(CLOUD_BASE_COL, vec3<f32>(1.0), silver);
 
-      col = mix(col, cloud_col, cloud * CLOUD_BLEND);
+      // single blend (NO black-multiply)
+      let cloud_a = CLOUD_BLEND * sqrt(clamp(cloud, 0.0, 1.0));
+      col = mix(col, cloud_col, cloud_a);
     }
   }
 
-  // Optional: dim sun disc through clouds (keep your existing behavior)
+  // Optional: dim ONLY very near the sun (prevents “black sky patches”)
   if (CLOUD_DIM_SUN_DISC) {
-    let Tc_view = exp(-CLOUD_SHADOW_ABSORB * cloud * CLOUD_SUN_DISC_ABSORB_SCALE);
-    // This scales only the sun contribution already in col; easiest is to re-add sun separately,
-    // but keep it minimal: treat Tc_view as extra darkening for very bright sun spot:
-    col = mix(col, col * Tc_view, cloud);
+    let mu = clamp(dot(rd, SUN_DIR), 0.0, 1.0);
+    let near_sun = smoothstep(0.92, 0.995, mu); // tight gate
+
+    // floor so it can't go charcoal
+    let Tc_view_raw = exp(-CLOUD_SUN_DISC_ABSORB * cloud);
+    let Tc_view     = max(Tc_view_raw, 0.40);
+
+    col = mix(col, col * Tc_view, cloud * near_sun);
   }
 
   return col;
 }
+

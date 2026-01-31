@@ -59,8 +59,8 @@ const GODRAY_ENERGY_BOOST    : f32 = 8.0;
 const GODRAY_KNEE_INTEGRATE  : f32 = 0.35;
 const GODRAY_COMPOSITE_SCALE : f32 = 6.5;
 
-const GODRAY_FADE_NEAR : f32 = 60.0;
-const GODRAY_FADE_FAR  : f32 = 160.0;
+const GODRAY_FADE_NEAR : f32 = 40.0;
+const GODRAY_FADE_FAR  : f32 = 80.0;
 
 const GODRAY_KNEE_COMPOSITE : f32 = 0.25;
 
@@ -77,7 +77,7 @@ const FOG_GODRAY_SCALE  : f32 = 1.0;
 const FOG_COLOR_GROUND    : vec3<f32> = vec3<f32>(0.40, 0.42, 0.45);
 const FOG_COLOR_SKY_BLEND : f32       = 0.10;
 
-const GODRAY_MAX_DIST : f32 = 50.0;
+const GODRAY_MAX_DIST : f32 = 100.0;
 
 const GODRAY_SCATTER_HEIGHT_FALLOFF : f32 = 0.04;
 const GODRAY_SCATTER_MIN_FRAC       : f32 = 0.35;
@@ -93,8 +93,15 @@ const GODRAY_HAZE_NEAR_FADE  : f32 = 18.0;
 const CLOUD_GODRAY_W         : f32 = 0.50;
 
 const GODRAY_TV_CUTOFF   : f32 = 0.02;
+
+// If near-camera shafts look under-sampled: MIN_STEPS 8 → 10/12
+// If mid/far looks under-sampled: STEPS_PER_METER 1.0 → 1.25
+// If still too slow: STEPS_PER_METER 1.0 → 0.75 (keep MIN_STEPS)
 const GODRAY_STEPS_FAST  : u32 = 24u;
-const GODRAY_STEPS_PER_METER = 1.0;
+const GODRAY_STEPS_PER_METER = 1.25;
+const GODRAY_MIN_STEPS: u32 = 8u;        // keep some detail near silhouettes
+const GODRAY_STEP_Q:   u32 = 4u;         // quantize step count to reduce temporal shimmer
+
 
 const GODRAY_SHAFT_GAIN: f32 = 3.0;
 
@@ -138,6 +145,7 @@ const CLOUD_BLEND      : f32       = 0.85;
 
 const CLOUD_DIM_SUN_DISC            : bool = true;
 const CLOUD_SUN_DISC_ABSORB_SCALE   : f32  = 0.8;
+const CLOUD_SUN_DISC_ABSORB: f32 = 1.8; // try 1.0..3.0
 
 const SKY_EXPOSURE : f32 = 0.40;
 

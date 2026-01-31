@@ -154,6 +154,24 @@ fn composite_pixel_mapped(
   let god_far   = smoothstep(GODRAY_FADE_NEAR, GODRAY_FADE_FAR, d0);
   let god_scale = GODRAY_COMPOSITE_SCALE * mix(1.0, 0.25, god_far);
 
+  // --- Keep far godrays more "sun-yellow" instead of washing to white ---
+  let lum_w = vec3<f32>(0.2126, 0.7152, 0.0722);
+
+  // Sun hue normalized (avoid divide-by-zero)
+  let sun_hue = normalize(max(SUN_COLOR, vec3<f32>(1e-4)));
+
+  // Match brightness but enforce sun hue
+  let g_lum = max(dot(god_lin, lum_w), 0.0);
+  let god_sun = sun_hue * g_lum;
+
+  // Apply more hue-lock as distance increases
+  let hue_lock = 0.55 * god_far;          // try 0.35..0.85
+  god_lin = mix(god_lin, god_sun, hue_lock);
+
+  // Optional extra warmth (subtle) for very far shafts
+  let warm = mix(vec3<f32>(1.0), vec3<f32>(1.08, 1.03, 0.92), god_far); // tweak to taste
+  god_lin *= warm;
+
   var hdr = max(base + god_scale * god_lin, vec3<f32>(0.0));
 
   // Bloom (hue-preserving + distance-faded)
@@ -184,7 +202,6 @@ fn composite_pixel_mapped(
   hdr += bloom_k_eff * min(bloom, bloom_max);
 
   // Distance-safe saturation compensation (HDR)
-  let lum_w  = vec3<f32>(0.2126, 0.7152, 0.0722);
   let l_hdr  = max(dot(hdr, lum_w), 1e-6);
   let gray_h = vec3<f32>(l_hdr);
 
