@@ -29,7 +29,8 @@ fn godray_integrate_5(
   j1: f32,
   j2: f32,
   j3: f32,
-  j4: f32
+  j4: f32,
+  j_phase: f32
 ) -> Godray5 {
   let base = fog_density_godray();
   if (base <= 0.0) {
@@ -55,7 +56,7 @@ fn godray_integrate_5(
   let N  = f32(GODRAY_STEPS_FAST);
   let dt = t_end_max / N;
 
-  // LP coefficients (shared; per-tap state uses these but only updates when active)
+  // LP coefficients
   let a_ts    = 1.0 - exp(-dt * 3.0);
   let a_shaft = 1.0 - exp(-dt * 5.0);
 
@@ -66,11 +67,8 @@ fn godray_integrate_5(
   var ts3: f32 = 1.0; var sh3: f32 = 0.0; var sum3 = vec3<f32>(0.0);
   var ts4: f32 = 1.0; var sh4: f32 = 0.0; var sum4 = vec3<f32>(0.0);
 
-  // Helper: "active" predicate with per-tap jitter affecting cutoff only (cheap).
-  // (We do not shift sample position per tap; that would require 5x p/Tv/Ts work again.)
-  // jitter is in [-0.1..0.1] range in your code; multiply by dt to make it step-sized.
   for (var i: u32 = 0u; i < GODRAY_STEPS_FAST; i = i + 1u) {
-    let ti = (f32(i) + 0.5) * dt;
+    let ti = max((f32(i) + 0.5 + j_phase) * dt, 0.0);
     if (ti <= 0.0) { continue; }
 
     // Shared expensive work at this ti
@@ -85,18 +83,20 @@ fn godray_integrate_5(
     let Tc_vol  = mix(1.0, Tc, CLOUD_GODRAY_W);
     let Ts_soft = pow(clamp(Ts_geom, 0.0, 1.0), 0.75);
 
-    // Height falloff + density at this ti (shared)
+    // Height falloff + density at this ti
     let haze_ramp = 1.0 - exp(-ti / GODRAY_HAZE_NEAR_FADE);
     let hfall = GODRAY_SCATTER_HEIGHT_FALLOFF;
     let hmin  = GODRAY_SCATTER_MIN_FRAC;
     let height_term = max(exp(-hfall * p.y), hmin);
     let dens = base * height_term;
 
-    // Common factor excluding per-tap ts/shaft weighting
     let common_factor = (SUN_COLOR * SUN_INTENSITY)
       * (dens * dt) * Tv * phase
       * Tc_vol
       * 0.70;
+
+    let mu = dot(rd, SUN_DIR);
+    let view_gate = 0.10 + 0.90 * smoothstep(0.0, 0.20, mu);
 
     // ---- Tap 0
     if (e0) {
@@ -117,13 +117,22 @@ fn godray_integrate_5(
         sh0 = mix(sh0, shaft, a_shaft);
         shaft = sh0;
 
+        // ---- NEW: edge-only energy boost (uses low-passed shaft)
+        let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
+
         let shaft_sun_gate = smoothstep(0.35, 0.80, ts0);
-        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts0, 2.0);
 
-        let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
-        let w = clamp(w_raw, 0.0, 1.0);
+        // (keeping your current tap0 w-shaping)
+        let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts0, 3.5);
+        let haze_cap = 0.08;
+        let haze_floor = min(haze, haze_cap);
 
-        sum0 += common_factor * (ts0 * w);
+        let shaft_gain = GODRAY_SHAFT_GAIN;
+        let shaft_term = clamp(shaft * shaft_sun_gate * shaft_gain, 0.0, 1.0);
+
+        let w = clamp(haze_floor + (1.0 - haze_floor) * shaft_term, 0.0, 1.0);
+
+        sum0 += common_factor * view_gate * edge_boost * (ts0 * w);
       }
     }
 
@@ -146,13 +155,16 @@ fn godray_integrate_5(
         sh1 = mix(sh1, shaft, a_shaft);
         shaft = sh1;
 
+        // ---- NEW
+        let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
+
         let shaft_sun_gate = smoothstep(0.35, 0.80, ts1);
         let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts1, 2.0);
 
         let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
         let w = clamp(w_raw, 0.0, 1.0);
 
-        sum1 += common_factor * (ts1 * w);
+        sum1 += common_factor * edge_boost * (ts1 * w);
       }
     }
 
@@ -175,13 +187,16 @@ fn godray_integrate_5(
         sh2 = mix(sh2, shaft, a_shaft);
         shaft = sh2;
 
+        // ---- NEW
+        let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
+
         let shaft_sun_gate = smoothstep(0.35, 0.80, ts2);
         let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts2, 2.0);
 
         let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
         let w = clamp(w_raw, 0.0, 1.0);
 
-        sum2 += common_factor * (ts2 * w);
+        sum2 += common_factor * edge_boost * (ts2 * w);
       }
     }
 
@@ -204,13 +219,16 @@ fn godray_integrate_5(
         sh3 = mix(sh3, shaft, a_shaft);
         shaft = sh3;
 
+        // ---- NEW
+        let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
+
         let shaft_sun_gate = smoothstep(0.35, 0.80, ts3);
         let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts3, 2.0);
 
         let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
         let w = clamp(w_raw, 0.0, 1.0);
 
-        sum3 += common_factor * (ts3 * w);
+        sum3 += common_factor * edge_boost * (ts3 * w);
       }
     }
 
@@ -233,18 +251,20 @@ fn godray_integrate_5(
         sh4 = mix(sh4, shaft, a_shaft);
         shaft = sh4;
 
+        // ---- NEW
+        let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
+
         let shaft_sun_gate = smoothstep(0.35, 0.80, ts4);
         let haze = GODRAY_BASE_HAZE * haze_ramp * pow(ts4, 2.0);
 
         let w_raw = haze + (1.0 - haze) * (shaft * shaft_sun_gate);
         let w = clamp(w_raw, 0.0, 1.0);
 
-        sum4 += common_factor * (ts4 * w);
+        sum4 += common_factor * edge_boost * (ts4 * w);
       }
     }
   }
 
-  // Match your original post-integrate shaping per tap
   var g0 = sum0 * GODRAY_ENERGY_BOOST;
   var g1 = sum1 * GODRAY_ENERGY_BOOST;
   var g2 = sum2 * GODRAY_ENERGY_BOOST;
@@ -259,7 +279,6 @@ fn godray_integrate_5(
 
   return Godray5(g0, g1, g2, g3, g4);
 }
-
 
 fn compute_godray_quarter_pixel(
   gid: vec2<u32>,
@@ -293,6 +312,16 @@ fn compute_godray_quarter_pixel(
   let j2 = 0.20 * (hash12(qpx * J2_SCALE + vec2<f32>(5.0, 17.0)) - 0.5);
   let j3 = 0.20 * (hash12(qpx * J3_SCALE + vec2<f32>(23.0, 29.0)) - 0.5);
 
+  // Phase jitter for raymarch sample positions (NOT cutoff jitter).
+  // In [-0.5 .. +0.5]. Keep it small and stable-ish.
+  let jf = f32(cam.frame_index & 255u);
+
+  // Option A: fully stable per pixel (best for stability, less dither):
+  // let j_phase = hash12(qpx * 0.91 + vec2<f32>(31.7, 12.3)) - 0.5;
+
+  // Option B: slowly varying with time/frame (kills banding more, relies on TAA):
+  let j_phase = hash12(qpx * 0.91 + vec2<f32>(31.7, 12.3) + vec2<f32>(jf * 0.07, jf * 0.03)) - 0.5;
+
   // Load depths (same)
   let t_scene0 = textureLoad(depth_tex, fp0, 0).x;
   let t_scene1 = textureLoad(depth_tex, fp1, 0).x;
@@ -316,8 +345,15 @@ fn compute_godray_quarter_pixel(
   // Center of the 4x4 block (base + 2,2) in full-res pixel coords.
   // -------------------------------------------------------------------------
   let res_full = vec2<f32>(f32(fdims.x), f32(fdims.y));
-  let center_px = vec2<f32>(f32(base_x + 2) + 0.5, f32(base_y + 2) + 0.5);
+  
+  // ~sub-texel in full-res pixels
+  let j_rd = vec2<f32>(
+    hash12(qpx + vec2<f32>(1.7, 9.2)) - 0.5,
+    hash12(qpx + vec2<f32>(8.3, 2.1)) - 0.5
+  );
+  let center_px = vec2<f32>(f32(base_x + 2) + 0.5, f32(base_y + 2) + 0.5) + 0.75 * j_rd;
   let rd_center = ray_dir_from_pixel(center_px, res_full);
+
   // -------------------------------------------------------------------------
 
   var acc = vec3<f32>(0.0);
@@ -327,7 +363,8 @@ fn compute_godray_quarter_pixel(
     let g5 = godray_integrate_5(
       ro, rd_center,
       t_end0, t_end1, t_end2, t_end3, t_end4,
-      j0, j1, j2, j3, 0.0
+      j0, j1, j2, j3, 0.0,
+      j_phase
     );
 
     if (t_end0 > 0.0) { acc += g5.g0; wsum += 1.0; }

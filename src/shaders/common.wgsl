@@ -88,20 +88,25 @@ const GODRAY_TS_LP_ALPHA : f32 = 0.40;
 const GODRAY_EDGE0       : f32 = 0.004;
 const GODRAY_EDGE1       : f32 = 0.035;
 
-const GODRAY_BASE_HAZE       : f32 = 0.04;
+const GODRAY_BASE_HAZE       : f32 = 0.02;
 const GODRAY_HAZE_NEAR_FADE  : f32 = 18.0;
-const CLOUD_GODRAY_W         : f32 = 0.25;
+const CLOUD_GODRAY_W         : f32 = 0.50;
 
 const GODRAY_TV_CUTOFF   : f32 = 0.02;
 const GODRAY_STEPS_FAST  : u32 = 16u;
+
+const GODRAY_SHAFT_GAIN: f32 = 3.0;
+
+const GODRAY_EDGE_ENERGY_BOOST: f32 = 2.5; // try 1.0 .. 4.0
+
 
 //// --------------------------------------------------------------------------
 //// Phase
 //// --------------------------------------------------------------------------
 
 const INV_4PI     : f32 = 0.0795774715;
-const PHASE_G     : f32 = 0.35;
-const PHASE_MIE_W : f32 = 0.30;
+const PHASE_G     : f32 = 0.15;
+const PHASE_MIE_W : f32 = 0.20;
 
 //// --------------------------------------------------------------------------
 //// Fractal clouds
@@ -118,10 +123,10 @@ const CLOUD_HORIZON_Y0 : f32 = 0.02;
 const CLOUD_HORIZON_Y1 : f32 = 0.25;
 
 // How clouds darken the SKY appearance (keep low)
-const CLOUD_SKY_DARKEN : f32 = 0.4;
+const CLOUD_SKY_DARKEN : f32 = 0.2;
 
 // How much clouds attenuate SUNLIGHT hitting the world (can be much higher)
-const CLOUD_SHADOW_ABSORB   : f32 = 4.0;   // try 4..12
+const CLOUD_SHADOW_ABSORB   : f32 = 6.0;   // try 4..12
 const CLOUD_SHADOW_STRENGTH : f32 = 0.8;   // 0..1 (mix control)
 
 
@@ -172,7 +177,7 @@ const TAU             : f32        = 6.28318530718;
 
 const PRIMARY_NUDGE_VOXEL_FRAC : f32 = 1e-4;
 
-const GODRAY_BLOCK_SIZE : i32 = 4;
+const GODRAY_BLOCK_SIZE : i32 = 2;
 
 const J0_SCALE : f32 = 1.31;
 const J1_SCALE : f32 = 2.11;
