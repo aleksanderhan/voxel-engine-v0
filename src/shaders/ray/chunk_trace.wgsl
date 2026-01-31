@@ -97,16 +97,6 @@ fn macro_cell_query(
   return MacroCell(macro_bmin, cell, empty);
 }
 
-fn macro_refresh_empty(m: MacroDDA, macro_base: u32) -> bool {
-  if (!m.valid) { return false; }
-  let mxu = u32(m.mx);
-  let myu = u32(m.my);
-  let mzu = u32(m.mz);
-  let bit = macro_bit_index(mxu, myu, mzu);
-  return !macro_test(macro_base, bit);
-}
-
-
 
 // --------------------------------------------------------------------------
 // Key decoding -> cube

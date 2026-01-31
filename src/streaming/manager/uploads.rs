@@ -112,26 +112,36 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
         None
     };
 
-    let mut push_front_same = |mgr: &mut ChunkManager, which: u8, u: ChunkUpload| {
+    // NOTE: push *back* so we don't immediately re-pop the same blocked item.
+    let mut push_back_same = |mgr: &mut ChunkManager, which: u8, u: ChunkUpload| {
         match which {
-            0 => mgr.uploads.uploads_rewrite.push_front(u),
-            1 => mgr.uploads.uploads_active.push_front(u),
-            _ => mgr.uploads.uploads_other.push_front(u),
+            0 => mgr.uploads.uploads_rewrite.push_back(u),
+            1 => mgr.uploads.uploads_active.push_back(u),
+            _ => mgr.uploads.uploads_other.push_back(u),
         }
     };
 
+    // Prevent infinite scan when gate is closed and almost everything is non-priority.
+    let mut deferred = 0usize;
+    let defer_cap = uploads_len_total(mgr).max(1);
+
     while let Some((which, mut u)) = pop_next(mgr) {
         if out.len() >= max_uploads {
-            push_front_same(mgr, which, u);
+            push_back_same(mgr, which, u);
             break;
         }
 
-        // priority gate (same as before)
+        // priority gate
         if u.completes_residency {
             if let Some(center) = mgr.build.last_center {
-                if !super::slots::priority_box_ready(mgr, center) && !super::slots::in_priority_box(mgr, center, u.key) {
-                    push_front_same(mgr, which, u);
-                    break;
+                let gate = !super::slots::priority_box_ready(mgr, center);
+                if gate && !super::slots::in_priority_box(mgr, center, u.key) {
+                    push_back_same(mgr, which, u);
+                    deferred += 1;
+                    if deferred >= defer_cap {
+                        break;
+                    }
+                    continue;
                 }
             }
         }
@@ -150,7 +160,7 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
         let ub = upload_bytes(&u);
 
         if bytes + ub > max_bytes && !out.is_empty() {
-            push_front_same(mgr, which, u);
+            push_back_same(mgr, which, u);
             break;
         }
 

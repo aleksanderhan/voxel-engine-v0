@@ -485,7 +485,8 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
         if in_priority_box(mgr, center, k) {
             continue;
         }
-        if keep::in_active_xz(center, k) { continue; }
+        // REMOVE this line for pass 2:
+        // if keep::in_active_xz(center, k) { continue; }
 
         let dx = (k.x - center.x) as f32;
         let dz = (k.z - center.z) as f32;
