@@ -515,3 +515,30 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
     false
 }
 
+#[cfg(debug_assertions)]
+pub fn assert_slot_invariants(mgr: &ChunkManager) {
+    // Prefix rule: [0 .. resident_slots) must be Resident, rest must be Uploading.
+    for (i, &k) in mgr.slots.slot_to_key.iter().enumerate() {
+        match mgr.build.chunks.get(&k) {
+            Some(ChunkState::Resident(r)) => {
+                assert!(i < mgr.slots.resident_slots, "Resident beyond prefix: i={i} resident_slots={} k={:?}", mgr.slots.resident_slots, k);
+                assert!(r.slot as usize == i, "Resident slot mismatch: i={i} r.slot={} k={:?}", r.slot, k);
+            }
+            Some(ChunkState::Uploading(u)) => {
+                assert!(i >= mgr.slots.resident_slots, "Uploading inside prefix: i={i} resident_slots={} k={:?}", mgr.slots.resident_slots, k);
+                assert!(u.slot as usize == i, "Uploading slot mismatch: i={i} u.slot={} k={:?}", u.slot, k);
+            }
+            other => {
+                panic!("slot_to_key contains key with non-slot state: i={i} k={:?} state={:?}", k, other);
+            }
+        }
+    }
+
+    // Also check that resident_slots isn't larger than the slot array.
+    assert!(
+        mgr.slots.resident_slots <= mgr.slots.slot_to_key.len(),
+        "resident_slots {} > slot_to_key.len {}",
+        mgr.slots.resident_slots,
+        mgr.slots.slot_to_key.len()
+    );
+}
