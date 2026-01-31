@@ -224,6 +224,10 @@ const GRASS_SEGS_FAR : u32 = 1u;
 const GRASS_TRACE_STEPS_MID : u32 = 6u;
 const GRASS_TRACE_STEPS_FAR : u32 = 4u;
 
+
+// Misc
+const ALBEDO_VAR_GAIN = 4.0;
+
 //// --------------------------------------------------------------------------
 //// GPU structs (must match Rust layouts)
 //// --------------------------------------------------------------------------
