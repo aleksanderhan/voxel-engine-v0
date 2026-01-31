@@ -254,7 +254,17 @@ fn try_promote_from_cache(mgr: &mut ChunkManager, center: ChunkKey, key: ChunkKe
     let colinfo_words = e.colinfo_words.clone();
 
     mgr.cache.touch(key);
-    slots::try_make_uploading(mgr, center, key, nodes, macro_words, ropes, colinfo_words)
+
+    let ok = slots::try_make_uploading(mgr, center, key, nodes, macro_words, ropes, colinfo_words);
+    if ok {
+        // purge stale queued bookkeeping
+        if mgr.build.queued_set.remove(&key) {
+            if let Some(pos) = mgr.build.build_queue.iter().position(|x| *x == key) {
+                mgr.build.build_queue.remove(pos);
+            }
+        }
+    }
+    ok
 }
 
 fn on_build_done(
@@ -341,24 +351,33 @@ fn make_prio(score: f32) -> u32 {
 }
 
 pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec3) {
-    // 1) Gather all queued keys: existing heap + staged build_queue
-    let mut keys: Vec<ChunkKey> = Vec::with_capacity(mgr.build.build_heap.len() + mgr.build.build_queue.len());
+    // Gather keys
+    let mut keys: Vec<ChunkKey> =
+        Vec::with_capacity(mgr.build.build_heap.len() + mgr.build.build_queue.len());
 
-    keys.extend(mgr.build.build_heap.iter().map(|it| it.key));
-    keys.extend(mgr.build.build_queue.drain(..)); // staging consumed
+    // Consume heap safely (avoid leaving stale items around)
+    let old_heap = std::mem::take(&mut mgr.build.build_heap);
+    keys.extend(old_heap.into_iter().map(|it| it.key));
+    keys.extend(mgr.build.build_queue.drain(..));
 
-    mgr.build.build_heap.clear();
+    // We will rebuild the heap from scratch
+    mgr.build.build_heap = BinaryHeap::new();
 
-    // 2) Filter invalid keys (copying your keep/sanity checks)
     let origin = mgr.grid.grid_origin_chunk;
     let nx = (2 * config::KEEP_RADIUS + 1) as i32;
 
-    let mut kept: Vec<ChunkKey> = Vec::with_capacity(keys.len());
-    let mut drop_keys: Vec<ChunkKey> = Vec::new();
+    let mut kept: Vec<ChunkKey> = Vec::new();
 
     for k in keys {
+        // If it's no longer queued, it must NOT be in queue bookkeeping,
+        // but we must NOT remove its state from build.chunks.
+        if !matches!(mgr.build.chunks.get(&k), Some(ChunkState::Queued)) {
+            mgr.build.queued_set.remove(&k);
+            continue;
+        }
+
+        // Your existing keep checks
         let keep_it =
-            matches!(mgr.build.chunks.get(&k), Some(ChunkState::Queued)) &&
             {
                 let dx = k.x - center.x;
                 let dz = k.z - center.z;
@@ -381,29 +400,28 @@ pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec
                 dy >= y_band_min() && dy <= y_band_max()
             };
 
-        if keep_it { kept.push(k); } else { drop_keys.push(k); }
-    }
-
-    // 3) Clean state for dropped keys (prevents orphan growth)
-    for k in drop_keys {
-        if let Some(c) = mgr.build.cancels.get(&k) {
-            c.store(true, AtomicOrdering::Relaxed);
+        if keep_it {
+            kept.push(k);
+        } else {
+            // Only safe to cancel/remove because it's STILL queued (no slots/arena allocated)
+            if let Some(c) = mgr.build.cancels.get(&k) {
+                c.store(true, AtomicOrdering::Relaxed);
+            }
+            mgr.build.chunks.remove(&k);
+            mgr.build.cancels.remove(&k);
+            mgr.build.queued_set.remove(&k);
         }
-        mgr.build.chunks.remove(&k);
-        mgr.build.cancels.remove(&k);
-        mgr.build.queued_set.remove(&k);
     }
 
-    // 4) Rebuild queued_set to match kept
+    // Rebuild queued_set to match kept
     mgr.build.queued_set.clear();
     mgr.build.queued_set.extend(kept.iter().copied());
 
-    // 5) Score + heapify
+    // Score + heapify
     let mut items: Vec<HeapItem> = Vec::with_capacity(kept.len());
     for (i, k) in kept.into_iter().enumerate() {
         let mut s = priority_score(k, center, cam_fwd);
 
-        // Preserve your “priority box first” behavior without special-casing structure:
         if super::slots::in_priority_box(mgr, center, k) {
             s -= 20_000.0;
         } else if super::keep::in_active_xz(center, k) {
@@ -415,3 +433,4 @@ pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec
 
     mgr.build.build_heap = BinaryHeap::from(items);
 }
+

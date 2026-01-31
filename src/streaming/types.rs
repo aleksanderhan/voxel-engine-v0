@@ -32,6 +32,7 @@ pub struct ChunkKey {
     pub z: i32,
 }
 
+#[derive(Debug)]
 pub enum ChunkState {
     Queued,
     Building,

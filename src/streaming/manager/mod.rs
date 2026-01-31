@@ -8,6 +8,8 @@ mod ground;
 mod keep;
 mod uploads;
 
+pub(crate) use slots::assert_slot_invariants;
+
 use std::{
     collections::{VecDeque, BinaryHeap},
     mem::size_of,
@@ -195,6 +197,8 @@ impl ChunkManager {
 
         // 6) unload outside keep
         build::unload_outside_keep(self, center);
+        #[cfg(debug_assertions)]
+        slots::assert_slot_invariants(self);
 
         // 7) handle center-change cleanup/sort
         build::rebuild_build_heap(self, center, cam_fwd);
@@ -202,11 +206,19 @@ impl ChunkManager {
         // 8) dispatch builds
         build::dispatch_builds(self, center);
 
-        // 9) harvest completions
+        // 9) harvest completions (can call on_build_done -> try_make_uploading)
         build::harvest_done_builds(self, center);
+        #[cfg(debug_assertions)]
+        slots::assert_slot_invariants(self);
 
         // 10) rebuild grid if dirty
-        grid::rebuild_if_dirty(self, center)
+        let changed = grid::rebuild_if_dirty(self, center);
+
+        // DEBUG: verify slot/chunk invariants every frame
+        #[cfg(debug_assertions)]
+        slots::assert_slot_invariants(self);
+
+        changed
     }
 
 

@@ -26,7 +26,7 @@ fn material_variation(world_p: vec3<f32>, cell_size_m: f32) -> f32 {
 
 fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f32> {
   var c = base;
-  let v = material_variation(hp, 0.05);
+  let v = ALBEDO_VAR_GAIN * material_variation(hp, 0.05);
 
   if (mat == MAT_GRASS) {
     c += vec3<f32>(0.02 * v, 0.05 * v, 0.01 * v);

@@ -17,67 +17,80 @@
 @group(2) @binding(3) var depth_full : texture_2d<f32>;
 @group(2) @binding(4) var godray_samp: sampler;
 
+var<workgroup> WG_SKY_UP : vec3<f32>;
+
 @compute @workgroup_size(8, 8, 1)
-fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main_primary(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(local_invocation_index) lid: u32
+) {
   let dims = textureDimensions(color_img);
   if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+
+  // Compute once per 8x8 workgroup
+  if (lid == 0u) {
+    WG_SKY_UP = sky_color_base(vec3<f32>(0.0, 1.0, 0.0));
+  }
+  workgroupBarrier();
+  let sky_up = WG_SKY_UP;
 
   let res = vec2<f32>(f32(dims.x), f32(dims.y));
   let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
 
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px, res);
+
   let sky = sky_color(rd);
-  let sky_up = sky_color_base(vec3<f32>(0.0, 1.0, 0.0));
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
 
-  // If no SVO chunks, still render clipmap terrain.
+  // If no SVO chunks => only heightfield.
   if (cam.chunk_count == 0u) {
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
     let surface = select(sky, shade_clip_hit(ro, rd, hf, sky_up), hf.hit);
     let t_scene = select(FOG_MAX_DIST, min(hf.t, FOG_MAX_DIST), hf.hit);
-
     let col = apply_fog(surface, ro, rd, t_scene, sky);
-
     textureStore(color_img, ip, vec4<f32>(col, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     return;
   }
 
-  // Streamed voxel grid trace
   let vt = trace_scene_voxels(ro, rd);
 
-  // Outside streamed grid => clipmap fallback.
+  // Outside streamed grid => only heightfield.
   if (!vt.in_grid) {
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
     let surface = select(sky, shade_clip_hit(ro, rd, hf, sky_up), hf.hit);
     let t_scene = select(FOG_MAX_DIST, min(hf.t, FOG_MAX_DIST), hf.hit);
-
     let col = apply_fog(surface, ro, rd, t_scene, sky);
-
     textureStore(color_img, ip, vec4<f32>(col, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     return;
   }
 
-  // If no voxel hit, try heightfield clipmap fallback.
-  let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
-
+  // In grid: heightfield is ONLY needed if voxel miss.
   let use_vox = (vt.best.hit != 0u);
-  let use_hf  = (!use_vox) && hf.hit;
 
-  let surface = select(
-    sky,
-    select(shade_clip_hit(ro, rd, hf, sky_up), shade_hit(ro, rd, vt.best, sky), use_vox),
-    (use_vox || use_hf)
-  );
+  var hf: ClipHit = ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+  var use_hf: bool = false;
+  if (!use_vox) {
+    hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+    use_hf = hf.hit;
+  }
 
-  let t_scene = select(
-    min(vt.t_exit, FOG_MAX_DIST),
-    select(min(hf.t, FOG_MAX_DIST), min(vt.best.t, FOG_MAX_DIST), use_vox),
-    (use_vox || use_hf)
-  );
+  let surface =
+    select(sky,
+      select(shade_clip_hit(ro, rd, hf, sky_up),
+             shade_hit(ro, rd, vt.best, sky_up),
+             use_vox),
+      (use_vox || use_hf));
+
+  let t_scene =
+    select(min(vt.t_exit, FOG_MAX_DIST),
+      select(min(hf.t, FOG_MAX_DIST),
+             min(vt.best.t, FOG_MAX_DIST),
+             use_vox),
+      (use_vox || use_hf));
 
   let col = apply_fog(surface, ro, rd, t_scene, sky);
 
