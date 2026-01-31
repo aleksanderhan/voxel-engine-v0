@@ -10,6 +10,9 @@ fn color_for_material(m: u32) -> vec3<f32> {
   if (m == MAT_STONE) { return vec3<f32>(0.50, 0.50, 0.55); }
   if (m == MAT_WOOD)  { return vec3<f32>(0.38, 0.26, 0.14); }
   if (m == MAT_LEAF)  { return vec3<f32>(0.10, 0.55, 0.12); }
+  if (m == MAT_BALL) {
+    return vec3<f32>(2.2, 0.15, 0.15); // bright-ish red in HDR
+  }
   return vec3<f32>(1.0, 0.0, 1.0);
 }
 

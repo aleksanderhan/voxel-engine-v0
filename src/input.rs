@@ -1,6 +1,6 @@
 // src/input.rs
 use winit::{
-    event::{DeviceEvent, ElementState, KeyEvent, WindowEvent},
+    event::{DeviceEvent, ElementState, KeyEvent, WindowEvent, MouseButton},
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window},
 };
@@ -15,6 +15,7 @@ pub struct KeyState {
     pub alt: bool,
     pub shift: bool,
     pub c: bool,
+    
 }
 
 impl KeyState {
@@ -40,6 +41,8 @@ pub struct InputState {
     pub mouse_dx: f32,
     pub mouse_dy: f32,
     c_pressed: bool,
+    lmb_down: bool,
+    lmb_pressed: bool,
 }
 
 impl InputState {
@@ -66,9 +69,26 @@ impl InputState {
                 } else {
                     let _ = window.set_cursor_grab(CursorGrabMode::None);
                     window.set_cursor_visible(true);
+
+                    self.lmb_down = false;
+                    self.lmb_pressed = false;
                 }
                 true
             }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                if !self.focused {
+                    return false;
+                }
+                if *button == MouseButton::Left {
+                    let down = *state == ElementState::Pressed;
+                    if down && !self.lmb_down {
+                        self.lmb_pressed = true; // edge-trigger
+                    }
+                    self.lmb_down = down;
+                }
+                false
+            }   
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if let KeyEvent {
@@ -89,6 +109,10 @@ impl InputState {
                         self.focused = false;
                         let _ = window.set_cursor_grab(CursorGrabMode::None);
                         window.set_cursor_visible(true);
+
+                        self.lmb_down = false;
+                        self.lmb_pressed = false;
+
                         return true;
                     }
                 }
@@ -110,6 +134,12 @@ impl InputState {
     pub fn take_c_pressed(&mut self) -> bool {
         let v = self.c_pressed;
         self.c_pressed = false;
+        v
+    }
+
+    pub fn take_lmb_pressed(&mut self) -> bool {
+        let v = self.lmb_pressed;
+        self.lmb_pressed = false;
         v
     }
 }

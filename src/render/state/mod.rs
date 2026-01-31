@@ -584,5 +584,9 @@ impl Renderer {
         })
     }
 
+    pub fn write_balls(&self, balls: &[crate::render::gpu_types::BallGpu]) {
+        let n = balls.len().min(self.buffers.balls_capacity as usize);
+        self.queue.write_buffer(&self.buffers.balls, 0, bytemuck::cast_slice(&balls[..n]));
+    }
 
 }

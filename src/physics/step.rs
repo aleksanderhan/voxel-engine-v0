@@ -7,6 +7,8 @@ use super::{
     collision::{sphere_voxels::resolve_sphere_vs_voxels, WorldQuery},
     player::{PlayerBody, PlayerTuning},
 };
+use super::projectiles::{Ball, BallTuning, step_balls};
+
 
 /// Fixed-step physics driver.
 /// Owns the player body for now; later this owns articulations too.
@@ -23,6 +25,9 @@ pub struct Physics {
 
     pub mouse_sens: f32,
     pub eye_offset: Vec3,
+
+    pub balls: Vec<Ball>,
+    pub ball_tuning: BallTuning,
 }
 
 impl Physics {
@@ -36,6 +41,8 @@ impl Physics {
             pitch: 0.15,
             mouse_sens: 0.0025,
             eye_offset: Vec3::new(0.0, 1.6, 0.0),
+            balls: Vec::new(),  
+            ball_tuning: BallTuning::default(),
         }
     }
 
@@ -175,6 +182,15 @@ impl Physics {
         if self.player.on_ground {
             self.player.jump_queued = false;
         }
+
+        // step balls after player
+        step_balls(&mut self.balls, world, self.ball_tuning, dt);
+
+        // optional: compact dead balls occasionally
+        if self.balls.len() > 256 {
+            self.balls.retain(|b| b.alive);
+        }
+
     }
 
     fn step_fixed_with_desired<W: WorldQuery>(
@@ -243,5 +259,50 @@ impl Physics {
         if self.player.on_ground {
             self.player.jump_queued = false;
         }
+
+        // step balls after player
+        step_balls(&mut self.balls, world, self.ball_tuning, dt);
+
+        // optional: compact dead balls occasionally
+        if self.balls.len() > 256 {
+            self.balls.retain(|b| b.alive);
+        }
     }
+
+    pub fn spawn_ball(&mut self, eye: Vec3, forward: Vec3) {
+        let f = if forward.length_squared() > 1e-6 { forward.normalize() } else { Vec3::Z };
+
+        let r = crate::config::BALL_RADIUS as f32 * crate::config::VOXEL_SIZE_M_F32;
+
+        let pos = eye + f * (r + crate::config::BALL_SPAWN_NUDGE_M);
+
+        self.ball_tuning.speed_mps = crate::config::BALL_SPEED_MPS;
+        self.ball_tuning.lifetime_s = crate::config::BALL_LIFETIME_S;
+
+        self.balls.push(Ball {
+            pos,
+            vel: f * self.ball_tuning.speed_mps,
+            radius: r,
+            age: 0.0,
+            alive: true,
+        });
+    }
+
+    #[inline]
+    pub fn balls_iter(&self) -> impl Iterator<Item = &super::projectiles::Ball> {
+        self.balls.iter().filter(|b| b.alive)
+    }
+
+    /// Iterate alive balls (mutable), if you ever need it.
+    #[inline]
+    pub fn balls_iter_mut(&mut self) -> impl Iterator<Item = &mut super::projectiles::Ball> {
+        self.balls.iter_mut().filter(|b| b.alive)
+    }
+
+    /// Optional helper: alive count for GPU uniforms etc.
+    #[inline]
+    pub fn balls_alive_count(&self) -> u32 {
+        self.balls_iter().count() as u32
+    }
+
 }

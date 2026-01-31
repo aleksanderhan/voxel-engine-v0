@@ -49,3 +49,21 @@ pub const CLIPMAP_BASE_CELL_M: f32 = 1.0;
 // How often we allow a full refresh per level at most (seconds).
 // (Prevents thrashing if you ever tie updates to very tiny camera jitter.)
 pub const CLIPMAP_MIN_UPDATE_INTERVAL_S: f32 = 0.0;
+
+
+// Ball radius in *voxels*
+pub const BALL_RADIUS: i32 = 3;
+
+pub const BALL_RADIUS_M: f32 = 0.3;
+
+// Spawn a tiny bit in front of the camera (meters)
+pub const BALL_SPAWN_NUDGE_M: f32 = 0.75;
+
+// Ball speed (meters per second)
+pub const BALL_SPEED_MPS: f32 = 55.0;
+
+// Optional: lifetime (seconds)
+pub const BALL_LIFETIME_S: f32 = 6.0;
+
+
+pub const MAX_BALLS: u32 = 256;

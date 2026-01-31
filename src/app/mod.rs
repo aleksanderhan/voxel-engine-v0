@@ -20,10 +20,33 @@ use crate::{
     clipmap::Clipmap,
     config,
     input::InputState,
-    render::{CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
+    render::{BallGpu, CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
     streaming::ChunkManager,
     world::WorldGen,
 };
+
+use glam::{Mat4, Vec2, Vec3, Vec4};
+
+pub fn camera_ray_dir_from_cursor(
+    cursor_px: Vec2,
+    present_size_px: Vec2,
+    proj_inv: Mat4,
+    view_inv: Mat4,
+) -> Vec3 {
+    // NDC (note Y flip matches WGSL)
+    let ndc = Vec4::new(
+        2.0 * cursor_px.x / present_size_px.x - 1.0,
+        1.0 - 2.0 * cursor_px.y / present_size_px.y,
+        1.0,
+        1.0,
+    );
+
+    let view = proj_inv * ndc;
+    let vdir = Vec4::new(view.x / view.w, view.y / view.w, view.z / view.w, 0.0);
+    let wdir = (view_inv * vdir).truncate();
+    wdir.normalize_or_zero()
+}
+
 
 pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
     let mut app = App::new(window).await;
@@ -42,6 +65,8 @@ pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
                 app.handle_event(event, elwt);
             }
         }
+
+        
     }).unwrap();
 }
 
@@ -249,45 +274,66 @@ impl App {
         // ---------------------------------------------------------------------
         let t0 = Instant::now();
 
-        // Toggle free camera on C (edge-trigger)
+        // sample shooting once per frame
+        let shoot = self.input.take_lmb_pressed();
+
+        let balls_gpu: Vec<BallGpu> = self.physics
+            .balls_iter()
+            .take(config::MAX_BALLS as usize)
+            .map(|b| BallGpu {
+                center_radius: [b.pos.x, b.pos.y, b.pos.z, config::BALL_RADIUS_M],
+                material: 42, // pick a material id for the ball voxels
+                _pad0: 0, _pad1: 0, _pad2: 0,
+            })
+            .collect();
+        let ball_count: u32 = balls_gpu.len() as u32;
+        self.renderer.write_balls(&balls_gpu);
+
+
+        // Toggle free camera on C (as you already have)
         if self.input.take_c_pressed() {
             self.free_cam = !self.free_cam;
 
             if self.free_cam {
-                // entering freecam: start freecam from player eye + current view
                 let eye = self.physics.player.pos + self.physics.eye_offset;
                 self.camera.set_position(eye);
                 self.camera.set_yaw_pitch(self.physics.yaw, self.physics.pitch);
             } else {
-                // leaving freecam: adopt camera view back into physics so it doesn't snap
                 let (yaw, pitch) = self.camera.yaw_pitch();
                 self.physics.yaw = yaw;
                 self.physics.pitch = pitch;
             }
         }
 
-        // World query adapter (as you had)
         let q = crate::physics::ChunkManagerQuery {
-            mgr: &self.chunks,                // or &self.chunks depending on your field name
-            world: Some(self.world.as_ref()),    // &WorldGen
+            mgr: &self.chunks,
+            world: Some(self.world.as_ref()),
         };
 
-        if self.free_cam {
-            // 1) advance player physics WITHOUT consuming mouse/WASD
+        let (eye, forward) = if self.free_cam {
             self.physics.step_frame_player_only(dt, &q);
-
-            // 2) free camera consumes mouse + WASD
             self.camera.integrate_input(&mut self.input, dt);
-        } else {
-            // Follow mode: physics consumes mouse/WASD and outputs view + eye
-            let eye = self.physics.step_frame(&mut self.input, dt, &q);
 
+            let eye = self.camera.position();
+            let fwd = self.camera.forward();
+            (eye, fwd)
+        } else {
+            let eye = self.physics.step_frame(&mut self.input, dt, &q);
             self.camera.set_position(eye);
             self.camera.set_yaw_pitch(self.physics.yaw, self.physics.pitch);
+
+            let fwd = self.camera.forward();
+            (eye, fwd)
+        };
+
+        // spawn after we know eye+forward in the active mode
+        if shoot {
+            self.physics.spawn_ball(eye, forward);
         }
 
         self.frame_index = self.frame_index.wrapping_add(1);
         self.profiler.cam(crate::profiler::FrameProf::mark_ms(t0));
+
 
 
         // ---------------------------------------------------------------------
@@ -375,6 +421,7 @@ impl App {
                 0,
             ],
             render_present_px: [rw, rh, self.config.width, self.config.height],
+            dyn_counts: [ball_count, 0, 0, 0],
         };
 
         self.renderer.write_camera(&cam_gpu);

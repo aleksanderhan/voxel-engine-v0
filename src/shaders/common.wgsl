@@ -27,6 +27,7 @@ const MAT_DIRT  : u32 = 2u;
 const MAT_STONE : u32 = 3u;
 const MAT_WOOD  : u32 = 4u;
 const MAT_LEAF  : u32 = 5u;
+const MAT_BALL  : u32 = 6u;
 
 //// --------------------------------------------------------------------------
 //// Sun / sky (shared, but shading logic lives in ray_core.wgsl)
@@ -228,6 +229,7 @@ const GRASS_TRACE_STEPS_FAR : u32 = 4u;
 // Misc
 const ALBEDO_VAR_GAIN = 4.0;
 
+
 //// --------------------------------------------------------------------------
 //// GPU structs (must match Rust layouts)
 //// --------------------------------------------------------------------------
@@ -272,7 +274,7 @@ struct Camera {
   // xy = render size in pixels, zw = present size in pixels
   render_present_px : vec4<u32>,
 
-  
+  dyn_counts: vec4<u32>,
 };
 
 
@@ -544,4 +546,194 @@ fn ip_render_from_present_px(px_present: vec2<f32>) -> vec2<i32> {
   let ix = clamp(i32(floor(pr.x)), 0, i32(rd.x) - 1);
   let iy = clamp(i32(floor(pr.y)), 0, i32(rd.y) - 1);
   return vec2<i32>(ix, iy);
+}
+
+
+
+
+
+
+
+
+// --- Ball storage (must match Rust layout) ---
+struct Ball {
+  center_radius: vec4<f32>, // xyz center (m), w radius (m)
+  material: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(11)
+var<storage, read> balls: array<Ball>;
+
+struct BallHit {
+  hit : bool,
+  t   : f32,
+  n   : vec3<f32>,
+  mat : u32,
+};
+
+fn ray_sphere_interval(ro: vec3<f32>, rd: vec3<f32>, c: vec3<f32>, r: f32) -> vec2<f32> {
+  // returns (t0,t1). If miss => (1,0)
+  let oc = ro - c;
+  let b  = dot(oc, rd);
+  let c0 = dot(oc, oc) - r * r;
+  let h  = b * b - c0;
+  if (h < 0.0) { return vec2<f32>(1.0, 0.0); }
+  let s = sqrt(h);
+  return vec2<f32>(-b - s, -b + s);
+}
+
+fn ball_voxel_contains(p_vox: vec3<i32>, c_vox: vec3<i32>, r_vox: i32) -> bool {
+  let d: vec3<i32> = p_vox - c_vox;
+  let d2: i32 = d.x*d.x + d.y*d.y + d.z*d.z;
+  return d2 <= r_vox * r_vox;
+}
+
+fn trace_ball_voxels(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_min: f32,
+  t_max: f32,
+  c_m: vec3<f32>,
+  r_m: f32,
+  mat: u32
+) -> BallHit {
+  let vs  = cam.voxel_params.x;
+  let eps = 1e-4 * vs;
+
+  // analytic interval for the sphere
+  let itv = ray_sphere_interval(ro, rd, c_m, r_m);
+  var t0 = max(itv.x, t_min);
+  let t1 = min(itv.y, t_max);
+  if (t1 <= t0) { return BallHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR); }
+
+  // nudge inside interval to avoid boundary problems
+  t0 = max(t0, 0.0) + eps;
+
+  // voxel-space center + radius
+  let c_vox = vec3<i32>(floor(c_m / vs));
+  let r_vox = i32(ceil(r_m / vs));
+
+  // DDA start at t0
+  var p = ro + rd * t0;
+  var v = vec3<i32>(floor(p / vs));
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  let stepX: i32 = select(-1, 1, rd.x > 0.0);
+  let stepY: i32 = select(-1, 1, rd.y > 0.0);
+  let stepZ: i32 = select(-1, 1, rd.z > 0.0);
+
+  // next boundary planes (world meters)
+  let nextBx = (f32(select(v.x, v.x + 1, stepX > 0)) * vs);
+  let nextBy = (f32(select(v.y, v.y + 1, stepY > 0)) * vs);
+  let nextBz = (f32(select(v.z, v.z + 1, stepZ > 0)) * vs);
+
+  var tMaxX: f32 = select(BIG_F32, t0 + (nextBx - p.x) * inv.x, abs(rd.x) >= EPS_INV);
+  var tMaxY: f32 = select(BIG_F32, t0 + (nextBy - p.y) * inv.y, abs(rd.y) >= EPS_INV);
+  var tMaxZ: f32 = select(BIG_F32, t0 + (nextBz - p.z) * inv.z, abs(rd.z) >= EPS_INV);
+
+  let tDeltaX: f32 = select(BIG_F32, vs * abs(inv.x), abs(rd.x) >= EPS_INV);
+  let tDeltaY: f32 = select(BIG_F32, vs * abs(inv.y), abs(rd.y) >= EPS_INV);
+  let tDeltaZ: f32 = select(BIG_F32, vs * abs(inv.z), abs(rd.z) >= EPS_INV);
+
+  // start inside occupied voxel?
+  if (ball_voxel_contains(v, c_vox, r_vox)) {
+    return BallHit(true, t0, normalize(-rd), mat);
+  }
+
+  let MAX_STEPS: u32 = 512u;
+  var tcur: f32 = t0;
+
+  for (var i: u32 = 0u; i < MAX_STEPS; i = i + 1u) {
+    if (tcur > t1) { break; }
+
+    var n = vec3<f32>(0.0);
+
+    // step to next voxel boundary
+    if (tMaxX < tMaxY) {
+      if (tMaxX < tMaxZ) {
+        tcur = tMaxX; tMaxX += tDeltaX;
+        v.x += stepX;
+        n = vec3<f32>(select( 1.0, -1.0, stepX > 0), 0.0, 0.0);
+      } else {
+        tcur = tMaxZ; tMaxZ += tDeltaZ;
+        v.z += stepZ;
+        n = vec3<f32>(0.0, 0.0, select( 1.0, -1.0, stepZ > 0));
+      }
+    } else {
+      if (tMaxY < tMaxZ) {
+        tcur = tMaxY; tMaxY += tDeltaY;
+        v.y += stepY;
+        n = vec3<f32>(0.0, select( 1.0, -1.0, stepY > 0), 0.0);
+      } else {
+        tcur = tMaxZ; tMaxZ += tDeltaZ;
+        v.z += stepZ;
+        n = vec3<f32>(0.0, 0.0, select( 1.0, -1.0, stepZ > 0));
+      }
+    }
+
+    if (tcur > t1) { break; }
+
+    if (ball_voxel_contains(v, c_vox, r_vox)) {
+      return BallHit(true, tcur, n, mat);
+    }
+  }
+
+  return BallHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+}
+
+fn trace_balls(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> BallHit {
+  let nballs: u32 = cam.dyn_counts.x;
+  if (nballs == 0u) {
+    return BallHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+  }
+
+  var best = BallHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+
+  // bounded by what CPU uploads
+  for (var i: u32 = 0u; i < nballs; i = i + 1u) {
+    let c = balls[i].center_radius.xyz;
+    let r = balls[i].center_radius.w;
+    let m = balls[i].material;
+
+    let h = trace_ball_voxels(ro, rd, t_min, t_max, c, r, m);
+    if (h.hit && h.t < best.t) { best = h; }
+  }
+
+  return best;
+}
+
+fn shade_ball_hit(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  bh: BallHit,
+  sky_up: vec3<f32>
+) -> vec3<f32> {
+  let hp = ro + bh.t * rd;
+
+  var base = color_for_material(bh.mat);
+
+  // simple lighting
+  let n = normalize(bh.n);
+
+  let hp_shadow = hp + n * (0.75 * cam.voxel_params.x);
+
+  let vis  = sun_transmittance(hp_shadow, SUN_DIR);
+  let diff = max(dot(n, SUN_DIR), 0.0);
+
+  let amb = hemi_ambient(n, sky_up) * 0.10;
+
+  // spec (cheap)
+  let vdir = normalize(-rd);
+  let hdir = normalize(vdir + SUN_DIR);
+  let ndh  = max(dot(n, hdir), 0.0);
+  let spec = pow(ndh, 64.0);
+
+  let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis;
+  let spec_col = SUN_COLOR * SUN_INTENSITY * spec * 0.04 * vis;
+
+  return base * (amb + direct) + spec_col;
 }

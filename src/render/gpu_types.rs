@@ -63,7 +63,22 @@ pub struct CameraGpu {
     pub grid_dims: [u32; 4],
 
     pub render_present_px: [u32; 4],
+
+    // x = ball_count, yzw reserved
+    pub dyn_counts: [u32; 4],
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Debug)]
+pub struct BallGpu {
+    // xyz = center in meters, w = radius in meters
+    pub center_radius: [f32; 4],
+    pub material: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
 
 /// Clipmap uniform payload.
 ///

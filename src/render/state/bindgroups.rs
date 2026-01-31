@@ -69,6 +69,11 @@ fn make_primary_bg(
                 binding: 10,
                 resource: buffers.colinfo.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: buffers.balls.as_entire_binding(),
+            },
+
 
         ],
     })

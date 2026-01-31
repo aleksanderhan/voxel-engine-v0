@@ -34,6 +34,8 @@ pub struct Buffers {
     pub colinfo: wgpu::Buffer,
     pub colinfo_capacity_u32: u32,
 
+    pub balls: wgpu::Buffer,
+    pub balls_capacity: u32,
 }
 
 fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
@@ -110,6 +112,14 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         (colinfo_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
     );
 
+    let balls_capacity: u32 = crate::config::MAX_BALLS;
+    let balls = make_storage_buffer(
+        device,
+        "balls_buf",
+        (balls_capacity as u64) * (std::mem::size_of::<crate::render::gpu_types::BallGpu>() as u64),
+    );
+
+
     Buffers {
         camera,
         overlay,
@@ -126,5 +136,7 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         rope_capacity,
         colinfo,
         colinfo_capacity_u32,
+        balls,
+        balls_capacity,
     }
 }

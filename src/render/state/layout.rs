@@ -140,6 +140,9 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         wgpu::TextureSampleType::Float { filterable: false },
     ));
 
+    primary_entries.push(bgl_storage_ro(11, cs_vis)); // balls
+
+
     let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("primary_bgl"),
         entries: &primary_entries,
