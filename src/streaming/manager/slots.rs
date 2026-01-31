@@ -229,6 +229,15 @@ pub fn try_make_uploading(
     ropes: Arc<[NodeRopesGpu]>,
     colinfo_words: Arc<[u32]>,
 ) -> bool {
+    match mgr.build.chunks.get(&key) {
+        Some(ChunkState::Resident(_)) => return true,
+        Some(ChunkState::Uploading(_)) => {
+            // Already has a slot + arena allocation. Don’t allocate a new slot.
+            return true;
+        }
+        _ => {}
+    }
+    
     if matches!(mgr.build.chunks.get(&key), Some(ChunkState::Resident(_))) {
         return true;
     }

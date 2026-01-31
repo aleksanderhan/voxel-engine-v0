@@ -280,8 +280,13 @@ fn on_build_done(
 
     mgr.cache.put(key, nodes_arc.clone(), macro_arc.clone(), ropes_arc.clone(), colinfo_arc.clone());
 
-    if matches!(mgr.build.chunks.get(&key), Some(ChunkState::Resident(_))) {
-        return;
+    match mgr.build.chunks.get(&key) {
+        Some(ChunkState::Resident(_)) => return,
+        Some(ChunkState::Uploading(_)) => {
+            // We already have a slot in flight; avoid double-slotting.
+            return;
+        }
+        _ => {}
     }
 
     // Defer GPU upload for non-priority until priority box is GPU-ready.

@@ -259,23 +259,18 @@ impl TreeMaskCache {
     }
 
     #[inline(always)]
-    fn write_leaf(&mut self, lx: i32, ly: i32, lz: i32) {
-        if (lx | ly | lz) < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
-            return;
-        }
+    fn write_wood_inbounds(&mut self, lx: i32, ly: i32, lz: i32) {
         let i = idx3_strided(self.stride_z, self.stride_y, lx, ly, lz);
-        if self.mask[i] != 1 {
-            self.mask[i] = 2;
-        }
+        unsafe { *self.mask.get_unchecked_mut(i) = 1; }
     }
 
     #[inline(always)]
-    fn write_wood(&mut self, lx: i32, ly: i32, lz: i32) {
-        if (lx | ly | lz) < 0 || lx >= self.size || ly >= self.size || lz >= self.size {
-            return;
-        }
+    fn write_leaf_inbounds(&mut self, lx: i32, ly: i32, lz: i32) {
         let i = idx3_strided(self.stride_z, self.stride_y, lx, ly, lz);
-        self.mask[i] = 1;
+        unsafe {
+            let p = self.mask.get_unchecked_mut(i);
+            if *p != 1 { *p = 2; }
+        }
     }
 }
 
@@ -741,7 +736,7 @@ impl WorldGen {
                 for z in minz..=maxz {
                     let dz = (z as f32) - cz;
                     if dx2 + dz * dz <= rr2 {
-                        out.write_wood(x - out.origin[0], wy - out.origin[1], z - out.origin[2]);
+                        out.write_wood_inbounds(x - out.origin[0], wy - out.origin[1], z - out.origin[2]);
                     }
                 }
             }
@@ -1059,7 +1054,7 @@ impl WorldGen {
                 let lx = (x - out.origin[0]) as i32;
                 let ly = (y - out.origin[1]) as i32;
                 for z in minz..=maxz {
-                    out.write_wood(lx, ly, z - out.origin[2]);
+                    out.write_wood_inbounds(lx, ly, z - out.origin[2]);
                 }
             }
         }
@@ -1084,57 +1079,73 @@ impl WorldGen {
         let rr = r.max(1.0);
         let ir = rr.ceil() as i32;
 
-        let minx = (cx.floor() as i32 - ir).max(out.origin[0]);
-        let maxx = (cx.ceil() as i32 + ir).min(out.origin[0] + out.size - 1);
-        let miny = (cy.floor() as i32 - ir).max(out.origin[1]);
-        let maxy = (cy.ceil() as i32 + ir).min(out.origin[1] + out.size - 1);
-        let minz = (cz.floor() as i32 - ir).max(out.origin[2]);
-        let maxz = (cz.ceil() as i32 + ir).min(out.origin[2] + out.size - 1);
+        let ox = out.origin[0];
+        let oy = out.origin[1];
+        let oz = out.origin[2];
+        let max_x = ox + out.size - 1;
+        let max_y = oy + out.size - 1;
+        let max_z = oz + out.size - 1;
+
+        let minx = (cx.floor() as i32 - ir).max(ox);
+        let maxx = (cx.ceil()  as i32 + ir).min(max_x);
+        let miny = (cy.floor() as i32 - ir).max(oy);
+        let maxy = (cy.ceil()  as i32 + ir).min(max_y);
 
         let r2 = rr * rr;
+        let shell_r = LEAF_SHELL_THRESH * rr;
+        let shell2 = shell_r * shell_r;
+
+        // pre-xor seeds so the hot loop doesn’t
+        let seed_gate   = seed ^ 0xA11C_E5ED;
+        let seed_in     = seed ^ 0xCAFE_BABE;
+        let seed_shell  = seed ^ 0xD00D_F00D;
 
         for y in miny..=maxy {
             let py = y as f32;
             let dy = (py - cy) * LEAF_SPHERE_Y_SCALE;
             let dy2 = dy * dy;
 
+            let ly = y - oy;
+
             for x in minx..=maxx {
                 let px = x as f32;
                 let dx = px - cx;
                 let dx2 = dx * dx;
 
+                let dxy2 = dx2 + dy2;
+                if dxy2 > r2 { continue; }
+
+                // scanline extent in z
+                let zext = (r2 - dxy2).sqrt();
+                let minz = ((cz - zext).floor() as i32).max(oz);
+                let maxz = ((cz + zext).ceil()  as i32).min(max_z);
+
+                let lx = x - ox;
+
                 for z in minz..=maxz {
-                    let pz = z as f32;
-                    let dz = pz - cz;
-                    let d2 = dx2 + dy2 + dz * dz;
-                    if d2 > r2 {
+                    // gate AFTER sphere test (still correct)
+                    if (hash3(seed_gate, x, y, z) & gate_mask) != 0 {
                         continue;
                     }
 
-                    // gate AFTER sphere test
-                    if (hash3(seed ^ 0xA11C_E5ED, x, y, z) & gate_mask) != 0 {
-                        continue;
-                    }
+                    // interior vs shell based on true d2
+                    let dz = (z as f32) - cz;
+                    let d2 = dxy2 + dz * dz;
 
-                    // only now do sqrt + interior/shell hashing
-                    let shell2 = (LEAF_SHELL_THRESH * rr) * (LEAF_SHELL_THRESH * rr);
                     if d2 < shell2 {
-                        let n = hash3(seed ^ 0xCAFE_BABE, x, y, z);
-                        if (n & interior_keep_mask) != 0 {
-                            continue;
-                        }
+                        let n = hash3(seed_in, x, y, z);
+                        if (n & interior_keep_mask) != 0 { continue; }
                     } else {
-                        let n = hash3(seed ^ 0xD00D_F00D, x, y, z);
-                        if (n & shell_drop_mask) == 0 {
-                            continue;
-                        }
+                        let n = hash3(seed_shell, x, y, z);
+                        if (n & shell_drop_mask) == 0 { continue; }
                     }
 
-                    out.write_leaf(x - out.origin[0], y - out.origin[1], z - out.origin[2]);
+                    out.write_leaf_inbounds(lx, ly, z - oz);
                 }
             }
         }
     }
+
 
     // -------------------------------------------------------------------------
     // SVO bounds helper
@@ -1145,4 +1156,5 @@ impl WorldGen {
         let (_seed, trunk_h_vox, crown_r_vox) = self.tree_at_meter_cell(xm, zm)?;
         Some((trunk_h_vox, crown_r_vox))
     }
+
 }
