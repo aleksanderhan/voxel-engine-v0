@@ -16,20 +16,6 @@ fn gamma_encode(x: vec3<f32>) -> vec3<f32> {
   return pow(x, vec3<f32>(1.0 / 2.2));
 }
 
-fn tonemap_aces_luma(hdr: vec3<f32>) -> vec3<f32> {
-  let w = vec3<f32>(0.2126, 0.7152, 0.0722);
-  let l_in = max(dot(hdr, w), 1e-6);
-
-  let a = 2.51;
-  let b = 0.03;
-  let c = 2.43;
-  let d = 0.59;
-  let e = 0.14;
-  let l_out = clamp((l_in*(a*l_in + b)) / (l_in*(c*l_in + d) + e), 0.0, 1.0);
-
-  return hdr * (l_out / l_in);
-}
-
 fn godray_sample_bilerp(
   px_full: vec2<f32>,
   godray_tex: texture_2d<f32>,
@@ -195,16 +181,65 @@ fn composite_pixel_mapped(
 
   hdr = mix(gray_h, hdr, sat_boost);
 
-  // Tonemap (luma-preserving)
-  var c = tonemap_aces_luma(hdr * POST_EXPOSURE);
+  // --- Grade knobs (constants or uniforms)
+  let exposure = 1.10;
+  let contrast = 1.05;
+  let temp     = 0.03; // +warm, -cool
+
+  hdr *= exposure;
+
+  // temperature: push R up, B down a bit
+  hdr *= vec3<f32>(1.0 + temp, 1.0, 1.0 - temp);
+
+  // contrast around mid-gray
+  let mid = vec3<f32>(0.18);
+  hdr = (hdr - mid) * contrast + mid;
+  hdr = max(hdr, vec3<f32>(0.0));
+
+
+  // --- Filmic tonemap (single global tonemap) ---
+  let white_point: f32 = 6.0; // try 4..10 (bigger = brighter highlights)
+  var c = tonemap_filmic_white_scale(hdr * POST_EXPOSURE, white_point);
+
+  // Clamp to display range (still linear at this point)
   c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+
+  // Optional tiny "print" bias (keep subtle)
   c = pow(c, vec3<f32>(0.98));
 
   // Dither/grain before gamma
-  let fi = f32(cam.frame_index & 1023u);
-  let n  = hash12(px_render * 1.7 + vec2<f32>(fi, 0.0)) - 0.5;
-  c += vec3<f32>(n / 1024.0);
+  let fi = f32(cam.frame_index & 255u);
+  let n0 = hash12(px_render + vec2<f32>(fi, 0.0)) - 0.5;
+  let n1 = hash12(px_render * 0.73 + vec2<f32>(0.0, fi)) - 0.5;
+  let n  = 0.6 * n0 + 0.4 * n1;
+  c += vec3<f32>(n / 1536.0);
 
+  // Gamma encode to LDR output
   let ldr = gamma_encode(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
   return vec4<f32>(ldr, 1.0);
+}
+
+// LUT-less filmic tonemap (Hable/Uncharted2-style), per-channel.
+// Input: HDR linear. Output: LDR-ish (0..~1), still linear until gamma.
+fn tonemap_filmic_hable(x: vec3<f32>) -> vec3<f32> {
+  // These are the classic Hable curve constants.
+  let A: f32 = 0.22;
+  let B: f32 = 0.30;
+  let C: f32 = 0.10;
+  let D: f32 = 0.20;
+  let E: f32 = 0.01;
+  let F: f32 = 0.30;
+
+  let num = x * (A * x + C * B) + D * E;
+  let den = x * (A * x + B)     + D * F;
+
+  return (num / max(den, vec3<f32>(1e-6))) - vec3<f32>(E / F);
+}
+
+// Optional: normalize so "white" maps nicely.
+// (Keeps highlights from feeling dim if you raise exposure.)
+fn tonemap_filmic_white_scale(x: vec3<f32>, white_point: f32) -> vec3<f32> {
+  let w = tonemap_filmic_hable(vec3<f32>(white_point));
+  let invw = vec3<f32>(1.0) / max(w, vec3<f32>(1e-6));
+  return tonemap_filmic_hable(x) * invw;
 }

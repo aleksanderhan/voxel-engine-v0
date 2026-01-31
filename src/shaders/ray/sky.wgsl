@@ -4,24 +4,31 @@
 //// --------------------------------------------------------------------------
 
 fn sky_color_base(rd: vec3<f32>) -> vec3<f32> {
-  // Base vertical gradient
-  let tsky = clamp(0.5 * (rd.y + 1.0), 0.0, 1.0);
+  // 4 (a,b) ramps (smoothstep edge pairs)
+  let a0: f32 = -0.10; let b0: f32 =  0.85; // vertical gradient
+  let a1: f32 = -0.20; let b1: f32 =  0.18; // horizon band
+  let a2: f32 =  0.15; let b2: f32 =  1.00; // zenith lift
+  let a3: f32 =  0.70; let b3: f32 =  0.98; // near-sun glow (mu space)
+
+  // --- Base vertical gradient
+  let t0 = smoothstep(a0, b0, rd.y);
   var col = mix(
-    vec3<f32>(0.05, 0.08, 0.12),
-    vec3<f32>(0.55, 0.75, 0.95),
-    tsky
+    vec3<f32>(0.05, 0.08, 0.12), // deep
+    vec3<f32>(0.55, 0.75, 0.95), // sky
+    t0
   );
 
-  // Horizon/zenith shaping
-  let y = clamp(rd.y, -0.2, 1.0);
-  let horizon = exp(-abs(y) * 8.0);
-  let zenith  = smoothstep(0.0, 1.0, y);
-  col += 0.12 * horizon * vec3<f32>(0.80, 0.75, 0.70);
-  col += 0.05 * zenith  * vec3<f32>(0.20, 0.35, 0.60);
+  // --- Horizon shaping (warm haze near y≈0)
+  let th = 1.0 - smoothstep(a1, b1, abs(rd.y));
+  col += (0.12 * th) * vec3<f32>(0.80, 0.75, 0.70);
+
+  // --- Zenith shaping (cooler up high)
+  let tz = smoothstep(a2, b2, rd.y);
+  col += (0.05 * tz) * vec3<f32>(0.20, 0.35, 0.60);
 
   col *= SKY_EXPOSURE;
 
-  // Sun term (NO acos)
+  // --- Sun disc + glow (no acos)
   let mu = clamp(dot(rd, SUN_DIR), -1.0, 1.0);
 
   let SUN_DISC_ANGULAR_RADIUS : f32 = 0.009;
@@ -32,12 +39,17 @@ fn sky_color_base(rd: vec3<f32>) -> vec3<f32> {
 
   let disc = smoothstep(mu_outer, mu_inner, mu);
 
-  let k_halo = 9000.0;
-  let halo = 0.15 * exp(-k_halo * max(0.0, 1.0 - mu));
+  // broad glow using (a3,b3) in mu-space near 1.0
+  let glow = smoothstep(a3, b3, mu);
 
-  col += SUN_COLOR * SUN_INTENSITY * (disc + halo);
+  // tight halo (still cheap)
+  let halo = 0.15 * exp(-9000.0 * max(0.0, 1.0 - mu));
+
+  col += SUN_COLOR * SUN_INTENSITY * (disc + halo + 0.04 * glow);
+
   return col;
 }
+
 
 fn sky_color(rd: vec3<f32>) -> vec3<f32> {
   var col = sky_color_base(rd);

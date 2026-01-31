@@ -122,7 +122,7 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>) -> ve
     base = mix(base, base + vec3<f32>(0.10, 0.10, 0.02), 0.35 * tip);
 
     let back = pow(clamp(dot(-SUN_DIR, hg.n), 0.0, 1.0), 2.0);
-    base += 0.18 * back * vec3<f32>(0.20, 0.35, 0.08);
+    base += 0.22 * back * vec3<f32>(0.18, 0.35, 0.10);
   }
 
   let vs = cam.voxel_params.x;
@@ -137,7 +137,11 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>) -> ve
 
   let amb_col      = hemi_ambient(hg.n, sky_up);
   let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
-  let ambient      = amb_col * amb_strength * ao;
+  var ambient      = amb_col * amb_strength * ao;
+
+  if (hg.mat == MAT_STONE) {
+    ambient *= vec3<f32>(0.92, 0.95, 1.05);
+  }
 
   var dapple = 1.0;
   if (hg.mat == MAT_LEAF) {
