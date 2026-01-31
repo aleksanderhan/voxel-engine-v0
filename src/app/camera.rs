@@ -70,11 +70,13 @@ impl Camera {
             self.yaw.sin() * self.pitch.cos(),
             self.pitch.sin(),
             self.yaw.cos() * self.pitch.cos(),
-        )
-        .normalize();
+        ).normalize();
 
+        // this makes A/D match your existing yaw/mouse convention
         let right = forward.cross(Vec3::Y).normalize();
         let up = right.cross(forward).normalize();
+
+
 
         // movement intent
         let k = input.keys;

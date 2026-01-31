@@ -47,8 +47,8 @@ pub struct PlayerTuning {
 impl Default for PlayerTuning {
     fn default() -> Self {
         Self {
-            speed_mps: 4.0,
-            sprint_mul: 2.5,
+            speed_mps: 2.5,
+            sprint_mul: 3.0,
             gravity_mps2: -9.81,
             accel_ground: 45.0,
             accel_air: 12.0,

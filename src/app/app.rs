@@ -208,9 +208,6 @@ impl App {
         self.last_frame = now;
         dt = dt.clamp(0.0, 0.05);
 
-        // 0) input -> camera look only (mouse), NO translation here
-        self.camera.integrate_input(&mut self.input, 0.0);
-
         // 1) camera mode toggle + physics step + camera update
         let t0 = Instant::now();
 
@@ -228,14 +225,18 @@ impl App {
         let ball_count: u32 = balls_gpu.len() as u32;
         self.renderer.write_balls(&balls_gpu);
 
+        // 1) camera mode toggle + physics step + camera update
+        // ---- mode toggle FIRST (before any mouse delta is consumed) ----
         if self.input.take_c_pressed() {
             self.free_cam = !self.free_cam;
 
             if self.free_cam {
+                // entering free cam: copy player view -> camera
                 let eye = self.physics.player.pos + self.physics.eye_offset;
                 self.camera.set_position(eye);
                 self.camera.set_yaw_pitch(self.physics.yaw, self.physics.pitch);
             } else {
+                // leaving free cam: copy camera view -> player
                 let (yaw, pitch) = self.camera.yaw_pitch();
                 self.physics.yaw = yaw;
                 self.physics.pitch = pitch;
@@ -248,20 +249,23 @@ impl App {
         };
 
         let (eye, forward) = if self.free_cam {
-            self.physics.step_frame_player_only(dt, &q);
+            // FREE CAM owns mouse look (consumes dx/dy here)
+            self.physics.step_frame_player_only(dt, &q);   // optional: keep player sim ticking
             self.camera.integrate_input(&mut self.input, dt);
 
-            let eye = self.camera.position();
-            let fwd = self.camera.forward();
-            (eye, fwd)
+            (self.camera.position(), self.camera.forward())
         } else {
+            // PLAYER MODE owns mouse look (consumes dx/dy inside physics)
             let eye = self.physics.step_frame(&mut self.input, dt, &q);
+
+            // camera is just a view of the player
             self.camera.set_position(eye);
             self.camera.set_yaw_pitch(self.physics.yaw, self.physics.pitch);
 
-            let fwd = self.camera.forward();
-            (eye, fwd)
+            (eye, self.camera.forward())
         };
+
+
 
         if shoot {
             self.physics.spawn_ball(eye, forward);

@@ -1,3 +1,5 @@
+// src/app/input.rs
+// ----------------
 use winit::{
     event::{DeviceEvent, ElementState, KeyEvent, WindowEvent, MouseButton},
     keyboard::{KeyCode, PhysicalKey},
@@ -35,15 +37,48 @@ impl KeyState {
 #[derive(Default)]
 pub struct InputState {
     pub keys: KeyState,
+
+    /// "Captured mouse" mode (cursor hidden + grabbed) used for FPS-style look.
     pub focused: bool,
+
     pub mouse_dx: f32,
     pub mouse_dy: f32,
+
     c_pressed: bool,
     lmb_down: bool,
     lmb_pressed: bool,
 }
 
 impl InputState {
+    #[inline]
+    fn capture_mouse(&mut self, window: &Window) {
+        self.focused = true;
+
+        let _ = window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+        window.set_cursor_visible(false);
+
+        // avoid a big jump on capture
+        self.mouse_dx = 0.0;
+        self.mouse_dy = 0.0;
+    }
+
+    #[inline]
+    fn release_mouse(&mut self, window: &Window) {
+        self.focused = false;
+
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
+        window.set_cursor_visible(true);
+
+        self.lmb_down = false;
+        self.lmb_pressed = false;
+
+        // optional: clear deltas
+        self.mouse_dx = 0.0;
+        self.mouse_dy = 0.0;
+    }
+
     pub fn on_device_event(&mut self, event: &DeviceEvent) {
         if !self.focused {
             return;
@@ -57,27 +92,32 @@ impl InputState {
     /// Returns true if event is fully handled/consumed.
     pub fn on_window_event(&mut self, event: &WindowEvent, window: &Window) -> bool {
         match event {
+            // OS focus change: if we gain focus, capture; if we lose it, release.
             WindowEvent::Focused(f) => {
-                self.focused = *f;
-                if self.focused {
-                    let _ = window
-                        .set_cursor_grab(CursorGrabMode::Locked)
-                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
-                    window.set_cursor_visible(false);
+                if *f {
+                    self.capture_mouse(window);
                 } else {
-                    let _ = window.set_cursor_grab(CursorGrabMode::None);
-                    window.set_cursor_visible(true);
-
-                    self.lmb_down = false;
-                    self.lmb_pressed = false;
+                    self.release_mouse(window);
                 }
                 true
             }
 
+            // Click-to-capture when not focused/captured.
             WindowEvent::MouseInput { state, button, .. } => {
+                // If not in captured mode, allow left click to enter captured mode.
                 if !self.focused {
+                    if *button == MouseButton::Left && *state == ElementState::Pressed {
+                        self.capture_mouse(window);
+
+                        // Consume this click (don't treat it as a gameplay click).
+                        self.lmb_down = false;
+                        self.lmb_pressed = false;
+                        return true;
+                    }
                     return false;
                 }
+
+                // Normal mouse handling while captured.
                 if *button == MouseButton::Left {
                     let down = *state == ElementState::Pressed;
                     if down && !self.lmb_down {
@@ -103,14 +143,9 @@ impl InputState {
 
                     self.keys.set(*code, down);
 
+                    // Escape releases capture
                     if down && *code == KeyCode::Escape {
-                        self.focused = false;
-                        let _ = window.set_cursor_grab(CursorGrabMode::None);
-                        window.set_cursor_visible(true);
-
-                        self.lmb_down = false;
-                        self.lmb_pressed = false;
-
+                        self.release_mouse(window);
                         return true;
                     }
                 }
