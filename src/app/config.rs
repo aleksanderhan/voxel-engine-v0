@@ -48,3 +48,7 @@ pub const VOXEL_SPEED_MPS: f32 = 35.0;
 pub const VOXEL_LIFETIME_S: f32 = 60.0;
 
 pub const MAX_VOXELS: u32 = 1024;
+
+// Voxel-ball (soft cluster) knobs
+pub const BALL_RADIUS_VOX: i32 = 3;       // radius in *sub-voxels* (grid steps)
+pub const BALL_COMPLIANCE: f32 = 1e-6;    // 0 = rigid; bigger = softer

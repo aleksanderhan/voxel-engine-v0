@@ -1,10 +1,13 @@
-use glam::Vec3;
 use std::collections::HashMap;
+use glam::{IVec3, Vec3};
+
+use crate::app::config;
 
 use crate::physics::collision::{
     sphere_voxels::{sweep_dynamic_voxel_vs_static_voxels, resolve_dynamic_voxel_vs_static_voxels},
     WorldQuery
 };
+
 
 #[derive(Clone, Copy, Debug)]
 pub struct DynamicVoxel {
@@ -31,6 +34,22 @@ pub struct DynamicVoxelTuning {
 
     pub ccd_min_dist_m: f32,
 }
+
+#[derive(Clone, Copy, Debug)]
+pub struct DistanceConstraint {
+    pub a: usize,
+    pub b: usize,
+    pub rest_len: f32,
+    pub compliance: f32, // 0 = rigid, >0 = soft (XPBD)
+    pub lambda: f32,     // XPBD accumulator
+}
+
+pub struct VoxelCluster {
+    pub voxels: Vec<DynamicVoxel>,
+    pub constraints: Vec<DistanceConstraint>,
+    pub alive: bool,
+}
+
 
 
 impl Default for DynamicVoxelTuning {
@@ -211,5 +230,198 @@ fn solve_voxel_voxel_grid(voxels: &mut [DynamicVoxel], mass: f32, restitution: f
     }
 }
 
+pub fn solve_distance_constraints_xpbd(
+    voxels: &mut [DynamicVoxel],
+    constraints: &mut [DistanceConstraint],
+    inv_mass: f32,
+    dt: f32,
+    iters: u32,
+) {
+    if inv_mass <= 0.0 || dt <= 0.0 { return; }
+
+    // XPBD: alpha = compliance / dt^2
+    let alpha = |c: f32| c / (dt * dt);
+
+    for _ in 0..iters {
+        for c in constraints.iter_mut() {
+            if !voxels[c.a].alive || !voxels[c.b].alive { continue; }
+
+            let pa = voxels[c.a].pos;
+            let pb = voxels[c.b].pos;
+
+            let d = pb - pa;
+            let len2 = d.length_squared();
+            if len2 < 1e-12 { continue; }
+
+            let len = len2.sqrt();
+            let n = d / len;
+
+            // C = |pb-pa| - rest
+            let C = len - c.rest_len;
+
+            // w = inv_ma + inv_mb  (same mass)
+            let w = inv_mass + inv_mass;
+
+            let a = alpha(c.compliance);
+            let dl = (-C - a * c.lambda) / (w + a);
+            c.lambda += dl;
+
+            // Δx_i = -w_i * dl * ∇C ; ∇C = n
+            let corr = n * dl;
+
+            voxels[c.a].pos -= corr * inv_mass;
+            voxels[c.b].pos += corr * inv_mass;
+        }
+    }
+}
 
 
+
+pub fn spawn_voxel_ball(
+    eye: Vec3,
+    forward: Vec3,
+    voxel_size_m: f32,   // spacing between sub-voxels (also rest length for 6-neighbor links)
+    speed_mps: f32,
+    radius_vox: i32,
+) -> VoxelCluster {
+    let f = forward.normalize_or_zero();
+    let sub_r = 0.5 * voxel_size_m;
+
+    let center = eye + f * (sub_r + config::VOXEL_SPAWN_NUDGE_M);
+    let vel = f * speed_mps;
+
+    // 1) filled sphere offsets in voxel grid
+    let mut offsets: Vec<IVec3> = Vec::new();
+    let r2 = radius_vox * radius_vox;
+
+    for z in -radius_vox..=radius_vox {
+        for y in -radius_vox..=radius_vox {
+            for x in -radius_vox..=radius_vox {
+                if x*x + y*y + z*z <= r2 {
+                    offsets.push(IVec3::new(x, y, z));
+                }
+            }
+        }
+    }
+
+    // offset -> index
+    let mut idx_of: HashMap<IVec3, usize> = HashMap::with_capacity(offsets.len());
+
+    let mut voxels: Vec<DynamicVoxel> = Vec::with_capacity(offsets.len());
+    for (i, off) in offsets.iter().enumerate() {
+        idx_of.insert(*off, i);
+        voxels.push(DynamicVoxel {
+            pos: center + off.as_vec3() * voxel_size_m,
+            vel,
+            radius: sub_r,
+            age: 0.0,
+            alive: true,
+        });
+    }
+
+    // 2) constraints: 6-neighbor links
+    let mut constraints = Vec::new();
+    let compliance = config::BALL_COMPLIANCE;
+
+    let neighbors = [
+        IVec3::new( 1, 0, 0),
+        IVec3::new(-1, 0, 0),
+        IVec3::new( 0, 1, 0),
+        IVec3::new( 0,-1, 0),
+        IVec3::new( 0, 0, 1),
+        IVec3::new( 0, 0,-1),
+    ];
+
+    for off in &offsets {
+        let a = idx_of[off];
+        for d in neighbors {
+            let nb = *off + d;
+            if let Some(&b) = idx_of.get(&nb) {
+                if b > a {
+                    constraints.push(DistanceConstraint {
+                        a,
+                        b,
+                        rest_len: voxel_size_m,
+                        compliance,
+                        lambda: 0.0,
+                    });
+                }
+            }
+        }
+    }
+
+    VoxelCluster { voxels, constraints, alive: true }
+}
+
+
+
+pub fn step_cluster<W: WorldQuery>(
+    cluster: &mut VoxelCluster,
+    world: &W,
+    tuning: DynamicVoxelTuning,
+    dt: f32,
+) {
+    if !cluster.alive { return; }
+
+    // 1) integrate + collide each voxel vs world (copy your pass-1 from step_voxels)
+    // IMPORTANT: do NOT run solve_voxel_voxel_grid on cluster.voxels (internal collisions fight constraints)
+
+    let max_impacts = tuning.solver_iters.max(1);
+
+    for v in cluster.voxels.iter_mut() {
+        if !v.alive { continue; }
+
+        v.age += dt;
+        if v.age > tuning.lifetime_s {
+            v.alive = false;
+            continue;
+        }
+
+        // gravity
+        v.vel.y += tuning.gravity_mps2 * dt;
+
+        let travel = v.vel.length() * dt;
+        if travel >= tuning.ccd_min_dist_m {
+            let (p2, v2, _g) = sweep_dynamic_voxel_vs_static_voxels(
+                world, v.pos, v.vel, v.radius, dt, max_impacts, tuning.restitution
+            );
+            v.pos = p2;
+            v.vel = v2;
+        } else {
+            let pos_pred = v.pos + v.vel * dt;
+            let (p2, v2, _g) = resolve_dynamic_voxel_vs_static_voxels(
+                world, pos_pred, v.vel, v.radius, 2, tuning.restitution
+            );
+            v.pos = p2;
+            v.vel = v2;
+        }
+    }
+
+    // 2) constraints (XPBD)
+    // store old positions so velocity matches the constraint correction
+    let mut old = Vec::with_capacity(cluster.voxels.len());
+    old.extend(cluster.voxels.iter().map(|v| v.pos));
+
+    let inv_m = if tuning.voxel_mass > 0.0 { 1.0 / tuning.voxel_mass } else { 0.0 };
+    solve_distance_constraints_xpbd(
+        &mut cluster.voxels,
+        &mut cluster.constraints,
+        inv_m,
+        dt,
+        tuning.voxel_voxel_iters.max(1), // reuse this as "constraint iters"
+    );
+
+    // velocity recompute from projected positions
+    if dt > 0.0 {
+        for (i, v) in cluster.voxels.iter_mut().enumerate() {
+            if !v.alive { continue; }
+            v.vel = (v.pos - old[i]) / dt;
+        }
+    }
+
+    // 3) cull cluster if too dead
+    let alive_count = cluster.voxels.iter().filter(|v| v.alive).count();
+    if alive_count == 0 {
+        cluster.alive = false;
+    }
+}

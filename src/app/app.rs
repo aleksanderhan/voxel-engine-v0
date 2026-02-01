@@ -224,17 +224,38 @@ impl App {
         q8 = q8.clamp(256, 8192);
 
 
-        let balls_gpu: Vec<DynamicVoxelGpu> = self.physics
-            .voxels_iter()
-            .take(config::MAX_VOXELS as usize)
-            .map(|b| DynamicVoxelGpu {
+        let mut balls_gpu: Vec<DynamicVoxelGpu> = Vec::new();
+        balls_gpu.reserve(config::MAX_VOXELS as usize);
+
+        // 1) loose voxels
+        for b in self.physics.voxels_iter() {
+            if balls_gpu.len() >= config::MAX_VOXELS as usize { break; }
+            let r = b.radius;
+            balls_gpu.push(DynamicVoxelGpu {
                 center_radius: [b.pos.x, b.pos.y, b.pos.z, r],
                 material: 42,
                 voxel_scale_q8: q8, _pad0: 0, _pad1: 0,
-            })
-            .collect();
+            });
+        }
+
+        // 2) cluster voxels
+        for c in &self.physics.clusters {
+            for b in &c.voxels {
+                if !b.alive { continue; }
+                if balls_gpu.len() >= config::MAX_VOXELS as usize { break; }
+                let r = b.radius;
+                balls_gpu.push(DynamicVoxelGpu {
+                    center_radius: [b.pos.x, b.pos.y, b.pos.z, r],
+                    material: 42,
+                    voxel_scale_q8: q8, _pad0: 0, _pad1: 0,
+                });
+            }
+            if balls_gpu.len() >= config::MAX_VOXELS as usize { break; }
+        }
+
         let ball_count: u32 = balls_gpu.len() as u32;
         self.renderer.write_balls(&balls_gpu);
+
 
         // 1) camera mode toggle + physics step + camera update
         // ---- mode toggle FIRST (before any mouse delta is consumed) ----
@@ -276,10 +297,8 @@ impl App {
             (eye, self.camera.forward())
         };
 
-
-
         if shoot {
-            self.physics.spawn_voxel(eye, forward);
+            self.physics.spawn_voxel_ball(eye, forward);
         }
 
         self.frame_index = self.frame_index.wrapping_add(1);

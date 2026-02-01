@@ -5,10 +5,18 @@ use crate::app::InputState;
 
 use crate::app::config;
 use super::{
-    collision::{sphere_voxels::resolve_dynamic_voxel_vs_static_voxels, WorldQuery},
+    collision::{sphere_voxels::{
+        resolve_dynamic_voxel_vs_static_voxels,
+        sweep_dynamic_voxel_vs_static_voxels},
+        WorldQuery
+    },
     player::{PlayerBody, PlayerTuning},
 };
-use super::projectiles::{DynamicVoxel, DynamicVoxelTuning, step_voxels};
+use super::projectiles::{
+    DynamicVoxel, DynamicVoxelTuning, step_voxels,
+    VoxelCluster, step_cluster, spawn_voxel_ball,
+};
+
 
 
 /// Fixed-step physics driver.
@@ -33,6 +41,9 @@ pub struct Physics {
 
     pub voxels: Vec<DynamicVoxel>,
     pub voxel_tuning: DynamicVoxelTuning,
+
+    pub clusters: Vec<VoxelCluster>,
+
 }
 
 impl Physics {
@@ -51,6 +62,8 @@ impl Physics {
             eye_offset: Vec3::new(0.0, 1.6, 0.0),
             voxels: Vec::new(),  
             voxel_tuning: DynamicVoxelTuning::default(),
+            clusters: Vec::new(),
+
         }
     }
 
@@ -206,11 +219,16 @@ impl Physics {
 
         // step voxels after player
         step_voxels(&mut self.voxels, world, self.voxel_tuning, dt);
-
-        // optional: compact dead voxels occasionally
         if self.voxels.len() > 256 {
             self.voxels.retain(|b| b.alive);
         }
+
+        // step clusters
+        for c in self.clusters.iter_mut() {
+            step_cluster(c, world, self.voxel_tuning, dt);
+        }
+        self.clusters.retain(|c| c.alive);
+
 
     }
 
@@ -281,31 +299,33 @@ impl Physics {
         }
 
         // step voxels after player
+        // step loose voxels
         step_voxels(&mut self.voxels, world, self.voxel_tuning, dt);
-
-        // optional: compact dead voxels occasionally
         if self.voxels.len() > 256 {
             self.voxels.retain(|b| b.alive);
         }
+
+        // step clusters
+        for c in self.clusters.iter_mut() {
+            step_cluster(c, world, self.voxel_tuning, dt);
+        }
+        self.clusters.retain(|c| c.alive);
+
+
     }
 
-    pub fn spawn_voxel(&mut self, eye: Vec3, forward: Vec3) {
-        let f = if forward.length_squared() > 1e-6 { forward.normalize() } else { Vec3::Z };
+    pub fn spawn_voxel_ball(&mut self, eye: Vec3, forward: Vec3) {
+        let r_vox = config::BALL_RADIUS_VOX.max(1);
 
-        let r = config::VOXEL_SIZE_M_F32 / 2.0;
+        let cluster = spawn_voxel_ball(
+            eye,
+            forward,
+            config::VOXEL_SIZE_M_F32,          // spacing between sub-voxels
+            self.voxel_tuning.speed_mps,       // launch speed
+            r_vox,
+        );
 
-        let pos = eye + f * (r + config::VOXEL_SPAWN_NUDGE_M);
-
-        self.voxel_tuning.speed_mps = config::VOXEL_SPEED_MPS;
-        self.voxel_tuning.lifetime_s = config::VOXEL_LIFETIME_S;
-
-        self.voxels.push(DynamicVoxel {
-            pos,
-            vel: f * self.voxel_tuning.speed_mps,
-            radius: r,
-            age: 0.0,
-            alive: true,
-        });
+        self.clusters.push(cluster);
     }
 
     #[inline]
@@ -338,3 +358,4 @@ impl Physics {
     }
 
 }
+

@@ -24,4 +24,9 @@ pub use voxel::{StaticVoxelQuery, StaticVoxelWorldQuery};
 pub use character::{CharacterController, CharacterState};
 
 pub mod projectiles;
-pub use projectiles::{DynamicVoxel, DynamicVoxelTuning};
+pub use projectiles::{
+    DynamicVoxel, DynamicVoxelTuning,
+    VoxelCluster, DistanceConstraint,
+    spawn_voxel_ball, step_cluster,
+};
+
