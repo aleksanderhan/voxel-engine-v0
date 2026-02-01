@@ -247,8 +247,7 @@ fn raycast_sphere_grid<W: WorldQuery>(
     let tdelta_z = if step_z != 0 { s / dir.z.abs() } else { f32::INFINITY };
 
     // How many neighbor voxels around current cell we need to test due to expansion.
-    // Usually radius ~= 1-2 voxels, so this is small.
-    let k = (radius / s).ceil() as i32;
+    let k = ((radius / s).ceil() as i32).min(1);
 
     // Safety cap on traversal steps (prevents pathological loops)
     let max_steps = ((d.length() / s).ceil() as i32 + 8).clamp(8, 2048);
