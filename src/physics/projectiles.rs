@@ -1,6 +1,6 @@
 use glam::Vec3;
 
-use crate::physics::collision::{sphere_voxels::resolve_sphere_vs_voxels, WorldQuery};
+use crate::physics::collision::{sphere_voxels::sweep_sphere_vs_voxels, WorldQuery};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Ball {
@@ -52,17 +52,20 @@ pub fn step_balls<W: WorldQuery>(balls: &mut [Ball], world: &W, tuning: BallTuni
         let pos_pred = b.pos + b.vel * dt;
 
         // collide
-        let (p2, v2, _on_ground) = resolve_sphere_vs_voxels(
+        // CCD collide (sweep)
+        let (p2, v2, _on_ground) = sweep_sphere_vs_voxels(
             world,
-            pos_pred,
+            b.pos,
             b.vel,
             b.radius,
-            tuning.solver_iters,
+            dt,
+            /*max_impacts=*/ 4,
             tuning.restitution,
         );
 
         b.pos = p2;
         b.vel = v2;
+
 
         // cheap “sleep” kill if it basically stopped
         if b.vel.length_squared() < 0.01 * 0.01 {

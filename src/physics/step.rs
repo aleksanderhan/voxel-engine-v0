@@ -20,6 +20,10 @@ pub struct Physics {
     pub player: PlayerBody,
     pub tuning: PlayerTuning,
 
+    // previous state for interpolation
+    prev_player_pos: Vec3,
+    prev_player_vel: Vec3,
+
     // view orientation (keep in physics so camera becomes a pure view-projection thing)
     pub yaw: f32,
     pub pitch: f32,
@@ -33,11 +37,14 @@ pub struct Physics {
 
 impl Physics {
     pub fn new(player_start: Vec3) -> Self {
+        let player = PlayerBody::new(player_start);
         Self {
             fixed_dt: 1.0 / 120.0,
             accum: 0.0,
             player: PlayerBody::new(player_start),
             tuning: PlayerTuning::default(),
+            prev_player_pos: player.pos,
+            prev_player_vel: player.vel,
             yaw: 0.0,
             pitch: 0.15,
             mouse_sens: 0.0025,
@@ -49,8 +56,12 @@ impl Physics {
 
     pub fn step_frame_player_only<W: WorldQuery>(&mut self, dt_frame: f32, world: &W) {
         self.accum += dt_frame.min(0.05);
+
         while self.accum >= self.fixed_dt {
-            self.step_fixed_with_desired(Vec3::ZERO, false, world, self.fixed_dt);
+            self.prev_player_pos = self.player.pos;
+            self.prev_player_vel = self.player.vel;
+
+            self.step_fixed_with_desired(Vec3::ZERO, world, self.fixed_dt);
             self.accum -= self.fixed_dt;
         }
     }
@@ -64,7 +75,7 @@ impl Physics {
         dt_frame: f32,
         world: &W,
     ) -> Vec3 {
-        // 1) mouse look -> yaw/pitch
+        // 1) mouse look -> yaw/pitch (once per rendered frame)
         if input.focused {
             let (dx, dy) = input.take_mouse_delta();
             self.yaw -= dx * self.mouse_sens;
@@ -73,22 +84,30 @@ impl Physics {
             let _ = input.take_mouse_delta();
         }
 
-        // 2) queue jump (space) on press; for now: space being held means "try jump"
-        // If you want true edge-triggered jump, track previous key state.
+        // 2) cache frame intent ONCE (deterministic across fixed ticks)
+        let desired = self.desired_move_velocity(input);
+
+        // 3) queue jump intent (still “hold to try jump”, but sampled once per frame)
         if input.keys.space {
             self.player.jump_queued = true;
         }
 
-        // 3) fixed-step loop
+        // 4) fixed-step loop
         self.accum += dt_frame.min(0.05);
+
         while self.accum >= self.fixed_dt {
-            self.step_fixed(input, world, self.fixed_dt);
+            // snapshot BEFORE advancing one tick (for interpolation)
+            self.prev_player_pos = self.player.pos;
+            self.prev_player_vel = self.player.vel;
+
+            self.step_fixed_with_desired(desired, world, self.fixed_dt);
             self.accum -= self.fixed_dt;
         }
 
-        // camera eye position derived from player
-        self.player.pos + self.eye_offset
+        // 5) return interpolated camera eye for rendering
+        self.interpolated_eye()
     }
+
 
     fn desired_move_velocity(&self, input: &InputState) -> Vec3 {
         let forward = Vec3::new(self.yaw.sin(), 0.0, self.yaw.cos()).normalize();
@@ -198,7 +217,6 @@ impl Physics {
     fn step_fixed_with_desired<W: WorldQuery>(
         &mut self,
         desired: Vec3,
-        _jump_pressed: bool,
         world: &W,
         dt: f32,
     ) {
@@ -305,6 +323,18 @@ impl Physics {
     #[inline]
     pub fn balls_alive_count(&self) -> u32 {
         self.balls_iter().count() as u32
+    }
+
+    #[inline]
+    pub fn render_alpha(&self) -> f32 {
+        (self.accum / self.fixed_dt).clamp(0.0, 1.0)
+    }
+
+    #[inline]
+    pub fn interpolated_eye(&self) -> Vec3 {
+        let a = self.render_alpha();
+        let p = self.prev_player_pos.lerp(self.player.pos, a);
+        p + self.eye_offset
     }
 
 }

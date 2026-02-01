@@ -213,12 +213,16 @@ impl App {
 
         let shoot = self.input.take_lmb_pressed();
 
-        let vs_world = config::VOXEL_SIZE_M_F32; 
-        let n = 16.0_f32;              // voxels across diameter
+        let vs_world = config::VOXEL_SIZE_M_F32;   // must match cam.voxel_params.x
         let r = config::BALL_RADIUS_M;
+        // try 8 first (very blocky). 10 is a bit smoother.
+        let n = 8.0_f32; // voxels across diameter
         let vs_target = (2.0 * r) / n;
+        // q8: 256 = vs_world, 512 = 2*vs_world, ...
         let mut q8 = (256.0 * (vs_target / vs_world)).round() as u32;
-        q8 = q8.max(256);
+        // clamp so you don't go insane
+        q8 = q8.clamp(256, 8192);
+
 
         let balls_gpu: Vec<BallGpu> = self.physics
             .balls_iter()

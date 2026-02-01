@@ -39,9 +39,9 @@ pub const CLIPMAP_BASE_CELL_M: f32 = 1.0;
 pub const CLIPMAP_MIN_UPDATE_INTERVAL_S: f32 = 0.0;
 
 // Ball radius in *voxels*
-pub const BALL_RADIUS: i32 = 3;
+pub const BALL_RADIUS: i32 = 2;
 
-pub const BALL_RADIUS_M: f32 = 0.3;
+pub const BALL_RADIUS_M: f32 = 0.2;
 
 // Spawn a tiny bit in front of the camera (meters)
 pub const BALL_SPAWN_NUDGE_M: f32 = 0.75;
