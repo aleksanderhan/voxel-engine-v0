@@ -73,11 +73,18 @@ pub struct CameraGpu {
 pub struct BallGpu {
     // xyz = center in meters, w = radius in meters
     pub center_radius: [f32; 4],
+
     pub material: u32,
+
+    // q8 fixed-point scale relative to world voxel size:
+    // 256 = 1.0x, 512 = 2.0x, 1024 = 4.0x, etc.
+    pub voxel_scale_q8: u32,
+
+    // padding to keep struct 16-byte aligned (WGSL array stride wants 16B alignment)
     pub _pad0: u32,
     pub _pad1: u32,
-    pub _pad2: u32,
 }
+
 
 
 /// Clipmap uniform payload.

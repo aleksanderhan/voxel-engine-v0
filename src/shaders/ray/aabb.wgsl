@@ -1,4 +1,3 @@
-// src/shaders/ray/aabb.wgsl
 //// --------------------------------------------------------------------------
 //// AABB helpers (vectorized slab + reuse)
 //// --------------------------------------------------------------------------
@@ -42,7 +41,6 @@ struct BoxHit {
 };
 
 // Normal + hit interval computed from a precomputed slab.
-// (Uses argmax(tminv) for face selection; no eps comparisons.)
 fn cube_hit_normal_from_slab(
   rd: vec3<f32>,
   slab: CubeSlab,

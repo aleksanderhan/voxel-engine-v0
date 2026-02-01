@@ -47,7 +47,7 @@ pub const BALL_RADIUS_M: f32 = 0.3;
 pub const BALL_SPAWN_NUDGE_M: f32 = 0.75;
 
 // Ball speed (meters per second)
-pub const BALL_SPEED_MPS: f32 = 55.0;
+pub const BALL_SPEED_MPS: f32 = 35.0;
 
 // Optional: lifetime (seconds)
 pub const BALL_LIFETIME_S: f32 = 6.0;

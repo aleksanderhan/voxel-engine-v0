@@ -219,7 +219,7 @@ impl App {
             .map(|b| BallGpu {
                 center_radius: [b.pos.x, b.pos.y, b.pos.z, config::BALL_RADIUS_M],
                 material: 42,
-                _pad0: 0, _pad1: 0, _pad2: 0,
+                voxel_scale_q8: 1, _pad0: 0, _pad1: 0,
             })
             .collect();
         let ball_count: u32 = balls_gpu.len() as u32;
