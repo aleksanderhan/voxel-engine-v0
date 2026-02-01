@@ -123,9 +123,9 @@ fn trace_ball_voxels_blocky(
   // If we start inside an occupied voxel: return that voxel's AABB entry at ~t0
   if (ball_voxel_occupied(v, c_m, r_m, vs)) {
     let bmin = vec3<f32>(f32(v.x), f32(v.y), f32(v.z)) * vs;
-    let rt   = intersect_aabb(ro, rd, bmin, bmin + vec3<f32>(vs));
-    let n0   = normalize(-rd); // ambiguous; good enough for inside-start
-    return BallHit(true, max(rt.x, t0), n0, mat, v, c_m, r_m, vs);
+    let bmax = bmin + vec3<f32>(vs);
+    let tn   = aabb_entry_t_and_n(ro, rd, bmin, bmax);
+    return BallHit(true, max(tn.w, t0), tn.xyz, mat, v, c_m, r_m, vs);
   }
 
   let MAX_STEPS: u32 = 512u;
@@ -163,9 +163,11 @@ fn trace_ball_voxels_blocky(
     if (ball_voxel_occupied(v, c_m, r_m, vs)) {
       // Exact hit with the voxel AABB (cube faces)
       let bmin = vec3<f32>(f32(v.x), f32(v.y), f32(v.z)) * vs;
-      let rt   = intersect_aabb(ro, rd, bmin, bmin + vec3<f32>(vs));
-      let thit = max(rt.x, t_min);
-      return BallHit(true, thit, nstep, mat, v, c_m, r_m, vs);
+      let bmax = bmin + vec3<f32>(vs);
+      let tn   = aabb_entry_t_and_n(ro, rd, bmin, bmax);
+      let thit = max(tn.w, t_min);
+      return BallHit(true, thit, tn.xyz, mat, v, c_m, r_m, vs);
+
     }
   }
 
@@ -196,7 +198,7 @@ fn shade_ball_hit(ro: vec3<f32>, rd: vec3<f32>, bh: BallHit, sky_up: vec3<f32>) 
   let bmax = bmin + vec3<f32>(bh.vs);
   let eps  = 1e-4 * bh.vs;
 
-  var n = vec3<f32>(0.0);
+  var n = normalize(bh.n); // will already be axis-aligned
 
   if (abs(hp.x - bmin.x) < eps) { n = vec3<f32>(-1.0,  0.0,  0.0); }
   else if (abs(hp.x - bmax.x) < eps) { n = vec3<f32>( 1.0,  0.0,  0.0); }
@@ -250,4 +252,28 @@ fn face_shade(n: vec3<f32>) -> f32 {
   if (n.y >  0.5) { return 1.00; } // top
   if (n.y < -0.5) { return 0.55; } // bottom
   return 0.80;                     // sides
+}
+
+fn aabb_entry_t_and_n(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec4<f32> {
+  // returns (nx, ny, nz, t_enter)
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  let t0 = (bmin - ro) * inv;
+  let t1 = (bmax - ro) * inv;
+
+  let tmin3 = min(t0, t1);
+  let tmax3 = max(t0, t1);
+
+  let t_enter = max(max(tmin3.x, tmin3.y), tmin3.z);
+  // let t_exit  = min(min(tmax3.x, tmax3.y), tmax3.z); // not needed here
+
+  let eps = 1e-5;
+
+  var n = vec3<f32>(0.0);
+
+  if (abs(t_enter - tmin3.x) < eps) { n = vec3<f32>(-sign(rd.x), 0.0, 0.0); }
+  else if (abs(t_enter - tmin3.y) < eps) { n = vec3<f32>(0.0, -sign(rd.y), 0.0); }
+  else { n = vec3<f32>(0.0, 0.0, -sign(rd.z)); }
+
+  return vec4<f32>(n, t_enter);
 }
