@@ -47,12 +47,12 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Trace the streamed voxel scene (your existing function)
   let vt = trace_scene_voxels(ro, rd);      // <-- must exist; should provide vt.in_grid, vt.t_exit, vt.best.hit, vt.best.t
 
-  // Always trace balls so they can appear both inside and outside the streamed grid
-  let bh = trace_balls(ro, rd, 0.0, FOG_MAX_DIST); // <-- must exist (from earlier)
-  let use_ball: bool = bh.hit;
+  // Always trace voxels so they can appear both inside and outside the streamed grid
+  let bh = trace_voxels(ro, rd, 0.0, FOG_MAX_DIST); // <-- must exist (from earlier)
+  let use_voxel: bool = bh.hit;
 
   // If we're outside the streamed grid, you typically used heightfield only.
-  // We now pick nearest of: heightfield, balls, or sky.
+  // We now pick nearest of: heightfield, voxels, or sky.
   if (!vt.in_grid) {
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST); // <-- must exist; should provide hf.hit, hf.t, hf.n, hf.mat
 
@@ -65,10 +65,10 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
       surface = shade_clip_hit(ro, rd, hf, sky_up); // <-- must exist
     }
 
-    // ball candidate
-    if (use_ball && bh.t < t_scene) {
+    // voxel candidate
+    if (use_voxel && bh.t < t_scene) {
       t_scene = bh.t;
-      surface = shade_ball_hit(ro, rd, bh, sky_up); // <-- must exist (from earlier)
+      surface = shade_voxel_hit(ro, rd, bh, sky_up); // <-- must exist (from earlier)
     }
 
     let col = apply_fog(surface, ro, rd, t_scene, sky); // <-- must exist
@@ -79,7 +79,7 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // Inside streamed grid:
   // You previously resolved: voxel hit if any, else heightfield, else sky.
-  // Now we resolve nearest of: voxel, heightfield (only if no voxel or if you want both), balls, sky.
+  // Now we resolve nearest of: voxel, heightfield (only if no voxel or if you want both), voxels, sky.
 
   let use_vox: bool = (vt.best.hit != 0u);
 
@@ -115,12 +115,12 @@ fn main_primary(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  // ball candidate
-  if (use_ball) {
+  // voxel candidate
+  if (use_voxel) {
     let tb = min(bh.t, FOG_MAX_DIST);
     if (tb < t_scene) {
       t_scene = tb;
-      surface = shade_ball_hit(ro, rd, bh, sky_up);
+      surface = shade_voxel_hit(ro, rd, bh, sky_up);
     }
   }
 

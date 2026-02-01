@@ -70,7 +70,7 @@ pub struct CameraGpu {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Debug)]
-pub struct BallGpu {
+pub struct DynamicVoxelGpu {
     // xyz = center in meters, w = radius in meters
     pub center_radius: [f32; 4],
 

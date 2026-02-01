@@ -55,7 +55,6 @@ pub struct Renderer {
     ts_qs: Option<wgpu::QuerySet>,
     ts_resolve: Option<wgpu::Buffer>,   // QUERY_RESOLVE | COPY_SRC
     ts_readback: Option<wgpu::Buffer>,  // COPY_DST | MAP_READ
-
 }
 
 #[derive(Clone)]
@@ -584,9 +583,11 @@ impl Renderer {
         })
     }
 
-    pub fn write_balls(&self, balls: &[crate::render::gpu_types::BallGpu]) {
-        let n = balls.len().min(self.buffers.balls_capacity as usize);
-        self.queue.write_buffer(&self.buffers.balls, 0, bytemuck::cast_slice(&balls[..n]));
+    pub fn write_balls(&self, voxels: &[crate::render::gpu_types::DynamicVoxelGpu]) {
+        let n = voxels.len().min(self.buffers.voxels_capacity as usize);
+        self.queue.write_buffer(&self.buffers.voxels, 0, bytemuck::cast_slice(&voxels[..n]));
     }
 
 }
+
+

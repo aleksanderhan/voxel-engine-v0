@@ -20,8 +20,8 @@ pub mod voxel;
 pub mod character;
 
 pub use articulated::{ArticulatedBody, Joint, JointType, RigidBodyInertia};
-pub use voxel::{VoxelQuery, VoxelWorldQuery};
+pub use voxel::{StaticVoxelQuery, StaticVoxelWorldQuery};
 pub use character::{CharacterController, CharacterState};
 
 pub mod projectiles;
-pub use projectiles::{Ball, BallTuning};
+pub use projectiles::{DynamicVoxel, DynamicVoxelTuning};

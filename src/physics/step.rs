@@ -5,10 +5,10 @@ use crate::app::InputState;
 
 use crate::app::config;
 use super::{
-    collision::{sphere_voxels::resolve_sphere_vs_voxels, WorldQuery},
+    collision::{sphere_voxels::resolve_dynamic_voxel_vs_static_voxels, WorldQuery},
     player::{PlayerBody, PlayerTuning},
 };
-use super::projectiles::{Ball, BallTuning, step_balls};
+use super::projectiles::{DynamicVoxel, DynamicVoxelTuning, step_voxels};
 
 
 /// Fixed-step physics driver.
@@ -31,8 +31,8 @@ pub struct Physics {
     pub mouse_sens: f32,
     pub eye_offset: Vec3,
 
-    pub balls: Vec<Ball>,
-    pub ball_tuning: BallTuning,
+    pub voxels: Vec<DynamicVoxel>,
+    pub voxel_tuning: DynamicVoxelTuning,
 }
 
 impl Physics {
@@ -49,8 +49,8 @@ impl Physics {
             pitch: 0.15,
             mouse_sens: 0.0025,
             eye_offset: Vec3::new(0.0, 1.6, 0.0),
-            balls: Vec::new(),  
-            ball_tuning: BallTuning::default(),
+            voxels: Vec::new(),  
+            voxel_tuning: DynamicVoxelTuning::default(),
         }
     }
 
@@ -186,7 +186,7 @@ impl Physics {
         let pos_pred = self.player.pos + vel * dt;
 
         // Collide
-        let (pos2, vel2, on_ground) = resolve_sphere_vs_voxels(
+        let (pos2, vel2, on_ground) = resolve_dynamic_voxel_vs_static_voxels(
             world,
             pos_pred,
             vel,
@@ -204,12 +204,12 @@ impl Physics {
             self.player.jump_queued = false;
         }
 
-        // step balls after player
-        step_balls(&mut self.balls, world, self.ball_tuning, dt);
+        // step voxels after player
+        step_voxels(&mut self.voxels, world, self.voxel_tuning, dt);
 
-        // optional: compact dead balls occasionally
-        if self.balls.len() > 256 {
-            self.balls.retain(|b| b.alive);
+        // optional: compact dead voxels occasionally
+        if self.voxels.len() > 256 {
+            self.voxels.retain(|b| b.alive);
         }
 
     }
@@ -263,7 +263,7 @@ impl Physics {
 
         let pos_pred = self.player.pos + vel * dt;
 
-        let (pos2, vel2, on_ground) = resolve_sphere_vs_voxels(
+        let (pos2, vel2, on_ground) = resolve_dynamic_voxel_vs_static_voxels(
             world,
             pos_pred,
             vel,
@@ -280,28 +280,28 @@ impl Physics {
             self.player.jump_queued = false;
         }
 
-        // step balls after player
-        step_balls(&mut self.balls, world, self.ball_tuning, dt);
+        // step voxels after player
+        step_voxels(&mut self.voxels, world, self.voxel_tuning, dt);
 
-        // optional: compact dead balls occasionally
-        if self.balls.len() > 256 {
-            self.balls.retain(|b| b.alive);
+        // optional: compact dead voxels occasionally
+        if self.voxels.len() > 256 {
+            self.voxels.retain(|b| b.alive);
         }
     }
 
-    pub fn spawn_ball(&mut self, eye: Vec3, forward: Vec3) {
+    pub fn spawn_voxel(&mut self, eye: Vec3, forward: Vec3) {
         let f = if forward.length_squared() > 1e-6 { forward.normalize() } else { Vec3::Z };
 
-        let r = config::BALL_RADIUS as f32 * config::VOXEL_SIZE_M_F32;
+        let r = config::VOXEL_SIZE_M_F32 / 2.0;
 
-        let pos = eye + f * (r + config::BALL_SPAWN_NUDGE_M);
+        let pos = eye + f * (r + config::VOXEL_SPAWN_NUDGE_M);
 
-        self.ball_tuning.speed_mps = config::BALL_SPEED_MPS;
-        self.ball_tuning.lifetime_s = config::BALL_LIFETIME_S;
+        self.voxel_tuning.speed_mps = config::VOXEL_SPEED_MPS;
+        self.voxel_tuning.lifetime_s = config::VOXEL_LIFETIME_S;
 
-        self.balls.push(Ball {
+        self.voxels.push(DynamicVoxel {
             pos,
-            vel: f * self.ball_tuning.speed_mps,
+            vel: f * self.voxel_tuning.speed_mps,
             radius: r,
             age: 0.0,
             alive: true,
@@ -309,20 +309,20 @@ impl Physics {
     }
 
     #[inline]
-    pub fn balls_iter(&self) -> impl Iterator<Item = &super::projectiles::Ball> {
-        self.balls.iter().filter(|b| b.alive)
+    pub fn voxels_iter(&self) -> impl Iterator<Item = &super::projectiles::DynamicVoxel> {
+        self.voxels.iter().filter(|b| b.alive)
     }
 
-    /// Iterate alive balls (mutable), if you ever need it.
+    /// Iterate alive voxels (mutable), if you ever need it.
     #[inline]
-    pub fn balls_iter_mut(&mut self) -> impl Iterator<Item = &mut super::projectiles::Ball> {
-        self.balls.iter_mut().filter(|b| b.alive)
+    pub fn voxels_iter_mut(&mut self) -> impl Iterator<Item = &mut super::projectiles::DynamicVoxel> {
+        self.voxels.iter_mut().filter(|b| b.alive)
     }
 
     /// Optional helper: alive count for GPU uniforms etc.
     #[inline]
-    pub fn balls_alive_count(&self) -> u32 {
-        self.balls_iter().count() as u32
+    pub fn voxels_alive_count(&self) -> u32 {
+        self.voxels_iter().count() as u32
     }
 
     #[inline]

@@ -14,7 +14,7 @@ use super::{camera::Camera, config, input::InputState, profiler::FrameProf};
 
 use crate::{
     clipmap::Clipmap,
-    render::{BallGpu, CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
+    render::{DynamicVoxelGpu, CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
     streaming::ChunkManager,
     world::WorldGen,
 };
@@ -214,7 +214,7 @@ impl App {
         let shoot = self.input.take_lmb_pressed();
 
         let vs_world = config::VOXEL_SIZE_M_F32;   // must match cam.voxel_params.x
-        let r = config::BALL_RADIUS_M;
+        let r = config::VOXEL_SIZE_M_F32 / 2.0;
         // try 8 first (very blocky). 10 is a bit smoother.
         let n = 8.0_f32; // voxels across diameter
         let vs_target = (2.0 * r) / n;
@@ -224,11 +224,11 @@ impl App {
         q8 = q8.clamp(256, 8192);
 
 
-        let balls_gpu: Vec<BallGpu> = self.physics
-            .balls_iter()
-            .take(config::MAX_BALLS as usize)
-            .map(|b| BallGpu {
-                center_radius: [b.pos.x, b.pos.y, b.pos.z, config::BALL_RADIUS_M],
+        let balls_gpu: Vec<DynamicVoxelGpu> = self.physics
+            .voxels_iter()
+            .take(config::MAX_VOXELS as usize)
+            .map(|b| DynamicVoxelGpu {
+                center_radius: [b.pos.x, b.pos.y, b.pos.z, r],
                 material: 42,
                 voxel_scale_q8: q8, _pad0: 0, _pad1: 0,
             })
@@ -279,7 +279,7 @@ impl App {
 
 
         if shoot {
-            self.physics.spawn_ball(eye, forward);
+            self.physics.spawn_voxel(eye, forward);
         }
 
         self.frame_index = self.frame_index.wrapping_add(1);

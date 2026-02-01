@@ -5,7 +5,7 @@ use crate::app::config;
 
 /// VoxelQuery: minimal interface physics needs.
 /// Positions are in meters (same as your camera).
-pub trait VoxelQuery {
+pub trait StaticVoxelQuery {
     /// Returns approximate ground height (meters) at x,z.
     /// If unknown, returns None.
     fn ground_height_m(&self, x_m: f32, z_m: f32) -> Option<f32>;
@@ -17,12 +17,12 @@ pub trait VoxelQuery {
 
 /// Query implementation backed by ChunkManager + WorldGen.
 /// Uses colinfo_words when chunks are available, falls back to WorldGen::ground_height.
-pub struct VoxelWorldQuery<'a> {
+pub struct StaticVoxelWorldQuery<'a> {
     pub world: &'a WorldGen,
     pub chunks: &'a ChunkManager,
 }
 
-impl<'a> VoxelWorldQuery<'a> {
+impl<'a> StaticVoxelWorldQuery<'a> {
     #[inline]
     fn m_to_vox(x_m: f32) -> i32 {
         (x_m / config::VOXEL_SIZE_M_F32).floor() as i32
@@ -90,7 +90,7 @@ impl<'a> VoxelWorldQuery<'a> {
     }
 }
 
-impl<'a> VoxelQuery for VoxelWorldQuery<'a> {
+impl<'a> StaticVoxelQuery for StaticVoxelWorldQuery<'a> {
     fn ground_height_m(&self, x_m: f32, z_m: f32) -> Option<f32> {
         let vx = Self::m_to_vox(x_m);
         let vz = Self::m_to_vox(z_m);

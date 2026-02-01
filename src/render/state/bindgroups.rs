@@ -71,7 +71,7 @@ fn make_primary_bg(
             },
             wgpu::BindGroupEntry {
                 binding: 11,
-                resource: buffers.balls.as_entire_binding(),
+                resource: buffers.voxels.as_entire_binding(),
             },
 
 

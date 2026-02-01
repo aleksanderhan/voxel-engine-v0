@@ -36,7 +36,7 @@ pub const RAY_CS_WGSL: &str = concat!(
     "\n",
     include_str!("../shaders/ray/composite.wgsl"),
     "\n",
-    include_str!("../shaders/ray/ball.wgsl"),
+    include_str!("../shaders/ray/voxel.wgsl"),
     "\n",
     
     include_str!("../shaders/clipmap.wgsl"),

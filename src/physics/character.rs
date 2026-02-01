@@ -1,6 +1,6 @@
 use glam::Vec3;
 
-use crate::physics::voxel::VoxelQuery;
+use crate::physics::voxel::StaticVoxelQuery;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CharacterState {
@@ -43,7 +43,7 @@ impl CharacterController {
     /// - apply gravity
     /// - integrate velocity
     /// - resolve ground penetration using ground_height_m
-    pub fn step(&self, st: &mut CharacterState, q: &dyn VoxelQuery, dt: f32) {
+    pub fn step(&self, st: &mut CharacterState, q: &dyn StaticVoxelQuery, dt: f32) {
         st.on_ground = false;
 
         // gravity

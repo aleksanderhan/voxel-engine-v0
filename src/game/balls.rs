@@ -6,14 +6,14 @@ use crate::config;
 use glam::{IVec3, Vec3};
 
 #[derive(Clone, Copy, Debug)]
-pub struct Ball {
+pub struct VoxelBall {
     pub pos_m: Vec3,   // world position in meters
     pub vel_mps: Vec3, // velocity in meters/sec
     pub age_s: f32,
 }
 
-pub struct BallSystem {
-    pub balls: Vec<Ball>,
+pub struct VoxelBallSystem {
+    pub balls: Vec<VoxelBall>,
 
     // Sparse voxel overlay: world-voxel -> material
     // (Only stores the voxels that should be forced to MAT_BALL.)
@@ -23,7 +23,7 @@ pub struct BallSystem {
     last_centers: Vec<IVec3>,
 }
 
-impl BallSystem {
+impl VoxelBallSystem {
     pub fn new() -> Self {
         Self {
             balls: Vec::new(),

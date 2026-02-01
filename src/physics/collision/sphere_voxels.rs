@@ -13,7 +13,7 @@ fn closest_point_aabb(p: Vec3, bmin: Vec3, bmax: Vec3) -> Vec3 {
 }
 
 #[inline]
-fn sphere_voxel_aabb(pos: Vec3, r: f32, voxel_size: f32) -> (IVec3i, IVec3i) {
+fn dynamic_voxel_static_voxel_aabb(pos: Vec3, r: f32, voxel_size: f32) -> (IVec3i, IVec3i) {
     let minp = pos - Vec3::splat(r);
     let maxp = pos + Vec3::splat(r);
 
@@ -25,14 +25,14 @@ fn sphere_voxel_aabb(pos: Vec3, r: f32, voxel_size: f32) -> (IVec3i, IVec3i) {
     )
 }
 
-/// Resolve a moving sphere against solid voxel AABBs.
+/// Resolve a moving dynamic voxel against static voxel AABBs.
 /// Returns (new_pos, new_vel, on_ground).
 ///
 /// Notes:
 /// - Iterative "push-out" for stability.
 /// - Removes velocity component into the surface normal.
 /// - on_ground when contact normal has strong +Y component.
-pub fn resolve_sphere_vs_voxels<W: WorldQuery>(
+pub fn resolve_dynamic_voxel_vs_static_voxels<W: WorldQuery>(
     world: &W,
     mut pos: Vec3,
     mut vel: Vec3,
@@ -44,7 +44,7 @@ pub fn resolve_sphere_vs_voxels<W: WorldQuery>(
     let s = world.voxel_size_m();
 
     for _ in 0..solver_iters {
-        let (min_v, max_v) = sphere_voxel_aabb(pos, radius, s);
+        let (min_v, max_v) = dynamic_voxel_static_voxel_aabb(pos, radius, s);
 
         let mut worst_pen = 0.0f32;
         let mut worst_n = Vec3::ZERO;
@@ -185,7 +185,7 @@ fn segment_aabb_hit(p0: Vec3, p1: Vec3, bmin: Vec3, bmax: Vec3) -> Option<(f32, 
 /// 3D DDA traversal over the voxel grid for a segment.
 /// At each visited cell, we test a small neighbor cube of voxels for intersection with the *expanded* AABB.
 /// Returns earliest hit fraction t in [0,1] and normal.
-fn raycast_sphere_grid<W: WorldQuery>(
+fn raycast_dynamic_voxel_grid<W: WorldQuery>(
     world: &W,
     p0: Vec3,
     p1: Vec3,
@@ -325,7 +325,7 @@ fn raycast_sphere_grid<W: WorldQuery>(
 /// - Finds earliest hit against voxels (as expanded AABBs)
 /// - Applies bounce/slide response
 /// - Supports a few impacts per step
-pub fn sweep_sphere_vs_voxels<W: WorldQuery>(
+pub fn sweep_dynamic_voxel_vs_static_voxels<W: WorldQuery>(
     world: &W,
     mut pos: Vec3,
     mut vel: Vec3,
@@ -347,7 +347,7 @@ pub fn sweep_sphere_vs_voxels<W: WorldQuery>(
         let p0 = pos;
         let p1 = pos + vel * remaining;
 
-        if let Some((t, n)) = raycast_sphere_grid(world, p0, p1, radius) {
+        if let Some((t, n)) = raycast_dynamic_voxel_grid(world, p0, p1, radius) {
             // Move to contact point
             pos = p0 + (p1 - p0) * t;
 
