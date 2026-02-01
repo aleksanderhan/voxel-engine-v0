@@ -57,11 +57,11 @@ impl Default for DynamicVoxelTuning {
         Self {
             speed_mps: 22.0,
             gravity_mps2: -9.81,
-            restitution: 0.25,
+            restitution: 0.0,
             solver_iters: 4,
             lifetime_s: 8.0,
             voxel_voxel_restitution: 0.6,
-            voxel_voxel_iters: 3,
+            voxel_voxel_iters: 48,
             voxel_mass: 1.0,
             ccd_min_dist_m: 0.10,
         }
@@ -323,25 +323,54 @@ pub fn spawn_voxel_ball(
     let mut constraints = Vec::new();
     let compliance = config::BALL_COMPLIANCE;
 
-    let neighbors = [
-        IVec3::new( 1, 0, 0),
-        IVec3::new(-1, 0, 0),
-        IVec3::new( 0, 1, 0),
-        IVec3::new( 0,-1, 0),
-        IVec3::new( 0, 0, 1),
-        IVec3::new( 0, 0,-1),
+    let edge = voxel_size_m;
+    let diag = voxel_size_m * 2.0_f32.sqrt();
+    let body = voxel_size_m * 3.0_f32.sqrt();
+
+    let dirs: &[(IVec3, f32)] = &[
+        // 6 edges
+        (IVec3::new( 1, 0, 0), edge),
+        (IVec3::new(-1, 0, 0), edge),
+        (IVec3::new( 0, 1, 0), edge),
+        (IVec3::new( 0,-1, 0), edge),
+        (IVec3::new( 0, 0, 1), edge),
+        (IVec3::new( 0, 0,-1), edge),
+
+        // 12 face diagonals
+        (IVec3::new( 1, 1, 0), diag),
+        (IVec3::new( 1,-1, 0), diag),
+        (IVec3::new(-1, 1, 0), diag),
+        (IVec3::new(-1,-1, 0), diag),
+        (IVec3::new( 1, 0, 1), diag),
+        (IVec3::new( 1, 0,-1), diag),
+        (IVec3::new(-1, 0, 1), diag),
+        (IVec3::new(-1, 0,-1), diag),
+        (IVec3::new( 0, 1, 1), diag),
+        (IVec3::new( 0, 1,-1), diag),
+        (IVec3::new( 0,-1, 1), diag),
+        (IVec3::new( 0,-1,-1), diag),
+
+        // 8 body diagonals  ✅
+        (IVec3::new( 1, 1, 1), body),
+        (IVec3::new( 1, 1,-1), body),
+        (IVec3::new( 1,-1, 1), body),
+        (IVec3::new( 1,-1,-1), body),
+        (IVec3::new(-1, 1, 1), body),
+        (IVec3::new(-1, 1,-1), body),
+        (IVec3::new(-1,-1, 1), body),
+        (IVec3::new(-1,-1,-1), body),
     ];
+
 
     for off in &offsets {
         let a = idx_of[off];
-        for d in neighbors {
-            let nb = *off + d;
+        for (d, rest_len) in dirs {
+            let nb = *off + *d;
             if let Some(&b) = idx_of.get(&nb) {
                 if b > a {
                     constraints.push(DistanceConstraint {
-                        a,
-                        b,
-                        rest_len: voxel_size_m,
+                        a, b,
+                        rest_len: *rest_len,
                         compliance,
                         lambda: 0.0,
                     });
@@ -363,11 +392,11 @@ pub fn step_cluster<W: WorldQuery>(
 ) {
     if !cluster.alive { return; }
 
-    // 1) integrate + collide each voxel vs world (copy your pass-1 from step_voxels)
-    // IMPORTANT: do NOT run solve_voxel_voxel_grid on cluster.voxels (internal collisions fight constraints)
+    // snapshot BEFORE any integration/constraints
+    let mut old = Vec::with_capacity(cluster.voxels.len());
+    old.extend(cluster.voxels.iter().map(|v| v.pos));
 
-    let max_impacts = tuning.solver_iters.max(1);
-
+    // 0) integrate positions (semi-implicit Euler)
     for v in cluster.voxels.iter_mut() {
         if !v.alive { continue; }
 
@@ -380,38 +409,42 @@ pub fn step_cluster<W: WorldQuery>(
         // gravity
         v.vel.y += tuning.gravity_mps2 * dt;
 
-        let travel = v.vel.length() * dt;
-        if travel >= tuning.ccd_min_dist_m {
-            let (p2, v2, _g) = sweep_dynamic_voxel_vs_static_voxels(
-                world, v.pos, v.vel, v.radius, dt, max_impacts, tuning.restitution
+        // integrate (NO collision here)
+        v.pos += v.vel * dt;
+    }
+
+    // 1) XPBD + world contact projection in the SAME loop
+    let inv_m = if tuning.voxel_mass > 0.0 { 1.0 / tuning.voxel_mass } else { 0.0 };
+    let iters = tuning.voxel_voxel_iters.max(1);
+
+    for _ in 0..iters {
+        // (a) distance constraints: do ONE iteration per outer loop
+        solve_distance_constraints_xpbd(
+            &mut cluster.voxels,
+            &mut cluster.constraints,
+            inv_m,
+            dt,
+            1,
+        );
+
+        // (b) project out of the world (position-only)
+        // Use your existing resolver with vel=0 and restitution=0 so it only pushes out.
+        for v in cluster.voxels.iter_mut() {
+            if !v.alive { continue; }
+
+            let (p2, _v2, _on_ground) = resolve_dynamic_voxel_vs_static_voxels(
+                world,
+                v.pos,
+                Vec3::ZERO,   // important: position projection only
+                v.radius,
+                2,            // small push-out iterations per projection
+                0.0,          // no bounce during projection
             );
             v.pos = p2;
-            v.vel = v2;
-        } else {
-            let pos_pred = v.pos + v.vel * dt;
-            let (p2, v2, _g) = resolve_dynamic_voxel_vs_static_voxels(
-                world, pos_pred, v.vel, v.radius, 2, tuning.restitution
-            );
-            v.pos = p2;
-            v.vel = v2;
         }
     }
 
-    // 2) constraints (XPBD)
-    // store old positions so velocity matches the constraint correction
-    let mut old = Vec::with_capacity(cluster.voxels.len());
-    old.extend(cluster.voxels.iter().map(|v| v.pos));
-
-    let inv_m = if tuning.voxel_mass > 0.0 { 1.0 / tuning.voxel_mass } else { 0.0 };
-    solve_distance_constraints_xpbd(
-        &mut cluster.voxels,
-        &mut cluster.constraints,
-        inv_m,
-        dt,
-        tuning.voxel_voxel_iters.max(1), // reuse this as "constraint iters"
-    );
-
-    // velocity recompute from projected positions
+    // 2) recompute velocity from corrected positions
     if dt > 0.0 {
         for (i, v) in cluster.voxels.iter_mut().enumerate() {
             if !v.alive { continue; }
@@ -419,9 +452,7 @@ pub fn step_cluster<W: WorldQuery>(
         }
     }
 
-    // 3) cull cluster if too dead
-    let alive_count = cluster.voxels.iter().filter(|v| v.alive).count();
-    if alive_count == 0 {
+    if cluster.voxels.iter().all(|v| !v.alive) {
         cluster.alive = false;
     }
 }
