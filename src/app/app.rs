@@ -213,13 +213,20 @@ impl App {
 
         let shoot = self.input.take_lmb_pressed();
 
+        let vs_world = config::VOXEL_SIZE_M_F32; 
+        let n = 16.0_f32;              // voxels across diameter
+        let r = config::BALL_RADIUS_M;
+        let vs_target = (2.0 * r) / n;
+        let mut q8 = (256.0 * (vs_target / vs_world)).round() as u32;
+        q8 = q8.max(256);
+
         let balls_gpu: Vec<BallGpu> = self.physics
             .balls_iter()
             .take(config::MAX_BALLS as usize)
             .map(|b| BallGpu {
                 center_radius: [b.pos.x, b.pos.y, b.pos.z, config::BALL_RADIUS_M],
                 material: 42,
-                voxel_scale_q8: 1, _pad0: 0, _pad1: 0,
+                voxel_scale_q8: q8, _pad0: 0, _pad1: 0,
             })
             .collect();
         let ball_count: u32 = balls_gpu.len() as u32;

@@ -55,16 +55,12 @@ fn ray_sphere_interval(ro: vec3<f32>, rd: vec3<f32>, c: vec3<f32>, r: f32) -> ve
 
 // sphere vs voxel AABB occupancy (sphere intersects the voxel AABB)
 fn ball_voxel_occupied(v_vox: vec3<i32>, c_m: vec3<f32>, r_m: f32, vs: f32) -> bool {
-  let bmin = vec3<f32>(f32(v_vox.x), f32(v_vox.y), f32(v_vox.z)) * vs;
-  let bmax = bmin + vec3<f32>(vs);
-
-  // distance from sphere center to AABB (0 if inside)
-  let d0 = max(bmin - c_m, vec3<f32>(0.0));
-  let d1 = max(c_m - bmax, vec3<f32>(0.0));
-  let d  = max(d0, d1);
-
+  // voxel center in world meters
+  let vc = (vec3<f32>(f32(v_vox.x), f32(v_vox.y), f32(v_vox.z)) + vec3<f32>(0.5)) * vs;
+  let d  = vc - c_m;
   return dot(d, d) <= (r_m * r_m);
 }
+
 
 fn ball_voxel_ao_6(v_vox: vec3<i32>, c_m: vec3<f32>, r_m: f32, vs: f32) -> f32 {
   var occ: f32 = 0.0;
@@ -194,7 +190,29 @@ fn trace_balls(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> BallHit 
 
 fn shade_ball_hit(ro: vec3<f32>, rd: vec3<f32>, bh: BallHit, sky_up: vec3<f32>) -> vec3<f32> {
   let hp = ro + bh.t * rd;
-  let n  = normalize(bh.n);
+
+  // Recompute axis-aligned face normal from voxel AABB.
+  let bmin = vec3<f32>(f32(bh.v_vox.x), f32(bh.v_vox.y), f32(bh.v_vox.z)) * bh.vs;
+  let bmax = bmin + vec3<f32>(bh.vs);
+  let eps  = 1e-4 * bh.vs;
+
+  var n = vec3<f32>(0.0);
+
+  if (abs(hp.x - bmin.x) < eps) { n = vec3<f32>(-1.0,  0.0,  0.0); }
+  else if (abs(hp.x - bmax.x) < eps) { n = vec3<f32>( 1.0,  0.0,  0.0); }
+  else if (abs(hp.y - bmin.y) < eps) { n = vec3<f32>( 0.0, -1.0,  0.0); }
+  else if (abs(hp.y - bmax.y) < eps) { n = vec3<f32>( 0.0,  1.0,  0.0); }
+  else if (abs(hp.z - bmin.z) < eps) { n = vec3<f32>( 0.0,  0.0, -1.0); }
+  else if (abs(hp.z - bmax.z) < eps) { n = vec3<f32>( 0.0,  0.0,  1.0); }
+  else {
+    // fallback: at least avoid smooth sphere normals
+    n = normalize(bh.n);
+    // optional: snap fallback to axis
+    let an = abs(n);
+    if (an.x > an.y && an.x > an.z) { n = vec3<f32>(sign(n.x), 0.0, 0.0); }
+    else if (an.y > an.z)          { n = vec3<f32>(0.0, sign(n.y), 0.0); }
+    else                           { n = vec3<f32>(0.0, 0.0, sign(n.z)); }
+  }
 
   var base = color_for_material(bh.mat);
 
