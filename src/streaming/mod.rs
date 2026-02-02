@@ -7,5 +7,5 @@ pub mod cache;
 pub mod manager;
 
 pub use manager::ChunkManager;
-pub use types::{StreamStats, ChunkUpload};
+pub use types::ChunkUpload;
 pub use node_arena::NodeArena;

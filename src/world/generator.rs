@@ -38,7 +38,7 @@ impl WorldGen {
     }
 
     pub fn material_at_voxel(&self, wx: i32, wy: i32, wz: i32) -> u32 {
-        use crate::world::materials::{AIR, DIRT, GRASS, STONE, WOOD};
+        use crate::world::materials::{AIR, DIRT, GRASS, STONE};
 
         let g = self.ground_height(wx, wz);
 

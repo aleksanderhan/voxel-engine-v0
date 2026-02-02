@@ -62,16 +62,26 @@ fn cancel_token(mgr: &mut ChunkManager, key: ChunkKey) -> Arc<AtomicBool> {
 pub fn commit_uploads_applied(mgr: &mut ChunkManager, applied: &[ChunkUpload]) -> bool {
     let mut any_promoted = false;
     let mut any_uploaded_flip = false;
+    let mut any_rewrite_cleared = false;
 
-    // Mark uploads as applied; detect first-time flip.
+    // 1) Mark uploads as applied.
     for u in applied {
-        if !u.completes_residency {
-            continue;
-        }
-        if let Some(ChunkState::Uploading(up)) = mgr.build.chunks.get_mut(&u.key) {
-            if !up.uploaded {
-                up.uploaded = true;
-                any_uploaded_flip = true;
+        match u.kind {
+            UploadKind::PromoteToResident => {
+                if let Some(ChunkState::Uploading(up)) = mgr.build.chunks.get_mut(&u.key) {
+                    if !up.uploaded {
+                        up.uploaded = true;
+                        any_uploaded_flip = true;
+                    }
+                }
+            }
+            UploadKind::RewriteResident => {
+                if let Some(ChunkState::Resident(r)) = mgr.build.chunks.get_mut(&u.key) {
+                    if r.rewrite_in_flight {
+                        r.rewrite_in_flight = false;
+                        any_rewrite_cleared = true;
+                    }
+                }
             }
         }
     }
@@ -81,6 +91,7 @@ pub fn commit_uploads_applied(mgr: &mut ChunkManager, applied: &[ChunkUpload]) -
         .map(|c| !priority_box_ready(mgr, c))
         .unwrap_or(false);
 
+    // 2) Promote ready Uploading chunks into the resident prefix.
     loop {
         if mgr.slots.resident_slots >= mgr.slots.slot_to_key.len() {
             break;
@@ -154,7 +165,6 @@ pub fn commit_uploads_applied(mgr: &mut ChunkManager, applied: &[ChunkUpload]) -
             }
         }
 
-        // Now the frontier slot should be ready; promote it.
         let slot = mgr.slots.resident_slots;
         let key = mgr.slots.slot_to_key[slot];
 
@@ -178,7 +188,14 @@ pub fn commit_uploads_applied(mgr: &mut ChunkManager, applied: &[ChunkUpload]) -
                 let slot_u32 = slot as u32;
                 let node_base = up.node_base;
                 let node_count = up.node_count;
-                *st = ChunkState::Resident(Resident { slot: slot_u32, node_base, node_count });
+
+                *st = ChunkState::Resident(Resident {
+                    slot: slot_u32,
+                    node_base,
+                    node_count,
+                    rewrite_in_flight: false, // IMPORTANT
+                });
+
                 mgr.slots.resident_slots += 1;
                 any_promoted = true;
                 continue;
@@ -188,7 +205,9 @@ pub fn commit_uploads_applied(mgr: &mut ChunkManager, applied: &[ChunkUpload]) -
         break;
     }
 
-    if any_promoted || any_uploaded_flip {
+    repair_slot_prefix(mgr);
+
+    if any_promoted || any_uploaded_flip || any_rewrite_cleared {
         mgr.grid.grid_dirty = true;
         if let Some(center) = mgr.build.last_center {
             super::grid::rebuild_grid(mgr, center);
@@ -295,6 +314,7 @@ pub fn try_make_uploading(
     super::uploads::enqueue(mgr, ChunkUpload {
         key,
         slot,
+        kind: UploadKind::PromoteToResident,
         meta,
         node_base,
         nodes,
@@ -304,18 +324,37 @@ pub fn try_make_uploading(
         completes_residency: true,
     });
 
+
     true
 }
 
 pub fn unload_chunk(mgr: &mut ChunkManager, center: ChunkKey, key: ChunkKey) {
-    let Some(state) = mgr.build.chunks.remove(&key) else {
-        return;
+    // Copy the info we need WITHOUT removing the map entry yet.
+    // This avoids swapping slots while `slot_to_key` still references a key missing from `build.chunks`.
+    enum Kind {
+        Resident { dead: usize, node_base: u32, node_count: u32 },
+        Uploading { dead: usize, node_base: u32, node_count: u32 },
+        QueuedOrBuilding,
+    }
+
+    let kind = match mgr.build.chunks.get(&key) {
+        None => return,
+        Some(ChunkState::Resident(r)) => Kind::Resident {
+            dead: r.slot as usize,
+            node_base: r.node_base,
+            node_count: r.node_count,
+        },
+        Some(ChunkState::Uploading(u)) => Kind::Uploading {
+            dead: u.slot as usize,
+            node_base: u.node_base,
+            node_count: u.node_count,
+        },
+        Some(ChunkState::Queued) | Some(ChunkState::Building) => Kind::QueuedOrBuilding,
     };
 
-    match state {
-        ChunkState::Resident(res) => {
-            mgr.arena.free(res.node_base, res.node_count);
-            let dead = res.slot as usize;
+    match kind {
+        Kind::Resident { dead, node_base, node_count } => {
+            mgr.arena.free(node_base, node_count);
 
             let last_res = mgr.slots.resident_slots.saturating_sub(1);
             debug_assert!(dead < mgr.slots.resident_slots, "resident slot out of prefix");
@@ -343,9 +382,8 @@ pub fn unload_chunk(mgr: &mut ChunkManager, center: ChunkKey, key: ChunkKey) {
             mgr.grid.grid_dirty = true;
         }
 
-        ChunkState::Uploading(up) => {
-            mgr.arena.free(up.node_base, up.node_count);
-            let dead = up.slot as usize;
+        Kind::Uploading { dead, node_base, node_count } => {
+            mgr.arena.free(node_base, node_count);
 
             debug_assert!(
                 dead >= mgr.slots.resident_slots,
@@ -362,30 +400,41 @@ pub fn unload_chunk(mgr: &mut ChunkManager, center: ChunkKey, key: ChunkKey) {
             mgr.slots.chunk_meta.pop();
             mgr.slots.slot_macro.pop();
             mgr.slots.slot_colinfo.pop();
+
+            // IMPORTANT: removing a slot can affect the grid even if it was Uploading+uploaded.
+            mgr.grid.grid_dirty = true;
         }
 
-        ChunkState::Queued | ChunkState::Building => {
+        Kind::QueuedOrBuilding => {
             cancel_token(mgr, key).store(true, Ordering::Relaxed);
             mgr.build.queued_set.remove(&key);
             mgr.grid.grid_dirty = true;
         }
     }
 
+    // Now remove bookkeeping. At this point the slot arrays no longer reference `key`.
+    mgr.build.chunks.remove(&key);
     mgr.build.cancels.remove(&key);
 
-    // If we removed something that was outside keep anyway, fine.
-    // If you want to be aggressive about cleaning cache too:
-    // mgr.cache.remove(&key);
-    let _ = center; // keep signature aligned with callers; can remove if unused.
+    repair_slot_prefix(mgr);
+
+    let _ = center;
 }
+
 
 fn enqueue_slot_rewrite(mgr: &mut ChunkManager, slot: usize) {
     let key = mgr.slots.slot_to_key[slot];
     let slot_u32 = slot as u32;
 
+    // If this is a resident chunk, track that a rewrite upload is in flight.
+    if let Some(ChunkState::Resident(r)) = mgr.build.chunks.get_mut(&key) {
+        r.rewrite_in_flight = true;
+    }
+
     super::uploads::enqueue(mgr, ChunkUpload {
         key,
         slot: slot_u32,
+        kind: UploadKind::RewriteResident,
         meta: mgr.slots.chunk_meta[slot],
         node_base: 0,
         nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
@@ -396,10 +445,9 @@ fn enqueue_slot_rewrite(mgr: &mut ChunkManager, slot: usize) {
     });
 }
 
-fn swap_slots(mgr: &mut ChunkManager, a: usize, b: usize) {
-    if a == b {
-        return;
-    }
+
+fn swap_slots_impl(mgr: &mut ChunkManager, a: usize, b: usize) {
+    if a == b { return; }
 
     let ka = mgr.slots.slot_to_key[a];
     let kb = mgr.slots.slot_to_key[b];
@@ -430,10 +478,66 @@ fn swap_slots(mgr: &mut ChunkManager, a: usize, b: usize) {
     }
 }
 
+fn swap_slots(mgr: &mut ChunkManager, a: usize, b: usize) {
+    #[cfg(debug_assertions)]
+    {
+        if a != b {
+            let ka = mgr.slots.slot_to_key[a];
+            let kb = mgr.slots.slot_to_key[b];
+
+            assert!(
+                mgr.build.chunks.contains_key(&ka),
+                "swap_slots: slot_to_key[a] missing in build.chunks: a={} ka={:?}",
+                a, ka
+            );
+            assert!(
+                mgr.build.chunks.contains_key(&kb),
+                "swap_slots: slot_to_key[b] missing in build.chunks: b={} kb={:?}",
+                b, kb
+            );
+
+            let a_is_res = matches!(mgr.build.chunks.get(&ka), Some(ChunkState::Resident(_)));
+            let b_is_res = matches!(mgr.build.chunks.get(&kb), Some(ChunkState::Resident(_)));
+
+            if a_is_res != b_is_res {
+                let a_in_prefix = a < mgr.slots.resident_slots;
+                let b_in_prefix = b < mgr.slots.resident_slots;
+                assert!(
+                    a_in_prefix == b_in_prefix,
+                    "swap_slots crosses prefix boundary: a={} b={} resident_slots={} ka={:?} kb={:?} ka_state={:?} kb_state={:?}",
+                    a, b, mgr.slots.resident_slots, ka, kb,
+                    mgr.build.chunks.get(&ka),
+                    mgr.build.chunks.get(&kb),
+                );
+            }
+        }
+    }
+
+    swap_slots_impl(mgr, a, b);
+}
+
+
+
 fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKey) -> bool {
     if mgr.slots.slot_to_key.is_empty() {
         return false;
     }
+
+    #[cfg(debug_assertions)]
+    {
+        if let Some(st) = mgr.build.chunks.get(&protect) {
+            let ps = match st {
+                ChunkState::Resident(r) => r.slot as usize,
+                ChunkState::Uploading(u) => u.slot as usize,
+                _ => usize::MAX,
+            };
+            // protect must still map back correctly
+            if ps != usize::MAX {
+                debug_assert_eq!(mgr.slots.slot_to_key[ps], protect);
+            }
+        }
+    }
+
 
     // Pass 1: evict farthest chunk that is OUTSIDE active xz.
     let mut best_outside: Option<(f32, ChunkKey)> = None;
@@ -443,6 +547,12 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
         if k == protect {
             continue;
         }
+        if let Some(ChunkState::Resident(r)) = mgr.build.chunks.get(&k) {
+            if r.rewrite_in_flight {
+                continue;
+            }
+        }
+
         if in_priority_box(mgr, center, k) {
             continue;
         }
@@ -472,6 +582,12 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
         if k == protect {
             continue;
         }
+        if let Some(ChunkState::Resident(r)) = mgr.build.chunks.get(&k) {
+            if r.rewrite_in_flight {
+                continue;
+            }
+        }
+
         if in_priority_box(mgr, center, k) {
             continue;
         }
@@ -498,6 +614,18 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
 
 #[cfg(debug_assertions)]
 pub fn assert_slot_invariants(mgr: &ChunkManager) {
+    use rustc_hash::FxHashSet;
+
+    // slot_to_key must not contain duplicates
+    let mut seen: FxHashSet<ChunkKey> = FxHashSet::default();
+    for (i, &k) in mgr.slots.slot_to_key.iter().enumerate() {
+        assert!(
+            seen.insert(k),
+            "DUPLICATE key in slot_to_key: i={} k={:?} resident_slots={} total_slots={}",
+            i, k, mgr.slots.resident_slots, mgr.slots.slot_to_key.len()
+        );
+    }
+
     // Prefix rule: [0 .. resident_slots) must be Resident, rest must be Uploading.
     for (i, &k) in mgr.slots.slot_to_key.iter().enumerate() {
         match mgr.build.chunks.get(&k) {
@@ -515,7 +643,6 @@ pub fn assert_slot_invariants(mgr: &ChunkManager) {
         }
     }
 
-    // Also check that resident_slots isn't larger than the slot array.
     assert!(
         mgr.slots.resident_slots <= mgr.slots.slot_to_key.len(),
         "resident_slots {} > slot_to_key.len {}",
@@ -523,6 +650,7 @@ pub fn assert_slot_invariants(mgr: &ChunkManager) {
         mgr.slots.slot_to_key.len()
     );
 }
+
 
 pub fn replace_chunk_contents(
     mgr: &mut ChunkManager,
@@ -533,17 +661,18 @@ pub fn replace_chunk_contents(
     ropes: Arc<[NodeRopesGpu]>,
     colinfo_words: Arc<[u32]>,
 ) -> bool {
-    // Must already have a slot
-    let (slot, old_base, old_count) = match mgr.build.chunks.get(&key) {
-        Some(ChunkState::Resident(r)) => (r.slot, r.node_base, r.node_count),
-        Some(ChunkState::Uploading(u)) => (u.slot, u.node_base, u.node_count),
+    // Determine whether this is a true resident rewrite or an Uploading refresh that still completes residency.
+    let (old_base, old_count, is_resident_now) = match mgr.build.chunks.get(&key) {
+        Some(ChunkState::Resident(r)) => (r.node_base, r.node_count, true),
+        Some(ChunkState::Uploading(u)) => (u.node_base, u.node_count, false),
         _ => return false,
     };
 
     let need = nodes.len() as u32;
     if need == 0 { return false; }
 
-    // allocate new node range (don’t free old until success)
+    // Allocate new node range (don’t free old until success).
+    // NOTE: evictions may swap slots, potentially moving `key`.
     let mut node_base = mgr.arena.alloc(need);
     if node_base.is_none() {
         for _ in 0..EVICT_ATTEMPTS {
@@ -554,14 +683,30 @@ pub fn replace_chunk_contents(
     }
     let Some(node_base) = node_base else { return false; };
 
-    // free old range now that we succeeded
+    // Now that allocation succeeded, free old range.
     mgr.arena.free(old_base, old_count);
 
-    // update meta for slot
+    // Re-fetch CURRENT slot (key may have moved due to evictions/swaps).
+    let slot = match mgr.build.chunks.get(&key) {
+        Some(ChunkState::Resident(r)) => r.slot,
+        Some(ChunkState::Uploading(u)) => u.slot,
+        _ => return false,
+    };
     let s = slot as usize;
+
+    debug_assert!(
+        mgr.slots.slot_to_key.get(s).copied() == Some(key),
+        "replace_chunk_contents: key moved but slot_to_key mismatch: key={:?} slot={} slot_key={:?}",
+        key,
+        slot,
+        mgr.slots.slot_to_key.get(s).copied()
+    );
+
+    // Update slot-owned CPU side payloads.
     mgr.slots.slot_macro[s]   = macro_words.clone();
     mgr.slots.slot_colinfo[s] = colinfo_words.clone();
 
+    // Update meta for that slot.
     let mut meta = mgr.slots.chunk_meta[s];
     meta.node_base = node_base;
     meta.node_count = need;
@@ -569,28 +714,115 @@ pub fn replace_chunk_contents(
     meta.colinfo_base = slot * COLINFO_WORDS_PER_CHUNK;
     mgr.slots.chunk_meta[s] = meta;
 
-    // update state
+    // Update state, but NEVER flip Resident -> Uploading.
     if let Some(st) = mgr.build.chunks.get_mut(&key) {
         match st {
-            ChunkState::Resident(r) => { r.node_base = node_base; r.node_count = need; }
-            ChunkState::Uploading(u) => { u.node_base = node_base; u.node_count = need; }
+            ChunkState::Resident(r) => {
+                r.slot = slot;
+                r.node_base = node_base;
+                r.node_count = need;
+                r.rewrite_in_flight = true; // rewrite upload will clear this on applied
+            }
+            ChunkState::Uploading(u) => {
+                u.slot = slot;
+                u.node_base = node_base;
+                u.node_count = need;
+                u.uploaded = false; // IMPORTANT: this upload will set it true when applied
+            }
             _ => {}
         }
     }
 
-    // enqueue upload that rewrites an existing slot (no residency flip)
+    // If we were Uploading, this upload MUST complete residency (it is the data that makes it ready).
+    let (kind, completes_residency) = if is_resident_now {
+        (UploadKind::RewriteResident, false)
+    } else {
+        (UploadKind::PromoteToResident, true)
+    };
+
     super::uploads::enqueue(mgr, ChunkUpload {
         key,
         slot,
+        kind,
         meta,
         node_base,
         nodes,
         macro_words,
         ropes,
         colinfo_words,
-        completes_residency: false,
+        completes_residency,
     });
 
     mgr.grid.grid_dirty = true;
     true
+}
+
+#[inline(always)]
+fn is_resident(mgr: &ChunkManager, k: ChunkKey) -> bool {
+    matches!(mgr.build.chunks.get(&k), Some(ChunkState::Resident(_)))
+}
+
+#[inline(always)]
+fn is_gpu_ready_key(mgr: &ChunkManager, k: ChunkKey) -> bool {
+    match mgr.build.chunks.get(&k) {
+        Some(ChunkState::Resident(_)) => true,
+        Some(ChunkState::Uploading(up)) => up.uploaded,
+        _ => false,
+    }
+}
+
+/// Enforce the invariant:
+/// - all Resident chunks are packed into the prefix [0..resident_slots)
+/// - all Uploading chunks are in [resident_slots..)
+fn repair_slot_prefix(mgr: &mut ChunkManager) {
+    // Count how many residents we actually have among slotted chunks.
+    let mut resident_count = 0usize;
+    for &k in &mgr.slots.slot_to_key {
+        if is_resident(mgr, k) {
+            resident_count += 1;
+        }
+    }
+
+    // Two-pointer partition by swapping.
+    let mut i = 0usize;
+    let mut j = mgr.slots.slot_to_key.len();
+
+    while i < resident_count {
+        let ki = mgr.slots.slot_to_key[i];
+        if is_resident(mgr, ki) {
+            i += 1;
+            continue;
+        }
+
+        // Find a resident from the end to swap into i.
+        while j > i {
+            j -= 1;
+            let kj = mgr.slots.slot_to_key[j];
+            if is_resident(mgr, kj) {
+                break;
+            }
+        }
+
+        if j <= i {
+            break;
+        }
+
+        // Before swap: record whether these slots need GPU rewrites.
+        let need_rewrite_i = is_gpu_ready_key(mgr, mgr.slots.slot_to_key[i]);
+        let need_rewrite_j = is_gpu_ready_key(mgr, mgr.slots.slot_to_key[j]);
+
+        swap_slots(mgr, i, j);
+
+        // After swap: if either slot is GPU-relevant, enqueue rewrites to fix bases/meta.
+        if need_rewrite_i || is_gpu_ready_key(mgr, mgr.slots.slot_to_key[i]) {
+            enqueue_slot_rewrite(mgr, i);
+        }
+        if need_rewrite_j || is_gpu_ready_key(mgr, mgr.slots.slot_to_key[j]) {
+            enqueue_slot_rewrite(mgr, j);
+        }
+
+        i += 1;
+    }
+
+    mgr.slots.resident_slots = resident_count;
 }

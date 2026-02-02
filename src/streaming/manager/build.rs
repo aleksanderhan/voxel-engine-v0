@@ -47,7 +47,6 @@ fn cancel_token(mgr: &mut ChunkManager, key: ChunkKey) -> Arc<AtomicBool> {
 }
 
 #[inline]
-#[inline]
 fn queue_build_front(mgr: &mut ChunkManager, center: ChunkKey, k: ChunkKey) {
     // Ensure it is tracked as queued
     match mgr.build.chunks.get(&k) {
@@ -205,8 +204,22 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
 
         let Some(item) = mgr.build.build_heap.pop() else { break; };
         let k = item.key;
+
+        // Heap contains stale entries; only queued chunks may be dispatched/canceled here.
+        let Some(st) = mgr.build.chunks.get(&k) else {
+            // Not tracked anymore.
+            continue;
+        };
+
+        // Ignore anything that isn't currently queued.
+        if !matches!(st, ChunkState::Queued) {
+            continue;
+        }
+
+        // Now it's safe to update queued bookkeeping.
         mgr.build.queued_set.remove(&k);
 
+        // If it's outside keep, just cancel/remove the queued entry.
         if !in_keep(mgr, center, k) {
             cancel_token(mgr, k).store(true, AtomicOrdering::Relaxed);
             mgr.build.chunks.remove(&k);
@@ -214,6 +227,7 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
             continue;
         }
 
+        // If cached, drop queued tracking and try promote.
         if mgr.cache.get(&k).is_some() {
             mgr.build.chunks.remove(&k);
             mgr.build.cancels.remove(&k);
@@ -221,24 +235,24 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
             continue;
         }
 
-        if matches!(mgr.build.chunks.get(&k), Some(ChunkState::Queued)) {
-            mgr.build.chunks.insert(k, ChunkState::Building);
+        // Dispatch the build job.
+        mgr.build.chunks.insert(k, ChunkState::Building);
 
-            let cancel = cancel_token(mgr, k);
-            cancel.store(false, AtomicOrdering::Relaxed);
+        let cancel = cancel_token(mgr, k);
+        cancel.store(false, AtomicOrdering::Relaxed);
 
-            let edits = mgr.edits.snapshot(k);
-            match mgr.build.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone(), edits }) {
-                Ok(()) => mgr.build.in_flight += 1,
-                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                    mgr.build.chunks.insert(k, ChunkState::Queued);
-                    mgr.build.build_queue.push_front(k);
-                    mgr.build.queued_set.insert(k);
-                    break;
-                }
+        let edits = mgr.edits.snapshot(k);
+        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone(), edits }) {
+            Ok(()) => mgr.build.in_flight += 1,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                mgr.build.chunks.insert(k, ChunkState::Queued);
+                mgr.build.build_queue.push_front(k);
+                mgr.build.queued_set.insert(k);
+                break;
             }
         }
     }
+
 
 }
 

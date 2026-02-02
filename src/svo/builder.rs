@@ -11,7 +11,6 @@ use crate::{
     },
 };
 use crate::world::edits::EditEntry;
-use crate::streaming::types::ChunkKey;
 
 use super::mips::{build_max_mip_inplace, build_minmax_mip_inplace, MaxMipView, MinMaxMipView};
 

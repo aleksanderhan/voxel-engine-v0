@@ -8,24 +8,23 @@ mod ground;
 mod keep;
 mod uploads;
 
-pub(crate) use slots::assert_slot_invariants;
 
 use std::{
     collections::{VecDeque, BinaryHeap},
     mem::size_of,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::AtomicBool,
         Arc,
     },
 };
 
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use glam::Vec3;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::app::config;
 use crate::{
-    render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu},
+    render::gpu_types::{ChunkMetaGpu, NodeGpu},
     world::WorldGen,
     streaming::types::StreamStats,
 };

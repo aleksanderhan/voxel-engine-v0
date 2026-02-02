@@ -54,6 +54,7 @@ pub struct Resident {
     pub slot: u32,
     pub node_base: u32,
     pub node_count: u32,
+    pub rewrite_in_flight: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -73,9 +74,16 @@ pub struct BuildDone {
     pub colinfo_words: Vec<u32>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum UploadKind {
+    PromoteToResident, // new chunk becoming resident
+    RewriteResident,   // resident chunk being refreshed
+}
+
 pub struct ChunkUpload {
     pub key: ChunkKey,
     pub slot: u32,
+    pub kind: UploadKind,
     pub meta: ChunkMetaGpu,
 
     pub node_base: u32,
