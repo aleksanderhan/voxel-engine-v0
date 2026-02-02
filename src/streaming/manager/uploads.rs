@@ -4,6 +4,43 @@ use crate::app::config;
 use crate::streaming::types::*;
 use super::{ChunkManager};
 use super::keep;
+use crate::Arc;
+
+pub fn mark_slot_rewrite(mgr: &mut ChunkManager, slot: usize) {
+    let s = slot as u32;
+    if mgr.uploads.slot_rewrite_set.insert(s) {
+        // push_front so newest churn is fixed first
+        mgr.uploads.slot_rewrite_q.push_front(s);
+    }
+}
+
+fn make_slot_rewrite_upload(mgr: &mut ChunkManager, slot: u32) -> Option<ChunkUpload> {
+    let s = slot as usize;
+    if s >= mgr.slots.slot_to_key.len() {
+        return None;
+    }
+
+    let key = mgr.slots.slot_to_key[s];
+
+    // If this is resident, track rewrite-in-flight.
+    if let Some(ChunkState::Resident(r)) = mgr.build.chunks.get_mut(&key) {
+        r.rewrite_in_flight = true;
+    }
+
+    Some(ChunkUpload {
+        key,
+        slot,
+        kind: UploadKind::RewriteResident,
+        meta: mgr.slots.chunk_meta[s],
+        node_base: 0,
+        nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
+        macro_words: mgr.slots.slot_macro[s].clone(),
+        ropes: Arc::<[NodeRopesGpu]>::from(Vec::<NodeRopesGpu>::new()),
+        colinfo_words: mgr.slots.slot_colinfo[s].clone(),
+        completes_residency: false,
+    })
+}
+
 
 #[inline]
 fn upload_bytes(u: &ChunkUpload) -> usize {
@@ -89,26 +126,74 @@ fn insert_sorted_by_center(q: &mut VecDeque<ChunkUpload>, u: ChunkUpload, center
 
 #[inline]
 fn uploads_len_total(mgr: &ChunkManager) -> usize {
-    mgr.uploads.uploads_rewrite.len() + mgr.uploads.uploads_active.len() + mgr.uploads.uploads_other.len()
+    mgr.uploads.slot_rewrite_q.len()
+        + mgr.uploads.uploads_rewrite.len()
+        + mgr.uploads.uploads_active.len()
+        + mgr.uploads.uploads_other.len()
 }
+
 
 pub fn take_all(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
     let mut out = Vec::new();
+
+    while let Some(slot) = mgr.uploads.slot_rewrite_q.pop_front() {
+        mgr.uploads.slot_rewrite_set.remove(&slot);
+        if let Some(u) = make_slot_rewrite_upload(mgr, slot) {
+            out.push(u);
+        }
+    }
+
     out.extend(mgr.uploads.uploads_rewrite.drain(..));
     out.extend(mgr.uploads.uploads_active.drain(..));
     out.extend(mgr.uploads.uploads_other.drain(..));
     out
 }
 
+
+// src/streaming/manager/uploads.rs
+
 pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
+    // GPU = graphics processing unit.
     let backlog = uploads_len_total(mgr);
 
     // Scale budgets with backlog a bit, but clamp to sane limits.
-    let max_uploads = (MAX_UPLOADS_PER_FRAME + backlog / 4).clamp(MAX_UPLOADS_PER_FRAME, 128);
-    let max_bytes   = (MAX_UPLOAD_BYTES_PER_FRAME + backlog * (256 << 10)).clamp(MAX_UPLOAD_BYTES_PER_FRAME, 128 << 20);
+    let max_uploads =
+        (MAX_UPLOADS_PER_FRAME + backlog / 4).clamp(MAX_UPLOADS_PER_FRAME, 128);
+    let max_bytes =
+        (MAX_UPLOAD_BYTES_PER_FRAME + backlog * (256 << 10)).clamp(MAX_UPLOAD_BYTES_PER_FRAME, 128 << 20);
 
     let mut out = Vec::new();
     let mut bytes = 0usize;
+
+    // ---------------------------------------------------------------------
+    // 0) SLOT REWRITES FIRST (deduped). This is what fixes the “trail”.
+    //     These are always RewriteResident uploads that refresh per-slot meta/macro/colinfo.
+    // ---------------------------------------------------------------------
+    while out.len() < max_uploads {
+        let Some(slot) = mgr.uploads.slot_rewrite_q.pop_front() else { break; };
+        mgr.uploads.slot_rewrite_set.remove(&slot);
+
+        let Some(u) = make_slot_rewrite_upload(mgr, slot) else {
+            continue;
+        };
+
+        let ub = upload_bytes(&u);
+
+        // Always allow at least ONE upload per frame even if it exceeds the byte budget.
+        if bytes + ub > max_bytes && !out.is_empty() {
+            // Put it back at the front so it stays highest priority next frame.
+            mgr.uploads.slot_rewrite_set.insert(slot);
+            mgr.uploads.slot_rewrite_q.push_front(slot);
+            break;
+        }
+
+        bytes += ub;
+        out.push(u);
+    }
+
+    // ---------------------------------------------------------------------
+    // 1) EXISTING BUDGETED UPLOADS (chunk-content rewrites, promotes, etc.)
+    // ---------------------------------------------------------------------
 
     // Rewrites are what makes edits “show up”.
     // Let rewrites take a big slice of the frame, scaling with backlog.

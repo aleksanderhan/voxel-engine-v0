@@ -424,26 +424,16 @@ pub fn unload_chunk(mgr: &mut ChunkManager, center: ChunkKey, key: ChunkKey) {
 
 fn enqueue_slot_rewrite(mgr: &mut ChunkManager, slot: usize) {
     let key = mgr.slots.slot_to_key[slot];
-    let slot_u32 = slot as u32;
 
-    // If this is a resident chunk, track that a rewrite upload is in flight.
+    // Track rewrite-in-flight for residents (used by eviction logic).
     if let Some(ChunkState::Resident(r)) = mgr.build.chunks.get_mut(&key) {
         r.rewrite_in_flight = true;
     }
 
-    super::uploads::enqueue(mgr, ChunkUpload {
-        key,
-        slot: slot_u32,
-        kind: UploadKind::RewriteResident,
-        meta: mgr.slots.chunk_meta[slot],
-        node_base: 0,
-        nodes: Arc::<[NodeGpu]>::from(Vec::<NodeGpu>::new()),
-        macro_words: mgr.slots.slot_macro[slot].clone(),
-        ropes: Arc::<[NodeRopesGpu]>::from(Vec::<NodeRopesGpu>::new()),
-        colinfo_words: mgr.slots.slot_colinfo[slot].clone(),
-        completes_residency: false,
-    });
+    // NEW: just mark the slot dirty; uploads::take_budgeted will materialize latest data.
+    super::uploads::mark_slot_rewrite(mgr, slot);
 }
+
 
 
 fn swap_slots_impl(mgr: &mut ChunkManager, a: usize, b: usize) {

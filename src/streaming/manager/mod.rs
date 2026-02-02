@@ -74,6 +74,9 @@ pub(crate) struct UploadState {
     pub uploads_rewrite: VecDeque<ChunkUpload>,
     pub uploads_active:  VecDeque<ChunkUpload>,
     pub uploads_other:   VecDeque<ChunkUpload>,
+
+    pub slot_rewrite_q: VecDeque<u32>,
+    pub slot_rewrite_set: HashSet<u32>,
 }
 
 /// Grid bucket.
@@ -159,6 +162,8 @@ impl ChunkManager {
                 uploads_rewrite: VecDeque::new(),
                 uploads_active:  VecDeque::new(),
                 uploads_other:   VecDeque::new(),
+                slot_rewrite_q: VecDeque::new(),
+                slot_rewrite_set: HashSet::default(),
             },
             grid: GridState {
                 grid_dirty: true,
