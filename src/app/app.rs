@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use glam::Vec3;
 
 use winit::{
     event::*,
@@ -100,6 +101,9 @@ pub struct App {
     // Streaming update throttle.
     last_stream_update: Instant,
     stream_period: Duration,
+
+    physics: crate::physics::Physics,
+    free_cam: bool,
 }
 
 impl App {
@@ -150,6 +154,13 @@ impl App {
 
         let clipmap = Clipmap::new();
 
+        let start_pos = Vec3::new(
+            (config::CHUNK_SIZE as f32 * config::VOXEL_SIZE_M_F32) * 0.5,
+            50.0,
+            -20.0,
+        );
+        let physics = crate::physics::Physics::new(start_pos);
+
         Self {
             window,
             start_time,
@@ -174,6 +185,8 @@ impl App {
             has_prev_view_proj: false,
             last_stream_update: Instant::now(),
             stream_period: Duration::from_millis(33), // 30 Hz
+            physics,
+            free_cam: false,
         }
     }
 
@@ -270,6 +283,40 @@ impl App {
 
     fn update_camera(&mut self, delta_seconds: f32) {
         let cpu_start = Instant::now();
+
+        if self.input.take_c_pressed() {
+            self.free_cam = !self.free_cam;
+
+            if self.free_cam {
+                // entering free cam: copy player view -> camera
+                let eye = self.physics.player.pos + self.physics.eye_offset;
+                self.camera.set_position(eye);
+                self.camera.set_yaw_pitch(self.physics.yaw, self.physics.pitch);
+            } else {
+                // leaving free cam: copy camera view -> player view
+                let (yaw, pitch) = self.camera.yaw_pitch();
+                self.physics.yaw = yaw;
+                self.physics.pitch = pitch;
+            }
+        }
+
+        let q = crate::physics::ChunkManagerQuery {
+            mgr: &self.chunks,
+            world: Some(self.world.as_ref()),
+        };
+
+        let (eye, forward) = if self.free_cam {
+            // free cam consumes mouse deltas inside camera.integrate_input()
+            self.physics.step_frame_player_only(delta_seconds, &q);
+            self.camera.integrate_input(&mut self.input, delta_seconds);
+            (self.camera.position(), self.camera.forward())
+        } else {
+            // player consumes mouse deltas inside physics.step_frame()
+            let eye = self.physics.step_frame(&mut self.input, delta_seconds, &q);
+            self.camera.set_position(eye);
+            self.camera.set_yaw_pitch(self.physics.yaw, self.physics.pitch);
+            (eye, self.camera.forward())
+        };
 
         self.camera.integrate_input(&mut self.input, delta_seconds);
         self.frame_index = self.frame_index.wrapping_add(1);

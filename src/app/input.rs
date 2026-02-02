@@ -14,6 +14,7 @@ pub struct KeyState {
     pub space: bool,
     pub alt: bool,
     pub shift: bool,
+    pub c: bool,
 }
 
 impl KeyState {
@@ -26,6 +27,7 @@ impl KeyState {
             KeyCode::Space => self.space = down,
             KeyCode::AltLeft | KeyCode::AltRight => self.alt = down,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => self.shift = down,
+            KeyCode::KeyC => self.c = down,
             _ => {}
         }
     }
@@ -37,6 +39,7 @@ pub struct InputState {
     pub focused: bool,
     pub mouse_dx: f32,
     pub mouse_dy: f32,
+    pub c_pressed: bool,
 }
 
 impl InputState {
@@ -75,6 +78,11 @@ impl InputState {
                 } = event
                 {
                     let down = *state == ElementState::Pressed;
+
+                    if down && *code == KeyCode::KeyC && !self.keys.c {
+                        self.c_pressed = true;
+                    }
+
                     self.keys.set(*code, down);
 
                     if down && *code == KeyCode::Escape {
@@ -97,5 +105,11 @@ impl InputState {
         self.mouse_dx = 0.0;
         self.mouse_dy = 0.0;
         (dx, dy)
+    }
+
+    pub fn take_c_pressed(&mut self) -> bool {
+        let v = self.c_pressed;
+        self.c_pressed = false;
+        v
     }
 }

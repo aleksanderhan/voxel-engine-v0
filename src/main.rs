@@ -5,6 +5,7 @@ mod render;
 mod streaming;
 mod svo;
 mod world;
+mod physics;
 
 use std::sync::Arc;
 use winit::{

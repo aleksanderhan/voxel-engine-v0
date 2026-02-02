@@ -109,4 +109,8 @@ impl Camera {
             pos: self.pos,
         }
     }
+
+    pub fn set_position(&mut self, p: glam::Vec3) { self.pos = p; }
+    pub fn set_yaw_pitch(&mut self, yaw: f32, pitch: f32) { self.yaw = yaw; self.pitch = pitch; }
+    pub fn yaw_pitch(&self) -> (f32, f32) { (self.yaw, self.pitch) }
 }
