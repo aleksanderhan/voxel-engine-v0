@@ -112,7 +112,7 @@ pub struct ChunkManager {
 
 impl ChunkManager {
     pub fn new(gen: Arc<WorldGen>) -> Self {
-        let cap = (config::MAX_IN_FLIGHT * 2).max(8);
+        let cap = (config::MAX_IN_FLIGHT * 8).max(64);
 
         let (tx_job, rx_job) = bounded::<BuildJob>(cap);
         let (tx_done, rx_done) = bounded::<BuildDone>(cap);

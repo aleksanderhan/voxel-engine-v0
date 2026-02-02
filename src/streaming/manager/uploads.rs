@@ -103,14 +103,17 @@ pub fn take_all(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
 pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
     let backlog = uploads_len_total(mgr);
 
-    let max_uploads = (MAX_UPLOADS_PER_FRAME + backlog / 4).clamp(MAX_UPLOADS_PER_FRAME, 32);
-    let max_bytes   = (MAX_UPLOAD_BYTES_PER_FRAME + backlog * (256 << 10)).clamp(MAX_UPLOAD_BYTES_PER_FRAME, 16 << 20);
+    // Scale budgets with backlog a bit, but clamp to sane limits.
+    let max_uploads = (MAX_UPLOADS_PER_FRAME + backlog / 4).clamp(MAX_UPLOADS_PER_FRAME, 128);
+    let max_bytes   = (MAX_UPLOAD_BYTES_PER_FRAME + backlog * (256 << 10)).clamp(MAX_UPLOAD_BYTES_PER_FRAME, 128 << 20);
 
     let mut out = Vec::new();
     let mut bytes = 0usize;
 
+    // Rewrites are what makes edits “show up”.
+    // Let rewrites take a big slice of the frame, scaling with backlog.
+    let rewrite_cap = ((max_uploads / 2).max(8)).min(64);
     let mut rewrites_taken = 0usize;
-    let rewrite_cap = 4;
 
     let mut pop_next = |mgr: &mut ChunkManager| -> Option<(u8, ChunkUpload)> {
         if rewrites_taken < rewrite_cap {
@@ -143,7 +146,8 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
             break;
         }
 
-        // priority gate
+        // Priority gate only applies to uploads that COMPLETE residency.
+        // (Rewrites should keep flowing even when the priority box isn’t ready.)
         if u.completes_residency {
             if let Some(center) = mgr.build.last_center {
                 let gate = !super::slots::priority_box_ready(mgr, center);
@@ -158,7 +162,7 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
             }
         }
 
-        // validate slot + update bases
+        // Validate slot + update bases.
         let slot = match mgr.build.chunks.get(&u.key) {
             Some(ChunkState::Resident(r)) => r.slot,
             Some(ChunkState::Uploading(up)) => up.slot,
@@ -171,6 +175,7 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
 
         let ub = upload_bytes(&u);
 
+        // Always allow at least ONE upload per frame even if it exceeds the byte budget.
         if bytes + ub > max_bytes && !out.is_empty() {
             push_back_same(mgr, which, u);
             break;
@@ -182,3 +187,4 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
 
     out
 }
+
