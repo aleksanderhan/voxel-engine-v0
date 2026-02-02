@@ -11,13 +11,13 @@ use crate::{
     render::gpu_types::{CameraGpu, OverlayGpu},
     streaming::ChunkUpload,
 };
-use bytemuck::{Pod, bytes_of, cast_slice};
+use bytemuck::{Pod, cast_slice};
 
 use bindgroups::{create_bind_groups, BindGroups};
 use buffers::{create_persistent_buffers, Buffers};
 use layout::{create_layouts, Layouts};
 use pipelines::{create_pipelines, Pipelines};
-use textures::{create_textures, half_dim, TextureSet};
+use textures::{create_textures, TextureSet};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuTimingsMs {

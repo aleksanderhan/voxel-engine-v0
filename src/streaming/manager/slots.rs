@@ -25,26 +25,6 @@ pub fn in_priority_box(mgr: &ChunkManager, center: ChunkKey, k: ChunkKey) -> boo
 }
 
 #[inline(always)]
-fn in_keep(mgr: &ChunkManager, center: ChunkKey, k: ChunkKey) -> bool {
-    let dx = k.x - center.x;
-    let dz = k.z - center.z;
-
-    if dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS {
-        return false;
-    }
-    if dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS {
-        return false;
-    }
-
-    let Some(ground_cy) = ground::ground_cy_for_column(mgr, k.x, k.z) else {
-        return false;
-    };
-
-    let dy = k.y - ground_cy;
-    dy >= y_band_min() && dy <= y_band_max()
-}
-
-#[inline(always)]
 pub fn is_gpu_ready(mgr: &ChunkManager, k: ChunkKey) -> bool {
     match mgr.build.chunks.get(&k) {
         Some(ChunkState::Resident(_)) => true,

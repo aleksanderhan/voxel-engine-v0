@@ -587,36 +587,6 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         }
     }
 
-    #[inline]
-    pub fn chunk_key_and_local_idx_from_world_vox(wx: i32, wy: i32, wz: i32) -> (ChunkKey, u32) {
-        let cs: i32 = config::CHUNK_SIZE as i32;   // 64
-        let cs_u: u32 = config::CHUNK_SIZE as u32; // 64
-
-        // Chunk coordinates in chunk units
-        let ck = ChunkKey {
-            x: wx.div_euclid(cs),
-            y: wy.div_euclid(cs),
-            z: wz.div_euclid(cs),
-        };
-
-        // Local voxel coordinates in [0..cs)
-        // rem_euclid is critical for negatives (e.g. -1 rem 64 => 63)
-        let lx = wx.rem_euclid(cs) as u32;
-        let ly = wy.rem_euclid(cs) as u32;
-        let lz = wz.rem_euclid(cs) as u32;
-
-        debug_assert!(lx < cs_u && ly < cs_u && lz < cs_u);
-
-        // Linear index matching idx3(side, x, y, z):
-        // idx = (y * side * side) + (z * side) + x
-        let idx = ly * cs_u * cs_u + lz * cs_u + lx;
-
-        debug_assert!(idx < cs_u * cs_u * cs_u);
-
-        (ck, idx)
-    }
-
-
     // -------------------------------------------------------------------------
     // Column top map (64x64): per (x,z), store top-most non-air voxel (y, mat)
     // packed u16: (mat8<<8) | y8, y8=255 means empty column

@@ -55,6 +55,10 @@ pub(crate) struct BuildState {
 
     pub rebuild_queue: VecDeque<ChunkKey>,
     pub rebuild_set: HashSet<ChunkKey>,
+    // needed to score heap inserts when center doesn't change
+    pub last_cam_fwd: Vec3,
+    // monotonically increasing tie-breaker so newer bumps win
+    pub heap_tie: u32,
 }
 
 /// Slot-residency bucket.
@@ -142,6 +146,8 @@ impl ChunkManager {
                 to_unload: Vec::new(),
                 rebuild_queue: VecDeque::new(),
                 rebuild_set: HashSet::default(),
+                last_cam_fwd: Vec3::Z, // or Vec3::ZERO
+                heap_tie: 0,
             },
             slots: SlotState {
                 slot_to_key: Vec::new(),
@@ -193,6 +199,9 @@ impl ChunkManager {
                 keep::compute_center( world.as_ref(), cam_pos_m)
             }
         };
+
+        self.build.last_cam_fwd = cam_fwd;
+
         
         // 2) ensure ground cache (only does real work when origin changes)
         ground::ensure_column_cache(self, world.as_ref(), center);

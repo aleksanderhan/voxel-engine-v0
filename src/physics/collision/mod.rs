@@ -23,14 +23,6 @@ pub trait WorldQuery {
     }
 }
 
-/// Small integer 3D coordinate helper (avoids pulling in glam::IVec3).
-#[derive(Clone, Copy, Debug)]
-pub struct IVec3i {
-    pub x: i32,
-    pub y: i32,
-    pub z: i32,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct WorldContact {
     pub cell: (i32, i32, i32), // static voxel coordinate (vx,vy,vz)

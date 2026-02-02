@@ -1,3 +1,3 @@
 mod lru;
 
-pub use lru::{CachedChunk, ChunkCache};
+pub use lru::{ChunkCache};

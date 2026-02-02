@@ -47,18 +47,19 @@ fn cancel_token(mgr: &mut ChunkManager, key: ChunkKey) -> Arc<AtomicBool> {
 }
 
 #[inline]
-fn queue_build_front(mgr: &mut ChunkManager, k: ChunkKey) {
-    if mgr.build.queued_set.contains(&k) {
-        if let Some(pos) = mgr.build.build_queue.iter().position(|x| *x == k) {
-            mgr.build.build_queue.remove(pos);
-            mgr.build.build_queue.push_front(k);
+#[inline]
+fn queue_build_front(mgr: &mut ChunkManager, center: ChunkKey, k: ChunkKey) {
+    // Ensure it is tracked as queued
+    match mgr.build.chunks.get(&k) {
+        Some(ChunkState::Queued) | Some(ChunkState::Building) | Some(ChunkState::Uploading(_)) | Some(ChunkState::Resident(_)) => {}
+        None => {
+            mgr.build.chunks.insert(k, ChunkState::Queued);
+            mgr.build.queued_set.insert(k);
         }
-        return;
     }
 
-    mgr.build.chunks.insert(k, ChunkState::Queued);
-    mgr.build.queued_set.insert(k);
-    mgr.build.build_queue.push_front(k);
+    // Big boost so it jumps ahead in the heap
+    heap_push(mgr, center, k, 100_000.0);
 }
 
 pub fn ensure_priority_box(mgr: &mut ChunkManager, center: ChunkKey) {
@@ -80,7 +81,7 @@ pub fn ensure_priority_box(mgr: &mut ChunkManager, center: ChunkKey) {
             | Some(ChunkState::Queued)
             | Some(ChunkState::Building) => {
                 if matches!(mgr.build.chunks.get(&k), Some(ChunkState::Queued)) {
-                    queue_build_front(mgr, k);
+                    queue_build_front(mgr, center, k);
                 }
             }
             None => {
@@ -91,7 +92,8 @@ pub fn ensure_priority_box(mgr: &mut ChunkManager, center: ChunkKey) {
 
                 let c = cancel_token(mgr, k);
                 c.store(false, AtomicOrdering::Relaxed);
-                queue_build_front(mgr, k);
+                queue_build_front(mgr, center, k);
+
             }
         }
     }
@@ -126,8 +128,9 @@ pub fn enqueue_active_ring(mgr: &mut ChunkManager, center: ChunkKey) {
 
                 mgr.build.chunks.insert(k, ChunkState::Queued);
                 if mgr.build.queued_set.insert(k) {
-                    mgr.build.build_queue.push_back(k);
+                    heap_push(mgr, center, k, 0.0);
                 }
+
             }
         }
     }
@@ -415,6 +418,27 @@ fn make_prio(score: f32) -> u32 {
     u32::MAX - ord
 }
 
+#[inline]
+fn heap_push(mgr: &mut ChunkManager, center: ChunkKey, k: ChunkKey, boost: f32) {
+    let cam_fwd = mgr.build.last_cam_fwd;
+    let mut s = priority_score(k, center, cam_fwd) - boost;
+
+    if super::slots::in_priority_box(mgr, center, k) {
+        s -= 20_000.0;
+    } else if super::keep::in_active_xz(center, k) {
+        s -= 10_000.0;
+    }
+
+    mgr.build.heap_tie = mgr.build.heap_tie.wrapping_add(1).max(1);
+
+    mgr.build.build_heap.push(HeapItem {
+        prio: make_prio(s),
+        tie: mgr.build.heap_tie,
+        key: k,
+    });
+}
+
+
 pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec3) {
     // Gather keys
     let mut keys: Vec<ChunkKey> =
@@ -520,15 +544,19 @@ pub fn request_edit_refresh(mgr: &mut ChunkManager, key: ChunkKey) {
     // Otherwise, future promote-from-cache can resurrect stale pre-edit data.
     mgr.cache.remove(&key);
 
+    // We might be called before the first update() publishes a center.
+    // Use last_center if available; otherwise fall back to the edited chunk itself.
+    let center = mgr.build.last_center.unwrap_or(key);
+
     match mgr.build.chunks.get(&key) {
         // already has a slot -> rebuild in place
         Some(ChunkState::Resident(_)) | Some(ChunkState::Uploading(_)) => {
             request_rebuild(mgr, key);
         }
 
-        // already queued -> boost priority (front)
+        // already queued -> boost priority (front / heap bump)
         Some(ChunkState::Queued) => {
-            queue_build_front(mgr, key);
+            queue_build_front(mgr, center, key);
         }
 
         // already building -> do nothing; completion will apply edits
@@ -538,7 +566,7 @@ pub fn request_edit_refresh(mgr: &mut ChunkManager, key: ChunkKey) {
         None => {
             let c = cancel_token(mgr, key);
             c.store(false, AtomicOrdering::Relaxed);
-            queue_build_front(mgr, key);
+            queue_build_front(mgr, center, key);
         }
     }
 }

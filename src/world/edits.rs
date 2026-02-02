@@ -158,40 +158,4 @@ impl EditStore {
         }
     }
 
-    /// Optional: clear all overrides in a chunk (handy for debugging).
-    pub fn clear_chunk(&self, key: ChunkKey) {
-        let mut map = self.map_write();
-        map.remove(&key);
-    }
-}
-
-/// Convert WORLD VOXEL coords -> (ChunkKey, chunk-local linear idx).
-///
-/// IMPORTANT:
-/// - `div_euclid` + `rem_euclid` handle negative coordinates correctly.
-/// - idx layout matches builder.rs: idx3(side, x, y, z) => (y*side*side) + (z*side) + x
-#[inline]
-pub fn chunk_key_and_local_idx_from_world_vox(wx: i32, wy: i32, wz: i32) -> (ChunkKey, u32) {
-    let cs: i32 = config::CHUNK_SIZE as i32; // e.g. 64
-    let cs_u: u32 = config::CHUNK_SIZE as u32;
-
-    // Chunk coordinates in chunk units
-    let ck = ChunkKey {
-        x: wx.div_euclid(cs),
-        y: wy.div_euclid(cs),
-        z: wz.div_euclid(cs),
-    };
-
-    // Local voxel coordinates in [0..cs)
-    let lx = wx.rem_euclid(cs) as u32;
-    let ly = wy.rem_euclid(cs) as u32;
-    let lz = wz.rem_euclid(cs) as u32;
-
-    debug_assert!(lx < cs_u && ly < cs_u && lz < cs_u);
-
-    let idx = ly * cs_u * cs_u + lz * cs_u + lx;
-
-    debug_assert!(idx < cs_u * cs_u * cs_u);
-
-    (ck, idx)
 }
