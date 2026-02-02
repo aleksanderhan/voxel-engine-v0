@@ -1,6 +1,7 @@
 // src/shaders/blit.wgsl
 // ---------------------
-// Minimal fullscreen blit + tiny HUD (FPS) optimized for speed:
+// Minimal fullscreen blit + tiny HUD (FPS) + centered crosshair.
+// Optimized for speed:
 // A) No digit work unless pixel is inside HUD rect
 // B) HUD layout + digits are precomputed on CPU and passed in a uniform
 // C) Digit masks are a LUT (no if-chain)
@@ -29,7 +30,6 @@ struct Overlay {
 };
 @group(0) @binding(2) var<uniform> overlay : Overlay;
 
-
 // -----------------------------------------------------------------------------
 // 3x5 digit font helpers (LUT)
 // -----------------------------------------------------------------------------
@@ -51,7 +51,7 @@ fn digit_mask(d: u32) -> u32 {
 }
 
 fn mask_bit(mask: u32, x: u32, y: u32) -> bool {
-  let bit = y * 3u + x;           // x in [0..2], y in [0..4]
+  let bit = y * 3u + x; // x in [0..2], y in [0..4]
   return ((mask >> bit) & 1u) != 0u;
 }
 
@@ -90,7 +90,7 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VSOut {
 }
 
 // -----------------------------------------------------------------------------
-// Fragment shader: sample + tonemap + FPS HUD
+// Fragment shader: sample + tonemap + FPS HUD + crosshair
 // -----------------------------------------------------------------------------
 
 @fragment
@@ -119,7 +119,7 @@ fn fs_main(
     let local_y = px.y - oy;
 
     let scale   = overlay.scale;
-    let stride  = overlay.stride;      // digit_w + gap
+    let stride  = overlay.stride; // digit_w + gap
     let digit_w = 3u * scale;
 
     // digit_i: 0..3 left->right
@@ -130,12 +130,12 @@ fn fs_main(
 
     // inside digit area (not gap) and in range
     if (digit_i < 4u && in_x < digit_w) {
-      let cell_x = in_x    / scale;    // 0..2
-      let cell_y = local_y / scale;    // 0..4
+      let cell_x = in_x    / scale; // 0..2
+      let cell_y = local_y / scale; // 0..4
 
       if (cell_y < 5u) {
         // thousands..ones left->right: digit_i=0 => d3, digit_i=3 => d0
-        let which = 3u - digit_i;      // maps to packed index (0..3)
+        let which = 3u - digit_i; // maps to packed index (0..3)
         let dig   = unpack_digit(overlay.digits_packed, which);
         let m     = digit_mask(dig);
 
@@ -143,6 +143,35 @@ fn fs_main(
           rgb = vec3<f32>(1.0, 1.0, 1.0);
         }
       }
+    }
+  }
+
+  // ---- Crosshair (present-space, centered) ----
+  // Assumes `img` is the presented/composited output (so its dimensions match screen).
+  // If `img` is render-res instead of present-res, you should pass present dims via uniform
+  // and use those instead.
+  let dims = textureDimensions(img);
+  let cx = i32(dims.x) / 2;
+  let cy = i32(dims.y) / 2;
+
+  let xi = i32(frag_pos.x);
+  let yi = i32(frag_pos.y);
+
+  // Tuning knobs (pixels)
+  let half_len  : i32 = 10; // arm length
+  let thickness : i32 = 1;  // line half-thickness (1 => 3px wide)
+  let gap       : i32 = 3;  // empty center gap (set 0 for a solid center)
+
+  let dx = abs(xi - cx);
+  let dy = abs(yi - cy);
+
+  // Tight early reject for speed
+  if (dx <= half_len && dy <= half_len) {
+    let on_vert = (dx <= thickness) && (dy <= half_len) && (dy >= gap);
+    let on_horz = (dy <= thickness) && (dx <= half_len) && (dx >= gap);
+
+    if (on_vert || on_horz) {
+      rgb = vec3<f32>(1.0, 1.0, 1.0);
     }
   }
 
