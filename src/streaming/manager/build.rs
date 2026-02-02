@@ -164,7 +164,17 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
     let mut attempts = 0usize;
     let max_attempts = mgr.build.build_heap.len().max(1);
 
-        // Also dispatch rebuilds for already-slotted chunks (no state changes).
+    // Reserve some capacity so edits (rebuilds) don’t sit behind streaming.
+    let reserve_for_rebuilds = 2usize;
+    let rebuild_pending = !mgr.build.rebuild_queue.is_empty();
+    let max_normal_in_flight = if rebuild_pending {
+        config::MAX_IN_FLIGHT.saturating_sub(reserve_for_rebuilds).max(1)
+    } else {
+        config::MAX_IN_FLIGHT
+    };
+
+
+    // Also dispatch rebuilds for already-slotted chunks (no state changes).
     while mgr.build.in_flight < config::MAX_IN_FLIGHT {
         let Some(k) = mgr.build.rebuild_queue.pop_front() else { break; };
         mgr.build.rebuild_set.remove(&k);
@@ -199,7 +209,7 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
     }
 
 
-    while mgr.build.in_flight < config::MAX_IN_FLIGHT && attempts < max_attempts {
+    while mgr.build.in_flight < max_normal_in_flight && attempts < max_attempts {
         attempts += 1;
 
         let Some(item) = mgr.build.build_heap.pop() else { break; };

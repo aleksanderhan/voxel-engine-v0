@@ -706,42 +706,6 @@ pub fn replace_chunk_contents(
         (new_base, need, false)
     };
 
-    // If reusing capacity and the new build is smaller, pad the upload buffers to alloc_cap.
-    // This keeps GPU meta/node_count consistent with what's actually in the arena allocation.
-    if pad_to_cap && need < alloc_cap {
-        let target = alloc_cap as usize;
-
-        // Pad nodes with harmless leaves (AIR leaf is fine; they will be unreachable).
-        let mut v_nodes = nodes.as_ref().to_vec();
-        v_nodes.reserve(target.saturating_sub(v_nodes.len()));
-        while v_nodes.len() < target {
-            v_nodes.push(NodeGpu {
-                child_base: 0xFFFF_FFFF, // LEAF
-                child_mask: 0,
-                material: 0,             // AIR
-                key: 0,
-            });
-        }
-        nodes = v_nodes.into();
-
-        // Pad ropes with invalids.
-        let mut v_ropes = ropes.as_ref().to_vec();
-        v_ropes.reserve(target.saturating_sub(v_ropes.len()));
-        while v_ropes.len() < target {
-            v_ropes.push(NodeRopesGpu {
-                px: 0xFFFF_FFFF,
-                nx: 0xFFFF_FFFF,
-                py: 0xFFFF_FFFF,
-                ny: 0xFFFF_FFFF,
-                pz: 0xFFFF_FFFF,
-                nz: 0xFFFF_FFFF,
-                _pad0: 0,
-                _pad1: 0,
-            });
-        }
-        ropes = v_ropes.into();
-    }
-
     // Now it's safe to update slot-owned CPU payloads.
     mgr.slots.slot_macro[s]   = macro_words.clone();
     mgr.slots.slot_colinfo[s] = colinfo_words.clone();
@@ -749,7 +713,7 @@ pub fn replace_chunk_contents(
     // Update meta. IMPORTANT: meta.node_count must match the uploaded buffer length and arena allocation capacity.
     let mut meta = mgr.slots.chunk_meta[s];
     meta.node_base = node_base;
-    meta.node_count = alloc_cap;
+    meta.node_count = need;
     meta.macro_base = slot * MACRO_WORDS_PER_CHUNK;
     meta.colinfo_base = slot * COLINFO_WORDS_PER_CHUNK;
     mgr.slots.chunk_meta[s] = meta;
