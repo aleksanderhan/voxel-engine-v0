@@ -92,7 +92,13 @@ fn main_primary(
              use_vox),
       (use_vox || use_hf));
 
-  let col = apply_fog(surface, ro, rd, t_scene, sky);
+  let hit_any = (use_vox || use_hf);
+  let col = select(
+    sky, // no hit → do NOT fog the sky
+    apply_fog(surface, ro, rd, t_scene, sky), // hit → fog geometry toward sky
+    hit_any
+  );
+
 
   textureStore(color_img, ip, vec4<f32>(col, 1.0));
   textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));

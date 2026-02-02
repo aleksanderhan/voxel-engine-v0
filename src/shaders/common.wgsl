@@ -90,7 +90,6 @@ const GODRAY_EDGE1       : f32 = 0.035;
 
 const GODRAY_BASE_HAZE       : f32 = 0.02;
 const GODRAY_HAZE_NEAR_FADE  : f32 = 18.0;
-const CLOUD_GODRAY_W         : f32 = 0.50;
 
 const GODRAY_TV_CUTOFF   : f32 = 0.02;
 
@@ -117,35 +116,54 @@ const PHASE_G     : f32 = 0.15;
 const PHASE_MIE_W : f32 = 0.20;
 
 //// --------------------------------------------------------------------------
-//// Fractal clouds
+//// Clouds (cheap volumetric slab)
 //// --------------------------------------------------------------------------
 
-const CLOUD_H        : f32      = 200.0;
-const CLOUD_UV_SCALE : f32      = 0.002;
+// Vertical slab in meters
+const CLOUD_BASE_H : f32 = 170.0;
+const CLOUD_TOP_H  : f32 = 250.0;
+
+// Horizontal scale and wind
+const CLOUD_UV_SCALE : f32       = 0.0016;
 const CLOUD_WIND     : vec2<f32> = vec2<f32>(0.020, 0.012);
 
-const CLOUD_COVERAGE : f32 = 0.45;
-const CLOUD_SOFTNESS : f32 = 0.10;
+// Coverage thresholding (raise coverage => fewer clouds)
+const CLOUD_COVERAGE : f32 = 0.40; 
+const CLOUD_SOFTNESS : f32 = 0.08;
 
+// Density + shaping
+const CLOUD_DENSITY     : f32 = 0.042; // extinction scale (bigger = thicker/darker)
+const CLOUD_PUFF_POW    : f32 = 1.8;   // >1 makes denser cores, airier edges
+const CLOUD_DETAIL_W    : f32 = 0.35;  // detail noise weight
+
+// March quality
+const CLOUD_STEPS_VIEW  : u32 = 8u;  // view ray steps in sky
+const CLOUD_STEPS_LIGHT : u32 = 4u;  // sun-light shadow steps
+
+// Horizon fade (keep)
 const CLOUD_HORIZON_Y0 : f32 = 0.02;
 const CLOUD_HORIZON_Y1 : f32 = 0.25;
 
-// How clouds darken the SKY appearance (keep low)
-const CLOUD_SKY_DARKEN : f32 = 0.2;
-
-// How much clouds attenuate SUNLIGHT hitting the world (can be much higher)
-const CLOUD_SHADOW_ABSORB   : f32 = 6.0;   // try 4..12
-const CLOUD_SHADOW_STRENGTH : f32 = 0.8;   // 0..1 (mix control)
-
-
+// Appearance knobs
 const CLOUD_BASE_COL   : vec3<f32> = vec3<f32>(0.72, 0.74, 0.76);
 const CLOUD_SILVER_POW : f32       = 8.0;
 const CLOUD_SILVER_STR : f32       = 0.6;
-const CLOUD_BLEND      : f32       = 0.85;
 
+// How clouds darken SKY (keep low)
+const CLOUD_SKY_DARKEN : f32 = 0.2;
+
+// How much clouds attenuate SUNLIGHT hitting the world
+const CLOUD_SHADOW_ABSORB   : f32 = 6.0;
+const CLOUD_SHADOW_STRENGTH : f32 = 0.8;
+
+// Sun-disc dim behavior (keep)
 const CLOUD_DIM_SUN_DISC            : bool = true;
 const CLOUD_SUN_DISC_ABSORB_SCALE   : f32  = 0.8;
-const CLOUD_SUN_DISC_ABSORB: f32 = 1.8; // try 1.0..3.0
+const CLOUD_SUN_DISC_ABSORB: f32 = 1.8;
+
+// Godray coupling (keep)
+const CLOUD_GODRAY_W : f32 = 0.50;
+
 
 const SKY_EXPOSURE : f32 = 0.40;
 

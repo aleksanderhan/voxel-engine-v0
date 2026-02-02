@@ -5,6 +5,7 @@
 // - Full-res temporal accumulation (history is full-res ping-pong texture)
 // - Stores: RGB = compressed godray, A = depth proxy (nearest depth)
 // -----------------------------------------------------------------------------
+
 fn approx_pow_0p75(x: f32) -> f32 {
   let y = clamp(x, 0.0, 1.0);
   // x^0.75 is between x^1 and x^0.5; blend is a decent cheap approximation
@@ -18,6 +19,14 @@ fn approx_pow_0p55(x: f32) -> f32 {
   return mix(s, y, 0.20);
 }
 
+// Cheap exp(-x) for x >= 0.
+// Fast monotone rational approximation (no native exp needed in the raymarch loop).
+fn exp_neg_fast(x_in: f32) -> f32 {
+  let x = max(x_in, 0.0);
+  let x2 = x * x;
+  // Tuned-ish coefficient; adjust ~0.45..0.55 if you want slightly different bias.
+  return 1.0 / (1.0 + x + 0.48 * x2);
+}
 
 fn godray_steps_for_tend(t_end: f32) -> u32 {
   // raw desired steps
@@ -58,6 +67,66 @@ fn godray_integrate_1(
   var sh: f32 = 0.0;
   var sum = vec3<f32>(0.0);
 
+  // ---------------------------------------------------------------------------
+  // Incremental view-fog transmittance (kills per-step fog_transmittance_godray)
+  //
+  // We maintain Tv_acc = transmittance from ro to the *current march position*.
+  // The original analytic call computed Tv(ro,rd,ti) each step; here we update
+  // it with a recurrence, using only cheap ops per step + a few exp() per pixel.
+  //
+  // Assumes the view-fog model used in fog_transmittance_godray is height fog:
+  //   density(y) ~ exp(-k*y)   (k = FOG_HEIGHT_FALLOFF)
+  // Optical depth between t0..t1:
+  //   OD = base * ∫ exp(-k*(y0 + dy*t)) dt
+  //
+  // We evaluate OD over two subsegments per dt:
+  //   (step start -> sample point) and (sample point -> step end),
+  // so Tv at the jittered sample matches your original (0.5 + j_phase) offset.
+  // ---------------------------------------------------------------------------
+  let k  = FOG_HEIGHT_FALLOFF;
+  let y0 = ro.y;
+  let dy = rd.y;
+
+  // Sample location within the step: (i + (0.5 + j_phase)) * dt
+  // Clamp for safety; j_phase is in ~[-0.5,0.5] so f is usually ~[0,1].
+  let f = clamp(0.5 + j_phase, 0.0, 1.0);
+  let one_m_f = 1.0 - f;
+
+  var Tv_acc: f32 = 1.0;
+
+  let horiz = abs(dy) < 1e-4;
+
+  // Horizontal case constants
+  var dens_const: f32 = 0.0;
+  var trans_to_sample_h: f32 = 1.0;
+  var trans_to_end_h: f32 = 1.0;
+
+  // General case constants (height fog)
+  var inv_kdy: f32 = 0.0;
+  var B: f32 = 0.0;
+  var r_f: f32 = 1.0;
+  var r_rem: f32 = 1.0;
+
+  if (horiz) {
+    // density along ray is constant (in this height-fog model)
+    let a = exp(-k * y0);             // one exp OUTSIDE the loop
+    dens_const = base * a;
+
+    // OD = dens_const * segment_length
+    trans_to_sample_h = exp_neg_fast(dens_const * dt * f);
+    trans_to_end_h    = exp_neg_fast(dens_const * dt * one_m_f);
+  } else {
+    inv_kdy = 1.0 / (k * dy);
+
+    // B(t) = exp(-k*(y0 + dy*t))
+    B = exp(-k * y0);                 // B at t = 0, one exp OUTSIDE loop
+
+    // Per-pixel constants for the jittered split within dt
+    r_f   = exp(-k * dy * dt * f);        // exp once per pixel
+    r_rem = exp(-k * dy * dt * one_m_f);  // exp once per pixel
+  }
+  // ---------------------------------------------------------------------------
+
   var Ts_geom: f32 = 1.0;
   for (var i: u32 = 0u; i < steps; i = i + 1u) {
     let ti = (f32(i) + 0.5 + j_phase) * dt;
@@ -67,13 +136,25 @@ fn godray_integrate_1(
 
     let p  = ro + rd * ti;
 
-    let Tv = fog_transmittance_godray(ro, rd, ti);
+    // ---- Incremental Tv at the sample point (replaces fog_transmittance_godray) ----
+    if (horiz) {
+      // step start -> sample point
+      Tv_acc *= trans_to_sample_h;
+    } else {
+      // step start B -> sample point B_s
+      let B_s = B * r_f;
+      let d_od = base * (B - B_s) * inv_kdy;          // should be >= 0
+      Tv_acc *= exp_neg_fast(max(d_od, 0.0));
+    }
+
+    let Tv = Tv_acc;
     if (Tv < GODRAY_TV_CUTOFF) { break; }
+    // ---------------------------------------------------------------------------
 
     if ((i & 3u) == 0u) {           // every 4 steps
       Ts_geom = sun_transmittance_geom_only(p, SUN_DIR);
     }
-    let Tc      = cloud_sun_transmittance_fast(p, SUN_DIR);
+    let Tc      = cloud_sun_transmittance_godray(p, SUN_DIR);
 
     let Tc_vol  = mix(1.0, Tc, CLOUD_GODRAY_W);
 
@@ -113,6 +194,20 @@ fn godray_integrate_1(
 
     let w = clamp(haze + (1.0 - haze) * (shaft * shaft_sun_gate), 0.0, 1.0);
     sum += common_factor * view_gate * edge_boost * (ts * w);
+
+    // ---- Finish advancing Tv_acc to end of this dt, and advance B ----
+    if (horiz) {
+      // sample point -> step end
+      Tv_acc *= trans_to_end_h;
+    } else {
+      // sample point B_s -> step end B_e
+      let B_s  = B * r_f;
+      let B_e  = B_s * r_rem;
+      let d_od2 = base * (B_s - B_e) * inv_kdy;        // should be >= 0
+      Tv_acc *= exp_neg_fast(max(d_od2, 0.0));
+      B = B_e;
+    }
+    // ---------------------------------------------------------------------------
   }
 
   var g = sum * GODRAY_ENERGY_BOOST;

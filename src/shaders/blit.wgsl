@@ -101,9 +101,7 @@ fn fs_main(
 
   // Sample the renderer's final output texture.
   let c = textureSample(img, samp, uv);
-
-  // Simple tonemap-ish curve: c / (c + 1)
-  var rgb = c.rgb / (c.rgb + vec3<f32>(1.0));
+  var rgb = c.rgb; // no tonemap here
 
   // ---- FPS overlay ----
   // Early bounds test: if not inside the HUD rect, do nothing (fast path).
