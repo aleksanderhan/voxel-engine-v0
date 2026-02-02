@@ -1,6 +1,7 @@
 // src/streaming/types.rs
 use std::sync::{Arc, atomic::AtomicBool};
 
+use crate::world::edits::EditEntry;
 use crate::render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu};
 
 pub const INVALID_U32: u32 = 0xFFFF_FFFF;
@@ -53,12 +54,14 @@ pub struct Resident {
     pub slot: u32,
     pub node_base: u32,
     pub node_count: u32,
+    pub rewrite_in_flight: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct BuildJob {
     pub key: ChunkKey,
     pub cancel: Arc<AtomicBool>,
+    pub edits: Arc<[EditEntry]>,
 }
 
 pub struct BuildDone {
@@ -71,9 +74,16 @@ pub struct BuildDone {
     pub colinfo_words: Vec<u32>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum UploadKind {
+    PromoteToResident, // new chunk becoming resident
+    RewriteResident,   // resident chunk being refreshed
+}
+
 pub struct ChunkUpload {
     pub key: ChunkKey,
     pub slot: u32,
+    pub kind: UploadKind,
     pub meta: ChunkMetaGpu,
 
     pub node_base: u32,

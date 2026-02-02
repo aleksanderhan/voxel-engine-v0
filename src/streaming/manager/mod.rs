@@ -1,5 +1,5 @@
 
-mod build;
+pub mod build;
 mod grid;
 mod slots;
 mod stats;
@@ -8,24 +8,23 @@ mod ground;
 mod keep;
 mod uploads;
 
-pub(crate) use slots::assert_slot_invariants;
 
 use std::{
     collections::{VecDeque, BinaryHeap},
     mem::size_of,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::AtomicBool,
         Arc,
     },
 };
 
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use glam::Vec3;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::app::config;
 use crate::{
-    render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu},
+    render::gpu_types::{ChunkMetaGpu, NodeGpu},
     world::WorldGen,
     streaming::types::StreamStats,
 };
@@ -53,6 +52,12 @@ pub(crate) struct BuildState {
     pub last_center: Option<ChunkKey>,
     pub to_unload: Vec<ChunkKey>,
 
+    pub rebuild_queue: VecDeque<ChunkKey>,
+    pub rebuild_set: HashSet<ChunkKey>,
+    // needed to score heap inserts when center doesn't change
+    pub last_cam_fwd: Vec3,
+    // monotonically increasing tie-breaker so newer bumps win
+    pub heap_tie: u32,
 }
 
 /// Slot-residency bucket.
@@ -100,6 +105,9 @@ pub struct ChunkManager {
 
     pub(crate) arena: NodeArena,
     pub(crate) cache: ChunkCache,
+
+    pub(crate) pinned: HashSet<ChunkKey>,
+    pub(crate) edits: Arc<crate::world::edits::EditStore>,
 }
 
 impl ChunkManager {
@@ -109,7 +117,8 @@ impl ChunkManager {
         let (tx_job, rx_job) = bounded::<BuildJob>(cap);
         let (tx_done, rx_done) = bounded::<BuildDone>(cap);
 
-        spawn_workers(gen, rx_job, tx_done);
+        let edits = Arc::new(crate::world::edits::EditStore::new());
+        spawn_workers(gen,  rx_job, tx_done);
 
         let node_capacity = (config::NODE_BUDGET_BYTES / size_of::<NodeGpu>()) as u32;
 
@@ -134,6 +143,10 @@ impl ChunkManager {
                 in_flight: 0,
                 last_center: None,
                 to_unload: Vec::new(),
+                rebuild_queue: VecDeque::new(),
+                rebuild_set: HashSet::default(),
+                last_cam_fwd: Vec3::Z, // or Vec3::ZERO
+                heap_tie: 0,
             },
             slots: SlotState {
                 slot_to_key: Vec::new(),
@@ -158,6 +171,9 @@ impl ChunkManager {
 
             arena: NodeArena::new(node_capacity),
             cache: ChunkCache::new(),
+
+            pinned: HashSet::default(),
+            edits,
         }
     }
 
@@ -182,6 +198,9 @@ impl ChunkManager {
                 keep::compute_center( world.as_ref(), cam_pos_m)
             }
         };
+
+        self.build.last_cam_fwd = cam_fwd;
+
         
         // 2) ensure ground cache (only does real work when origin changes)
         ground::ensure_column_cache(self, world.as_ref(), center);

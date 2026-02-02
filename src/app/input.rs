@@ -1,6 +1,6 @@
 // src/input.rs
 use winit::{
-    event::{DeviceEvent, ElementState, KeyEvent, WindowEvent},
+    event::{DeviceEvent, ElementState, KeyEvent, WindowEvent, MouseScrollDelta, MouseButton},
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window},
 };
@@ -40,6 +40,9 @@ pub struct InputState {
     pub mouse_dx: f32,
     pub mouse_dy: f32,
     pub c_pressed: bool,
+    pub wheel_steps: i32,
+    pub lmb_pressed: bool,
+    pub lmb_down: bool,
 }
 
 impl InputState {
@@ -95,6 +98,28 @@ impl InputState {
                 false
             }
 
+            WindowEvent::MouseInput { button, state, .. } => {
+                if *button == MouseButton::Left {
+                    let down = *state == ElementState::Pressed;
+                    if down && !self.lmb_down {
+                        self.lmb_pressed = true; // rising edge
+                    }
+                    self.lmb_down = down;
+                    return true;
+                }
+                false
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                // convert to "notches"
+                let steps = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (*y).round() as i32,
+                    MouseScrollDelta::PixelDelta(p) => (p.y / 120.0).round() as i32, // common Windows scale
+                };
+                self.wheel_steps += steps;
+                true
+            }
+
             _ => false,
         }
     }
@@ -110,6 +135,18 @@ impl InputState {
     pub fn take_c_pressed(&mut self) -> bool {
         let v = self.c_pressed;
         self.c_pressed = false;
+        v
+    }
+
+    pub fn take_wheel_steps(&mut self) -> i32 {
+        let v = self.wheel_steps;
+        self.wheel_steps = 0;
+        v
+    }
+
+    pub fn take_lmb_pressed(&mut self) -> bool {
+        let v = self.lmb_pressed;
+        self.lmb_pressed = false;
         v
     }
 }

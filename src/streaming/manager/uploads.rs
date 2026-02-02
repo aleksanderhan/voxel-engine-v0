@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, mem::size_of, sync::Arc};
+use std::{collections::VecDeque, mem::size_of};
 use crate::{render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu}};
 use crate::app::config;
 use crate::streaming::types::*;
@@ -24,6 +24,17 @@ pub fn upload_dist_score(k: ChunkKey, c: ChunkKey) -> f32 {
 }
 
 pub fn enqueue(mgr: &mut ChunkManager, u: ChunkUpload) {
+    #[cfg(debug_assertions)]
+    {
+        let expect = matches!(u.kind, UploadKind::PromoteToResident);
+        debug_assert_eq!(
+            u.completes_residency, expect,
+            "ChunkUpload kind/completes_residency mismatch: key={:?} kind={:?} completes_residency={}",
+            u.key, u.kind, u.completes_residency
+        );
+    }
+
+
     if !u.completes_residency {
         mgr.uploads.uploads_rewrite.push_front(u);
         return;
@@ -114,7 +125,7 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
     };
 
     // NOTE: push *back* so we don't immediately re-pop the same blocked item.
-    let mut push_back_same = |mgr: &mut ChunkManager, which: u8, u: ChunkUpload| {
+    let push_back_same = |mgr: &mut ChunkManager, which: u8, u: ChunkUpload| {
         match which {
             0 => mgr.uploads.uploads_rewrite.push_back(u),
             1 => mgr.uploads.uploads_active.push_back(u),

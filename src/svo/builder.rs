@@ -10,6 +10,7 @@ use crate::{
         WorldGen,
     },
 };
+use crate::world::edits::EditEntry;
 
 use super::mips::{build_max_mip_inplace, build_minmax_mip_inplace, MaxMipView, MinMaxMipView};
 
@@ -350,6 +351,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     chunk_size: u32,
     cancel: &AtomicBool,
     scratch: &mut BuildScratch,
+    edits: &[EditEntry],
 ) -> (Vec<NodeGpu>, Vec<u32>, Vec<NodeRopesGpu>, Vec<u32>) {
     if should_cancel(cancel) {
         return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -511,8 +513,8 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     // -------------------------------------------------------------------------
     BuildScratch::ensure_3d_u32(&mut scratch.material, side, AIR);
 
+    // NOTE: we will rebuild col_top_* AFTER edits are applied
     BuildScratch::ensure_coltop(&mut scratch.col_top_y, &mut scratch.col_top_mat, side);
-
 
     let dirt_depth = 3 * vpm;
 
@@ -540,13 +542,47 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
                 let i3 = idx3(side, lx as usize, ly as usize, lz as usize);
                 scratch.material[i3] = m;
+            }
+        }
+    }
 
-                //track top-most non-air for this (x,z) column
+    // -------------------------------------------------------------------------
+    // Apply per-voxel overrides (edits)
+    // edits[].idx is a linear 64^3 index into scratch.material
+    // -------------------------------------------------------------------------
+    for e in edits {
+        let idx = e.idx as usize;
+        if idx < scratch.material.len() {
+            scratch.material[idx] = e.mat;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Rebuild per-column top-most non-air AFTER edits are applied.
+    // For each (x,z), find highest y where material != AIR.
+    // -------------------------------------------------------------------------
+    scratch.col_top_y.fill(255);
+    scratch.col_top_mat.fill(0);
+
+    for lz in 0..cs_i {
+        for lx in 0..cs_i {
+            let col = idx2(side, lx as usize, lz as usize);
+
+            let mut top_y: u8 = 255;
+            let mut top_mat: u8 = 0;
+
+            // scan upward; last non-air wins (highest y)
+            for ly in 0..cs_i {
+                let i3 = idx3(side, lx as usize, ly as usize, lz as usize);
+                let m = scratch.material[i3];
                 if m != AIR {
-                    scratch.col_top_y[col] = ly as u8;            // last non-air wins => highest y
-                    scratch.col_top_mat[col] = (m & 0xFF) as u8;  // pack only low 8 bits
+                    top_y = ly as u8;
+                    top_mat = (m & 0xFF) as u8;
                 }
             }
+
+            scratch.col_top_y[col] = top_y;
+            scratch.col_top_mat[col] = top_mat;
         }
     }
 

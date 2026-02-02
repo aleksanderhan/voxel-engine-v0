@@ -51,6 +51,7 @@ pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Se
                         config::CHUNK_SIZE,
                         job.cancel.as_ref(),
                         &mut scratch,
+                        &job.edits,
                     );
 
                 let canceled = job.cancel.load(Ordering::Relaxed);

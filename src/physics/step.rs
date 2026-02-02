@@ -4,7 +4,6 @@ use rayon::prelude::*;
 
 use crate::app::InputState;
 
-use crate::app::config;
 use super::{
     collision::{
         WorldQuery

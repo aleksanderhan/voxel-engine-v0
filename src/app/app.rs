@@ -27,6 +27,7 @@ use crate::{
     streaming::ChunkManager,
     world::WorldGen,
 };
+use crate::world::materials::{AIR, DIRT, STONE, WOOD};
 
 pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
     let mut app = App::new(window).await;
@@ -104,7 +105,18 @@ pub struct App {
 
     physics: crate::physics::Physics,
     free_cam: bool,
+
+    edit_mode: usize,
+    edit_modes: Vec<EditMode>,
+
 }
+
+#[derive(Clone, Copy)]
+enum EditMode {
+    Dig,          // set hit voxel to AIR
+    Place(u32),   // place material into prev-voxel
+}
+
 
 impl App {
     pub async fn new(window: Arc<Window>) -> Self {
@@ -161,6 +173,15 @@ impl App {
         );
         let physics = crate::physics::Physics::new(start_pos);
 
+
+        let edit_modes = vec![
+            EditMode::Dig,
+            EditMode::Place(AIR),   // “place air” mode if you want it explicitly
+            EditMode::Place(DIRT),
+            EditMode::Place(STONE),
+            EditMode::Place(WOOD),
+        ];
+
         Self {
             window,
             start_time,
@@ -187,6 +208,8 @@ impl App {
             stream_period: Duration::from_millis(33), // 30 Hz
             physics,
             free_cam: false,
+            edit_mode: 0,
+            edit_modes,
         }
     }
 
@@ -236,6 +259,7 @@ impl App {
         let delta_seconds = self.compute_frame_dt_seconds();
 
         self.update_camera(delta_seconds);
+        self.update_editor();
         self.update_streaming();
         let clipmap_update = self.update_clipmap_cpu();
         let camera_gpu = self.build_camera_gpu(clipmap_update.time_seconds);
@@ -609,6 +633,173 @@ impl App {
         let frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
         self.profiler.end_frame(frame_ms, streaming_stats, gpu_timings_ms);
     }
+
+    fn update_editor(&mut self) {
+        // scroll wheel selects mode
+        let steps = self.input.take_wheel_steps();
+        if steps != 0 {
+            let n = self.edit_modes.len() as i32;
+            let mut i = self.edit_mode as i32;
+            i = (i + steps).rem_euclid(n);
+            self.edit_mode = i as usize;
+        }
+
+        // click applies operation (one-shot per click)
+        if self.input.take_lmb_pressed() {
+            self.apply_edit_click();
+        }
+    }
+
+    fn enqueue_chunk_rebuild_now(&mut self, key: crate::streaming::types::ChunkKey) {
+        let Some(center) = self.chunks.build.last_center else { return; };
+
+        crate::streaming::manager::build::request_edit_refresh(&mut self.chunks, key);
+        crate::streaming::manager::build::dispatch_builds(&mut self.chunks, center);
+    }
+
+
+
+    fn apply_edit_click(&mut self) {
+        let eye = self.camera.position();
+        let dir = self.camera.forward();
+
+        let max_dist_m = 80.0;
+        let voxel = config::VOXEL_SIZE_M_F32;
+
+        let Some((hit_w, prev_w)) = self.raycast_voxel(eye, dir, max_dist_m, voxel) else {
+            return;
+        };
+
+        // choose target voxel depending on mode
+        let (tx, ty, tz, mat) = match self.edit_modes[self.edit_mode] {
+            EditMode::Dig => (hit_w.0, hit_w.1, hit_w.2, crate::world::materials::AIR),
+            EditMode::Place(m) => (prev_w.0, prev_w.1, prev_w.2, m),
+        };
+
+        // chunk key + local coords
+        let cs = config::CHUNK_SIZE as i32;
+        let cx = tx.div_euclid(cs);
+        let cy = ty.div_euclid(cs);
+        let cz = tz.div_euclid(cs);
+
+        let lx = tx.rem_euclid(cs);
+        let ly = ty.rem_euclid(cs);
+        let lz = tz.rem_euclid(cs);
+
+        let key = crate::streaming::types::ChunkKey { x: cx, y: cy, z: cz };
+        println!("edit key={:?} state={:?}", key, self.chunks.build.chunks.get(&key));
+
+        // pin so it will never unload
+        self.chunks.pinned.insert(key);
+
+        // write edit override
+        self.chunks.edits.apply_voxel(key, lx, ly, lz, mat);
+
+        // force a rebuild soon
+        self.enqueue_chunk_rebuild_now(key);
+    }
+
+    fn raycast_voxel(
+        &self,
+        origin_m: glam::Vec3,
+        dir_m: glam::Vec3,
+        max_dist_m: f32,
+        voxel_m: f32,
+    ) -> Option<((i32,i32,i32),(i32,i32,i32))> {
+        let dir = dir_m.normalize();
+        let mut t = 0.0f32;
+
+        // start voxel
+        let mut vx = (origin_m.x / voxel_m).floor() as i32;
+        let mut vy = (origin_m.y / voxel_m).floor() as i32;
+        let mut vz = (origin_m.z / voxel_m).floor() as i32;
+
+        let step_x = if dir.x >= 0.0 { 1 } else { -1 };
+        let step_y = if dir.y >= 0.0 { 1 } else { -1 };
+        let step_z = if dir.z >= 0.0 { 1 } else { -1 };
+
+        let next_boundary = |v: i32, step: i32| -> f32 {
+            if step > 0 { (v as f32 + 1.0) * voxel_m } else { (v as f32) * voxel_m }
+        };
+
+        let mut t_max_x = if dir.x.abs() < 1e-6 {
+            f32::INFINITY
+        } else {
+            (next_boundary(vx, step_x) - origin_m.x) / dir.x
+        };
+        let mut t_max_y = if dir.y.abs() < 1e-6 {
+            f32::INFINITY
+        } else {
+            (next_boundary(vy, step_y) - origin_m.y) / dir.y
+        };
+        let mut t_max_z = if dir.z.abs() < 1e-6 {
+            f32::INFINITY
+        } else {
+            (next_boundary(vz, step_z) - origin_m.z) / dir.z
+        };
+
+        let t_delta_x = if dir.x.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.x.abs() };
+        let t_delta_y = if dir.y.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.y.abs() };
+        let t_delta_z = if dir.z.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.z.abs() };
+
+        let mut prev = (vx, vy, vz);
+
+        // march
+        let max_t = max_dist_m;
+        for _ in 0..512 { // hard cap
+            // sample voxel (worldgen + edits)
+            if self.sample_voxel_material(vx, vy, vz) != crate::world::materials::AIR {
+                return Some(((vx, vy, vz), prev));
+            }
+
+            prev = (vx, vy, vz);
+
+            // advance along smallest t_max
+            if t_max_x < t_max_y && t_max_x < t_max_z {
+                vx += step_x;
+                t = t_max_x;
+                t_max_x += t_delta_x;
+            } else if t_max_y < t_max_z {
+                vy += step_y;
+                t = t_max_y;
+                t_max_y += t_delta_y;
+            } else {
+                vz += step_z;
+                t = t_max_z;
+                t_max_z += t_delta_z;
+            }
+
+            if t > max_t {
+                break;
+            }
+        }
+
+        None
+    }
+
+    fn sample_voxel_material(&self, wx: i32, wy: i32, wz: i32) -> u32 {
+        let cs = config::CHUNK_SIZE as i32;
+        let cx = wx.div_euclid(cs);
+        let cy = wy.div_euclid(cs);
+        let cz = wz.div_euclid(cs);
+
+        let lx = wx.rem_euclid(cs);
+        let ly = wy.rem_euclid(cs);
+        let lz = wz.rem_euclid(cs);
+
+        let key = crate::streaming::types::ChunkKey { x: cx, y: cy, z: cz };
+
+        if let Some(m) = self.chunks.edits.get_override(key, lx, ly, lz) {
+            return m;
+        }
+
+        // You need a single-voxel “procedural material” function.
+        // Implement this in WorldGen to match your builder logic.
+        self.world.material_at_voxel(wx, wy, wz)
+    }
+
+
+
 }
 
 fn choose_present_mode(surface_caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
@@ -631,3 +822,5 @@ fn choose_present_mode(surface_caps: &wgpu::SurfaceCapabilities) -> wgpu::Presen
         surface_caps.present_modes[0]
     }
 }
+
+
