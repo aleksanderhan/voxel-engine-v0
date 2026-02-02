@@ -1,6 +1,7 @@
 // src/streaming/types.rs
 use std::sync::{Arc, atomic::AtomicBool};
 
+use crate::world::edits::EditEntry;
 use crate::render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu};
 
 pub const INVALID_U32: u32 = 0xFFFF_FFFF;
@@ -59,6 +60,7 @@ pub struct Resident {
 pub struct BuildJob {
     pub key: ChunkKey,
     pub cancel: Arc<AtomicBool>,
+    pub edits: Arc<[EditEntry]>,
 }
 
 pub struct BuildDone {

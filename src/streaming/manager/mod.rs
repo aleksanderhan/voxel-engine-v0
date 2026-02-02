@@ -1,5 +1,5 @@
 
-mod build;
+pub mod build;
 mod grid;
 mod slots;
 mod stats;
@@ -53,6 +53,8 @@ pub(crate) struct BuildState {
     pub last_center: Option<ChunkKey>,
     pub to_unload: Vec<ChunkKey>,
 
+    pub rebuild_queue: VecDeque<ChunkKey>,
+    pub rebuild_set: HashSet<ChunkKey>,
 }
 
 /// Slot-residency bucket.
@@ -100,6 +102,9 @@ pub struct ChunkManager {
 
     pub(crate) arena: NodeArena,
     pub(crate) cache: ChunkCache,
+
+    pub(crate) pinned: HashSet<ChunkKey>,
+    pub(crate) edits: Arc<crate::world::edits::EditStore>,
 }
 
 impl ChunkManager {
@@ -109,7 +114,8 @@ impl ChunkManager {
         let (tx_job, rx_job) = bounded::<BuildJob>(cap);
         let (tx_done, rx_done) = bounded::<BuildDone>(cap);
 
-        spawn_workers(gen, rx_job, tx_done);
+        let edits = Arc::new(crate::world::edits::EditStore::new());
+        spawn_workers(gen,  rx_job, tx_done);
 
         let node_capacity = (config::NODE_BUDGET_BYTES / size_of::<NodeGpu>()) as u32;
 
@@ -134,6 +140,8 @@ impl ChunkManager {
                 in_flight: 0,
                 last_center: None,
                 to_unload: Vec::new(),
+                rebuild_queue: VecDeque::new(),
+                rebuild_set: HashSet::default(),
             },
             slots: SlotState {
                 slot_to_key: Vec::new(),
@@ -158,6 +166,9 @@ impl ChunkManager {
 
             arena: NodeArena::new(node_capacity),
             cache: ChunkCache::new(),
+
+            pinned: HashSet::default(),
+            edits,
         }
     }
 

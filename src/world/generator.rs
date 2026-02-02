@@ -36,4 +36,25 @@ impl WorldGen {
 
         ((base_m + hills_m) * self.voxels_per_meter).round() as i32
     }
+
+    pub fn material_at_voxel(&self, wx: i32, wy: i32, wz: i32) -> u32 {
+        use crate::world::materials::{AIR, DIRT, GRASS, STONE, WOOD};
+
+        let g = self.ground_height(wx, wz);
+
+        // match builder’s “dirt_depth = 3 * vpm”
+        let dirt_depth = 3 * crate::app::config::VOXELS_PER_METER;
+
+        if wy < g {
+            if wy >= g - dirt_depth { DIRT } else { STONE }
+        } else if wy == g {
+            // If you want tree trunks to override ground at y==g,
+            // you can add a trunk/canopy test here and return WOOD.
+            GRASS
+        } else {
+            // Optional: approximate trees here if you want ray hits on leaves/wood.
+            // For now: air above ground.
+            AIR
+        }
+    }
 }

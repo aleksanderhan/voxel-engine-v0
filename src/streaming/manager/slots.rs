@@ -459,6 +459,7 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
     let mut best_outside: Option<(f32, ChunkKey)> = None;
 
     for &k in &mgr.slots.slot_to_key {
+        if mgr.pinned.contains(&k) { continue; }
         if k == protect {
             continue;
         }
@@ -541,4 +542,75 @@ pub fn assert_slot_invariants(mgr: &ChunkManager) {
         mgr.slots.resident_slots,
         mgr.slots.slot_to_key.len()
     );
+}
+
+pub fn replace_chunk_contents(
+    mgr: &mut ChunkManager,
+    center: ChunkKey,
+    key: ChunkKey,
+    nodes: Arc<[NodeGpu]>,
+    macro_words: Arc<[u32]>,
+    ropes: Arc<[NodeRopesGpu]>,
+    colinfo_words: Arc<[u32]>,
+) -> bool {
+    // Must already have a slot
+    let (slot, old_base, old_count) = match mgr.build.chunks.get(&key) {
+        Some(ChunkState::Resident(r)) => (r.slot, r.node_base, r.node_count),
+        Some(ChunkState::Uploading(u)) => (u.slot, u.node_base, u.node_count),
+        _ => return false,
+    };
+
+    let need = nodes.len() as u32;
+    if need == 0 { return false; }
+
+    // allocate new node range (don’t free old until success)
+    let mut node_base = mgr.arena.alloc(need);
+    if node_base.is_none() {
+        for _ in 0..EVICT_ATTEMPTS {
+            if !evict_one_farthest(mgr, center, key) { break; }
+            node_base = mgr.arena.alloc(need);
+            if node_base.is_some() { break; }
+        }
+    }
+    let Some(node_base) = node_base else { return false; };
+
+    // free old range now that we succeeded
+    mgr.arena.free(old_base, old_count);
+
+    // update meta for slot
+    let s = slot as usize;
+    mgr.slots.slot_macro[s]   = macro_words.clone();
+    mgr.slots.slot_colinfo[s] = colinfo_words.clone();
+
+    let mut meta = mgr.slots.chunk_meta[s];
+    meta.node_base = node_base;
+    meta.node_count = need;
+    meta.macro_base = slot * MACRO_WORDS_PER_CHUNK;
+    meta.colinfo_base = slot * COLINFO_WORDS_PER_CHUNK;
+    mgr.slots.chunk_meta[s] = meta;
+
+    // update state
+    if let Some(st) = mgr.build.chunks.get_mut(&key) {
+        match st {
+            ChunkState::Resident(r) => { r.node_base = node_base; r.node_count = need; }
+            ChunkState::Uploading(u) => { u.node_base = node_base; u.node_count = need; }
+            _ => {}
+        }
+    }
+
+    // enqueue upload that rewrites an existing slot (no residency flip)
+    super::uploads::enqueue(mgr, ChunkUpload {
+        key,
+        slot,
+        meta,
+        node_base,
+        nodes,
+        macro_words,
+        ropes,
+        colinfo_words,
+        completes_residency: false,
+    });
+
+    mgr.grid.grid_dirty = true;
+    true
 }

@@ -18,6 +18,11 @@ use super::ChunkManager;
 
 #[inline(always)]
 fn in_keep(mgr: &ChunkManager, center: ChunkKey, k: ChunkKey) -> bool {
+    if mgr.pinned.contains(&k) {
+        return true;
+    }
+
+
     let dx = k.x - center.x;
     let dz = k.z - center.z;
 
@@ -132,6 +137,7 @@ pub fn unload_outside_keep(mgr: &mut ChunkManager, center: ChunkKey) {
     mgr.build.to_unload.clear();
 
     for &k in mgr.build.chunks.keys() {
+        if mgr.pinned.contains(&k) { continue; }
         if slots::in_priority_box(mgr, center, k) { continue; }
 
         if keep::in_active_xz(center, k) {
@@ -155,6 +161,41 @@ pub fn unload_outside_keep(mgr: &mut ChunkManager, center: ChunkKey) {
 pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
     let mut attempts = 0usize;
     let max_attempts = mgr.build.build_heap.len().max(1);
+
+        // Also dispatch rebuilds for already-slotted chunks (no state changes).
+    while mgr.build.in_flight < config::MAX_IN_FLIGHT {
+        let Some(k) = mgr.build.rebuild_queue.pop_front() else { break; };
+        mgr.build.rebuild_set.remove(&k);
+
+        // Must still exist and still be slotted.
+        let Some(st) = mgr.build.chunks.get(&k) else { continue; };
+        if !matches!(st, ChunkState::Resident(_) | ChunkState::Uploading(_)) {
+            continue;
+        }
+
+        // If it’s outside keep, skip (optional but consistent with your other logic).
+        if !in_keep(mgr, center, k) {
+            continue;
+        }
+
+        // Make a fresh cancel token and replace the stored one,
+        // so stale completions get dropped by Arc::ptr_eq in harvest_done_builds.
+        let cancel = Arc::new(AtomicBool::new(false));
+        mgr.build.cancels.insert(k, cancel.clone());
+
+        let edits = mgr.edits.snapshot(k);
+
+        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel, edits }) {
+            Ok(()) => mgr.build.in_flight += 1,
+            Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
+                // Put it back and stop trying this frame.
+                mgr.build.rebuild_set.insert(job.key);
+                mgr.build.rebuild_queue.push_front(job.key);
+                break;
+            }
+        }
+    }
+
 
     while mgr.build.in_flight < config::MAX_IN_FLIGHT && attempts < max_attempts {
         attempts += 1;
@@ -183,7 +224,8 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
             let cancel = cancel_token(mgr, k);
             cancel.store(false, AtomicOrdering::Relaxed);
 
-            match mgr.build.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone() }) {
+            let edits = mgr.edits.snapshot(k);
+            match mgr.build.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone(), edits }) {
                 Ok(()) => mgr.build.in_flight += 1,
                 Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                     mgr.build.chunks.insert(k, ChunkState::Queued);
@@ -194,6 +236,7 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
             }
         }
     }
+
 }
 
 pub fn harvest_done_builds(mgr: &mut ChunkManager, center: ChunkKey) {
@@ -289,16 +332,36 @@ fn on_build_done(
     let ropes_arc: Arc<[NodeRopesGpu]> = ropes.into();
     let colinfo_arc: Arc<[u32]> = colinfo_words.into();
 
-    mgr.cache.put(key, nodes_arc.clone(), macro_arc.clone(), ropes_arc.clone(), colinfo_arc.clone());
-
+    // If we already have a slot, replace contents in-place (enqueue rewrite upload).
     match mgr.build.chunks.get(&key) {
-        Some(ChunkState::Resident(_)) => return,
-        Some(ChunkState::Uploading(_)) => {
-            // We already have a slot in flight; avoid double-slotting.
+        Some(ChunkState::Resident(_)) | Some(ChunkState::Uploading(_)) => {
+            let ok = super::slots::replace_chunk_contents(
+                mgr,
+                center,
+                key,
+                nodes_arc.clone(),
+                macro_arc.clone(),
+                ropes_arc.clone(),
+                colinfo_arc.clone(),
+            );
+
+            if ok {
+                // cache the new version once
+                mgr.cache.put(key, nodes_arc, macro_arc, ropes_arc, colinfo_arc);
+            }
             return;
         }
         _ => {}
     }
+
+    // Cache it even if we’re going to defer upload (so promote-from-cache works).
+    mgr.cache.put(
+        key,
+        nodes_arc.clone(),
+        macro_arc.clone(),
+        ropes_arc.clone(),
+        colinfo_arc.clone(),
+    );
 
     // Defer GPU upload for non-priority until priority box is GPU-ready.
     if !slots::priority_box_ready(mgr, center) && !slots::in_priority_box(mgr, center, key) {
@@ -314,6 +377,7 @@ fn on_build_done(
         mgr.build.chunks.remove(&key);
     }
 }
+
 
 #[derive(Clone, Copy)]
 pub struct HeapItem {
@@ -433,5 +497,49 @@ pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec
     }
 
     mgr.build.build_heap = BinaryHeap::from(items);
+}
+
+pub fn request_rebuild(mgr: &mut ChunkManager, key: ChunkKey) {
+    // Don’t enqueue rebuilds for chunks we don’t track.
+    let Some(st) = mgr.build.chunks.get(&key) else { return; };
+
+    // Only meaningful if it already has a slot (Uploading or Resident).
+    match st {
+        ChunkState::Resident(_) | ChunkState::Uploading(_) => {}
+        _ => return,
+    }
+
+    // Dedup
+    if mgr.build.rebuild_set.insert(key) {
+        mgr.build.rebuild_queue.push_back(key);
+    }
+}
+
+pub fn request_edit_refresh(mgr: &mut ChunkManager, key: ChunkKey) {
+    // (A) Always invalidate cached CPU chunk contents when we know edits changed it.
+    // Otherwise, future promote-from-cache can resurrect stale pre-edit data.
+    mgr.cache.remove(&key);
+
+    match mgr.build.chunks.get(&key) {
+        // already has a slot -> rebuild in place
+        Some(ChunkState::Resident(_)) | Some(ChunkState::Uploading(_)) => {
+            request_rebuild(mgr, key);
+        }
+
+        // already queued -> boost priority (front)
+        Some(ChunkState::Queued) => {
+            queue_build_front(mgr, key);
+        }
+
+        // already building -> do nothing; completion will apply edits
+        Some(ChunkState::Building) => {}
+
+        // not tracked -> enqueue a build (safe; does NOT touch slots)
+        None => {
+            let c = cancel_token(mgr, key);
+            c.store(false, AtomicOrdering::Relaxed);
+            queue_build_front(mgr, key);
+        }
+    }
 }
 

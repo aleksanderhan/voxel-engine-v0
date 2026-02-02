@@ -1430,6 +1430,7 @@ dependencies = [
  "futures-intrusive",
  "glam",
  "noise",
+ "parking_lot",
  "pollster",
  "rayon",
  "rustc-hash 2.1.1",
