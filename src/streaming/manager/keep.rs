@@ -5,20 +5,51 @@ use crate::streaming::types::*;
 
 use super::ChunkManager;
 
+// src/streaming/manager/keep.rs
+
 #[inline]
 pub fn build_offsets(radius: i32) -> Vec<(i32, i32, i32)> {
     let mut v = Vec::new();
-    v.reserve((GRID_Y_COUNT as usize) * ((2 * radius + 1) as usize) * ((2 * radius + 1) as usize));
 
+    let r2 = radius * radius;
     for dy in GRID_Y_MIN_DY..=(GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1) {
         for dz in -radius..=radius {
             for dx in -radius..=radius {
-                v.push((dx, dy, dz));
+                if dx*dx + dz*dz <= r2 {
+                    v.push((dx, dy, dz));
+                }
             }
         }
     }
+
+    // Optional but helps uniform “rings”: sort by xz distance (then dy).
+    v.sort_by_key(|(dx, dy, dz)| (dx*dx + dz*dz, *dy, *dz, *dx));
     v
 }
+
+#[inline(always)]
+pub fn in_active_xz(center: ChunkKey, k: ChunkKey) -> bool {
+    let ar = config::ACTIVE_RADIUS.max(PRIORITY_RADIUS);
+    let dx = k.x - center.x;
+    let dz = k.z - center.z;
+    dx*dx + dz*dz <= ar*ar
+}
+
+#[inline(always)]
+pub fn in_priority_xz(center: ChunkKey, k: ChunkKey) -> bool {
+    let dx = k.x - center.x;
+    let dz = k.z - center.z;
+    dx*dx + dz*dz <= PRIORITY_RADIUS*PRIORITY_RADIUS
+}
+
+pub fn keep_origin_for(center: ChunkKey) -> [i32; 3] {
+    let ox = center.x - config::KEEP_RADIUS;
+    let oz = center.z - config::KEEP_RADIUS;
+    let oy = center.y + GRID_Y_MIN_DY;
+    [ox, oy, oz]
+}
+
+
 
 #[inline]
 pub fn compute_center(world: &WorldGen, cam_pos_m: Vec3) -> ChunkKey {
@@ -37,28 +68,6 @@ pub fn compute_center(world: &WorldGen, cam_pos_m: Vec3) -> ChunkKey {
     let ground_cy = ground_y_vox.div_euclid(cs);
 
     ChunkKey { x: ccx, y: ground_cy, z: ccz }
-}
-
-#[inline]
-pub fn keep_origin_for(center: ChunkKey) -> [i32; 3] {
-    let ox = center.x - config::KEEP_RADIUS;
-    let oz = center.z - config::KEEP_RADIUS;
-    let oy = center.y + GRID_Y_MIN_DY;
-    [ox, oy, oz]
-}
-
-#[inline(always)]
-pub fn in_active_xz(center: ChunkKey, k: ChunkKey) -> bool {
-    let dx = (k.x - center.x).abs();
-    let dz = (k.z - center.z).abs();
-    dx <= config::ACTIVE_RADIUS.max(PRIORITY_RADIUS) && dz <= config::ACTIVE_RADIUS.max(PRIORITY_RADIUS)
-}
-
-#[inline(always)]
-pub fn in_priority_xz(center: ChunkKey, k: ChunkKey) -> bool {
-    let dx = (k.x - center.x).abs();
-    let dz = (k.z - center.z).abs();
-    dx <= PRIORITY_RADIUS && dz <= PRIORITY_RADIUS
 }
 
 /// publish new center; if changed, rebucket uploads.

@@ -16,18 +16,26 @@ use crate::app::config;
 use super::{ground, keep, slots};
 use super::ChunkManager;
 
+// src/streaming/manager/build.rs
+
 #[inline(always)]
 fn in_keep(mgr: &ChunkManager, center: ChunkKey, k: ChunkKey) -> bool {
     if mgr.pinned.contains(&k) {
         return true;
     }
 
-
     let dx = k.x - center.x;
     let dz = k.z - center.z;
 
-    if dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS { return false; }
-    if dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS { return false; }
+    // OLD:
+    // if dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS { return false; }
+    // if dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS { return false; }
+
+    // NEW: circular keep
+    let r = config::KEEP_RADIUS;
+    if dx*dx + dz*dz > r*r {
+        return false;
+    }
 
     let Some(ground_cy) = ground::ground_cy_for_column(mgr, k.x, k.z) else {
         return false;
@@ -36,6 +44,7 @@ fn in_keep(mgr: &ChunkManager, center: ChunkKey, k: ChunkKey) -> bool {
     let dy = k.y - ground_cy;
     dy >= y_band_min() && dy <= y_band_max()
 }
+
 
 #[inline]
 fn cancel_token(mgr: &mut ChunkManager, key: ChunkKey) -> Arc<AtomicBool> {
@@ -494,8 +503,8 @@ pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec
             {
                 let dx = k.x - center.x;
                 let dz = k.z - center.z;
-                !(dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS ||
-                  dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS)
+                let r = config::KEEP_RADIUS;
+                dx*dx + dz*dz <= r*r
             } &&
             {
                 let ix = k.x - origin[0];
