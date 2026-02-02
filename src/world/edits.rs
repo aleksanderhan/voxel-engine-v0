@@ -12,6 +12,21 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::app::config;
 use crate::streaming::types::ChunkKey;
 
+#[inline]
+pub fn voxel_to_chunk_local(wx: i32, wy: i32, wz: i32) -> (ChunkKey, i32, i32, i32) {
+    let cs = config::CHUNK_SIZE as i32;
+
+    let cx = wx.div_euclid(cs);
+    let cy = wy.div_euclid(cs);
+    let cz = wz.div_euclid(cs);
+
+    let lx = wx.rem_euclid(cs);
+    let ly = wy.rem_euclid(cs);
+    let lz = wz.rem_euclid(cs);
+
+    (ChunkKey { x: cx, y: cy, z: cz }, lx, ly, lz)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct EditEntry {
     /// Chunk-local linear index:

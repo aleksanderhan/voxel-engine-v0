@@ -706,6 +706,27 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
             return make_leaf(chunk_size, ox, oy, oz, size, AIR);
         }
 
+        // If we’re at voxel resolution, edits are already in `material`, so just return it.
+        if size == 1 {
+            let sx = ox as usize;
+            let sy = oy as usize;
+            let sz = oz as usize;
+            let m = material[idx3(side, sx, sy, sz)];
+            return make_leaf(chunk_size, ox, oy, oz, size, m);
+        }
+
+        // --- NEW: occupancy test FIRST (this includes edits) ---
+        let sx = ox as usize;
+        let sy = oy as usize;
+        let sz = oz as usize;
+        let s  = size as usize;
+
+        let sum = prefix_sum_cube(prefix, side, sx, sy, sz, s);
+        if sum == 0 {
+            return make_leaf(chunk_size, ox, oy, oz, size, AIR);
+        }
+
+        let cs_u = chunk_size;
         let size_u = size as u32;
 
         let (gmin, gmax) = ground_mip.query(ox, oz, size_u);
@@ -714,36 +735,17 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         let y0 = chunk_oy + oy;
         let y1 = y0 + size - 1;
 
-        // above everything
-        let top_solid = gmax.max(tmax);
-        if y0 > top_solid {
-            return make_leaf(chunk_size, ox, oy, oz, size, AIR);
-        }
+        // Above everything: ONLY safe to early-out if region is empty (already handled).
+        // So don’t return AIR here; edits may have placed solids above terrain.
 
-        // deep solid stone
-        if y1 < gmin - dirt_depth {
+        // Deep solid stone: ONLY safe if region is completely full.
+        if sum == (s * s * s) as u32 && y1 < gmin - dirt_depth {
             return make_leaf(chunk_size, ox, oy, oz, size, STONE);
         }
 
-        // empty check via prefix
-        let sx = ox as usize;
-        let sy = oy as usize;
-        let sz = oz as usize;
-        let s = size as usize;
-
-        let sum = prefix_sum_cube(prefix, side, sx, sy, sz, s);
-        if sum == 0 {
-            return make_leaf(chunk_size, ox, oy, oz, size, AIR);
-        }
-
-        if size == 1 {
-            let m = material[idx3(side, sx, sy, sz)];
-            return make_leaf(chunk_size, ox, oy, oz, size, m);
-        }
-
+        // Continue as before: subdivide and build children.
         let half = size / 2;
 
-        // Collect child roots without pushing them yet (so they end up contiguous)
         let mut child_roots: [Option<NodeGpu>; 8] = [None; 8];
         let mut mask: u32 = 0;
 
@@ -760,7 +762,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
             let csy = (oy + dy) as usize;
             let csz = (oz + dz) as usize;
 
-            // fast empty test for the child region
+            // fast empty test for the child region (still good)
             if prefix_sum_cube(prefix, side, csx, csy, csz, half as usize) == 0 {
                 continue;
             }
@@ -790,7 +792,6 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
             return make_leaf(chunk_size, ox, oy, oz, size, AIR);
         }
 
-        // NOW push roots contiguously
         let base = nodes.len() as u32;
         for ci in 0..8 {
             if let Some(ch) = child_roots[ci] {
@@ -804,9 +805,8 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
             material: 0,
             key: pack_key(chunk_size, ox, oy, oz, size),
         }
-
-
     }
+
 
     // Root must be at index 0 for GPU.
     let mut nodes = vec![make_leaf(cs_u, 0, 0, 0, cs_i, AIR)];

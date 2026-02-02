@@ -677,16 +677,8 @@ impl App {
         };
 
         // chunk key + local coords
-        let cs = config::CHUNK_SIZE as i32;
-        let cx = tx.div_euclid(cs);
-        let cy = ty.div_euclid(cs);
-        let cz = tz.div_euclid(cs);
+        let (key, lx, ly, lz) = crate::world::edits::voxel_to_chunk_local(tx, ty, tz);
 
-        let lx = tx.rem_euclid(cs);
-        let ly = ty.rem_euclid(cs);
-        let lz = tz.rem_euclid(cs);
-
-        let key = crate::streaming::types::ChunkKey { x: cx, y: cy, z: cz };
         println!("edit key={:?} state={:?}", key, self.chunks.build.chunks.get(&key));
 
         // pin so it will never unload

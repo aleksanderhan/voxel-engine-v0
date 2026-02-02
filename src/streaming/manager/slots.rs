@@ -656,14 +656,14 @@ pub fn replace_chunk_contents(
     mgr: &mut ChunkManager,
     center: ChunkKey,
     key: ChunkKey,
-    nodes: Arc<[NodeGpu]>,
+    mut nodes: Arc<[NodeGpu]>,
     macro_words: Arc<[u32]>,
-    ropes: Arc<[NodeRopesGpu]>,
+    mut ropes: Arc<[NodeRopesGpu]>,
     colinfo_words: Arc<[u32]>,
 ) -> bool {
-    // Determine whether this is a true resident rewrite or an Uploading refresh that still completes residency.
-    let (old_base, old_count, is_resident_now) = match mgr.build.chunks.get(&key) {
-        Some(ChunkState::Resident(r)) => (r.node_base, r.node_count, true),
+    // (node_base, allocated_capacity, is_resident_now)
+    let (old_base, old_cap, is_resident_now) = match mgr.build.chunks.get(&key) {
+        Some(ChunkState::Resident(r))  => (r.node_base, r.node_count, true),
         Some(ChunkState::Uploading(u)) => (u.node_base, u.node_count, false),
         _ => return false,
     };
@@ -671,24 +671,9 @@ pub fn replace_chunk_contents(
     let need = nodes.len() as u32;
     if need == 0 { return false; }
 
-    // Allocate new node range (don’t free old until success).
-    // NOTE: evictions may swap slots, potentially moving `key`.
-    let mut node_base = mgr.arena.alloc(need);
-    if node_base.is_none() {
-        for _ in 0..EVICT_ATTEMPTS {
-            if !evict_one_farthest(mgr, center, key) { break; }
-            node_base = mgr.arena.alloc(need);
-            if node_base.is_some() { break; }
-        }
-    }
-    let Some(node_base) = node_base else { return false; };
-
-    // Now that allocation succeeded, free old range.
-    mgr.arena.free(old_base, old_count);
-
-    // Re-fetch CURRENT slot (key may have moved due to evictions/swaps).
+    // Re-fetch CURRENT slot.
     let slot = match mgr.build.chunks.get(&key) {
-        Some(ChunkState::Resident(r)) => r.slot,
+        Some(ChunkState::Resident(r))  => r.slot,
         Some(ChunkState::Uploading(u)) => u.slot,
         _ => return false,
     };
@@ -696,44 +681,98 @@ pub fn replace_chunk_contents(
 
     debug_assert!(
         mgr.slots.slot_to_key.get(s).copied() == Some(key),
-        "replace_chunk_contents: key moved but slot_to_key mismatch: key={:?} slot={} slot_key={:?}",
-        key,
-        slot,
-        mgr.slots.slot_to_key.get(s).copied()
+        "replace_chunk_contents: slot_to_key mismatch: key={:?} slot={} slot_key={:?}",
+        key, slot, mgr.slots.slot_to_key.get(s).copied()
     );
 
-    // Update slot-owned CPU side payloads.
+    // Decide allocation strategy FIRST (so we don't partially mutate state on failure).
+    let (node_base, alloc_cap, pad_to_cap) = if need <= old_cap {
+        // Reuse old allocation. Keep capacity as old_cap to avoid leaking arena space.
+        (old_base, old_cap, true)
+    } else {
+        // Need bigger: allocate new range, then free old.
+        let mut new_base = mgr.arena.alloc(need);
+        if new_base.is_none() {
+            for _ in 0..EVICT_ATTEMPTS {
+                if !evict_one_farthest(mgr, center, key) { break; }
+                new_base = mgr.arena.alloc(need);
+                if new_base.is_some() { break; }
+            }
+        }
+        let Some(new_base) = new_base else {
+            return false; // keep old chunk intact
+        };
+        mgr.arena.free(old_base, old_cap);
+        (new_base, need, false)
+    };
+
+    // If reusing capacity and the new build is smaller, pad the upload buffers to alloc_cap.
+    // This keeps GPU meta/node_count consistent with what's actually in the arena allocation.
+    if pad_to_cap && need < alloc_cap {
+        let target = alloc_cap as usize;
+
+        // Pad nodes with harmless leaves (AIR leaf is fine; they will be unreachable).
+        let mut v_nodes = nodes.as_ref().to_vec();
+        v_nodes.reserve(target.saturating_sub(v_nodes.len()));
+        while v_nodes.len() < target {
+            v_nodes.push(NodeGpu {
+                child_base: 0xFFFF_FFFF, // LEAF
+                child_mask: 0,
+                material: 0,             // AIR
+                key: 0,
+            });
+        }
+        nodes = v_nodes.into();
+
+        // Pad ropes with invalids.
+        let mut v_ropes = ropes.as_ref().to_vec();
+        v_ropes.reserve(target.saturating_sub(v_ropes.len()));
+        while v_ropes.len() < target {
+            v_ropes.push(NodeRopesGpu {
+                px: 0xFFFF_FFFF,
+                nx: 0xFFFF_FFFF,
+                py: 0xFFFF_FFFF,
+                ny: 0xFFFF_FFFF,
+                pz: 0xFFFF_FFFF,
+                nz: 0xFFFF_FFFF,
+                _pad0: 0,
+                _pad1: 0,
+            });
+        }
+        ropes = v_ropes.into();
+    }
+
+    // Now it's safe to update slot-owned CPU payloads.
     mgr.slots.slot_macro[s]   = macro_words.clone();
     mgr.slots.slot_colinfo[s] = colinfo_words.clone();
 
-    // Update meta for that slot.
+    // Update meta. IMPORTANT: meta.node_count must match the uploaded buffer length and arena allocation capacity.
     let mut meta = mgr.slots.chunk_meta[s];
     meta.node_base = node_base;
-    meta.node_count = need;
+    meta.node_count = alloc_cap;
     meta.macro_base = slot * MACRO_WORDS_PER_CHUNK;
     meta.colinfo_base = slot * COLINFO_WORDS_PER_CHUNK;
     mgr.slots.chunk_meta[s] = meta;
 
-    // Update state, but NEVER flip Resident -> Uploading.
+    // Update state. IMPORTANT: keep node_count as allocation capacity (alloc_cap).
     if let Some(st) = mgr.build.chunks.get_mut(&key) {
         match st {
             ChunkState::Resident(r) => {
                 r.slot = slot;
                 r.node_base = node_base;
-                r.node_count = need;
-                r.rewrite_in_flight = true; // rewrite upload will clear this on applied
+                r.node_count = alloc_cap;
+                r.rewrite_in_flight = true;
             }
             ChunkState::Uploading(u) => {
                 u.slot = slot;
                 u.node_base = node_base;
-                u.node_count = need;
-                u.uploaded = false; // IMPORTANT: this upload will set it true when applied
+                u.node_count = alloc_cap;
+                u.uploaded = false;
             }
             _ => {}
         }
     }
 
-    // If we were Uploading, this upload MUST complete residency (it is the data that makes it ready).
     let (kind, completes_residency) = if is_resident_now {
         (UploadKind::RewriteResident, false)
     } else {
@@ -756,6 +795,8 @@ pub fn replace_chunk_contents(
     mgr.grid.grid_dirty = true;
     true
 }
+
+
 
 #[inline(always)]
 fn is_resident(mgr: &ChunkManager, k: ChunkKey) -> bool {
