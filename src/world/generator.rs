@@ -2,7 +2,7 @@
 
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
 
-use crate::config;
+use crate::app::config;
 
 #[derive(Clone)]
 pub struct WorldGen {

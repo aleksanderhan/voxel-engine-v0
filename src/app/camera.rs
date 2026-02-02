@@ -1,7 +1,8 @@
 // src/camera.rs
 use glam::{Mat4, Vec3};
 
-use crate::{config, input::InputState};
+use crate::app::config;
+use crate::app::input::InputState;
 
 pub struct Camera {
     pos: Vec3,

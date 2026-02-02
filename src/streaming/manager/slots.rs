@@ -3,8 +3,8 @@ use std::sync::{
     Arc,
 };
 
+use crate::app::config;
 use crate::{
-    config,
     render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu},
     streaming::types::*,
 };

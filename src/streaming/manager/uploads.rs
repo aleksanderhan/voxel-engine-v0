@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, mem::size_of, sync::Arc};
-use crate::{config, render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu}};
+use crate::{render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu}};
+use crate::app::config;
 use crate::streaming::types::*;
 use super::{ChunkManager};
 use super::keep;

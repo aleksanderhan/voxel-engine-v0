@@ -3,8 +3,8 @@ use std::sync::{Arc, atomic::Ordering};
 
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::app::config;
 use crate::{
-    config,
     render::gpu_types::{NodeGpu, NodeRopesGpu},
     svo::{build_chunk_svo_sparse_cancelable_with_scratch, BuildScratch},
     world::WorldGen,

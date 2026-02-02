@@ -1,5 +1,7 @@
 use crate::streaming::types::*;
-use crate::{config, world::WorldGen};
+use crate::{world::WorldGen};
+use crate::app::config;
+
 use super::{ChunkManager};
 use super::keep;
 

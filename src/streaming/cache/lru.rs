@@ -1,7 +1,8 @@
 use std::{collections::VecDeque, mem::size_of, sync::Arc};
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::{config, render::gpu_types::{NodeGpu, NodeRopesGpu}};
+use crate::app::config;
+use crate::{render::gpu_types::{NodeGpu, NodeRopesGpu}};
 use crate::streaming::types::ChunkKey;
 
 #[derive(Clone)]

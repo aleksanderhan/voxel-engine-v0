@@ -2,8 +2,8 @@
 //
 // Persistent GPU buffers and capacities.
 
+use crate::app::config;
 use crate::{
-    config,
     render::gpu_types::{ChunkMetaGpu, ClipmapGpu, NodeGpu, NodeRopesGpu},
 };
 

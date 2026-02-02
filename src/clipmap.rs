@@ -5,7 +5,8 @@
 
 use glam::Vec3;
 
-use crate::{config, world::WorldGen};
+use crate::app::config;
+use crate::{world::WorldGen};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ClipLevelParams {

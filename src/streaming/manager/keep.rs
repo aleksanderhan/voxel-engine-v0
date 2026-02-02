@@ -1,5 +1,6 @@
 use glam::Vec3;
-use crate::{config, world::WorldGen};
+use crate::{world::WorldGen};
+use crate::app::config;
 use crate::streaming::types::*;
 
 use super::ChunkManager;
