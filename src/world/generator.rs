@@ -4,7 +4,7 @@ use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
 
 use crate::app::config;
 use crate::world::materials::{AIR, DIRT, GRASS, STONE, WOOD, LEAF};
-use crate::world::hash::{hash2, hash_u32, u01};
+use crate::world::hash::{hash2, hash_u32, u01, s11};
 use crate::world::edits::{EditStore, voxel_to_chunk_local};
 
 #[derive(Clone)]
@@ -142,10 +142,11 @@ impl WorldGen {
         let xm = (wx as f64) * config::VOXEL_SIZE_M_F64;
         let zm = (wz as f64) * config::VOXEL_SIZE_M_F64;
 
-        // layer depth varies smoothly: 10m..26m below ground
+        // layer depth varies smoothly: 4m..14m below ground (much closer to surface)
         let lv = self.cave_level.get([xm, zm]) as f32; // ~[-1,1]
         let lv01 = 0.5 + 0.5 * lv;
-        let layer_depth_m = 10.0 + 16.0 * lv01;
+        let layer_depth_m = 4.0 + 10.0 * lv01;
+
 
         let tunnel_center_y = (ground_y_vox as f32) - layer_depth_m * vpm;
         let dy_to_center = (wy as f32) - tunnel_center_y;
@@ -183,19 +184,22 @@ impl WorldGen {
         let entrance_band_m = 6.0;
         let roof_m = 3.0;
 
+        let entrance_band_m = 6.0;
+        let roof_m = 3.0;
+
         if depth_m < entrance_band_m {
-            // Ensure we only open entrances where a tunnel is present *under* us.
-            // Probe at the layer center height at this column (roughly).
-            let probe_y = tunnel_center_y.round() as i32;
+            // Probe: only open entrances where the 2D tunnel line is strong
             let (pr0, pr1) = self.cave_ridged_pair_2d(wx, wz);
             let probe_ridge = pr0.min(pr1);
 
-            let has_tunnel_here = probe_ridge > thr2d;
+            let thr2d = 0.72; // MUST match the thr2d you use for in_main_tunnel
 
-            // Make entrances not-too-frequent, but not “never”.
-            // 1 per ~ (14m x 14m x 16) ≈ 3136 m^2 => ~56m average spacing
+            let probe_core = ((probe_ridge - thr2d) * (1.0 / (1.0 - thr2d))).clamp(0.0, 1.0);
+            let has_tunnel_here = probe_ridge > (thr2d + 0.06) && probe_core > 0.35;
+
+            // Entrance placement grid (in meters)
             let cell_m: i32 = 14;
-            let gate_mask: u32 = 7; // 1/16
+            let gate_mask: u32 = 3; // 1/4 for testing; use 7 for 1/8, 15 for 1/16
 
             let xm_i = wx.div_euclid(vpm_i);
             let zm_i = wz.div_euclid(vpm_i);
@@ -205,42 +209,60 @@ impl WorldGen {
             let h = hash2(self.seed ^ 0xE17A_0001, gx, gz);
 
             if has_tunnel_here && (h & gate_mask) == 0 {
-                // Entrance center at cell center (in voxels)
-                let cxm = gx * cell_m + cell_m / 2;
-                let czm = gz * cell_m + cell_m / 2;
+                // Cell center in meters
+                let cxm0 = gx * cell_m + cell_m / 2;
+                let czm0 = gz * cell_m + cell_m / 2;
+
+                // Jitter inside the cell so entrances aren’t a perfect grid
+                let jitter_m = 4.0;
+                let jx = s11(hash_u32(h ^ 0x51A1_0001)) * jitter_m;
+                let jz = s11(hash_u32(h ^ 0x51A1_0002)) * jitter_m;
+
+                let cxm = (cxm0 as f32 + jx).round() as i32;
+                let czm = (czm0 as f32 + jz).round() as i32;
+
+                // Convert entrance center to voxels
                 let cxv = cxm * vpm_i + vpm_i / 2;
                 let czv = czm * vpm_i + vpm_i / 2;
 
-                // Simple circular shaft that connects to the tunnel layer.
-                let mouth_r_m = 1.6;
-                let shaft_r_m = 1.15;
+                // Cheap reject: only carve when we're near this entrance center
+                let dx0 = (wx - cxv) as f32;
+                let dz0 = (wz - czv) as f32;
+                let max_r_vox = (2.2 * vpm).max(8.0);
 
-                let mouth_r = mouth_r_m * vpm;
-                let shaft_r = shaft_r_m * vpm;
+                if dx0 * dx0 + dz0 * dz0 <= max_r_vox * max_r_vox {
+                    // Shaft radii
+                    let mouth_r_m = 2.2;
+                    let shaft_r_m = 1.5;
 
-                // Carve the shaft down until we hit (a bit past) tunnel center.
-                let shaft_bottom = (tunnel_center_y - 2.0 * vpm).min((ground_y_vox as f32) - roof_m * vpm);
+                    let mouth_r = mouth_r_m * vpm;
+                    let shaft_r = shaft_r_m * vpm;
 
-                if (wy as f32) >= shaft_bottom {
-                    let dx = (wx - cxv) as f32;
-                    let dz = (wz - czv) as f32;
+                    // Carve down to (a bit below) the tunnel layer center
+                    let shaft_bottom = (tunnel_center_y - 2.0 * vpm).min((ground_y_vox as f32) - roof_m * vpm);
 
-                    // Smoothly transition mouth->shaft radius over the entrance band.
-                    let t = (depth_m / entrance_band_m).clamp(0.0, 1.0);
-                    let smooth = t * t * (3.0 - 2.0 * t);
-                    let r = mouth_r + (shaft_r - mouth_r) * smooth;
+                    if (wy as f32) >= shaft_bottom {
+                        // Smooth mouth -> shaft radius through entrance band
+                        let t = (depth_m / entrance_band_m).clamp(0.0, 1.0);
+                        let smooth = t * t * (3.0 - 2.0 * t); // smoothstep
+                        let r = mouth_r + (shaft_r - mouth_r) * smooth;
 
-                    if dx * dx + dz * dz <= r * r {
-                        return true;
+                        // Actual carve test
+                        let dx = (wx - cxv) as f32;
+                        let dz = (wz - czv) as f32;
+                        if dx * dx + dz * dz <= r * r {
+                            return true;
+                        }
                     }
                 }
             }
 
-            // Keep near-surface rock intact unless we're in a carved shaft
+            // Roof protection: don't swiss-cheese the surface unless we returned true above
             if depth_m < roof_m {
                 return false;
             }
         }
+
 
         // -----------------------------------------------------------------------------
         // 5) Final carve: main tunnel layer

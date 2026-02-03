@@ -3,7 +3,7 @@ use crate::app::config;
 
 use super::{
     generator::WorldGen,
-    hash::{hash2, hash3, hash_u32, u01},
+    hash::{hash2, hash3, hash_u32, u01, s11},
     materials::{AIR, LEAF, WOOD},
 };
 
@@ -282,11 +282,6 @@ impl WorldGen {
     #[inline(always)]
     fn lerp(a: f32, b: f32, t: f32) -> f32 {
         a + (b - a) * t
-    }
-
-    #[inline(always)]
-    fn s11(n: u32) -> f32 {
-        (u01(n) - 0.5) * 2.0
     }
 
     #[inline(always)]
@@ -583,7 +578,7 @@ impl WorldGen {
 
             let r = hash_u32(tree.seed ^ 0xC0DE_0001 ^ (i as u32).wrapping_mul(0x9E37_79B9));
             let jitter =
-                (Self::s11(r ^ 0x1111) * PRIMARY_START_JITTER_FRAC * (tree.trunk_h as f32)) as i32;
+                (s11(r ^ 0x1111) * PRIMARY_START_JITTER_FRAC * (tree.trunk_h as f32)) as i32;
             out[i] = (y_base + jitter).clamp(y_lo, y_hi);
         }
 
@@ -641,7 +636,7 @@ impl WorldGen {
             len = len.max(CHILD_LEN_M_FLOOR * vpm);
 
             let fan_amp = CHILD_FAN_AMP_BASE + CHILD_FAN_AMP_DEPTH * (depth as f32);
-            let fan = Self::s11(sj ^ 0x3333) * fan_amp;
+            let fan = s11(sj ^ 0x3333) * fan_amp;
 
             let up = 1.65 * (CHILD_UP_BASE + CHILD_UP_DEPTH * (depth as f32))
                 + 1.25 * (CHILD_UP_RAND * u01(sj ^ 0x4444));
@@ -666,10 +661,10 @@ impl WorldGen {
 
             let bend = (CHILD_BEND_M_MIN * vpm) + (CHILD_BEND_M_RAND * vpm) * u01(sj ^ 0x6666);
 
-            let k1 = Self::s11(sj ^ 0x7777);
-            let k2 = Self::s11(sj ^ 0x8888);
-            let u1 = Self::s11(sj ^ 0x9999);
-            let u2 = Self::s11(sj ^ 0xAAAA);
+            let k1 = s11(sj ^ 0x7777);
+            let k2 = s11(sj ^ 0x8888);
+            let u1 = s11(sj ^ 0x9999);
+            let u2 = s11(sj ^ 0xAAAA);
 
             let c1x = ax + dirx * (CHILD_C1_T * len)
                 + sideways.0 * (bend * CHILD_C1_BEND_SCALE * k1);
@@ -777,7 +772,7 @@ impl WorldGen {
 
                 let ox = ang.cos() * ring_r;
                 let oz = ang.sin() * ring_r;
-                let oy = Self::s11(rr ^ 0xB2) * (0.18 * vpm_f);
+                let oy = s11(rr ^ 0xB2) * (0.18 * vpm_f);
 
                 self.raster_sphere_leaf_tuft_with_masks(
                     out,
@@ -807,7 +802,7 @@ impl WorldGen {
             let sy = starts[i];
             let br_seed = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
 
-            let ang_j = Self::s11(hash_u32(br_seed ^ 0xABCD_0001)) * PRIMARY_ANG_JITTER;
+            let ang_j = s11(hash_u32(br_seed ^ 0xABCD_0001)) * PRIMARY_ANG_JITTER;
             let ang =
                 ang0 + (i as f32) * (std::f32::consts::TAU / (primary_count as f32)) + ang_j;
 
@@ -838,10 +833,10 @@ impl WorldGen {
 
             let bend = (PRIMARY_BEND_M_MIN * vpm_f)
                 + (PRIMARY_BEND_M_RAND * vpm_f) * u01(hash_u32(br_seed ^ 0x9000));
-            let k1 = Self::s11(hash_u32(br_seed ^ 0x9001));
-            let k2 = Self::s11(hash_u32(br_seed ^ 0x9002));
-            let u1 = Self::s11(hash_u32(br_seed ^ 0x9003));
-            let u2 = Self::s11(hash_u32(br_seed ^ 0x9004));
+            let k1 = s11(hash_u32(br_seed ^ 0x9001));
+            let k2 = s11(hash_u32(br_seed ^ 0x9002));
+            let u1 = s11(hash_u32(br_seed ^ 0x9003));
+            let u2 = s11(hash_u32(br_seed ^ 0x9004));
 
             let perpx = -dirz;
             let perpz = dirx;
@@ -925,9 +920,9 @@ impl WorldGen {
                 let t = LEAF_SLEEVE_T_MIN + LEAF_SLEEVE_T_RAND * u01(rr ^ 0x0101);
                 let (mx, my, mz) = Self::bez_point(b, t);
 
-                let ox = Self::s11(rr ^ 0x0202) * (LEAF_SLEEVE_OFFSET_M_XZ * vpm_f);
+                let ox = s11(rr ^ 0x0202) * (LEAF_SLEEVE_OFFSET_M_XZ * vpm_f);
                 let oy = u01(rr ^ 0x0303) * (LEAF_SLEEVE_OFFSET_M_Y * vpm_f);
-                let oz = Self::s11(rr ^ 0x0404) * (LEAF_SLEEVE_OFFSET_M_XZ * vpm_f);
+                let oz = s11(rr ^ 0x0404) * (LEAF_SLEEVE_OFFSET_M_XZ * vpm_f);
 
                 self.raster_sphere_leaf_tuft_with_masks(
                     out,
@@ -946,9 +941,9 @@ impl WorldGen {
             let h = hash_u32(b.seed ^ 0xABC0_0001);
             if (h & LEAF_OFFSET_TIP_MASK) != 0 {
                 let rr = hash_u32(b.seed ^ 0xABC0_0002);
-                let ox = Self::s11(rr ^ 0xABC1) * (LEAF_OFFSET_M_XZ * vpm_f);
+                let ox = s11(rr ^ 0xABC1) * (LEAF_OFFSET_M_XZ * vpm_f);
                 let oy = u01(rr ^ 0xABC2) * (LEAF_OFFSET_M_Y * vpm_f);
-                let oz = Self::s11(rr ^ 0xABC3) * (LEAF_OFFSET_M_XZ * vpm_f);
+                let oz = s11(rr ^ 0xABC3) * (LEAF_OFFSET_M_XZ * vpm_f);
 
                 self.raster_sphere_leaf_tuft_with_masks(
                     out,
