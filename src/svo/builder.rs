@@ -1,6 +1,7 @@
 // src/svo/builder.rs
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use rayon::prelude::*;
 
 use crate::app::config;
 use crate::{
@@ -384,17 +385,26 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     let cache_h = (cache_z1 - cache_z0 + 1) as usize;
 
     scratch.ensure_height_cache(cache_w, cache_h);
-    for z in 0..cache_h {
-        if (z & 15) == 0 && should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        }
-        let wz = cache_z0 + z as i32;
-        let row = z * cache_w;
-        for x in 0..cache_w {
-            let wx = cache_x0 + x as i32;
-            scratch.height_cache[row + x] = gen.ground_height(wx, wz);
-        }
+
+    scratch
+        .height_cache
+        .par_chunks_mut(cache_w)
+        .enumerate()
+        .for_each(|(z, row)| {
+            if (z & 15) == 0 && should_cancel(cancel) {
+                return;
+            }
+            let wz = cache_z0 + z as i32;
+            for x in 0..cache_w {
+                let wx = cache_x0 + x as i32;
+                row[x] = gen.ground_height(wx, wz);
+            }
+        });
+
+    if should_cancel(cancel) {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
+
 
     let height_at = |wx: i32, wz: i32| -> i32 {
         if wx < cache_x0 || wx > cache_x1 || wz < cache_z0 || wz > cache_z1 {
@@ -423,18 +433,23 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     // -------------------------------------------------------------------------
     BuildScratch::ensure_2d(&mut scratch.ground, side, 0);
 
-    for lz in 0..cs_i {
-        if (lz & 15) == 0 && should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        }
-        for lx in 0..cs_i {
-            let wx = chunk_ox + lx;
-            let wz = chunk_oz + lz;
-            let g = height_at(wx, wz);
+    scratch
+        .ground
+        .par_chunks_mut(side)
+        .enumerate()
+        .for_each(|(lz, row)| {
+            if (lz & 15) == 0 && should_cancel(cancel) {
+                return;
+            }
+            let wz = chunk_oz + lz as i32;
+            for lx in 0..side {
+                let wx = chunk_ox + lx as i32;
+                row[lx] = height_at(wx, wz);
+            }
+        });
 
-            let i = idx2(side, lx as usize, lz as usize);
-            scratch.ground[i] = g;
-        }
+    if should_cancel(cancel) {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
 
     let ground_mip: MinMaxMipView<'_> = build_minmax_mip_inplace(
@@ -518,33 +533,62 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     let dirt_depth = 3 * vpm;
 
-    for ly in 0..cs_i {
-        if (ly & 7) == 0 && should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        }
+    let side2 = side * side;
 
-        let wy = chunk_oy + ly;
-
-        for lz in 0..cs_i {
-            for lx in 0..cs_i {
-                let col = idx2(side, lx as usize, lz as usize);
-                let g = scratch.ground[col];
-
-                let m: u32 = if wy < g {
-                    if wy >= g - dirt_depth { DIRT } else { STONE }
-                } else if wy == g {
-                    let tm = tree_mask.material_local(lx as usize, ly as usize, lz as usize);
-                    if tm == WOOD { WOOD } else { GRASS }
-                } else {
-                    let tm = tree_mask.material_local(lx as usize, ly as usize, lz as usize);
-                    if tm != AIR { tm } else { AIR }
-                };
-
-                let i3 = idx3(side, lx as usize, ly as usize, lz as usize);
-                scratch.material[i3] = m;
+    // If WorldGen ever stops being Sync, switch to per-thread clones:
+    // scratch.material.par_chunks_mut(side2).enumerate().for_each_init(|| gen.clone(), |gen, (ly, slab)| { ... })
+    scratch
+        .material
+        .par_chunks_mut(side2)
+        .enumerate()
+        .for_each(|(ly, slab)| {
+            if (ly & 7) == 0 && should_cancel(cancel) {
+                return;
             }
-        }
+
+            let wy = chunk_oy + ly as i32;
+
+            for lz in 0..side {
+                let wz = chunk_oz + lz as i32;
+                let row_off = lz * side;
+
+                for lx in 0..side {
+                    let wx = chunk_ox + lx as i32;
+
+                    let col = idx2(side, lx, lz);
+                    let g = scratch.ground[col];
+
+                    // --- 1) terrain ---
+                    let mut m: u32 = if wy < g {
+                        if wy >= g - dirt_depth { DIRT } else { STONE }
+                    } else if wy == g {
+                        GRASS
+                    } else {
+                        AIR
+                    };
+
+                    // --- 2) caves ---
+                    if m != AIR && gen.carve_cave(wx, wy, wz, g) {
+                        m = AIR;
+                    }
+
+                    // --- 3) trees overlay ---
+                    if m == AIR {
+                        let tm = tree_mask.material_local(lx, ly, lz);
+                        if tm != AIR {
+                            m = tm;
+                        }
+                    }
+
+                    slab[row_off + lx] = m;
+                }
+            }
+        });
+
+    if should_cancel(cancel) {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
+
 
     // -------------------------------------------------------------------------
     // Apply per-voxel overrides (edits)
