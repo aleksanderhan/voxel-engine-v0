@@ -132,7 +132,7 @@ const CLOUD_COVERAGE : f32 = 0.30;
 const CLOUD_SOFTNESS : f32 = 0.08;
 
 // Density + shaping
-const CLOUD_DENSITY     : f32 = 0.042; // extinction scale (bigger = thicker/darker)
+const CLOUD_DENSITY     : f32 = 0.058; // extinction scale (bigger = thicker/darker)
 const CLOUD_PUFF_POW    : f32 = 1.8;   // >1 makes denser cores, airier edges
 const CLOUD_DETAIL_W    : f32 = 0.35;  // detail noise weight
 

@@ -14,6 +14,20 @@ It’s structured like a minimal “engine loop” (winit) + a rendering backend
 
 ---
 
+## Usage
+
+Default (profiling off):
+
+    cargo run
+
+Enable profiling:
+
+    cargo run -- --profile
+
+Optional print cadence:
+
+    cargo run -- --profile --profile-every-ms 250
+
 ## What you get
 
 - **GPU ray tracing of voxels** (compute shader), with lighting and volumetrics.

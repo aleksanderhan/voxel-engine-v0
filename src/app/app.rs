@@ -1,4 +1,5 @@
-// src/app/mod.rs
+// src/app/app.rs
+// --------------
 //
 // Application loop + per-frame orchestration.
 //
@@ -9,6 +10,7 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
 use glam::Vec3;
 
 use winit::{
@@ -18,9 +20,9 @@ use winit::{
 };
 
 use super::profiler;
-use crate::app::input::InputState;
 use crate::app::camera::Camera;
 use crate::app::config;
+use crate::app::input::InputState;
 use crate::{
     clipmap::Clipmap,
     render::{CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
@@ -108,15 +110,13 @@ pub struct App {
 
     edit_mode: usize,
     edit_modes: Vec<EditMode>,
-
 }
 
 #[derive(Clone, Copy)]
 enum EditMode {
-    Dig,          // set hit voxel to AIR
-    Place(u32),   // place material into prev-voxel
+    Dig,        // set hit voxel to AIR
+    Place(u32), // place material into prev-voxel
 }
-
 
 impl App {
     pub async fn new(window: Arc<Window>) -> Self {
@@ -173,14 +173,17 @@ impl App {
         );
         let physics = crate::physics::Physics::new(start_pos);
 
-
         let edit_modes = vec![
             EditMode::Dig,
-            EditMode::Place(AIR),   // “place air” mode if you want it explicitly
+            EditMode::Place(AIR), // “place air” mode if you want it explicitly
             EditMode::Place(DIRT),
             EditMode::Place(STONE),
             EditMode::Place(WOOD),
         ];
+
+        // --- Profiling (default off) ---------------------------------------------------------
+        let (prof_enabled, prof_every) = profiler::settings_from_args();
+        let profiler = profiler::FrameProf::new(prof_enabled, prof_every);
 
         Self {
             window,
@@ -200,7 +203,7 @@ impl App {
             fps_frames: 0,
             fps_last_update: Instant::now(),
             frame_index: 0,
-            profiler: profiler::FrameProf::new(),
+            profiler,
             last_frame_time: Instant::now(),
             prev_view_proj: glam::Mat4::IDENTITY,
             has_prev_view_proj: false,
@@ -306,18 +309,16 @@ impl App {
     }
 
     fn update_camera(&mut self, delta_seconds: f32) {
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
 
         if self.input.take_c_pressed() {
             self.free_cam = !self.free_cam;
 
             if self.free_cam {
-                // entering free cam: copy player view -> camera
                 let eye = self.physics.player.pos + self.physics.eye_offset;
                 self.camera.set_position(eye);
                 self.camera.set_yaw_pitch(self.physics.yaw, self.physics.pitch);
             } else {
-                // leaving free cam: copy camera view -> player view
                 let (yaw, pitch) = self.camera.yaw_pitch();
                 self.physics.yaw = yaw;
                 self.physics.pitch = pitch;
@@ -329,27 +330,26 @@ impl App {
             world: Some(self.world.as_ref()),
         };
 
-        let (eye, forward) = if self.free_cam {
-            // free cam consumes mouse deltas inside camera.integrate_input()
+        let (_eye, _forward) = if self.free_cam {
+            // free cam: camera owns mouse + movement
             self.physics.step_frame_player_only(delta_seconds, &q);
             self.camera.integrate_input(&mut self.input, delta_seconds);
             (self.camera.position(), self.camera.forward())
         } else {
-            // player consumes mouse deltas inside physics.step_frame()
+            // player cam: physics owns mouse + movement; camera just mirrors
             let eye = self.physics.step_frame(&mut self.input, delta_seconds, &q);
             self.camera.set_position(eye);
-            self.camera.set_yaw_pitch(self.physics.yaw, self.physics.pitch);
+            self.camera
+                .set_yaw_pitch(self.physics.yaw, self.physics.pitch);
             (eye, self.camera.forward())
         };
 
-        self.camera.integrate_input(&mut self.input, delta_seconds);
         self.frame_index = self.frame_index.wrapping_add(1);
-
-        self.profiler.cam(profiler::FrameProf::mark_ms(cpu_start));
+        self.profiler.cam(profiler::FrameProf::end_ms(t0));
     }
 
     fn update_streaming(&mut self) {
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
 
         // Always do cheap housekeeping each frame.
         let grid_changed_by_pump = self.chunks.pump_completed();
@@ -371,11 +371,11 @@ impl App {
             self.renderer.write_chunk_grid(self.chunks.chunk_grid());
         }
 
-        self.profiler.stream(profiler::FrameProf::mark_ms(cpu_start));
+        self.profiler.stream(profiler::FrameProf::end_ms(t0));
     }
 
     fn update_clipmap_cpu(&mut self) -> ClipmapCpuUpdate {
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
 
         let time_seconds = self.start_time.elapsed().as_secs_f32();
         let camera_position = self.camera.position();
@@ -391,7 +391,7 @@ impl App {
             .sum::<usize>();
 
         self.profiler
-            .clip_update(profiler::FrameProf::mark_ms(cpu_start));
+            .clip_update(profiler::FrameProf::end_ms(t0));
         self.profiler
             .add_clip_uploads(clip_uploads.len(), upload_bytes);
 
@@ -405,7 +405,7 @@ impl App {
     }
 
     fn build_camera_gpu(&mut self, time_seconds: f32) -> CameraGpu {
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
 
         let aspect = self.surface_config.width as f32 / self.surface_config.height as f32;
         let camera_frame = self.camera.frame_matrices(aspect);
@@ -462,14 +462,13 @@ impl App {
         };
 
         self.renderer.write_camera(&camera_gpu);
-        self.profiler
-            .cam_write(profiler::FrameProf::mark_ms(cpu_start));
+        self.profiler.cam_write(profiler::FrameProf::end_ms(t0));
 
         camera_gpu
     }
 
     fn write_overlay_fps(&mut self) {
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
 
         self.fps_frames += 1;
 
@@ -490,12 +489,11 @@ impl App {
         );
         self.renderer.write_overlay(&overlay);
 
-        self.profiler
-            .overlay(profiler::FrameProf::mark_ms(cpu_start));
+        self.profiler.overlay(profiler::FrameProf::end_ms(t0));
     }
 
     fn apply_chunk_uploads_and_refresh_grid(&mut self) {
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
 
         let chunk_uploads = self.chunks.take_uploads_budgeted();
         self.profiler.add_chunk_uploads(chunk_uploads.len());
@@ -508,8 +506,7 @@ impl App {
             self.renderer.write_chunk_grid(self.chunks.chunk_grid());
         }
 
-        self.profiler
-            .chunk_up(profiler::FrameProf::mark_ms(cpu_start));
+        self.profiler.chunk_up(profiler::FrameProf::end_ms(t0));
     }
 
     fn create_frame_encoder(&self) -> wgpu::CommandEncoder {
@@ -523,9 +520,9 @@ impl App {
     fn encode_clipmap_updates(
         &mut self,
         clipmap_update: &ClipmapCpuUpdate,
-        encoder: &mut wgpu::CommandEncoder,
+        _encoder: &mut wgpu::CommandEncoder,
     ) {
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
 
         // This call should encode both:
         // - texture uploads (staging -> clipmap textures)
@@ -534,12 +531,11 @@ impl App {
         self.renderer
             .write_clipmap_updates(&clipmap_update.clip_gpu, &clipmap_update.clip_uploads);
 
-        self.profiler
-            .enc_clip(profiler::FrameProf::mark_ms(cpu_start));
+        self.profiler.enc_clip(profiler::FrameProf::end_ms(t0));
     }
 
     fn encode_compute_pass(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
 
         self.renderer.encode_compute(
             encoder,
@@ -547,15 +543,14 @@ impl App {
             self.surface_config.height,
         );
 
-        self.profiler
-            .enc_comp(profiler::FrameProf::mark_ms(cpu_start));
+        self.profiler.enc_comp(profiler::FrameProf::end_ms(t0));
     }
 
     fn acquire_swapchain_frame(
         &mut self,
         elwt: &EventLoopWindowTarget<()>,
     ) -> Option<wgpu::SurfaceTexture> {
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -578,45 +573,45 @@ impl App {
         };
 
         self.profiler
-            .acq_swapchain(profiler::FrameProf::mark_ms(cpu_start));
+            .acq_swapchain(profiler::FrameProf::end_ms(t0));
 
         Some(frame)
     }
 
-    fn encode_blit_pass(&mut self, swapchain_view: &wgpu::TextureView, encoder: &mut wgpu::CommandEncoder) {
-        let cpu_start = Instant::now();
+    fn encode_blit_pass(
+        &mut self,
+        swapchain_view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        let t0 = self.profiler.start();
 
         self.renderer.encode_blit(encoder, swapchain_view);
 
-        self.profiler
-            .enc_blit(profiler::FrameProf::mark_ms(cpu_start));
+        self.profiler.enc_blit(profiler::FrameProf::end_ms(t0));
     }
 
-    fn submit_and_present(
-        &mut self,
-        encoder: wgpu::CommandEncoder,
-        frame: wgpu::SurfaceTexture,
-    ) {
+    fn submit_and_present(&mut self, encoder: wgpu::CommandEncoder, frame: wgpu::SurfaceTexture) {
         // Submit
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
         self.renderer.queue().submit(Some(encoder.finish()));
-        self.profiler
-            .submit(profiler::FrameProf::mark_ms(cpu_start));
+        self.profiler.submit(profiler::FrameProf::end_ms(t0));
 
         // Poll (keeps mapping/timestamp queries flowing)
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
         self.renderer.device().poll(wgpu::Maintain::Poll);
-        self.profiler
-            .poll_wait(profiler::FrameProf::mark_ms(cpu_start));
+        self.profiler.poll_wait(profiler::FrameProf::end_ms(t0));
 
         // Present
-        let cpu_start = Instant::now();
+        let t0 = self.profiler.start();
         frame.present();
-        self.profiler
-            .present(profiler::FrameProf::mark_ms(cpu_start));
+        self.profiler.present(profiler::FrameProf::end_ms(t0));
     }
 
     fn finish_frame_profiling(&mut self, frame_start: Instant) {
+        if !self.profiler.enabled() {
+            return;
+        }
+
         // Readback timings only when printing; keep default path cheap.
         let gpu_timings_ms = if self.profiler.should_print() {
             self.renderer.read_gpu_timings_ms_blocking()
@@ -657,8 +652,6 @@ impl App {
         crate::streaming::manager::build::dispatch_builds(&mut self.chunks, center);
     }
 
-
-
     fn apply_edit_click(&mut self) {
         let eye = self.camera.position();
         let dir = self.camera.forward();
@@ -697,7 +690,7 @@ impl App {
         dir_m: glam::Vec3,
         max_dist_m: f32,
         voxel_m: f32,
-    ) -> Option<((i32,i32,i32),(i32,i32,i32))> {
+    ) -> Option<((i32, i32, i32), (i32, i32, i32))> {
         let dir = dir_m.normalize();
         let mut t = 0.0f32;
 
@@ -711,7 +704,11 @@ impl App {
         let step_z = if dir.z >= 0.0 { 1 } else { -1 };
 
         let next_boundary = |v: i32, step: i32| -> f32 {
-            if step > 0 { (v as f32 + 1.0) * voxel_m } else { (v as f32) * voxel_m }
+            if step > 0 {
+                (v as f32 + 1.0) * voxel_m
+            } else {
+                (v as f32) * voxel_m
+            }
         };
 
         let mut t_max_x = if dir.x.abs() < 1e-6 {
@@ -730,15 +727,28 @@ impl App {
             (next_boundary(vz, step_z) - origin_m.z) / dir.z
         };
 
-        let t_delta_x = if dir.x.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.x.abs() };
-        let t_delta_y = if dir.y.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.y.abs() };
-        let t_delta_z = if dir.z.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.z.abs() };
+        let t_delta_x = if dir.x.abs() < 1e-6 {
+            f32::INFINITY
+        } else {
+            voxel_m / dir.x.abs()
+        };
+        let t_delta_y = if dir.y.abs() < 1e-6 {
+            f32::INFINITY
+        } else {
+            voxel_m / dir.y.abs()
+        };
+        let t_delta_z = if dir.z.abs() < 1e-6 {
+            f32::INFINITY
+        } else {
+            voxel_m / dir.z.abs()
+        };
 
         let mut prev = (vx, vy, vz);
 
         // march
         let max_t = max_dist_m;
-        for _ in 0..512 { // hard cap
+        for _ in 0..512 {
+            // hard cap
             // sample voxel (worldgen + edits)
             if self.sample_voxel_material(vx, vy, vz) != crate::world::materials::AIR {
                 return Some(((vx, vy, vz), prev));
@@ -789,9 +799,6 @@ impl App {
         // Implement this in WorldGen to match your builder logic.
         self.world.material_at_voxel(wx, wy, wz)
     }
-
-
-
 }
 
 fn choose_present_mode(surface_caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
@@ -814,5 +821,3 @@ fn choose_present_mode(surface_caps: &wgpu::SurfaceCapabilities) -> wgpu::Presen
         surface_caps.present_modes[0]
     }
 }
-
-

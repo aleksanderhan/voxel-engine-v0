@@ -1,8 +1,13 @@
+// src/app/profiler.rs
+// -------------------
 use std::time::{Duration, Instant};
-use crate::streaming::types::StreamStats;
+
 use crate::render::state::GpuTimingsMs;
+use crate::streaming::types::StreamStats;
 
 pub struct FrameProf {
+    enabled: bool,
+
     pub frame: u64,
     pub last_print: Instant,
     pub print_every: Duration,
@@ -28,17 +33,17 @@ pub struct FrameProf {
     pub max_frame_ms: f64,
 
     pub t_poll_wait: f64,
-
     pub t_acq_swapchain: f64,
-
 }
 
 impl FrameProf {
-    pub fn new() -> Self {
+    pub fn new(enabled: bool, print_every: Duration) -> Self {
         Self {
+            enabled,
+
             frame: 0,
             last_print: Instant::now(),
-            print_every: Duration::from_millis(500),
+            print_every,
 
             n_frames: 0,
             t_cam: 0.0,
@@ -61,41 +66,74 @@ impl FrameProf {
             max_frame_ms: 0.0,
 
             t_poll_wait: 0.0,
-
             t_acq_swapchain: 0.0,
-
         }
     }
 
     #[inline]
-    pub fn mark_ms(t0: Instant) -> f64 {
-        t0.elapsed().as_secs_f64() * 1000.0
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
 
-    // --- per-slot adders (avoid borrow conflicts) ---
-    #[inline] pub fn cam(&mut self, ms: f64) { self.t_cam += ms; }
-    #[inline] pub fn stream(&mut self, ms: f64) { self.t_stream += ms; }
-    #[inline] pub fn clip_update(&mut self, ms: f64) { self.t_clipmap_update += ms; }
-    #[inline] pub fn cam_write(&mut self, ms: f64) { self.t_cam_write += ms; }
-    #[inline] pub fn overlay(&mut self, ms: f64) { self.t_overlay += ms; }
-    #[inline] pub fn chunk_up(&mut self, ms: f64) { self.t_chunk_uploads += ms; }
-    #[inline] pub fn enc_clip(&mut self, ms: f64) { self.t_encode_clipmap += ms; }
-    #[inline] pub fn enc_comp(&mut self, ms: f64) { self.t_encode_compute += ms; }
-    #[inline] pub fn enc_blit(&mut self, ms: f64) { self.t_encode_blit += ms; }
-    #[inline] pub fn submit(&mut self, ms: f64) { self.t_submit += ms; }
-    #[inline] pub fn poll(&mut self, ms: f64) { self.t_poll += ms; }
-    #[inline] pub fn present(&mut self, ms: f64) { self.t_present += ms; }
+    /// Returns `Some(Instant::now())` only when profiling is enabled.
+    #[inline]
+    pub fn start(&self) -> Option<Instant> {
+        if self.enabled {
+            Some(Instant::now())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn end_ms(t0: Option<Instant>) -> f64 {
+        match t0 {
+            Some(t) => t.elapsed().as_secs_f64() * 1000.0,
+            None => 0.0,
+        }
+    }
+
+    // --- per-slot adders (no-op when disabled) ---
+    #[inline] pub fn cam(&mut self, ms: f64) { if self.enabled { self.t_cam += ms; } }
+    #[inline] pub fn stream(&mut self, ms: f64) { if self.enabled { self.t_stream += ms; } }
+    #[inline] pub fn clip_update(&mut self, ms: f64) { if self.enabled { self.t_clipmap_update += ms; } }
+    #[inline] pub fn cam_write(&mut self, ms: f64) { if self.enabled { self.t_cam_write += ms; } }
+    #[inline] pub fn overlay(&mut self, ms: f64) { if self.enabled { self.t_overlay += ms; } }
+    #[inline] pub fn chunk_up(&mut self, ms: f64) { if self.enabled { self.t_chunk_uploads += ms; } }
+    #[inline] pub fn enc_clip(&mut self, ms: f64) { if self.enabled { self.t_encode_clipmap += ms; } }
+    #[inline] pub fn enc_comp(&mut self, ms: f64) { if self.enabled { self.t_encode_compute += ms; } }
+    #[inline] pub fn enc_blit(&mut self, ms: f64) { if self.enabled { self.t_encode_blit += ms; } }
+    #[inline] pub fn submit(&mut self, ms: f64) { if self.enabled { self.t_submit += ms; } }
+    #[inline] pub fn poll(&mut self, ms: f64) { if self.enabled { self.t_poll += ms; } }
+    #[inline] pub fn present(&mut self, ms: f64) { if self.enabled { self.t_present += ms; } }
+    #[inline] pub fn poll_wait(&mut self, ms: f64) { if self.enabled { self.t_poll_wait += ms; } }
+    #[inline] pub fn acq_swapchain(&mut self, ms: f64) { if self.enabled { self.t_acq_swapchain += ms; } }
 
     pub fn add_clip_uploads(&mut self, n: usize, bytes: usize) {
+        if !self.enabled { return; }
         self.clip_uploads += n as u64;
         self.clip_bytes += bytes as u64;
     }
 
     pub fn add_chunk_uploads(&mut self, n: usize) {
+        if !self.enabled { return; }
         self.chunk_uploads += n as u64;
     }
 
-    pub fn end_frame(&mut self, frame_ms: f64, stream: Option<StreamStats>, gpu: Option<GpuTimingsMs>) {
+    pub fn should_print(&self) -> bool {
+        self.enabled && self.last_print.elapsed() >= self.print_every
+    }
+
+    pub fn end_frame(
+        &mut self,
+        frame_ms: f64,
+        stream: Option<StreamStats>,
+        gpu: Option<GpuTimingsMs>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+
         self.frame += 1;
         self.n_frames += 1;
         self.max_frame_ms = self.max_frame_ms.max(frame_ms);
@@ -105,9 +143,20 @@ impl FrameProf {
             let avg = |x: f64| x / nf;
 
             let avg_frame = avg(
-                self.t_cam + self.t_stream + self.t_clipmap_update + self.t_cam_write + self.t_overlay
-                    + self.t_chunk_uploads + self.t_acq_swapchain + self.t_encode_clipmap + self.t_encode_compute
-                    + self.t_encode_blit + self.t_submit + self.t_poll + self.t_poll_wait + self.t_present
+                self.t_cam
+                    + self.t_stream
+                    + self.t_clipmap_update
+                    + self.t_cam_write
+                    + self.t_overlay
+                    + self.t_chunk_uploads
+                    + self.t_acq_swapchain
+                    + self.t_encode_clipmap
+                    + self.t_encode_compute
+                    + self.t_encode_blit
+                    + self.t_submit
+                    + self.t_poll
+                    + self.t_poll_wait
+                    + self.t_present,
             );
 
             println!(
@@ -161,7 +210,6 @@ impl FrameProf {
             self.chunk_uploads = 0;
             self.max_frame_ms = 0.0;
             self.t_acq_swapchain = 0.0;
-
         }
 
         if let Some(s) = stream {
@@ -181,7 +229,6 @@ impl FrameProf {
                 s.cache_entries, s.cache_lru,
                 s.build_queue_len, s.queued_set_len, s.cancels_len, s.orphan_queued
             );
-
         }
 
         if let Some(g) = gpu {
@@ -190,22 +237,48 @@ impl FrameProf {
                 g.primary, g.godray, g.composite, g.blit, g.total
             );
         }
+    }
+}
 
-
-        
-
+/// Parse command-line flags:
+/// - `--profile` enables profiling
+/// - optional: `--profile-every-ms=500` or `--profile-every-ms 500`
+pub fn settings_from_args() -> (bool, Duration) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return (false, Duration::from_millis(500));
     }
 
-    #[inline]
-    pub fn poll_wait(&mut self, ms: f64) {
-        self.t_poll_wait += ms;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut enabled = false;
+        let mut every_ms: Option<u64> = None;
+
+        let mut it = std::env::args().skip(1);
+        while let Some(a) = it.next() {
+            if a == "--profile" || a == "--profiling" {
+                enabled = true;
+                continue;
+            }
+
+            if let Some(v) = a.strip_prefix("--profile-every-ms=") {
+                if let Ok(n) = v.parse::<u64>() {
+                    every_ms = Some(n);
+                }
+                continue;
+            }
+
+            if a == "--profile-every-ms" {
+                if let Some(v) = it.next() {
+                    if let Ok(n) = v.parse::<u64>() {
+                        every_ms = Some(n);
+                    }
+                }
+                continue;
+            }
+        }
+
+        let print_every = Duration::from_millis(every_ms.unwrap_or(500));
+        (enabled, print_every)
     }
-
-    #[inline] pub fn acq_swapchain(&mut self, ms: f64) { self.t_acq_swapchain += ms; }
-
-    pub fn should_print(&self) -> bool {
-        self.last_print.elapsed() >= self.print_every
-    }
-
-
 }
