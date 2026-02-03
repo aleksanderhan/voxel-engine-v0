@@ -10,7 +10,7 @@ use crate::{
     svo::{build_chunk_svo_sparse_cancelable_with_scratch, BuildScratch},
     world::WorldGen,
 };
-use crate::svo::builder::BuildTimingsMs;
+use crate::svo::builder::{BuildOutput, BuildTimingsMs};
 
 use super::types::{BuildDone, BuildJob};
 
@@ -52,13 +52,13 @@ pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Se
                     0,
                 ];
 
-                let (nodes, macro_words, ropes, colinfo_words, tim): (
-                    Vec<NodeGpu>,
-                    Vec<u32>,
-                    Vec<NodeRopesGpu>,
-                    Vec<u32>,
-                    BuildTimingsMs,
-                ) = build_chunk_svo_sparse_cancelable_with_scratch(
+                let BuildOutput {
+                    nodes,
+                    macro_words,
+                    ropes,
+                    colinfo_words,
+                    timings: tim,
+                } = build_chunk_svo_sparse_cancelable_with_scratch(
                     &gen,
                     [origin[0], origin[1], origin[2]],
                     config::CHUNK_SIZE,
@@ -66,6 +66,7 @@ pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Se
                     &mut scratch,
                     &job.edits,
                 );
+
 
 
                 let canceled = job.cancel.load(Ordering::Relaxed);
