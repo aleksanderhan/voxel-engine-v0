@@ -249,6 +249,17 @@ fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
     let pr = ropes[idx as usize];
     let mask = p.child_mask;
 
+    // Precompute child index for each ci in one pass (no count_ones in hot loop).
+    let mut child_of_ci = [INVALID_U32; 8];
+    let mut rank = 0u32;
+    for ci in 0u32..8u32 {
+        if (mask & (1u32 << ci)) != 0 {
+            child_of_ci[ci as usize] = p.child_base + rank;
+            rank += 1;
+        }
+    }
+
+
     // For each *existing* child, compute its ropes.
     for ci in 0u32..8u32 {
         if (mask & (1u32 << ci)) == 0 {
@@ -259,7 +270,7 @@ fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
         let hy = (ci >> 1) & 1;
         let hz = (ci >> 2) & 1;
 
-        let self_child = child_idx(nodes, idx, ci);
+        let self_child = child_of_ci[ci as usize];
         debug_assert_ne!(self_child, INVALID_U32);
 
         let sib_x = ci ^ 1;
@@ -268,11 +279,7 @@ fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
 
         // helper: sibling root if it exists
         let sib = |sci: u32| -> u32 {
-            if (mask & (1u32 << sci)) != 0 {
-                child_idx(nodes, idx, sci)
-            } else {
-                INVALID_U32
-            }
+            child_of_ci[sci as usize]
         };
 
         // +X / -X
@@ -328,7 +335,7 @@ fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
         if (mask & (1u32 << ci)) == 0 {
             continue;
         }
-        let c = child_idx(nodes, idx, ci);
+        let c = child_of_ci[ci as usize];
         if c != INVALID_U32 {
             build_ropes_rec(nodes, ropes, c);
         }
@@ -608,27 +615,37 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     scratch.col_top_y.fill(255);
     scratch.col_top_mat.fill(0);
 
-    for lz in 0..cs_i {
-        for lx in 0..cs_i {
-            let col = idx2(side, lx as usize, lz as usize);
+    let cs_us = cs_i as usize;
 
-            let mut top_y: u8 = 255;
-            let mut top_mat: u8 = 0;
+    // (x,z) columns are independent => parallelize
+    scratch
+        .col_top_y
+        .par_iter_mut()
+        .zip(scratch.col_top_mat.par_iter_mut())
+        .enumerate()
+        .for_each(|(col, (out_y, out_m))| {
+            let lx = (col % side) as usize;
+            let lz = (col / side) as usize;
 
-            // scan upward; last non-air wins (highest y)
-            for ly in 0..cs_i {
-                let i3 = idx3(side, lx as usize, ly as usize, lz as usize);
-                let m = scratch.material[i3];
+            // Scan from top down so we can break early.
+            // If you have lots of AIR above ground, this is a big win.
+            let mut y8: u8 = 255;
+            let mut m8: u8 = 0;
+
+            for ly in (0..cs_us).rev() {
+                let i3 = idx3(side, lx, ly, lz);
+                let m = unsafe { *scratch.material.get_unchecked(i3) };
                 if m != AIR {
-                    top_y = ly as u8;
-                    top_mat = (m & 0xFF) as u8;
+                    y8 = ly as u8;
+                    m8 = (m & 0xFF) as u8;
+                    break;
                 }
             }
 
-            scratch.col_top_y[col] = top_y;
-            scratch.col_top_mat[col] = top_mat;
-        }
-    }
+            *out_y = y8;
+            *out_m = m8;
+        });
+
 
     // -------------------------------------------------------------------------
     // Column top map (64x64): per (x,z), store top-most non-air voxel (y, mat)
@@ -664,31 +681,100 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
 
     // -------------------------------------------------------------------------
-    // Prefix sum over solid occupancy
+    // Prefix sum (summed-volume table) over solid occupancy
+    // prefix[x,y,z] = sum of occupancy in [0..x)×[0..y)×[0..z)
     // -------------------------------------------------------------------------
     BuildScratch::ensure_prefix(&mut scratch.prefix, side);
     let dim = side + 1;
+    let side_us = side;
 
-    for z in 1..=side {
-        if (z & 7) == 0 && should_cancel(cancel) {
+    // material is read-only here (Sync), prefix is written via disjoint chunks
+    let material: &[u32] = &scratch.material;
+
+    // ---- Pass 1: write occupancy and prefix along X for each (y,z) row ----
+    // We parallelize over x-rows of the 3D prefix buffer.
+    // Layout: pidx(dim,x,y,z) = z*dim*dim + y*dim + x, so x is contiguous.
+    scratch
+        .prefix
+        .par_chunks_mut(dim)
+        .enumerate()
+        .for_each(|(row_idx, row)| {
+            // row_idx corresponds to (z,y):
+            let z = row_idx / dim;
+            let y = row_idx % dim;
+
+            // keep z=0 or y=0 boundary planes as 0
+            if z == 0 || y == 0 || z > side_us || y > side_us {
+                return;
+            }
+
+            // optional cancel check: cheap + not too frequent
+            if (z & 7) == 0 && should_cancel(cancel) {
+                return;
+            }
+
+            // row[0] stays 0
+            let base_m = idx3(side_us, 0, y - 1, z - 1);
+
+            let mut run: u32 = 0;
+            for x in 1..=side_us {
+                // material index advances by +1 in x
+                let m = unsafe { *material.get_unchecked(base_m + (x - 1)) };
+                run += (m != AIR) as u32;
+                row[x] = run;
+            }
+        });
+
+    if should_cancel(cancel) {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
+
+    // ---- Pass 2: prefix along Y within each Z-plane ----
+    // Each z-plane is a contiguous slab of size dim*dim.
+    let plane = dim * dim;
+    scratch
+        .prefix
+        .par_chunks_mut(plane)
+        .enumerate()
+        .for_each(|(z, slab)| {
+            if z == 0 || z > side_us {
+                return; // boundary plane remains 0
+            }
+            if (z & 7) == 0 && should_cancel(cancel) {
+                return;
+            }
+
+            // For each x, scan y = 1..=side; index in slab is (y*dim + x)
+            for x in 1..=side_us {
+                let mut run: u32 = 0;
+                for y in 1..=side_us {
+                    let idx = y * dim + x;
+                    run += slab[idx];
+                    slab[idx] = run;
+                }
+            }
+        });
+
+    if should_cancel(cancel) {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
+
+    // ---- Pass 3: prefix along Z (sequential; small for 65³) ----
+    for y in 1..=side_us {
+        if (y & 7) == 0 && should_cancel(cancel) {
             return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
-        for y in 1..=side {
+        for x in 1..=side_us {
             let mut run: u32 = 0;
-            for x in 1..=side {
-                let v = (scratch.material[idx3(side, x - 1, y - 1, z - 1)] != AIR) as u32;
-                run += v;
-
-                let a = scratch.prefix[pidx(dim, x, y, z - 1)] as i64;
-                let b = scratch.prefix[pidx(dim, x, y - 1, z)] as i64;
-                let c = scratch.prefix[pidx(dim, x, y - 1, z - 1)] as i64;
-
-                let p = a + b - c + (run as i64);
-                debug_assert!(p >= 0);
-                scratch.prefix[pidx(dim, x, y, z)] = p as u32;
+            for z in 1..=side_us {
+                let idx = pidx(dim, x, y, z);
+                run += scratch.prefix[idx];
+                scratch.prefix[idx] = run;
             }
         }
     }
+
+
 
     // -------------------------------------------------------------------------
     // Macro occupancy bitset (8x8x8 => 512 bits => 16 u32 words)

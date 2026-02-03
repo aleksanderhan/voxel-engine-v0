@@ -21,7 +21,6 @@ pub struct WorldGen {
     cave_a: Fbm<Perlin>,
     cave_b: Fbm<Perlin>,
     cave_warp: Fbm<Perlin>,
-    cave_room: Fbm<Perlin>,
 
     voxels_per_meter: f32,
 }
@@ -40,12 +39,9 @@ impl WorldGen {
         // Warp: keep twist but prevent cavern blow-ups.
         let cave_warp = Fbm::<Perlin>::new(seed ^ 0xC3C3_C3C3).set_octaves(2).set_frequency(0.030);
 
-        // Room modulation: keep field but we'll effectively disable rooms in carve_cave
-        let cave_room = Fbm::<Perlin>::new(seed ^ 0xE6E6_E6E6).set_octaves(1).set_frequency(0.012);
-
         let voxels_per_meter = (1.0 / config::VOXEL_SIZE_M_F64) as f32;
 
-        Self { seed, height, detail, cave_a, cave_b, cave_warp, cave_room, voxels_per_meter }
+        Self { seed, height, detail, cave_a, cave_b, cave_warp, voxels_per_meter }
 
     }
 
