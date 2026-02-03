@@ -29,7 +29,7 @@ use crate::{
     streaming::ChunkManager,
     world::WorldGen,
 };
-use crate::world::materials::{AIR, DIRT, STONE, WOOD};
+use crate::world::materials::{AIR, DIRT, STONE, WOOD, LIGHT};
 
 pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
     let mut app = App::new(window).await;
@@ -179,6 +179,7 @@ impl App {
             EditMode::Place(DIRT),
             EditMode::Place(STONE),
             EditMode::Place(WOOD),
+            EditMode::Place(LIGHT),
         ];
 
         // --- Profiling (default off) ---------------------------------------------------------
@@ -481,8 +482,14 @@ impl App {
             self.fps_last_update = Instant::now();
         }
 
-        let overlay = OverlayGpu::from_fps_and_dims(
+        let edit_value = match self.edit_modes[self.edit_mode] {
+            EditMode::Dig => crate::world::materials::AIR,   // or keep a dedicated “DIG” path if you prefer
+            EditMode::Place(m) => m,
+        };
+
+        let overlay = OverlayGpu::from_fps_and_edit(
             self.fps_value,
+            edit_value,
             self.surface_config.width,
             self.surface_config.height,
             8,
@@ -491,6 +498,7 @@ impl App {
 
         self.profiler.overlay(profiler::FrameProf::end_ms(t0));
     }
+
 
     fn apply_chunk_uploads_and_refresh_grid(&mut self) {
         let t0 = self.profiler.start();
@@ -682,6 +690,12 @@ impl App {
 
         // write edit override
         self.chunks.edits.apply_voxel(key, lx, ly, lz, mat);
+
+        let verify = self.chunks.edits.get_override(key, lx, ly, lz);
+        println!("edit verify key={:?} local=({}, {}, {}) wrote={} readback={:?}",
+            key, lx, ly, lz, mat, verify
+        );
+
 
         // force a rebuild soon
         self.enqueue_chunk_rebuild_now(key);

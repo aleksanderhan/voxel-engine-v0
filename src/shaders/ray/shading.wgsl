@@ -10,8 +10,10 @@ fn color_for_material(m: u32) -> vec3<f32> {
   if (m == MAT_STONE) { return vec3<f32>(0.50, 0.50, 0.55); }
   if (m == MAT_WOOD)  { return vec3<f32>(0.38, 0.26, 0.14); }
   if (m == MAT_LEAF)  { return vec3<f32>(0.10, 0.55, 0.12); }
+  if (m == MAT_LIGHT) { return vec3<f32>(1.0, 0.95, 0.75); }
   return vec3<f32>(1.0, 0.0, 1.0);
 }
+
 
 fn hemi_ambient(n: vec3<f32>, sky_up: vec3<f32>) -> vec3<f32> {
   let upw = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
@@ -97,6 +99,7 @@ fn material_roughness(mat: u32) -> f32 {
   if (mat == MAT_LEAF)  { return 0.80; }
   if (mat == MAT_GRASS) { return 0.85; }
   if (mat == MAT_DIRT)  { return 0.90; }
+  if (mat == MAT_LIGHT) { return 0.25; }
   return 0.90;
 }
 
@@ -106,14 +109,46 @@ fn material_f0(mat: u32) -> f32 {
   if (mat == MAT_LEAF)  { return 0.05; }
   if (mat == MAT_GRASS) { return 0.04; }
   if (mat == MAT_DIRT)  { return 0.02; }
+  if (mat == MAT_LIGHT) { return 0.08; }
   return 0.02;
 }
+
+fn material_emission(mat: u32) -> vec3<f32> {
+  if (mat == MAT_LIGHT) {
+    // HDR emission. Tune this to taste.
+    // Bigger => brighter + more bloom in composite.
+    return 18.0 * vec3<f32>(1.0, 0.95, 0.75);
+  }
+  return vec3<f32>(0.0);
+}
+
 
 fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
   let hp = ro + hg.t * rd;
 
+  // Emissive voxel itself (looks like a lamp)
+  if (hg.mat == MAT_LIGHT) {
+    let v = normalize(-rd);
+    let ndv = max(dot(hg.n, v), 0.0);
+
+    // bright core + mild rim
+    let core = 22.0 * vec3<f32>(1.0, 0.95, 0.75);
+    let rim  = 10.0 * pow(1.0 - ndv, 3.0) * vec3<f32>(1.0, 0.85, 0.55);
+
+    return core + rim;
+  }
+
   var base = color_for_material(hg.mat);
   base = apply_material_variation(base, hg.mat, hp);
+
+  let local_light = gather_voxel_lights(
+    hp,
+    hg.n,
+    hg.root_bmin,
+    hg.root_size,
+    hg.node_base,
+    hg.macro_base
+  );
 
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
@@ -172,11 +207,17 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis_geom * Tc * dapple;
   let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis_geom * Tc;
 
-  return base * (ambient + direct) + 0.20 * spec_col;
+  // local_light is already HDR radiance; treat as extra direct lighting
+  return base * (ambient + direct) + base * local_light + 0.20 * spec_col;
 }
 
 fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
   let hp = ro + ch.t * rd;
+
+  if (ch.mat == MAT_LIGHT) {
+    let facing = 0.65 + 0.35 * max(dot(ch.n, normalize(-rd)), 0.0);
+    return material_emission(ch.mat) * facing;
+  }
 
   var base = color_for_material(ch.mat);
   base = apply_material_variation_clip(base, ch.mat, hp);

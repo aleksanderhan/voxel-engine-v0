@@ -29,6 +29,7 @@ const MAT_DIRT  : u32 = 2u;
 const MAT_STONE : u32 = 3u;
 const MAT_WOOD  : u32 = 4u;
 const MAT_LEAF  : u32 = 5u;
+const MAT_LIGHT : u32 = 6u;
 
 //// --------------------------------------------------------------------------
 //// Sun / sky (shared, but shading logic lives in ray_core.wgsl)
