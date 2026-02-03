@@ -13,15 +13,13 @@ use super::{ground, keep};
 use super::ChunkManager;
 
 #[inline(always)]
-pub fn in_priority_box(mgr: &ChunkManager, center: ChunkKey, k: ChunkKey) -> bool {
-    if !keep::in_priority_xz(center, k) {
-        return false;
-    }
-    let Some(ground_cy) = ground::ground_cy_for_column(mgr, k.x, k.z) else {
-        return false;
-    };
-    let dy = k.y - ground_cy;
-    dy >= GRID_Y_MIN_DY && dy <= (GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1)
+fn y_band_min_dyn(mgr: &ChunkManager) -> i32 {
+    if mgr.build.cam_below_ground { GRID_Y_MIN_DY } else { 0 }
+}
+
+#[inline(always)]
+fn y_band_max_dyn(_mgr: &ChunkManager) -> i32 {
+    GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1
 }
 
 #[inline(always)]
@@ -31,23 +29,6 @@ pub fn is_gpu_ready(mgr: &ChunkManager, k: ChunkKey) -> bool {
         Some(ChunkState::Uploading(up)) => up.uploaded,
         _ => false,
     }
-}
-
-pub fn priority_box_ready(mgr: &ChunkManager, center: ChunkKey) -> bool {
-    for &(dx, dy, dz) in &mgr.offsets.priority_offsets {
-        let x = center.x + dx;
-        let z = center.z + dz;
-
-        let Some(ground_cy) = ground::ground_cy_for_column(mgr, x, z) else {
-            continue;
-        };
-        let k = ChunkKey { x, y: ground_cy + dy, z };
-
-        if !is_gpu_ready(mgr, k) {
-            return false;
-        }
-    }
-    true
 }
 
 #[inline]
@@ -86,11 +67,6 @@ pub fn commit_uploads_applied(mgr: &mut ChunkManager, applied: &[ChunkUpload]) -
         }
     }
 
-    let center_opt = mgr.build.last_center;
-    let priority_gate = center_opt
-        .map(|c| !priority_box_ready(mgr, c))
-        .unwrap_or(false);
-
     // 2) Promote ready Uploading chunks into the resident prefix.
     loop {
         if mgr.slots.resident_slots >= mgr.slots.slot_to_key.len() {
@@ -107,16 +83,9 @@ pub fn commit_uploads_applied(mgr: &mut ChunkManager, applied: &[ChunkUpload]) -
         if !next_ready {
             // Find the best READY uploading chunk in [resident_slots..].
             let mut best: Option<(f32, usize)> = None;
-
+            let center_opt = mgr.build.last_center;
             for s in mgr.slots.resident_slots..mgr.slots.slot_to_key.len() {
                 let k = mgr.slots.slot_to_key[s];
-
-                if priority_gate {
-                    let c = center_opt.unwrap();
-                    if !in_priority_box(mgr, c, k) {
-                        continue;
-                    }
-                }
 
                 let Some(ChunkState::Uploading(up)) = mgr.build.chunks.get(&k) else { continue; };
                 if !up.uploaded {
@@ -133,9 +102,7 @@ pub fn commit_uploads_applied(mgr: &mut ChunkManager, applied: &[ChunkUpload]) -
                     if keep::in_active_xz(c, k) {
                         score -= 10_000.0;
                     }
-                    if in_priority_box(mgr, c, k) {
-                        score -= 20_000.0;
-                    }
+
                 }
 
                 if best.map_or(true, |(bs, _)| score < bs) {
@@ -167,13 +134,6 @@ pub fn commit_uploads_applied(mgr: &mut ChunkManager, applied: &[ChunkUpload]) -
 
         let slot = mgr.slots.resident_slots;
         let key = mgr.slots.slot_to_key[slot];
-
-        if priority_gate {
-            let c = center_opt.unwrap();
-            if !in_priority_box(mgr, c, key) {
-                break;
-            }
-        }
 
         let ready = matches!(
             mgr.build.chunks.get(&key),
@@ -543,9 +503,6 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
             }
         }
 
-        if in_priority_box(mgr, center, k) {
-            continue;
-        }
         if keep::in_active_xz(center, k) {
             continue;
         }
@@ -578,9 +535,6 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
             }
         }
 
-        if in_priority_box(mgr, center, k) {
-            continue;
-        }
         // REMOVE this line for pass 2:
         // if keep::in_active_xz(center, k) { continue; }
 

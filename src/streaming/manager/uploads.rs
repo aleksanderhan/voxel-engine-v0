@@ -93,7 +93,7 @@ pub fn rebucket_for_center(mgr: &mut ChunkManager, center: ChunkKey) {
     let mut new_active = VecDeque::with_capacity(mgr.uploads.uploads_active.len());
     let mut new_other  = VecDeque::with_capacity(mgr.uploads.uploads_other.len());
 
-    let ar = config::ACTIVE_RADIUS.max(PRIORITY_RADIUS);
+    let ar = config::ACTIVE_RADIUS;
 
     let is_active = |k: ChunkKey| {
         let dx = (k.x - center.x).abs();
@@ -229,22 +229,6 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
         if out.len() >= max_uploads {
             push_back_same(mgr, which, u);
             break;
-        }
-
-        // Priority gate only applies to uploads that COMPLETE residency.
-        // (Rewrites should keep flowing even when the priority box isn’t ready.)
-        if u.completes_residency {
-            if let Some(center) = mgr.build.last_center {
-                let gate = !super::slots::priority_box_ready(mgr, center);
-                if gate && !super::slots::in_priority_box(mgr, center, u.key) {
-                    push_back_same(mgr, which, u);
-                    deferred += 1;
-                    if deferred >= defer_cap {
-                        break;
-                    }
-                    continue;
-                }
-            }
         }
 
         // Validate slot + update bases.

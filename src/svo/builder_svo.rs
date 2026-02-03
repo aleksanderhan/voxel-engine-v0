@@ -82,16 +82,19 @@ fn build_level_bottom_up(
     ground_mip: &MinMaxMipView<'_>,
     dirt_depth: i32,
     cancel: &AtomicBool,
+    scratch: &mut SvoScratch,
 ) -> (Vec<NodeGpu>, Vec<u32>, Vec<NodeGpu>) {
     debug_assert_eq!(child_side, parent_side * 2);
     debug_assert_eq!(child_idx_grid.len(), child_side * child_side * child_side);
 
     let parent_cells = parent_side * parent_side * parent_side;
 
-    // Per parent-cell metadata (dense, deterministic scan order).
-    // mask == 0 => empty => parent doesn't exist in compacted parent_nodes.
-    let mut mask_dense = vec![0u8; parent_cells];
-    let mut collapse_stone_dense = vec![0u8; parent_cells]; // 1 => collapse to STONE leaf
+    SvoScratch::ensure_u8(&mut scratch.mask_dense, parent_cells, 0);
+    SvoScratch::ensure_u8(&mut scratch.collapse_dense, parent_cells, 0);
+
+    let mask_dense: &mut [u8] = &mut scratch.mask_dense[..];
+    let collapse_stone_dense: &mut [u8] = &mut scratch.collapse_dense[..];
+
 
     // 1) Compute child masks (parallel-friendly, deterministic storage)
     mask_dense
@@ -133,6 +136,15 @@ fn build_level_bottom_up(
     if should_cancel(cancel) {
         return (Vec::new(), Vec::new(), Vec::new());
     }
+
+    // Exact reserve for packed children = sum(popcount(mask)) across parents.
+    let mut packed_len: usize = 0;
+    for &m in mask_dense.iter() {
+        packed_len += (m as u32).count_ones() as usize;
+    }
+    scratch.packed_children.clear();
+    scratch.packed_children.reserve_exact(packed_len);
+
 
     // 2) Optional collapse-to-stone decision (only where it can trigger)
     //    We avoid prefix_sum_cube() unless y1 < gmin - dirt_depth.
@@ -182,7 +194,9 @@ fn build_level_bottom_up(
     }
 
     // 3) Compact parent nodes (prefix-sum over "exists") in deterministic order.
-    let mut parent_idx_grid = vec![INVALID; parent_cells];
+    SvoScratch::ensure_u32(&mut scratch.parent_idx_grid, parent_cells, INVALID);
+    let parent_idx_grid = &mut scratch.parent_idx_grid;
+
     let mut parent_count: u32 = 0;
 
     for pi in 0..parent_cells {
@@ -195,9 +209,16 @@ fn build_level_bottom_up(
         }
     }
 
-    let mut parent_nodes = vec![make_leaf(chunk_size, 0, 0, 0, parent_size, AIR); parent_count as usize];
-    let mut packed_children = Vec::<NodeGpu>::new();
-    packed_children.reserve((parent_count as usize) * 4); // rough; grows if needed
+    scratch.parent_nodes.clear();
+    scratch.parent_nodes.resize(
+        parent_count as usize,
+        make_leaf(chunk_size, 0, 0, 0, parent_size, AIR),
+    );
+    let parent_nodes = &mut scratch.parent_nodes;
+
+    // packed_children uses scratch buffer; will be returned via mem::take() at end.
+    let packed_children = &mut scratch.packed_children;
+
 
     // 4) Fill parent_nodes and produce packed children (sequential, cache-friendly).
     //    Ordering:
@@ -265,7 +286,12 @@ fn build_level_bottom_up(
         };
     }
 
-    (parent_nodes, parent_idx_grid, packed_children)
+    (
+        std::mem::take(&mut scratch.parent_nodes),
+        std::mem::take(&mut scratch.parent_idx_grid),
+        std::mem::take(&mut scratch.packed_children),
+    )
+
 }
 
 pub fn build_svo_bottom_up(
@@ -276,6 +302,7 @@ pub fn build_svo_bottom_up(
     ground_mip: &MinMaxMipView<'_>,
     dirt_depth: i32,
     cancel: &AtomicBool,
+    scratch: &mut SvoScratch,
 ) -> Vec<NodeGpu> {
     let side_vox = chunk_size as usize;
     debug_assert!(chunk_size.is_power_of_two());
@@ -283,80 +310,127 @@ pub fn build_svo_bottom_up(
 
     let max_lvl = chunk_size.trailing_zeros() as usize; // 64 -> 6
 
-    // ---------------------------
-    // Level max_lvl (leaf voxels)
-    // ---------------------------
-    let n = material.len();
-
-    // occ[i]=1 if solid, else 0 (parallel)
-    let mut occ = vec![0u8; n];
-    occ.par_iter_mut()
-        .enumerate()
-        .for_each(|(i, o)| *o = (material[i] != (AIR as u8)) as u8);
-
-
-    if should_cancel(cancel) {
-        return Vec::new();
-    }
-
-    // positions via prefix sum (sequential, deterministic)
-    let mut pos = vec![INVALID; n];
-    let mut total: u32 = 0;
-    for i in 0..n {
-        if occ[i] != 0 {
-            pos[i] = total;
-            total += 1;
-        }
-        if (i & 65535) == 0 && should_cancel(cancel) {
-            return Vec::new();
-        }
-    }
-
-    let mut inv = vec![0u32; total as usize];
-    for i in 0..n {
-        if occ[i] != 0 {
-            inv[pos[i] as usize] = i as u32;
-        }
-    }
-
-    // leaf nodes + dense idx grid
-    let mut leaf_nodes = vec![make_leaf(chunk_size, 0, 0, 0, 1, AIR); total as usize];
-    let mut leaf_idx_grid = vec![INVALID; n];
-
-    leaf_nodes
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(p, out)| {
-            let i = inv[p] as usize;
-            let (x, y, z) = coord_from_linear(i, side_vox);
-            let m = material[i] as u32;
-            *out = make_leaf(chunk_size, x as i32, y as i32, z as i32, 1, m);
-        });
-
-    leaf_idx_grid
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(i, out)| {
-            if occ[i] != 0 {
-                *out = pos[i];
-            }
-        });
-
-    if should_cancel(cancel) {
-        return Vec::new();
-    }
-
     // packed_children_levels[l] stores nodes at level l, packed by parents.
     // We'll fill levels 1..=max_lvl. Level 0 is the root node.
     let mut packed_children_levels: Vec<Vec<NodeGpu>> = vec![Vec::new(); max_lvl + 1];
 
+    // ---------------------------
+    // Level max_lvl (leaf voxels)
+    // ---------------------------
+    // Deterministic 2-pass blocked compaction (no occ/pos/inv arrays).
+    const BLOCK: usize = 4096;
+    let n = material.len();
+    let nb = (n + BLOCK - 1) / BLOCK;
+
+    scratch.block_counts.resize(nb, 0);
+    scratch.block_offsets.resize(nb, 0);
+
+    // Pass 1: count solid voxels per block (parallel)
+    scratch
+        .block_counts
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(bi, out)| {
+            if (bi & 63) == 0 && should_cancel(cancel) {
+                return;
+            }
+            let i0 = bi * BLOCK;
+            let i1 = (i0 + BLOCK).min(n);
+
+            let mut c: u32 = 0;
+            for i in i0..i1 {
+                c += (material[i] != (AIR as u8)) as u32;
+            }
+            *out = c;
+        });
+
+    if should_cancel(cancel) {
+        return Vec::new();
+    }
+
+    // Prefix over blocks (sequential, deterministic)
+    let mut total: u32 = 0;
+    for bi in 0..nb {
+        scratch.block_offsets[bi] = total;
+        total += scratch.block_counts[bi];
+        if (bi & 255) == 0 && should_cancel(cancel) {
+            return Vec::new();
+        }
+    }
+
+    // Dense grid: voxel -> compact leaf index (or INVALID)
+    SvoScratch::ensure_u32(&mut scratch.child_idx_grid, n, INVALID);
+
+    // Compact leaf nodes
+    scratch.child_nodes.clear();
+    scratch
+        .child_nodes
+        .resize(total as usize, make_leaf(chunk_size, 0, 0, 0, 1, AIR));
+
+    // ---- Pass 2 (FIXED): fill dense index grid + leaf nodes in parallel
+    // Use raw pointers to avoid capturing &mut scratch.* inside Fn closures.
+    let idx_ptr = scratch.child_idx_grid.as_mut_ptr() as usize;
+    let node_ptr = scratch.child_nodes.as_mut_ptr() as usize;
+
+    scratch
+        .block_counts
+        .par_iter()
+        .zip(scratch.block_offsets.par_iter())
+        .enumerate()
+        .for_each(|(bi, (&count, &base))| {
+            if count == 0 {
+                return;
+            }
+            if (bi & 63) == 0 && should_cancel(cancel) {
+                return;
+            }
+
+            let i0 = bi * BLOCK;
+            let i1 = (i0 + BLOCK).min(n);
+
+            let idx_ptr = idx_ptr as *mut u32;
+            let node_ptr = node_ptr as *mut NodeGpu;
+
+            let mut local: u32 = 0;
+            for i in i0..i1 {
+                let m = unsafe { *material.get_unchecked(i) };
+                if m == (AIR as u8) {
+                    continue;
+                }
+
+                let out_idx = base + local;
+                local += 1;
+
+                unsafe {
+                    // i is unique per block => disjoint writes across threads
+                    *idx_ptr.add(i) = out_idx;
+                }
+
+                let (x, y, z) = coord_from_linear(i, side_vox);
+                let leaf = make_leaf(chunk_size, x as i32, y as i32, z as i32, 1, m as u32);
+
+                unsafe {
+                    // out_idx range [base..base+count) is unique per block => disjoint writes
+                    *node_ptr.add(out_idx as usize) = leaf;
+                }
+            }
+
+            debug_assert_eq!(local, count);
+        });
+
+    if should_cancel(cancel) {
+        return Vec::new();
+    }
+
     // Current child representation used to compute the next level up.
-    let mut child_nodes = leaf_nodes;
-    let mut child_idx_grid = leaf_idx_grid;
-    let mut child_side = side_vox;
+    let mut child_nodes: Vec<NodeGpu> = std::mem::take(&mut scratch.child_nodes);
+    let mut child_idx_grid: Vec<u32> = std::mem::take(&mut scratch.child_idx_grid);
+    let mut child_side: usize = side_vox;
     let mut child_size: i32 = 1;
 
+    // ---------------------------
     // Build from level (max_lvl-1) down to 0
+    // ---------------------------
     for _lvl in (0..max_lvl).rev() {
         if should_cancel(cancel) {
             return Vec::new();
@@ -379,13 +453,14 @@ pub fn build_svo_bottom_up(
             ground_mip,
             dirt_depth,
             cancel,
+            scratch,
         );
 
         if should_cancel(cancel) {
             return Vec::new();
         }
 
-        // packed children correspond to the current child_size
+        // packed_children correspond to the current child_size
         let child_level = (chunk_size / (child_size as u32)).trailing_zeros() as usize;
         debug_assert!(child_level <= max_lvl);
         packed_children_levels[child_level] = packed_children;
@@ -407,7 +482,7 @@ pub fn build_svo_bottom_up(
 
     // -----------------------------------------
     // Flatten into one Vec<NodeGpu> + fix child_base
-    // Layout: [root] + level1 + level2 + ... + level6
+    // Layout: [root] + level1 + ... + level max_lvl
     // -----------------------------------------
     let mut bases = vec![0u32; max_lvl + 1];
     let mut cur: u32 = 1;
@@ -416,7 +491,6 @@ pub fn build_svo_bottom_up(
         cur += packed_children_levels[lvl].len() as u32;
     }
 
-    // Fix-up child_base pointers (only for internal nodes)
     let mut root_fixed = root;
     if root_fixed.child_base != LEAF {
         root_fixed.child_base += bases[1];
@@ -431,7 +505,6 @@ pub fn build_svo_bottom_up(
         }
     }
 
-    // Concatenate
     let total_nodes = cur as usize;
     let mut out = Vec::with_capacity(total_nodes);
     out.push(root_fixed);
@@ -440,4 +513,59 @@ pub fn build_svo_bottom_up(
     }
 
     out
+}
+
+
+
+pub struct SvoScratch {
+    // Leaf construction (blocked prefix)
+    block_counts: Vec<u32>,
+    block_offsets: Vec<u32>,
+
+    // Reused dense grids (sizes vary by level)
+    child_idx_grid: Vec<u32>,     // current level dense grid
+    parent_idx_grid: Vec<u32>,    // next level dense grid
+
+    // Reused per-parent metadata
+    mask_dense: Vec<u8>,
+    collapse_dense: Vec<u8>,
+
+    // Reused node buffers
+    child_nodes: Vec<NodeGpu>,    // compact nodes for current level
+    parent_nodes: Vec<NodeGpu>,   // compact nodes for parent level
+    packed_children: Vec<NodeGpu>,// packed children emitted per level
+}
+
+impl SvoScratch {
+    pub fn new() -> Self {
+        Self {
+            block_counts: Vec::new(),
+            block_offsets: Vec::new(),
+            child_idx_grid: Vec::new(),
+            parent_idx_grid: Vec::new(),
+            mask_dense: Vec::new(),
+            collapse_dense: Vec::new(),
+            child_nodes: Vec::new(),
+            parent_nodes: Vec::new(),
+            packed_children: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn ensure_u32(v: &mut Vec<u32>, n: usize, fill: u32) {
+        if v.len() != n {
+            v.resize(n, fill);
+        } else {
+            v.fill(fill);
+        }
+    }
+
+    #[inline]
+    fn ensure_u8(v: &mut Vec<u8>, n: usize, fill: u8) {
+        if v.len() != n {
+            v.resize(n, fill);
+        } else {
+            v.fill(fill);
+        }
+    }
 }

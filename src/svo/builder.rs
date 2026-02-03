@@ -232,6 +232,11 @@ pub struct BuildScratch {
     height_cache_z0: i32,
     height_cache_valid: bool,
 
+    cave_mask: Vec<u8>,   // 0/1 samples
+    cave_step: usize,     // e.g. 4
+    cave_dim: usize,      // side / step
+
+    svo: svo::SvoScratch,
 }
 
 impl BuildScratch {
@@ -252,6 +257,10 @@ impl BuildScratch {
             height_cache_x0: 0,
             height_cache_z0: 0,
             height_cache_valid: false,
+            cave_mask: Vec::new(),
+            cave_step: 0,
+            cave_dim: 0,
+            svo: svo::SvoScratch::new(),
         }
     }
 
@@ -296,6 +305,20 @@ impl BuildScratch {
         } else {
             v.fill(fill);
         }
+    }
+
+    #[inline]
+    fn ensure_cave_mask(&mut self, side: usize, step: usize) {
+        debug_assert!(side % step == 0);
+        let dim = side / step;
+        let need = dim * dim * dim;
+        if self.cave_mask.len() != need {
+            self.cave_mask.resize(need, 0);
+        } else {
+            self.cave_mask.fill(0);
+        }
+        self.cave_step = step;
+        self.cave_dim = dim;
     }
 
 }
@@ -526,6 +549,14 @@ fn fill_material(
     let side = ctx.side;
     let side2 = side * side;
 
+    let ground: &[i32] = &scratch.ground;
+    let tree_top: &[i32] = &scratch.tree_top;
+
+    let cave_mask: &[u8] = &scratch.cave_mask;
+    let cave_step: usize = scratch.cave_step;
+    let cave_dim: usize = scratch.cave_dim;
+
+
     // cave depth gate (same as before)
     let max_depth_vox: i32 = (48.0_f32 * (ctx.vpm as f32)).round() as i32;
 
@@ -548,7 +579,7 @@ fn fill_material(
                     let wx = ctx.ox + lx as i32;
 
                     let col = idx_xz(side, lx, lz);
-                    let g = scratch.ground[col];
+                    let g = ground[col];
 
                     // 1) terrain
                     let mut m: u8 = if wy < g {
@@ -563,19 +594,24 @@ fn fill_material(
                     if m != AIR8 {
                         let depth_vox = g - wy;
                         if depth_vox > 0 && depth_vox <= max_depth_vox {
-                            if gen.carve_cave(wx, wy, wz, g) {
+                            if cave_mask_at_slices(cave_mask, cave_step, cave_dim, lx, ly, lz) {
                                 m = AIR8;
                             }
                         }
                     }
 
+
                     // 3) trees overlay
                     if m == AIR8 {
-                        let tm = tree_material_local(lx, ly, lz);
-                        if tm != AIR8 {
-                            m = tm;
+                        let ttop = tree_top[col]; // -1 means no tree influence in this column
+                        if ttop >= 0 && (ly as i32) <= ttop {
+                            let tm = tree_material_local(lx, ly, lz);
+                            if tm != AIR8 {
+                                m = tm;
+                            }
                         }
                     }
+
 
                     slab[row_off + lx] = m;
                 }
@@ -590,6 +626,97 @@ fn fill_material(
             scratch.material[i] = (e.mat & 0xFF) as u8;
         }
     }
+}
+
+
+fn build_cave_mask_coarse(
+    gen: &WorldGen,
+    ctx: ChunkCtx,
+    scratch: &mut BuildScratch,
+    cancel: &AtomicBool,
+) {
+    // Tune: 2 = higher quality, 4 = much faster, 8 = very blocky but extremely fast.
+    let step: usize = 4;
+
+    scratch.ensure_cave_mask(ctx.side, step);
+
+    let dim = scratch.cave_dim;
+    let side = ctx.side;
+
+    // constants mirrored from WorldGen::carve_cave
+    let max_depth_vox: i32 = (48.0_f32 * (ctx.vpm as f32)).round() as i32;
+
+    scratch
+        .cave_mask
+        .par_chunks_mut(dim * dim) // y-slabs in the coarse grid
+        .enumerate()
+        .for_each(|(sy, slab)| {
+            if (sy & 3) == 0 && should_cancel(cancel) {
+                return;
+            }
+
+            // sample y in voxel coords (center of the step cell)
+            let ly = (sy * step + (step / 2)).min(side - 1);
+            let wy = ctx.oy + ly as i32;
+
+            for sz in 0..dim {
+                let lz = (sz * step + (step / 2)).min(side - 1);
+                let wz = ctx.oz + lz as i32;
+
+                let row_off = sz * dim;
+
+                for sx in 0..dim {
+                    let lx = (sx * step + (step / 2)).min(side - 1);
+                    let wx = ctx.ox + lx as i32;
+
+                    // ground for this (x,z) column
+                    let g = scratch.ground[idx_xz(side, lx, lz)];
+
+                    // only bother where caves can exist
+                    let depth_vox = g - wy;
+                    let carve =
+                        depth_vox > 0 &&
+                        depth_vox <= max_depth_vox &&
+                        gen.carve_cave(wx, wy, wz, g);
+
+                    slab[row_off + sx] = carve as u8;
+                }
+            }
+        });
+}
+
+#[inline(always)]
+fn cave_mask_at(scratch: &BuildScratch, lx: usize, ly: usize, lz: usize) -> bool {
+    let step = scratch.cave_step;
+    let dim = scratch.cave_dim;
+
+    // nearest-neighbor upsample
+    let sx = (lx / step).min(dim - 1);
+    let sy = (ly / step).min(dim - 1);
+    let sz = (lz / step).min(dim - 1);
+
+    scratch.cave_mask[idx3(dim, sx, sy, sz)] != 0
+}
+
+#[inline(always)]
+fn idx3(dim: usize, x: usize, y: usize, z: usize) -> usize {
+    (y * dim * dim) + (z * dim) + x
+}
+
+#[inline(always)]
+fn cave_mask_at_slices(
+    cave_mask: &[u8],
+    cave_step: usize,
+    cave_dim: usize,
+    lx: usize,
+    ly: usize,
+    lz: usize,
+) -> bool {
+    // nearest-neighbor upsample
+    let sx = (lx / cave_step).min(cave_dim - 1);
+    let sy = (ly / cave_step).min(cave_dim - 1);
+    let sz = (lz / cave_step).min(cave_dim - 1);
+    cave_mask[idx3(cave_dim, sx, sy, sz)] != 0
 }
 
 
@@ -756,6 +883,9 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     // Material fill
     time_it!(tim, material_fill, {
+        // Build coarse cave mask FIRST (included in material_fill time for now)
+        build_cave_mask_coarse(gen, ctx, scratch, cancel);
+
         let tree_mat = |lx: usize, ly: usize, lz: usize| -> u8 {
             (tree_mask.material_local(lx, ly, lz) & 0xFF) as u8
         };
@@ -820,6 +950,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
             &ground_mip,
             ctx.dirt_depth,
             cancel,
+            &mut scratch.svo,
         )
     });
     cancel_if!(cancel, tim);

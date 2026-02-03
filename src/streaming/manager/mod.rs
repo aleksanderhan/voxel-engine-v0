@@ -4,7 +4,7 @@ pub mod build;
 mod grid;
 mod slots;
 mod stats;
-
+mod visibility;
 mod ground;
 mod keep;
 mod uploads;
@@ -38,6 +38,12 @@ use crate::streaming::{
     workers::spawn_workers,
 };
 
+/// Column visibility (PVS) bucket.
+pub(crate) struct VisibilityState {
+    pub col_visible: Vec<u8>,
+}
+
+
 /// Build-related state bucket.
 pub(crate) struct BuildState {
     pub chunks: HashMap<ChunkKey, ChunkState>,
@@ -60,6 +66,9 @@ pub(crate) struct BuildState {
     pub last_cam_fwd: Vec3,
     // monotonically increasing tie-breaker so newer bumps win
     pub heap_tie: u32,
+
+    // if true, allow negative dy (we are in caves / below terrain surface)
+    pub cam_below_ground: bool,
 }
 
 /// Slot-residency bucket.
@@ -91,13 +100,12 @@ pub(crate) struct GridState {
 
 /// Column ground cache bucket.
 pub(crate) struct GroundState {
-    pub col_ground_cy: Vec<i32>,
+    pub col_ground_y_vox: Vec<i32>,
 }
 
 /// Offset precomputes bucket.
 pub(crate) struct Offsets {
     pub active_offsets: Vec<(i32, i32, i32)>,
-    pub priority_offsets: Vec<(i32, i32, i32)>,
 }
 
 pub struct ChunkManager {
@@ -113,6 +121,8 @@ pub struct ChunkManager {
 
     pub(crate) pinned: HashSet<ChunkKey>,
     pub(crate) edits: Arc<crate::world::edits::EditStore>,
+
+    pub(crate) vis: VisibilityState,
 
     // Build timing window (drained on stats() print cadence)
     pub timing: StreamTimingWindow,
@@ -137,7 +147,6 @@ impl ChunkManager {
         let grid_len = (nx * ny * nz) as usize;
 
         let active_offsets = keep::build_offsets(config::ACTIVE_RADIUS);
-        let priority_offsets = keep::build_offsets(PRIORITY_RADIUS);
 
         Self {
             build: BuildState {
@@ -155,6 +164,7 @@ impl ChunkManager {
                 rebuild_set: HashSet::default(),
                 last_cam_fwd: Vec3::Z, // or Vec3::ZERO
                 heap_tie: 0,
+                cam_below_ground: false,
             },
             slots: SlotState {
                 slot_to_key: Vec::new(),
@@ -176,14 +186,16 @@ impl ChunkManager {
                 grid_dims: [nx, ny, nz],
                 chunk_grid: vec![INVALID_U32; grid_len],
             },
-            ground: GroundState { col_ground_cy: Vec::new() },
-            offsets: Offsets { active_offsets, priority_offsets },
+            ground: GroundState { col_ground_y_vox: Vec::new() },
+            offsets: Offsets { active_offsets },
 
             arena: NodeArena::new(node_capacity),
             cache: ChunkCache::new(),
 
             pinned: HashSet::default(),
             edits,
+
+            vis: VisibilityState { col_visible: Vec::new() },
 
             timing: StreamTimingWindow::default(),
         }
@@ -217,11 +229,31 @@ impl ChunkManager {
         // 2) ensure ground cache (only does real work when origin changes)
         ground::ensure_column_cache(self, world.as_ref(), center);
 
+        // determine if camera is below ground at the current center column
+        let cam_y_vox = cam_pos_m.y / config::VOXEL_SIZE_M_F32;
+        let ground_y_vox = ground::ground_y_vox_for_column(self, center.x, center.z)
+            .unwrap_or_else(|| {
+                // fallback (should be rare): compute at center column
+                let cs = config::CHUNK_SIZE as i32;
+                let half = cs / 2;
+                let wx = center.x * cs + half;
+                let wz = center.z * cs + half;
+                world.ground_height(wx, wz)
+            }) as f32;
+
+        // small margin to avoid flicker when standing exactly on the surface
+        self.build.cam_below_ground = cam_y_vox < (ground_y_vox - 1.0);
+
+
         // 3) publish center (rebuckets uploads only if changed)
         let center_changed = keep::publish_center_and_rebucket(self, center);
 
+        if center_changed {
+            visibility::ensure_visible_columns(self, center, cam_pos_m);
+        }
+
+
         // Always do cheap “keep things moving”
-        build::ensure_priority_box(self, center);
         build::harvest_done_builds(self, center);
         build::dispatch_builds(self, center);
 
@@ -389,3 +421,4 @@ impl StreamTimingWindow {
         std::mem::take(self)
     }
 }
+

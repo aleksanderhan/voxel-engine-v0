@@ -11,8 +11,9 @@ use crate::world::WorldGen;
 use crate::svo::BuildScratch;
 use crate::app::config;
 use rayon::ThreadPoolBuilder;
+
 thread_local! {
-    static TLS_SCRATCH: RefCell<BuildScratch> = RefCell::new(BuildScratch::new());
+    static TLS_SCRATCH: RefCell<Vec<BuildScratch>> = RefCell::new(Vec::new());
 }
 
 pub static BUILD_POOL: Lazy<ThreadPool> = Lazy::new(|| {
@@ -30,15 +31,24 @@ pub fn build_chunk_svo_sparse_cancelable_tls(
     cancel: &AtomicBool,
     edits: &[EditEntry],
 ) -> BuildOutput {
+    // Take a scratch out of TLS WITHOUT holding the RefCell borrow during the build.
+    let mut scratch = TLS_SCRATCH.with(|cell| {
+        cell.borrow_mut().pop().unwrap_or_else(BuildScratch::new)
+    });
+
+    let out = build_chunk_svo_sparse_cancelable_with_scratch(
+        gen,
+        chunk_origin,
+        chunk_size,
+        cancel,
+        &mut scratch,
+        edits,
+    );
+
+    // Return scratch to the per-thread pool.
     TLS_SCRATCH.with(|cell| {
-        let mut scratch = cell.borrow_mut();
-        build_chunk_svo_sparse_cancelable_with_scratch(
-            gen,
-            chunk_origin,
-            chunk_size,
-            cancel,
-            &mut *scratch,
-            edits,
-        )
-    })
+        cell.borrow_mut().push(scratch);
+    });
+
+    out
 }

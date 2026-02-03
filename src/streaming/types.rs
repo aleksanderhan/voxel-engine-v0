@@ -25,8 +25,6 @@ pub const COLINFO_WORDS_PER_CHUNK_USIZE: usize = 2048;
 pub const MAX_UPLOADS_PER_FRAME: usize = 64;
 pub const MAX_UPLOAD_BYTES_PER_FRAME: usize = 64 << 20;
 
-pub const PRIORITY_RADIUS: i32 = 2; // => 5x5 in XZ, and with GRID_Y_* => 5 in Y
-
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 pub struct ChunkKey {

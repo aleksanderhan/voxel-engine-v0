@@ -11,15 +11,26 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use glam::Vec3;
 
-use crate::streaming::priority::priority_score;
 use crate::streaming::types::*;
 use crate::{render::gpu_types::{NodeGpu, NodeRopesGpu}};
 use crate::app::config;
 
 use super::{ground, keep, slots};
 use super::ChunkManager;
+use crate::streaming::priority::priority_score;
 
 // src/streaming/manager/build.rs
+
+
+#[inline(always)]
+fn y_band_min_dyn(mgr: &ChunkManager) -> i32 {
+    if mgr.build.cam_below_ground { y_band_min() } else { 0 }
+}
+
+#[inline(always)]
+fn y_band_max_dyn(_mgr: &ChunkManager) -> i32 {
+    y_band_max()
+}
 
 #[inline(always)]
 fn in_keep(mgr: &ChunkManager, center: ChunkKey, k: ChunkKey) -> bool {
@@ -30,22 +41,27 @@ fn in_keep(mgr: &ChunkManager, center: ChunkKey, k: ChunkKey) -> bool {
     let dx = k.x - center.x;
     let dz = k.z - center.z;
 
-    // OLD:
-    // if dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS { return false; }
-    // if dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS { return false; }
-
     // NEW: circular keep
     let r = config::KEEP_RADIUS;
     if dx*dx + dz*dz > r*r {
         return false;
     }
 
+    let ar = config::ACTIVE_RADIUS;
+    if dx*dx + dz*dz > ar*ar {
+        if !super::visibility::column_visible(mgr, k.x, k.z) {
+            return false;
+        }
+    }
+
+
     let Some(ground_cy) = ground::ground_cy_for_column(mgr, k.x, k.z) else {
         return false;
     };
 
     let dy = k.y - ground_cy;
-    dy >= y_band_min() && dy <= y_band_max()
+    dy >= y_band_min_dyn(mgr) && dy <= y_band_max_dyn(mgr)
+
 }
 
 
@@ -73,50 +89,30 @@ fn queue_build_front(mgr: &mut ChunkManager, center: ChunkKey, k: ChunkKey) {
     heap_push(mgr, center, k, 100_000.0);
 }
 
-pub fn ensure_priority_box(mgr: &mut ChunkManager, center: ChunkKey) {
-    let n = mgr.offsets.priority_offsets.len();
-
-    for i in 0..n {
-        // copy the tuple out; immutable borrow ends right here
-        let (dx, dy, dz) = mgr.offsets.priority_offsets[i];
-
-        let x = center.x + dx;
-        let z = center.z + dz;
-
-        let Some(ground_cy_col) = ground::ground_cy_for_column(mgr, x, z) else { continue; };
-        let k = ChunkKey { x, y: ground_cy_col + dy, z };
-
-        match mgr.build.chunks.get(&k) {
-            Some(ChunkState::Resident(_))
-            | Some(ChunkState::Uploading(_))
-            | Some(ChunkState::Queued)
-            | Some(ChunkState::Building) => {
-                if matches!(mgr.build.chunks.get(&k), Some(ChunkState::Queued)) {
-                    queue_build_front(mgr, center, k);
-                }
-            }
-            None => {
-                if mgr.cache.get(&k).is_some() {
-                    let _ = try_promote_from_cache(mgr, center, k);
-                    continue;
-                }
-
-                let c = cancel_token(mgr, k);
-                c.store(false, AtomicOrdering::Relaxed);
-                queue_build_front(mgr, center, k);
-
-            }
-        }
-    }
-}
-
 
 pub fn enqueue_active_ring(mgr: &mut ChunkManager, center: ChunkKey) {
     let n_active = mgr.offsets.active_offsets.len();
     for i in 0..n_active {
         let (dx, dy, dz) = mgr.offsets.active_offsets[i];
+
+        if dy < y_band_min_dyn(mgr) || dy > y_band_max_dyn(mgr) {
+            continue;
+        }
+
         let x = center.x + dx;
         let z = center.z + dz;
+
+        // Outside priority radius: only consider columns that are in the 360° PVS.
+        let ddx = x - center.x;
+        let ddz = z - center.z;
+        let ar = config::ACTIVE_RADIUS;
+        if dx*dx + dz*dz > ar*ar {
+            if !super::visibility::column_visible(mgr, x, z) {
+                continue;
+            }
+        }
+
+
 
         let Some(ground_cy_col) = ground::ground_cy_for_column(mgr, x, z) else {
             continue;
@@ -152,7 +148,6 @@ pub fn unload_outside_keep(mgr: &mut ChunkManager, center: ChunkKey) {
 
     for &k in mgr.build.chunks.keys() {
         if mgr.pinned.contains(&k) { continue; }
-        if slots::in_priority_box(mgr, center, k) { continue; }
 
         if keep::in_active_xz(center, k) {
             match mgr.build.chunks.get(&k) {
@@ -332,15 +327,6 @@ pub fn harvest_done_builds(mgr: &mut ChunkManager, center: ChunkKey) {
 }
 
 fn try_promote_from_cache(mgr: &mut ChunkManager, center: ChunkKey, key: ChunkKey) -> bool {
-    // If priority box isn't ready, defer non-priority promotions.
-    if !slots::priority_box_ready(mgr, center) && !slots::in_priority_box(mgr, center, key) {
-        mgr.build.chunks.insert(key, ChunkState::Queued);
-        if mgr.build.queued_set.insert(key) {
-            mgr.build.build_queue.push_back(key);
-        }
-        return false;
-    }
-
     let Some(e) = mgr.cache.get(&key) else { return false; };
 
     let nodes = e.nodes.clone();
@@ -361,6 +347,7 @@ fn try_promote_from_cache(mgr: &mut ChunkManager, center: ChunkKey, key: ChunkKe
     }
     ok
 }
+
 
 fn on_build_done(
     mgr: &mut ChunkManager,
@@ -414,15 +401,6 @@ fn on_build_done(
         colinfo_arc.clone(),
     );
 
-    // Defer GPU upload for non-priority until priority box is GPU-ready.
-    if !slots::priority_box_ready(mgr, center) && !slots::in_priority_box(mgr, center, key) {
-        mgr.build.chunks.insert(key, ChunkState::Queued);
-        if mgr.build.queued_set.insert(key) {
-            mgr.build.build_queue.push_back(key);
-        }
-        return;
-    }
-
     let ok = slots::try_make_uploading(mgr, center, key, nodes_arc, macro_arc, ropes_arc, colinfo_arc);
     if !ok {
         mgr.build.chunks.remove(&key);
@@ -471,11 +449,10 @@ fn heap_push(mgr: &mut ChunkManager, center: ChunkKey, k: ChunkKey, boost: f32) 
     let cam_fwd = mgr.build.last_cam_fwd;
     let mut s = priority_score(k, center, cam_fwd) - boost;
 
-    if super::slots::in_priority_box(mgr, center, k) {
-        s -= 20_000.0;
-    } else if super::keep::in_active_xz(center, k) {
+    if super::keep::in_active_xz(center, k) {
         s -= 10_000.0;
     }
+
 
     mgr.build.heap_tie = mgr.build.heap_tie.wrapping_add(1).max(1);
 
@@ -528,14 +505,17 @@ pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec
             } &&
             {
                 let idx = ((k.z - origin[2]) * nx + (k.x - origin[0])) as usize;
-                mgr.ground.col_ground_cy.get(idx).is_some()
+                // if idx is in-bounds, we have a cached value
+                idx < mgr.ground.col_ground_y_vox.len()
             } &&
             {
                 let idx = ((k.z - origin[2]) * nx + (k.x - origin[0])) as usize;
-                let ground_cy = mgr.ground.col_ground_cy[idx];
+                let ground_y_vox = mgr.ground.col_ground_y_vox[idx];
+                let ground_cy = ground_y_vox.div_euclid(config::CHUNK_SIZE as i32);
                 let dy = k.y - ground_cy;
                 dy >= y_band_min() && dy <= y_band_max()
             };
+
 
         if keep_it {
             kept.push(k);
@@ -559,9 +539,7 @@ pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec
     for (i, k) in kept.into_iter().enumerate() {
         let mut s = priority_score(k, center, cam_fwd);
 
-        if super::slots::in_priority_box(mgr, center, k) {
-            s -= 20_000.0;
-        } else if super::keep::in_active_xz(center, k) {
+        if super::keep::in_active_xz(center, k) {
             s -= 10_000.0;
         }
 
