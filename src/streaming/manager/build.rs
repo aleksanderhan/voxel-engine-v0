@@ -168,8 +168,24 @@ pub fn unload_outside_keep(mgr: &mut ChunkManager, center: ChunkKey) {
 }
 
 pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
-    let mut attempts = 0usize;
-    let max_attempts = mgr.build.build_heap.len().max(1);
+    // ---------------------------------------------------------------------
+    // 0) Re-inject deferred queued keys back into the heap.
+    //     build_queue is used when we couldn't dispatch (tx full)
+    //     or couldn't allocate arena/slot (upload deferral).
+    //     Without this, those chunks stall until center changes.
+    // ---------------------------------------------------------------------
+    let reinject_cap = 64usize.min(mgr.build.build_queue.len());
+    for _ in 0..reinject_cap {
+        let Some(k) = mgr.build.build_queue.pop_front() else { break; };
+
+        // Only re-score if it is STILL queued (it might have been canceled/promoted).
+        if !matches!(mgr.build.chunks.get(&k), Some(ChunkState::Queued)) {
+            continue;
+        }
+
+        // Keep it queued; just make it eligible for dispatch again.
+        heap_push(mgr, center, k, 0.0);
+    }
 
     // Reserve some capacity so edits (rebuilds) don’t sit behind streaming.
     let reserve_for_rebuilds = 2usize;
@@ -180,34 +196,31 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         config::MAX_IN_FLIGHT
     };
 
-
-    // Also dispatch rebuilds for already-slotted chunks (no state changes).
+    // ---------------------------------------------------------------------
+    // 1) Dispatch rebuilds for already-slotted chunks.
+    // ---------------------------------------------------------------------
     while mgr.build.in_flight < config::MAX_IN_FLIGHT {
         let Some(k) = mgr.build.rebuild_queue.pop_front() else { break; };
         mgr.build.rebuild_set.remove(&k);
 
-        // Must still exist and still be slotted.
         let Some(st) = mgr.build.chunks.get(&k) else { continue; };
         if !matches!(st, ChunkState::Resident(_) | ChunkState::Uploading(_)) {
             continue;
         }
 
-        // If it’s outside keep, skip (optional but consistent with your other logic).
         if !in_keep(mgr, center, k) {
             continue;
         }
 
-        // Make a fresh cancel token and replace the stored one,
-        // so stale completions get dropped by Arc::ptr_eq in harvest_done_builds.
+        // Fresh cancel token so stale completions get dropped.
         let cancel = Arc::new(AtomicBool::new(false));
         mgr.build.cancels.insert(k, cancel.clone());
 
         let edits = mgr.edits.snapshot(k);
 
-        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel, edits, enqueued_at: Instant::now(), }) {
+        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel, edits, enqueued_at: Instant::now() }) {
             Ok(()) => mgr.build.in_flight += 1,
             Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
-                // Put it back and stop trying this frame.
                 mgr.build.rebuild_set.insert(job.key);
                 mgr.build.rebuild_queue.push_front(job.key);
                 break;
@@ -215,6 +228,11 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // 2) Dispatch normal queued builds from the heap.
+    // ---------------------------------------------------------------------
+    let mut attempts = 0usize;
+    let max_attempts = mgr.build.build_heap.len().max(1);
 
     while mgr.build.in_flight < max_normal_in_flight && attempts < max_attempts {
         attempts += 1;
@@ -222,21 +240,17 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         let Some(item) = mgr.build.build_heap.pop() else { break; };
         let k = item.key;
 
-        // Heap contains stale entries; only queued chunks may be dispatched/canceled here.
         let Some(st) = mgr.build.chunks.get(&k) else {
-            // Not tracked anymore.
-            continue;
+            continue; // Not tracked anymore
         };
 
-        // Ignore anything that isn't currently queued.
         if !matches!(st, ChunkState::Queued) {
-            continue;
+            continue; // stale heap entry
         }
 
         // Now it's safe to update queued bookkeeping.
         mgr.build.queued_set.remove(&k);
 
-        // If it's outside keep, just cancel/remove the queued entry.
         if !in_keep(mgr, center, k) {
             cancel_token(mgr, k).store(true, AtomicOrdering::Relaxed);
             mgr.build.chunks.remove(&k);
@@ -244,7 +258,7 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
             continue;
         }
 
-        // If cached, drop queued tracking and try promote.
+        // If cached, try promote instead of rebuilding.
         if mgr.cache.get(&k).is_some() {
             mgr.build.chunks.remove(&k);
             mgr.build.cancels.remove(&k);
@@ -259,19 +273,20 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         cancel.store(false, AtomicOrdering::Relaxed);
 
         let edits = mgr.edits.snapshot(k);
-        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone(), edits, enqueued_at: Instant::now(), }) {
+        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone(), edits, enqueued_at: Instant::now() }) {
             Ok(()) => mgr.build.in_flight += 1,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                // Put it back as queued and ensure it will be retried soon.
                 mgr.build.chunks.insert(k, ChunkState::Queued);
-                mgr.build.build_queue.push_front(k);
-                mgr.build.queued_set.insert(k);
+                if mgr.build.queued_set.insert(k) {
+                    mgr.build.build_queue.push_front(k);
+                }
                 break;
             }
         }
     }
-
-
 }
+
 
 pub fn harvest_done_builds(mgr: &mut ChunkManager, center: ChunkKey) {
     let done_backlog = mgr.build.rx_done.len();
@@ -361,8 +376,20 @@ fn on_build_done(
     if let Some(c) = mgr.build.cancels.get(&key) {
         if c.load(AtomicOrdering::Relaxed) {
             mgr.build.chunks.remove(&key);
+            mgr.build.cancels.remove(&key);
             return;
         }
+    }
+
+    // Reject clearly invalid outputs early (also avoids caching garbage).
+    if nodes.is_empty()
+        || macro_words.len() != MACRO_WORDS_PER_CHUNK_USIZE
+        || ropes.len() != nodes.len()
+        || colinfo_words.len() != COLINFO_WORDS_PER_CHUNK_USIZE
+    {
+        mgr.build.chunks.remove(&key);
+        mgr.build.cancels.remove(&key);
+        return;
     }
 
     let nodes_arc: Arc<[NodeGpu]> = nodes.into();
@@ -384,7 +411,6 @@ fn on_build_done(
             );
 
             if ok {
-                // cache the new version once
                 mgr.cache.put(key, nodes_arc, macro_arc, ropes_arc, colinfo_arc);
             }
             return;
@@ -402,10 +428,20 @@ fn on_build_done(
     );
 
     let ok = slots::try_make_uploading(mgr, center, key, nodes_arc, macro_arc, ropes_arc, colinfo_arc);
+
     if !ok {
-        mgr.build.chunks.remove(&key);
+        // IMPORTANT:
+        // try_make_uploading() already defers by setting ChunkState::Queued + pushing into build_queue
+        // when arena/slot allocation fails. Do NOT delete that state here, or the chunk will vanish
+        // until center changes.
+        //
+        // If try_make_uploading considered it fatal, it removed the entry itself; clean up cancels too.
+        if mgr.build.chunks.get(&key).is_none() {
+            mgr.build.cancels.remove(&key);
+        }
     }
 }
+
 
 
 #[derive(Clone, Copy)]

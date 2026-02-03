@@ -236,7 +236,7 @@ pub fn try_make_uploading(
         // Defer rather than drop on the floor.
         mgr.build.chunks.insert(key, ChunkState::Queued);
         if mgr.build.queued_set.insert(key) {
-            mgr.build.build_queue.push_back(key);
+            mgr.build.build_queue.push_front(key);
         }
         return false;
     };
