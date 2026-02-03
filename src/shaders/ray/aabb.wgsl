@@ -82,15 +82,3 @@ fn aabb_hit_normal_inv(
   let slab = cube_slab_inv(ro, inv, bmin, size);
   return cube_hit_normal_from_slab(rd, slab, t_min, t_max);
 }
-
-// Optional: keep this for older callsites (now just returns slab.t_exit).
-fn exit_time_from_cube_inv(
-  ro: vec3<f32>,
-  rd: vec3<f32>,
-  inv: vec3<f32>,
-  bmin: vec3<f32>,
-  size: f32
-) -> f32 {
-  let slab = cube_slab_inv(ro, inv, bmin, size);
-  return slab.t_exit;
-}

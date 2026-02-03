@@ -11,7 +11,6 @@ const HF_MAX_STEPS : u32 = 96u;
 const HF_BISECT    : u32 = 5u;
 
 // dt clamp (meters along ray)
-const HF_DT_MIN : f32 = 1.00;
 const HF_DT_MAX : f32 = 48.0;
 
 struct ClipmapParams {
@@ -35,13 +34,6 @@ fn imod(a: i32, m: i32) -> i32 {
 fn clip_offsets(level: u32) -> vec2<i32> {
   let o = clip.offset[level];
   return vec2<i32>(i32(o.x), i32(o.y));
-}
-
-// Fixed level choice: coarsest level (max range).
-// If you want a specific level index, return that instead.
-fn clip_fixed_level() -> u32 {
-  let n = min(clip.levels, CLIP_LEVELS_MAX);
-  return max(n, 1u) - 1u;
 }
 
 struct HSample { h: f32, ok: bool };

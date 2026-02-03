@@ -43,9 +43,7 @@ const SUN_INTENSITY : f32       = 5.0;
 //// --------------------------------------------------------------------------
 
 const SHADOW_BIAS  : f32 = 2e-4;
-const SHADOW_STEPS : u32 = 32u;
 
-const SHADOW_DISPLACED_LEAVES : bool = false;
 const VOLUME_DISPLACED_LEAVES : bool = true;
 
 const VSM_STEPS            : u32 = 16u;
@@ -149,9 +147,6 @@ const CLOUD_BASE_COL   : vec3<f32> = vec3<f32>(0.72, 0.74, 0.76);
 const CLOUD_SILVER_POW : f32       = 8.0;
 const CLOUD_SILVER_STR : f32       = 0.6;
 
-// How clouds darken SKY (keep low)
-const CLOUD_SKY_DARKEN : f32 = 0.2;
-
 // How much clouds attenuate SUNLIGHT hitting the world
 const CLOUD_SHADOW_ABSORB   : f32 = 6.0;
 const CLOUD_SHADOW_STRENGTH : f32 = 0.8;
@@ -163,10 +158,6 @@ const CLOUD_DIM_SUN_DISC : bool = true;
 // If a cloud looks opaque-ish, the disc should vanish quickly.
 const CLOUD_SUN_DISC_DIM_POW   : f32 = 8.0;  // try 4..12 (bigger = dimmer disc)
 const CLOUD_SUN_DISC_DIM_FLOOR : f32 = 0.0;  // set ~0.01 if you want “always visible” sun
-
-// Legacy (no longer used by sky for disc dimming, but kept to avoid ripples)
-const CLOUD_SUN_DISC_ABSORB_SCALE : f32 = 0.8;
-const CLOUD_SUN_DISC_ABSORB       : f32 = 1.8;
 
 // Godray coupling (keep)
 const CLOUD_GODRAY_W : f32 = 0.50;
@@ -445,8 +436,6 @@ fn chunk_max_depth() -> u32 {
 }
 
 // ---- Column info (64x64) ----
-// 4096 columns, packed 2x u16 per u32 => 2048 u32 words per chunk.
-const CHUNK_COL_WORDS_PER_CHUNK : u32 = 2048u;
 
 fn col_idx_64(ix: u32, iz: u32) -> u32 {
   return iz * 64u + ix; // 0..4095

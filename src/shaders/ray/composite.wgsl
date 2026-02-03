@@ -16,62 +16,6 @@ fn gamma_encode(x: vec3<f32>) -> vec3<f32> {
   return pow(x, vec3<f32>(1.0 / 2.2));
 }
 
-fn godray_sample_bilerp(
-  px_full: vec2<f32>,
-  godray_tex: texture_2d<f32>,
-  depth_full: texture_2d<f32>
-) -> vec3<f32> {
-  let q = px_full * 0.25;
-  let q0 = vec2<i32>(i32(floor(q.x)), i32(floor(q.y)));
-  let f  = fract(q);
-
-  let qdims = textureDimensions(godray_tex);
-  let x0 = clamp(q0.x, 0, i32(qdims.x) - 1);
-  let y0 = clamp(q0.y, 0, i32(qdims.y) - 1);
-  let x1 = min(x0 + 1, i32(qdims.x) - 1);
-  let y1 = min(y0 + 1, i32(qdims.y) - 1);
-
-  let c00 = textureLoad(godray_tex, vec2<i32>(x0, y0), 0).xyz;
-  let c10 = textureLoad(godray_tex, vec2<i32>(x1, y0), 0).xyz;
-  let c01 = textureLoad(godray_tex, vec2<i32>(x0, y1), 0).xyz;
-  let c11 = textureLoad(godray_tex, vec2<i32>(x1, y1), 0).xyz;
-
-  let ip = vec2<i32>(i32(floor(px_full.x)), i32(floor(px_full.y)));
-  let d0 = textureLoad(depth_full, ip, 0).x;
-
-  let df = textureDimensions(depth_full);
-  let p00 = vec2<i32>(clamp(x0 * 4, 0, i32(df.x) - 1), clamp(y0 * 4, 0, i32(df.y) - 1));
-  let p10 = vec2<i32>(clamp(x1 * 4, 0, i32(df.x) - 1), clamp(y0 * 4, 0, i32(df.y) - 1));
-  let p01 = vec2<i32>(clamp(x0 * 4, 0, i32(df.x) - 1), clamp(y1 * 4, 0, i32(df.y) - 1));
-  let p11 = vec2<i32>(clamp(x1 * 4, 0, i32(df.x) - 1), clamp(y1 * 4, 0, i32(df.y) - 1));
-
-  let d00 = textureLoad(depth_full, p00, 0).x;
-  let d10 = textureLoad(depth_full, p10, 0).x;
-  let d01 = textureLoad(depth_full, p01, 0).x;
-  let d11 = textureLoad(depth_full, p11, 0).x;
-
-  let tol = 0.02 + 0.06 * smoothstep(10.0, 80.0, d0);
-
-  let w00 = exp(-abs(d00 - d0) / tol);
-  let w10 = exp(-abs(d10 - d0) / tol);
-  let w01 = exp(-abs(d01 - d0) / tol);
-  let w11 = exp(-abs(d11 - d0) / tol);
-
-  let wf00 = w00 * (1.0 - f.x) * (1.0 - f.y);
-  let wf10 = w10 * (f.x)       * (1.0 - f.y);
-  let wf01 = w01 * (1.0 - f.x) * (f.y);
-  let wf11 = w11 * (f.x)       * (f.y);
-
-  let wsum = max(wf00 + wf10 + wf01 + wf11, 1e-4);
-  let c = (c00 * wf00 + c10 * wf10 + c01 * wf01 + c11 * wf11) / wsum;
-
-  // decompress back to linear energy (k must match quarter pass compression)
-  let k = 0.25;
-  let one = vec3<f32>(1.0);
-  let denom = max(one - c, vec3<f32>(1e-4));
-  return (k * c) / denom;
-}
-
 fn composite_pixel_mapped(
   ip_render: vec2<i32>,
   px_render: vec2<f32>,
