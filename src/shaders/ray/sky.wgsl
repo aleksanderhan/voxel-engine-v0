@@ -1,34 +1,33 @@
 // src/shaders/ray/sky.wgsl
+// ------------------------
+// src/shaders/ray/sky.wgsl
 //// --------------------------------------------------------------------------
 //// Sky
 //// --------------------------------------------------------------------------
 
-fn sky_color_base(rd: vec3<f32>) -> vec3<f32> {
-  // 4 (a,b) ramps (smoothstep edge pairs)
-  let a0: f32 = -0.10; let b0: f32 =  0.85; // vertical gradient
-  let a1: f32 = -0.20; let b1: f32 =  0.18; // horizon band
-  let a2: f32 =  0.15; let b2: f32 =  1.00; // zenith lift
-  let a3: f32 =  0.70; let b3: f32 =  0.98; // near-sun glow (mu space)
+fn sky_bg(rd: vec3<f32>) -> vec3<f32> {
+  let a0: f32 = -0.10; let b0: f32 =  0.85;
+  let a1: f32 = -0.20; let b1: f32 =  0.18;
+  let a2: f32 =  0.15; let b2: f32 =  1.00;
 
-  // --- Base vertical gradient
   let t0 = smoothstep(a0, b0, rd.y);
   var col = mix(
-    vec3<f32>(0.05, 0.08, 0.12), // deep
-    vec3<f32>(0.55, 0.75, 0.95), // sky
+    vec3<f32>(0.05, 0.08, 0.12),
+    vec3<f32>(0.55, 0.75, 0.95),
     t0
   );
 
-  // --- Horizon shaping (warm haze near y≈0)
   let th = 1.0 - smoothstep(a1, b1, abs(rd.y));
   col += (0.12 * th) * vec3<f32>(0.80, 0.75, 0.70);
 
-  // --- Zenith shaping (cooler up high)
   let tz = smoothstep(a2, b2, rd.y);
   col += (0.05 * tz) * vec3<f32>(0.20, 0.35, 0.60);
 
   col *= SKY_EXPOSURE;
+  return col;
+}
 
-  // --- Sun disc + glow (no acos)
+fn sky_sun(rd: vec3<f32>) -> vec3<f32> {
   let mu = clamp(dot(rd, SUN_DIR), -1.0, 1.0);
 
   let SUN_DISC_ANGULAR_RADIUS : f32 = 0.009;
@@ -38,27 +37,19 @@ fn sky_color_base(rd: vec3<f32>) -> vec3<f32> {
   let mu_outer = cos(SUN_DISC_ANGULAR_RADIUS + SUN_DISC_SOFTNESS);
 
   let disc = smoothstep(mu_outer, mu_inner, mu);
-
-  // broad glow using (a3,b3) in mu-space near 1.0
-  let glow = smoothstep(a3, b3, mu);
-
-  // tight halo (still cheap)
+  let glow = smoothstep(0.70, 0.98, mu);
   let halo = 0.03 * exp(-2500.0 * max(0.0, 1.0 - mu));
 
-
-  col += SUN_COLOR * SUN_INTENSITY * (disc + halo + 0.04 * glow);
-
-  return col;
+  return SUN_COLOR * SUN_INTENSITY * (disc + halo + 0.04 * glow);
 }
 
-
 fn sky_color(rd: vec3<f32>) -> vec3<f32> {
-  // Base sky + sun
-  var col = sky_color_base(rd);
+  // Background (no sun) + separate sun term
+  let bg  = sky_bg(rd);
+  let sun = sky_sun(rd);
 
-  // We'll track a stable "how cloudy is this view ray" scalar for optional sun-disc dimming.
-  // 0 = clear, 1 = fully cloud-occluded (approx).
-  var cloud_view: f32 = 0.0;
+  var T_view: f32 = 1.0;         // view transmittance through clouds
+  var acc  = vec3<f32>(0.0);     // cloud radiance
 
   // ------------------------------------------------------------------------
   // Volumetric slab clouds (cheap front-to-back)
@@ -86,9 +77,6 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
       let steps = CLOUD_STEPS_VIEW;
       let dt    = (t_exit - t_enter) / f32(max(steps, 1u));
 
-      var T: f32 = 1.0;         // view transmittance through clouds
-      var acc = vec3<f32>(0.0); // accumulated cloud radiance
-
       // Phase for forward scattering (cheap + stable)
       let phase = phase_blended(dot(rd, SUN_DIR));
 
@@ -103,49 +91,50 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
           // Self-shadow towards sun (adds “volume”)
           let Tl = cloud_light_transmittance(p, time_s);
 
-          // “Silver lining” bias near sun direction
+          // Silver lining bias near sun direction
           let toward_sun = clamp(dot(rd, SUN_DIR), 0.0, 1.0);
           let silver = pow(toward_sun, CLOUD_SILVER_POW) * CLOUD_SILVER_STR;
 
           let cloud_col = mix(CLOUD_BASE_COL, vec3<f32>(1.0), silver);
 
-          // Extinction step (Beer-Lambert)
-          let a = 1.0 - exp(-CLOUD_DENSITY * dens * dt);
+          // Beer-Lambert step extinction
+          let tau = CLOUD_DENSITY * dens * dt;
+          let a   = 1.0 - exp(-tau);
 
           // Single-scatter-ish add
           let scatter = cloud_col * (SUN_COLOR * SUN_INTENSITY) * (phase * Tl);
 
-          acc += T * a * scatter;
-          T *= (1.0 - a);
+          acc   += T_view * a * scatter;
+          T_view *= (1.0 - a);
 
-          // Track view cloudiness as max occlusion (stable, cheap)
-          cloud_view = max(cloud_view, 1.0 - T);
-
-          // Early out once opaque
-          if (T < 0.02) { break; }
+          if (T_view < 0.02) { break; }
         }
       }
-
-      // Composite: sky behind attenuated + cloud radiance
-      col = col * T + acc;
     }
   }
 
   // ------------------------------------------------------------------------
-  // Optional: dim ONLY very near the sun (prevents “black sky patches”)
+  // Composite: background attenuated by clouds + cloud radiance
   // ------------------------------------------------------------------------
-  if (CLOUD_DIM_SUN_DISC) {
-    let mu = clamp(dot(rd, SUN_DIR), 0.0, 1.0);
-    let near_sun = smoothstep(0.92, 0.995, mu); // tight gate
+  var col = bg * T_view + acc;
 
-    // floor so it can't go charcoal
-    let Tc_view_raw = exp(-CLOUD_SUN_DISC_ABSORB * cloud_view);
-    let Tc_view     = max(Tc_view_raw, 0.40);
+  // ------------------------------------------------------------------------
+  // Separately attenuated sun (disc/halo/glow) through clouds
+  //
+  // FIX:
+  // Drive sun-disc attenuation from the same *visual* cloud transmittance T_view,
+  // and raise it to a power so moderately-opaque clouds kill the disc.
+  // ------------------------------------------------------------------------
+  var T_sun: f32 = 1.0;
 
-    col = mix(col, col * Tc_view, cloud_view * near_sun);
+  if (CLOUD_DIM_SUN_DISC && rd.y > 0.01) {
+    // If a cloud makes the sky behind it dim (T_view < 1),
+    // the disc should dim *much more*.
+    T_sun = pow(clamp(T_view, 0.0, 1.0), CLOUD_SUN_DISC_DIM_POW);
+    T_sun = max(T_sun, CLOUD_SUN_DISC_DIM_FLOOR);
   }
+
+  col += sun * T_sun;
 
   return col;
 }
-
-

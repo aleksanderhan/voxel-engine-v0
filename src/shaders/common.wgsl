@@ -1,4 +1,6 @@
 // src/shaders/common.wgsl
+// -----------------------
+// src/shaders/common.wgsl
 //
 // Shared WGSL:
 // - Constants / tuning knobs
@@ -101,11 +103,9 @@ const GODRAY_STEPS_PER_METER = 1.25;
 const GODRAY_MIN_STEPS: u32 = 8u;        // keep some detail near silhouettes
 const GODRAY_STEP_Q:   u32 = 4u;         // quantize step count to reduce temporal shimmer
 
-
 const GODRAY_SHAFT_GAIN: f32 = 3.0;
 
 const GODRAY_EDGE_ENERGY_BOOST: f32 = 2.5; // try 1.0 .. 4.0
-
 
 //// --------------------------------------------------------------------------
 //// Phase
@@ -128,7 +128,7 @@ const CLOUD_UV_SCALE : f32       = 0.0016;
 const CLOUD_WIND     : vec2<f32> = vec2<f32>(0.020, 0.012);
 
 // Coverage thresholding (raise coverage => fewer clouds)
-const CLOUD_COVERAGE : f32 = 0.40; 
+const CLOUD_COVERAGE : f32 = 0.30;
 const CLOUD_SOFTNESS : f32 = 0.08;
 
 // Density + shaping
@@ -157,13 +157,19 @@ const CLOUD_SHADOW_ABSORB   : f32 = 6.0;
 const CLOUD_SHADOW_STRENGTH : f32 = 0.8;
 
 // Sun-disc dim behavior (keep)
-const CLOUD_DIM_SUN_DISC            : bool = true;
-const CLOUD_SUN_DISC_ABSORB_SCALE   : f32  = 0.8;
-const CLOUD_SUN_DISC_ABSORB: f32 = 1.8;
+const CLOUD_DIM_SUN_DISC : bool = true;
+
+// NEW: make sun-disc dim track *visual opacity* (T_view) strongly.
+// If a cloud looks opaque-ish, the disc should vanish quickly.
+const CLOUD_SUN_DISC_DIM_POW   : f32 = 8.0;  // try 4..12 (bigger = dimmer disc)
+const CLOUD_SUN_DISC_DIM_FLOOR : f32 = 0.0;  // set ~0.01 if you want “always visible” sun
+
+// Legacy (no longer used by sky for disc dimming, but kept to avoid ripples)
+const CLOUD_SUN_DISC_ABSORB_SCALE : f32 = 0.8;
+const CLOUD_SUN_DISC_ABSORB       : f32 = 1.8;
 
 // Godray coupling (keep)
 const CLOUD_GODRAY_W : f32 = 0.50;
-
 
 const SKY_EXPOSURE : f32 = 0.40;
 
@@ -171,7 +177,7 @@ const SKY_EXPOSURE : f32 = 0.40;
 //// Leaf wind (displaced cubes)
 //// --------------------------------------------------------------------------
 
-const WIND_CELL_FREQ : f32      = 2.5;
+const WIND_CELL_FREQ : f32       = 2.5;
 const WIND_DIR_XZ    : vec2<f32> = vec2<f32>(0.9, 0.4);
 
 const WIND_RAMP_Y0 : f32 = 2.0;
@@ -228,11 +234,9 @@ const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.08;
 const GRASS_VOXEL_TAPER           : f32 = 0.70;
 const GRASS_OVERHANG_VOX          : f32 = 0.20;
 
-// Grass level-of-detail (LOD) distances in meters-ish (assuming rd normalized).
 const GRASS_LOD_MID_START : f32 = 15.0;
 const GRASS_LOD_FAR_START : f32 = 40.0;
 
-// Mid/far quality knobs (tune freely)
 const GRASS_BLADE_COUNT_MID : u32 = 2u;
 const GRASS_BLADE_COUNT_FAR : u32 = 1u;
 
@@ -241,7 +245,6 @@ const GRASS_SEGS_FAR : u32 = 1u;
 
 const GRASS_TRACE_STEPS_MID : u32 = 6u;
 const GRASS_TRACE_STEPS_FAR : u32 = 4u;
-
 
 // Misc
 const ALBEDO_VAR_GAIN = 4.0;
@@ -258,13 +261,13 @@ struct Node {
 };
 
 struct NodeRopes {
-  px: u32, 
-  nx: u32, 
-  py: u32, 
-  ny: u32, 
-  pz: u32, 
+  px: u32,
+  nx: u32,
+  py: u32,
+  ny: u32,
+  pz: u32,
   nz: u32,
-  _pad0: u32, 
+  _pad0: u32,
   _pad1: u32,
 };
 
@@ -274,7 +277,7 @@ struct Camera {
 
   view_proj: mat4x4<f32>,
   prev_view_proj: mat4x4<f32>,
-  
+
   cam_pos     : vec4<f32>,
 
   chunk_size  : u32,
@@ -289,10 +292,7 @@ struct Camera {
 
   // xy = render size in pixels, zw = present size in pixels
   render_present_px : vec4<u32>,
-
-  
 };
-
 
 struct ChunkMeta {
   origin       : vec4<i32>,
@@ -314,12 +314,11 @@ struct ChunkMeta {
 @group(0) @binding(9) var<storage, read> node_ropes: array<NodeRopes>;
 @group(0) @binding(10) var<storage, read> chunk_colinfo : array<u32>;
 
-
 //// --------------------------------------------------------------------------
 //// Shared helpers
 //// --------------------------------------------------------------------------
 
-const MACRO_DIM : u32 = 8u;          // 8x8x8 macro cells per chunk
+const MACRO_DIM : u32 = 8u;              // 8x8x8 macro cells per chunk
 const MACRO_WORDS_PER_CHUNK : u32 = 16u; // 512 bits / 32
 
 fn macro_cell_size(root_size: f32) -> f32 {
@@ -337,7 +336,6 @@ fn macro_test(macro_base: u32, bit: u32) -> bool {
   let word = macro_occ[macro_base + w];
   return (word & (1u << b)) != 0u;
 }
-
 
 fn safe_inv(x: f32) -> f32 {
   return select(1.0 / x, BIG_F32, abs(x) < EPS_INV);
@@ -459,7 +457,6 @@ fn colinfo_load(ch: ChunkMeta, ix: u32, iz: u32) -> vec2<u32> {
   return vec2<u32>(y8, mat8);
 }
 
-
 //// --------------------------------------------------------------------------
 //// Hash / noise helpers (shared)
 //// --------------------------------------------------------------------------
@@ -484,8 +481,6 @@ fn hash2_u32(x: u32, y: u32) -> u32 {
 
 // Replacement: 2D -> [0,1)
 fn hash12(p: vec2<f32>) -> f32 {
-  // Most of your callsites already pass integer-ish coordinates (floor() outputs),
-  // but this also works fine for pixel coords by flooring.
   let ix: u32 = bitcast<u32>(i32(floor(p.x)));
   let iy: u32 = bitcast<u32>(i32(floor(p.y)));
   let h: u32 = hash2_u32(ix, iy);
@@ -534,7 +529,6 @@ fn fbm(p: vec2<f32>) -> f32 {
   }
   return sum;
 }
-
 
 fn render_dims_f() -> vec2<f32> {
   return vec2<f32>(f32(cam.render_present_px.x), f32(cam.render_present_px.y));

@@ -29,7 +29,7 @@ fn main_primary(
 
   // Compute once per 8x8 workgroup
   if (lid == 0u) {
-    WG_SKY_UP = sky_color_base(vec3<f32>(0.0, 1.0, 0.0));
+    WG_SKY_UP = sky_bg(vec3<f32>(0.0, 1.0, 0.0));
   }
   workgroupBarrier();
   let sky_up = WG_SKY_UP;
