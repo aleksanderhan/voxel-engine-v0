@@ -32,17 +32,16 @@ impl WorldGen {
         let height = Fbm::<Perlin>::new(seed).set_octaves(7).set_frequency(0.010);
         let detail = Fbm::<Perlin>::new(seed ^ 0xA5A5_A5A5).set_octaves(3).set_frequency(0.02);
 
-        // Cave knobs:
+        // Cave knobs: smaller, tunnel-only
         // Higher frequency => smaller features (tighter tunnels).
-        let cave_a = Fbm::<Perlin>::new(seed ^ 0xB4B4_B4B4).set_octaves(3).set_frequency(0.085);
-        let cave_b = Fbm::<Perlin>::new(seed ^ 0xD1D1_D1D1).set_octaves(3).set_frequency(0.093);
+        let cave_a = Fbm::<Perlin>::new(seed ^ 0xB4B4_B4B4).set_octaves(4).set_frequency(0.135);
+        let cave_b = Fbm::<Perlin>::new(seed ^ 0xD1D1_D1D1).set_octaves(4).set_frequency(0.148);
 
-        // Warp: keep twist, but reduce "cathedral blobs" by not over-warping vertically.
-        let cave_warp = Fbm::<Perlin>::new(seed ^ 0xC3C3_C3C3).set_octaves(3).set_frequency(0.024);
+        // Warp: keep twist but prevent cavern blow-ups.
+        let cave_warp = Fbm::<Perlin>::new(seed ^ 0xC3C3_C3C3).set_octaves(2).set_frequency(0.030);
 
-        // Low-frequency modulation for rooms/chambers (big features but gated rare).
-        let cave_room = Fbm::<Perlin>::new(seed ^ 0xE6E6_E6E6).set_octaves(2).set_frequency(0.018);
-
+        // Room modulation: keep field but we'll effectively disable rooms in carve_cave
+        let cave_room = Fbm::<Perlin>::new(seed ^ 0xE6E6_E6E6).set_octaves(1).set_frequency(0.012);
 
         let voxels_per_meter = (1.0 / config::VOXEL_SIZE_M_F64) as f32;
 
@@ -67,17 +66,17 @@ impl WorldGen {
     }
 
     #[inline(always)]
-    fn cave_ridged_pair(&self, wx: i32, wy: i32, wz: i32) -> (f32, f32) {
+    fn cave_ridged_pair_scaled(&self, wx: i32, wy: i32, wz: i32, scale: f64) -> (f32, f32) {
         // Sample in meters so frequencies are stable even if VOXEL_SIZE changes.
-        let xm = (wx as f64) * config::VOXEL_SIZE_M_F64;
-        let ym = (wy as f64) * config::VOXEL_SIZE_M_F64;
-        let zm = (wz as f64) * config::VOXEL_SIZE_M_F64;
+        let xm = (wx as f64) * config::VOXEL_SIZE_M_F64 * scale;
+        let ym = (wy as f64) * config::VOXEL_SIZE_M_F64 * scale;
+        let zm = (wz as f64) * config::VOXEL_SIZE_M_F64 * scale;
 
         // Domain warp (shared), but decorrelate the two fields slightly.
         let w0 = self.cave_warp.get([xm, ym, zm]) as f32; // ~[-1,1]
         let w1 = self.cave_warp.get([xm + 31.7, ym - 12.4, zm + 8.9]) as f32;
 
-        let warp_m = 4.5; // meters; lower => fewer huge open spaces
+        let warp_m = 2.8; // meters; lower => fewer huge open spaces
         let xw0 = xm + (w0 as f64) * (warp_m as f64);
         let yw0 = ym + (w0 as f64) * (warp_m as f64) * 0.30; // less vertical warp
         let zw0 = zm - (w0 as f64) * (warp_m as f64);
@@ -95,140 +94,179 @@ impl WorldGen {
         (r0, r1)
     }
 
+    #[inline(always)]
+    fn cave_ridged_pair(&self, wx: i32, wy: i32, wz: i32) -> (f32, f32) {
+        self.cave_ridged_pair_scaled(wx, wy, wz, 1.0)
+    }
 
     #[inline(always)]
     pub fn carve_cave(&self, wx: i32, wy: i32, wz: i32, ground_y_vox: i32) -> bool {
-        // Depth below surface in meters
         let vpm = config::VOXELS_PER_METER as f32;
-        let depth_vox = (ground_y_vox - wy) as f32;
+        let vpm_i = config::VOXELS_PER_METER;
 
-        // Don’t open caves at/near the surface by default (prevents swiss-cheese terrain),
-        // BUT allow rare entrances that connect to cave noise below.
+        // Depth below surface in voxels/meters
+        let depth_vox = (ground_y_vox - wy) as f32;
+        let depth_m = depth_vox / vpm;
+
+        // Small helper: map hash -> [-1,1]
+        #[inline(always)]
+        fn s11(n: u32) -> f32 {
+            (u01(n) - 0.5) * 2.0
+        }
+
+        // -----------------------------------------------------------------------------
+        // 1) Surface connectivity: shafts / entrances (NOW voxel-precise + irregular)
+        // -----------------------------------------------------------------------------
         let roof_m = 3.0;
         let roof_vox = roof_m * vpm;
 
-        if depth_vox < roof_vox {
-            let vpm_i = config::VOXELS_PER_METER;
+        let entrance_band_m = 6.0;
+        let entrance_band_vox = entrance_band_m * vpm;
+
+        if depth_vox < entrance_band_vox {
+            // Meter coords (used ONLY for gating / placement)
             let xm = wx.div_euclid(vpm_i);
             let zm = wz.div_euclid(vpm_i);
 
-            // ---- TUNING ----
-            // Smaller cell => more candidate cells
-            let cell_m: i32 = 6;           // was 12
-            // Lower mask => higher probability (mask=127 => 1/128)
-            let gate_mask: u32 = 31;      // was 511
-            // Wider mouth radius so you can actually *see* the entrance
-            let mouth_r_m: i32 = 4;        // 3m radius (~7m diameter)
-            // Slightly easier threshold at the probe depth
-            let entrance_thr: f32 = 0.50;  // was 0.58
-            // ----------------
+            // --- TUNING (entrances / shafts) ---
+            let cell_m: i32 = 10;         // was 8 (spread them out)
+            let gate_mask: u32 = 31;      // was 15 (rarer: 1/32)
+
+            let mouth_r_m: f32 = 1.6;     // was 3.0
+            let shaft_r_m: f32 = 1.1;     // was 2.0
+            let shaft_depth_m: f32 = 14.0; // was 22.0
+
+            let probe_depth_m: f32 = 12.0; // was 10.0 (avoid surface swiss-cheese)
+            let entrance_thr: f32 = 0.62;  // was 0.46 (much stricter: only real tunnels connect)
+
+            // ----------------------------------
 
             let gx = xm.div_euclid(cell_m);
             let gz = zm.div_euclid(cell_m);
 
             let h = hash2(self.seed ^ 0xE17A_0001, gx, gz);
-            if (h & gate_mask) != 0 {
-                return false;
+            if (h & gate_mask) == 0 {
+                // Entrance cell center in *meters*
+                let cxm = gx * cell_m + cell_m / 2;
+                let czm = gz * cell_m + cell_m / 2;
+
+                // Convert that to a voxel-space center (sub-meter precision comes from jitter/meander)
+                let cxv0 = cxm * vpm_i + vpm_i / 2;
+                let czv0 = czm * vpm_i + vpm_i / 2;
+
+                // Per-entrance variability (radius + center jitter)
+                let mouth_r_vox = (mouth_r_m * (0.85 + 0.45 * u01(hash_u32(h ^ 0xA11C_0001))) * vpm).max(2.0);
+                let shaft_r_vox = (shaft_r_m * (0.85 + 0.35 * u01(hash_u32(h ^ 0xA11C_0002))) * vpm).max(1.5);
+
+                // Center jitter up to ~1.2m
+                let jitter_amp_vox = 1.2 * vpm;
+                let jx = s11(hash_u32(h ^ 0x51A1_0001)) * jitter_amp_vox;
+                let jz = s11(hash_u32(h ^ 0x51A1_0002)) * jitter_amp_vox;
+
+                // Only consider voxels reasonably near this entrance (cheap reject)
+                let dx0 = (wx - cxv0) as f32;
+                let dz0 = (wz - czv0) as f32;
+                let near_r = (mouth_r_vox + 2.0 * vpm).max(shaft_r_vox + 2.0 * vpm);
+                if dx0 * dx0 + dz0 * dz0 <= near_r * near_r {
+                    // Probe below to ensure we don’t open dead shafts
+                    let probe_y = (ground_y_vox as f32 - probe_depth_m * vpm).round() as i32;
+                    let (p0, p1) = self.cave_ridged_pair(wx, probe_y, wz);
+                    let (q0, q1) = self.cave_ridged_pair_scaled(wx, probe_y, wz, 0.55);
+
+                    let has_cave_below =
+                        (p0 > entrance_thr && p1 > entrance_thr) ||
+                        (q0 > entrance_thr && q1 > entrance_thr);
+
+                    if has_cave_below {
+                        // Depth along the shaft (0 at surface → 1 at shaft bottom)
+                        let shaft_depth_vox = (shaft_depth_m * vpm).round();
+                        let shaft_bottom = ground_y_vox as f32 - shaft_depth_vox;
+
+                        // Meander: shift the shaft center slightly as we go down
+                        // (use cave_warp as a smooth 3D field keyed by entrance cell + depth)
+                        let d01 = ((ground_y_vox as f32 - wy as f32) / shaft_depth_vox.max(1.0)).clamp(0.0, 1.0);
+                        let meander_amp = (0.9 * vpm) * (d01 * d01); // grows with depth
+                        let nmx = self.cave_warp.get([
+                            (cxm as f64) * 0.11,
+                            (depth_m as f64) * 0.23,
+                            (czm as f64) * 0.11,
+                        ]) as f32;
+                        let nmz = self.cave_warp.get([
+                            (cxm as f64) * 0.11 + 19.7,
+                            (depth_m as f64) * 0.23 - 6.3,
+                            (czm as f64) * 0.11 + 8.9,
+                        ]) as f32;
+
+                        let cx = (cxv0 as f32) + jx + nmx * meander_amp;
+                        let cz = (czv0 as f32) + jz + nmz * meander_amp;
+
+                        // Radius transitions: mouth → shaft (no hard step)
+                        let t = (depth_m / entrance_band_m).clamp(0.0, 1.0);
+                        let smooth = t * t * (3.0 - 2.0 * t); // smoothstep
+                        let r_base = mouth_r_vox + (shaft_r_vox - mouth_r_vox) * smooth;
+
+                        // Boundary noise so the mouth isn’t a perfect circle
+                        let wxm = (wx as f64) * config::VOXEL_SIZE_M_F64;
+                        let wym = (wy as f64) * config::VOXEL_SIZE_M_F64;
+                        let wzm = (wz as f64) * config::VOXEL_SIZE_M_F64;
+
+                        let bn = self.cave_warp.get([wxm * 0.55, wym * 0.22, wzm * 0.55]) as f32; // ~[-1,1]
+                        let rough = 1.0 + 0.22 * bn * (1.0 - smooth); // stronger near the mouth
+                        let r = (r_base * rough).max(1.5);
+
+                        // Carve only above shaft bottom
+                        if (wy as f32) >= shaft_bottom {
+                            let dx = (wx as f32) - cx;
+                            let dz = (wz as f32) - cz;
+                            if dx * dx + dz * dz <= r * r {
+                                return true;
+                            }
+                        }
+                    }
+                }
             }
 
-            // Carve a visible "mouth" disk around the cell center in meters.
-            let cxm = gx * cell_m + cell_m / 2;
-            let czm = gz * cell_m + cell_m / 2;
-            let dxm = xm - cxm;
-            let dzm = zm - czm;
-            if dxm * dxm + dzm * dzm > mouth_r_m * mouth_r_m {
+            // Keep the roof intact very near the surface unless we’re inside an accepted shaft carve
+            if depth_vox < roof_vox {
                 return false;
             }
-
-            // Probe below the roof so we only open when there's a cave worth connecting to.
-            let probe_y = ground_y_vox - roof_vox as i32;
-            let (r0p, r1p) = self.cave_ridged_pair(wx, probe_y, wz);
-            // Entrance opens only if a *tunnel* exists below (prevents random surface holes).
-            return (r0p > entrance_thr) && (r1p > entrance_thr);
-
         }
 
-
-
-        // If you only stream a small vertical band, keep caves inside it:
-        // (This still works without this clamp; it just reduces “wasted” patterns.)
-        let max_depth_m = 40.0;
-        if depth_vox > max_depth_m * vpm {
+        // -----------------------------------------------------------------------------
+        // 2) Underground: tunnel-only (single scale, no chambers)
+        // -----------------------------------------------------------------------------
+        let max_depth_m = 48.0; // was 55; shallower caves feel less "world-spanning"
+        if depth_m > max_depth_m {
             return false;
         }
 
-        // Make caves more likely deeper down.
-        let depth_m = depth_vox / vpm;
+        // Depth ramp 0..1 below roof
         let t = ((depth_m - roof_m) / (max_depth_m - roof_m)).clamp(0.0, 1.0);
 
-        // --- TUNNELS (Minecraft-y) ---
-        // Two ridged fields; require BOTH high -> tunnels instead of giant sheets/cathedrals.
+        // Single scale: use the ridged intersection, but make it THIN.
+        // Using min() forces BOTH ridges to be near their zero-crossing simultaneously -> tube centerline.
         let (r0, r1) = self.cave_ridged_pair(wx, wy, wz);
+        let mut ridge = r0.min(r1);
 
-        // Threshold ramps with depth: shallow => stricter, deep => looser.
-        // (Slightly stricter overall than before to avoid huge voids.)
-        let thr_shallow = 0.62;
-        let thr_deep = 0.52;
-        let thr = thr_shallow + (thr_deep - thr_shallow) * t;
+        // Slight vertical breakup so we don't get long planar strata
+        ridge *= 0.96 + 0.04 * (((wy & 31) as f32) * (1.0 / 31.0));
 
-        // Vertical anti-sheet jitter (keeps things from becoming huge planar caverns)
-        let y_bias = ((wy as i32) & 7) as f32 * (1.0 / 7.0);
-        let r0 = r0 * (0.94 + 0.06 * y_bias);
-        let r1 = r1 * (0.94 + 0.06 * (1.0 - y_bias));
+        // Tight threshold: small tunnels near surface, only slightly wider deeper.
+        // (Higher threshold => thinner tunnels.)
+        let mut thr = 0.78 + (0.70 - 0.78) * t; // 0.78 -> 0.70
 
-        let carve_tunnel = (r0 > thr) && (r1 > thr);
+        // Tiny threshold noise breaks uniform walls WITHOUT creating caverns.
+        let wxm = (wx as f64) * config::VOXEL_SIZE_M_F64;
+        let wym = (wy as f64) * config::VOXEL_SIZE_M_F64;
+        let wzm = (wz as f64) * config::VOXEL_SIZE_M_F64;
+        let tn = self.cave_warp.get([wxm * 0.40, wym * 0.24, wzm * 0.40]) as f32; // ~[-1,1]
+        thr += 0.010 * tn;
 
-        // --- CHAMBERS (rare bigger interiors) ---
-        // Seed occasional spheres in a 3D meter-grid so you get rooms connected by tunnels.
-        let vpm_i = config::VOXELS_PER_METER;
-        let xm = wx.div_euclid(vpm_i);
-        let ym = wy.div_euclid(vpm_i);
-        let zm = wz.div_euclid(vpm_i);
-
-        // Room grid in meters: bigger = rarer.
-        let room_cell_m: i32 = 18;
-        let rx = xm.div_euclid(room_cell_m);
-        let ry = ym.div_euclid(room_cell_m);
-        let rz = zm.div_euclid(room_cell_m);
-
-        // 1/(mask+1) chance per cell.
-        let room_gate_mask: u32 = 63; // 1/64
-        let h = hash3(self.seed ^ 0xCAFE_600D, rx, ry, rz);
-
-        let mut carve_room = false;
-        if (h & room_gate_mask) == 0 {
-            // Cell center (meters)
-            let cxm = rx * room_cell_m + room_cell_m / 2;
-            let cym = ry * room_cell_m + room_cell_m / 2;
-            let czm = rz * room_cell_m + room_cell_m / 2;
-
-            let dxm = xm - cxm;
-            let dym = ym - cym;
-            let dzm = zm - czm;
-
-            // Radius in meters (Minecraft-ish "small room" range)
-            let r_m = 4 + (hash_u32(h ^ 0x1234) % 6) as i32; // 4..9m
-
-            // Slightly squash vertically so rooms feel cave-like, not domes.
-            let d2 = (dxm * dxm) + (dzm * dzm) + ((dym * dym) * 2);
-
-            if d2 <= r_m * r_m {
-                // Modulate with a low-frequency noise so rooms aren't perfect spheres.
-                let wxm = (wx as f64) * config::VOXEL_SIZE_M_F64;
-                let wym = (wy as f64) * config::VOXEL_SIZE_M_F64;
-                let wzm = (wz as f64) * config::VOXEL_SIZE_M_F64;
-                let rn = self.cave_room.get([wxm, wym, wzm]) as f32; // ~[-1,1]
-                let room_r = 1.0 - rn.abs();
-
-                // Only keep the "core" of the chamber; prevents giant blown-out volumes.
-                carve_room = room_r > 0.55;
-            }
-        }
-
-        // Final carve: tunnels everywhere, rooms only where the rare chamber condition hits.
-        carve_tunnel || carve_room
+        // Final carve: tunnel-only
+        ridge > thr
 
     }
+
 
     pub fn material_at_voxel(&self, wx: i32, wy: i32, wz: i32) -> u32 {
         // --- terrain ---
