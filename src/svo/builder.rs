@@ -19,15 +19,11 @@ use crate::{
     },
 };
 
-use super::mips::{build_max_mip_inplace, build_minmax_mip_inplace, MinMaxMipView};
+use super::mips::{build_max_mip_inplace, build_minmax_mip_inplace};
 
 use super::builder_prefix as prefix;
 use super::builder_ropes as ropes;
 use super::builder_svo as svo;
-
-// Using u32::MAX as the sentinel for "invalid" indices/pointers.
-const INVALID: u32 = u32::MAX;
-const LEAF: u32 = INVALID;
 
 // 8^3 bits = 512 bits = 16 u32
 const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
@@ -125,11 +121,6 @@ impl BuildOutput {
 #[inline]
 fn idx_xz(side: usize, x: usize, z: usize) -> usize {
     z * side + x
-}
-
-#[inline]
-fn idx_xyz(side: usize, x: usize, y: usize, z: usize) -> usize {
-    (y * side * side) + (z * side) + x
 }
 
 // -----------------------------------------------------------------------------

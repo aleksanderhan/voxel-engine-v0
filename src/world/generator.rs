@@ -6,7 +6,6 @@ use crate::app::config;
 use crate::world::materials::{AIR, DIRT, GRASS, STONE, WOOD, LEAF};
 use crate::world::hash::{hash2, hash_u32, u01};
 use crate::world::edits::{EditStore, voxel_to_chunk_local};
-use crate::world::hash::hash3;
 
 #[derive(Clone)]
 pub struct WorldGen {
