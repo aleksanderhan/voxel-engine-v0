@@ -249,12 +249,59 @@ fn build_level_bottom_up(
             continue;
         }
 
-        let base = packed_children.len() as u32;
-
         let cx0 = px * 2;
         let cy0 = py * 2;
         let cz0 = pz * 2;
 
+        // ------------------------------------------------------------
+        // NEW: Uniform-material collapse (8 leaf children, same material)
+        // ------------------------------------------------------------
+        if m == 0xFF {
+            // Fetch first child as reference
+            let c0_lin = idx_xyz(child_side, cx0, cy0, cz0);
+            let c0_idx = unsafe { *child_idx_grid.get_unchecked(c0_lin) };
+            debug_assert!(c0_idx != INVALID);
+
+            let c0 = &child_nodes[c0_idx as usize];
+
+            // Only collapse if all 8 are LEAF and same material
+            if c0.child_base == LEAF {
+                let mat0 = c0.material;
+                let mut ok = true;
+
+                for ci in 1u32..8u32 {
+                    let dx = (ci & 1) as usize;
+                    let dy = ((ci >> 1) & 1) as usize;
+                    let dz = ((ci >> 2) & 1) as usize;
+
+                    let cx = cx0 + dx;
+                    let cy = cy0 + dy;
+                    let cz = cz0 + dz;
+
+                    let c_lin = idx_xyz(child_side, cx, cy, cz);
+                    let c_idx = unsafe { *child_idx_grid.get_unchecked(c_lin) };
+                    if c_idx == INVALID {
+                        ok = false;
+                        break;
+                    }
+
+                    let c = &child_nodes[c_idx as usize];
+                    if c.child_base != LEAF || c.material != mat0 {
+                        ok = false;
+                        break;
+                    }
+                }
+
+                if ok {
+                    parent_nodes[p_out as usize] =
+                        make_leaf(chunk_size, ox, oy, oz, parent_size, mat0);
+                    continue;
+                }
+            }
+        }
+
+        // Normal pack-children path
+        let base = packed_children.len() as u32;
         let mut child_mask_u32: u32 = 0;
 
         for ci in 0u32..8u32 {
@@ -284,6 +331,7 @@ fn build_level_bottom_up(
             material: 0,
             key: pack_key(chunk_size, ox, oy, oz, parent_size),
         };
+
     }
 
     (

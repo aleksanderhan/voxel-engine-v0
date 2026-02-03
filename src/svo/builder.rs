@@ -233,7 +233,7 @@ pub struct BuildScratch {
     height_cache_valid: bool,
 
     cave_mask: Vec<u8>,   // 0/1 samples
-    cave_step: usize,     // e.g. 4
+    cave_shift: u32,     // e.g. 4
     cave_dim: usize,      // side / step
 
     svo: svo::SvoScratch,
@@ -258,7 +258,7 @@ impl BuildScratch {
             height_cache_z0: 0,
             height_cache_valid: false,
             cave_mask: Vec::new(),
-            cave_step: 0,
+            cave_shift: 0,
             cave_dim: 0,
             svo: svo::SvoScratch::new(),
         }
@@ -317,7 +317,9 @@ impl BuildScratch {
         } else {
             self.cave_mask.fill(0);
         }
-        self.cave_step = step;
+        debug_assert!(step.is_power_of_two());
+        self.cave_shift = step.trailing_zeros();
+
         self.cave_dim = dim;
     }
 
@@ -360,14 +362,9 @@ fn build_height_cache<'g>(
         tim.cache_w = cache_w as u32;
         tim.cache_h = cache_h as u32;
 
-        let xs_m: Vec<f64> = (0..cache_w)
-            .map(|x| (cache_x0 + x as i32) as f64 * config::VOXEL_SIZE_M_F64)
-            .collect();
-
-        let zs_m: Vec<f64> = (0..cache_h)
-            .map(|z| (cache_z0 + z as i32) as f64 * config::VOXEL_SIZE_M_F64)
-            .collect();
-
+        let step_m = config::VOXEL_SIZE_M_F64;
+        let x0m = (cache_x0 as f64) * step_m;
+        let z0m = (cache_z0 as f64) * step_m;
 
         scratch.height_cache
             .par_chunks_mut(cache_w)
@@ -376,12 +373,16 @@ fn build_height_cache<'g>(
                 if (z & 15) == 0 && should_cancel(cancel) {
                     return;
                 }
-                let zm = zs_m[z];
+
+                let zm = z0m + (z as f64) * step_m;
+                let mut xm = x0m;
+
+                // tight inner loop: no indexing into xs_m
                 for x in 0..cache_w {
-                    row[x] = gen.ground_height_m(xs_m[x], zm);
+                    row[x] = gen.ground_height_m(xm, zm);
+                    xm += step_m;
                 }
             });
-
 
         scratch.height_cache_x0 = cache_x0;
         scratch.height_cache_z0 = cache_z0;
@@ -553,7 +554,7 @@ fn fill_material(
     let tree_top: &[i32] = &scratch.tree_top;
 
     let cave_mask: &[u8] = &scratch.cave_mask;
-    let cave_step: usize = scratch.cave_step;
+    let cave_shift: u32 = scratch.cave_shift;
     let cave_dim: usize = scratch.cave_dim;
 
 
@@ -572,13 +573,10 @@ fn fill_material(
             let wy = ctx.oy + ly as i32;
 
             for lz in 0..side {
-                let wz = ctx.oz + lz as i32;
                 let row_off = lz * side;
 
                 for lx in 0..side {
-                    let wx = ctx.ox + lx as i32;
-
-                    let col = idx_xz(side, lx, lz);
+                    let col = row_off + lx;
                     let g = ground[col];
 
                     // 1) terrain
@@ -594,7 +592,7 @@ fn fill_material(
                     if m != AIR8 {
                         let depth_vox = g - wy;
                         if depth_vox > 0 && depth_vox <= max_depth_vox {
-                            if cave_mask_at_slices(cave_mask, cave_step, cave_dim, lx, ly, lz) {
+                            if cave_mask_at_shifted(cave_mask, cave_dim, cave_shift, lx, ly, lz) {
                                 m = AIR8;
                             }
                         }
@@ -686,38 +684,25 @@ fn build_cave_mask_coarse(
 }
 
 #[inline(always)]
-fn cave_mask_at(scratch: &BuildScratch, lx: usize, ly: usize, lz: usize) -> bool {
-    let step = scratch.cave_step;
-    let dim = scratch.cave_dim;
-
-    // nearest-neighbor upsample
-    let sx = (lx / step).min(dim - 1);
-    let sy = (ly / step).min(dim - 1);
-    let sz = (lz / step).min(dim - 1);
-
-    scratch.cave_mask[idx3(dim, sx, sy, sz)] != 0
-}
-
-#[inline(always)]
 fn idx3(dim: usize, x: usize, y: usize, z: usize) -> usize {
     (y * dim * dim) + (z * dim) + x
 }
 
 #[inline(always)]
-fn cave_mask_at_slices(
+fn cave_mask_at_shifted(
     cave_mask: &[u8],
-    cave_step: usize,
     cave_dim: usize,
+    cave_shift: u32,
     lx: usize,
     ly: usize,
     lz: usize,
 ) -> bool {
-    // nearest-neighbor upsample
-    let sx = (lx / cave_step).min(cave_dim - 1);
-    let sy = (ly / cave_step).min(cave_dim - 1);
-    let sz = (lz / cave_step).min(cave_dim - 1);
+    let sx = (lx >> cave_shift).min(cave_dim - 1);
+    let sy = (ly >> cave_shift).min(cave_dim - 1);
+    let sz = (lz >> cave_shift).min(cave_dim - 1);
     cave_mask[idx3(cave_dim, sx, sy, sz)] != 0
 }
+
 
 
 fn build_colinfo_words(ctx: ChunkCtx, scratch: &BuildScratch) -> Vec<u32> {
