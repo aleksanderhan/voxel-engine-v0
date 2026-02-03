@@ -219,6 +219,8 @@ impl FrameProf {
                     "Q={} B={} U={} R={} in_flight={} done_backlog={}\n",
                     "           uploads: rw={} act={} oth={} | cache: {:.1}MB entries={} lru={}\n",
                     "           build_q={} queued_set={} cancels={} orphanQ={}\n",
+                    "           builds: done={} canceled={} | queue_ms(avg/max)={:.2}/{:.2} ",
+                    "build_ms(avg/max)={:.2}/{:.2} | nodes(avg/max)={:.0}/{:.0}\n",
                 ),
                 s.center.0, s.center.1, s.center.2,
                 s.resident_slots, s.total_slots, s.chunks_map,
@@ -227,8 +229,51 @@ impl FrameProf {
                 s.up_rewrite, s.up_active, s.up_other,
                 (s.cache_bytes as f64) / (1024.0 * 1024.0),
                 s.cache_entries, s.cache_lru,
-                s.build_queue_len, s.queued_set_len, s.cancels_len, s.orphan_queued
+                s.build_queue_len, s.queued_set_len, s.cancels_len, s.orphan_queued,
+                s.builds_done, s.builds_canceled,
+                s.queue_ms_avg, s.queue_ms_max,
+                s.build_ms_avg, s.build_ms_max,
+                s.nodes_avg, s.nodes_max as f64,
             );
+
+            if s.builds_done > 0 {
+                println!(
+                    concat!(
+                        "           bt_ms(avg/max): total={:.2}/{:.2} height_cache={:.2}/{:.2} tree_mask={:.2}/{:.2}\n",
+                        "                         ground_2d={:.2}/{:.2} ground_mip={:.2}/{:.2} tree_top={:.2}/{:.2} tree_mip={:.2}/{:.2}\n",
+                        "                         material_fill={:.2}/{:.2} colinfo={:.2}/{:.2} prefix_x={:.2}/{:.2} prefix_y={:.2}/{:.2} prefix_z={:.2}/{:.2}\n",
+                        "                         macro_occ={:.2}/{:.2} svo_build={:.2}/{:.2} ropes={:.2}/{:.2}\n",
+                        "           bt_cnt(max): cache_w={} cache_h={} tree_cells_tested={} tree_instances={} solid_voxels={} nodes={}\n"
+                    ),
+                    s.bt_avg.total,         s.bt_max.total,
+                    s.bt_avg.height_cache,  s.bt_max.height_cache,
+                    s.bt_avg.tree_mask,     s.bt_max.tree_mask,
+
+                    s.bt_avg.ground_2d,     s.bt_max.ground_2d,
+                    s.bt_avg.ground_mip,    s.bt_max.ground_mip,
+                    s.bt_avg.tree_top,      s.bt_max.tree_top,
+                    s.bt_avg.tree_mip,      s.bt_max.tree_mip,
+
+                    s.bt_avg.material_fill, s.bt_max.material_fill,
+                    s.bt_avg.colinfo,       s.bt_max.colinfo,
+                    s.bt_avg.prefix_x,      s.bt_max.prefix_x,
+                    s.bt_avg.prefix_y,      s.bt_max.prefix_y,
+                    s.bt_avg.prefix_z,      s.bt_max.prefix_z,
+
+                    s.bt_avg.macro_occ,     s.bt_max.macro_occ,
+                    s.bt_avg.svo_build,     s.bt_max.svo_build,
+                    s.bt_avg.ropes,         s.bt_max.ropes,
+
+                    s.bt_max.cache_w,
+                    s.bt_max.cache_h,
+                    s.bt_max.tree_cells_tested,
+                    s.bt_max.tree_instances,
+                    s.bt_max.solid_voxels,
+                    s.bt_max.nodes,
+                );
+            }
+
+
         }
 
         if let Some(g) = gpu {

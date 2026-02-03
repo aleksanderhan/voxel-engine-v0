@@ -1,7 +1,10 @@
+// src/streaming/manager/build.rs
 use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
     Arc,
 };
+use std::time::Instant;
+
 
 use crossbeam_channel::TrySendError;
 use std::cmp::Ordering;
@@ -206,7 +209,7 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
 
         let edits = mgr.edits.snapshot(k);
 
-        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel, edits }) {
+        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel, edits, enqueued_at: Instant::now(), }) {
             Ok(()) => mgr.build.in_flight += 1,
             Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
                 // Put it back and stop trying this frame.
@@ -261,7 +264,7 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         cancel.store(false, AtomicOrdering::Relaxed);
 
         let edits = mgr.edits.snapshot(k);
-        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone(), edits }) {
+        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone(), edits, enqueued_at: Instant::now(), }) {
             Ok(()) => mgr.build.in_flight += 1,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 mgr.build.chunks.insert(k, ChunkState::Queued);
@@ -291,6 +294,18 @@ pub fn harvest_done_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         // Drop stale completions (job from an old cancel token)
         let Some(cur_cancel) = mgr.build.cancels.get(&done.key) else { continue; };
         if !Arc::ptr_eq(cur_cancel, &done.cancel) { continue; }
+
+        let canceled = done.canceled || done.cancel.load(AtomicOrdering::Relaxed);
+        let nodes_n = done.tim.nodes.max(done.nodes.len() as u32);
+
+        // Record timing window FIRST (even if we'll discard the result due to keep/cancel)
+        mgr.timing.record_build(
+            done.queue_ms,
+            done.build_ms,
+            nodes_n,
+            canceled,
+            &done.tim,
+        );
 
         if done.canceled || done.cancel.load(AtomicOrdering::Relaxed) {
             mgr.build.chunks.remove(&done.key);

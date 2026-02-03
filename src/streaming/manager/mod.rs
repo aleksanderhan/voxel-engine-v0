@@ -1,4 +1,5 @@
 
+// src/streaming/manager/mod.rs
 pub mod build;
 mod grid;
 mod slots;
@@ -17,6 +18,7 @@ use std::{
         Arc,
     },
 };
+use crate::svo::builder::BuildTimingsMs;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use glam::Vec3;
@@ -111,6 +113,9 @@ pub struct ChunkManager {
 
     pub(crate) pinned: HashSet<ChunkKey>,
     pub(crate) edits: Arc<crate::world::edits::EditStore>,
+
+    // Build timing window (drained on stats() print cadence)
+    pub timing: StreamTimingWindow,
 }
 
 impl ChunkManager {
@@ -179,6 +184,8 @@ impl ChunkManager {
 
             pinned: HashSet::default(),
             edits,
+
+            timing: StreamTimingWindow::default(),
         }
     }
 
@@ -255,9 +262,10 @@ impl ChunkManager {
         slots::commit_uploads_applied(self, applied)
     }
 
-    pub fn stats(&self) -> Option<StreamStats> {
+    pub fn stats(&mut self) -> Option<StreamStats> {
         stats::stats(self)
     }
+
 
     /// Cheap per-frame maintenance. MUST NOT do expensive planning.
     /// - harvest worker completions
@@ -284,5 +292,100 @@ impl ChunkManager {
         slots::assert_slot_invariants(self);
 
         changed
+    }
+}
+
+
+#[derive(Clone, Debug, Default)]
+pub struct StreamTimingWindow {
+    pub builds_done: u32,
+    pub builds_canceled: u32,
+
+    pub queue_ms_sum: f64,
+    pub queue_ms_max: f64,
+
+    pub build_ms_sum: f64,
+    pub build_ms_max: f64,
+
+    pub nodes_sum: u64,
+    pub nodes_max: u32,
+
+    pub bt_sum: BuildTimingsMs, // sums (times)
+    pub bt_max: BuildTimingsMs, // max  (times + counters as max signal)
+}
+
+
+impl StreamTimingWindow {
+    #[inline]
+    pub fn record_build(
+        &mut self,
+        queue_ms: f64,
+        build_ms: f64,
+        nodes: u32,
+        canceled: bool,
+        tim: &BuildTimingsMs, // NEW
+    ) {
+        if canceled {
+            self.builds_canceled += 1;
+            return;
+        }
+
+        self.builds_done += 1;
+
+        self.queue_ms_sum += queue_ms;
+        self.queue_ms_max = self.queue_ms_max.max(queue_ms);
+
+        self.build_ms_sum += build_ms;
+        self.build_ms_max = self.build_ms_max.max(build_ms);
+
+        self.nodes_sum += nodes as u64;
+        self.nodes_max = self.nodes_max.max(nodes);
+
+        // ---- per-stage sums ----
+        self.bt_sum.total         += tim.total;
+        self.bt_sum.height_cache  += tim.height_cache;
+        self.bt_sum.tree_mask     += tim.tree_mask;
+        self.bt_sum.ground_2d     += tim.ground_2d;
+        self.bt_sum.ground_mip    += tim.ground_mip;
+        self.bt_sum.tree_top      += tim.tree_top;
+        self.bt_sum.tree_mip      += tim.tree_mip;
+        self.bt_sum.material_fill += tim.material_fill;
+        self.bt_sum.colinfo       += tim.colinfo;
+        self.bt_sum.prefix_x      += tim.prefix_x;
+        self.bt_sum.prefix_y      += tim.prefix_y;
+        self.bt_sum.prefix_z      += tim.prefix_z;
+        self.bt_sum.macro_occ     += tim.macro_occ;
+        self.bt_sum.svo_build     += tim.svo_build;
+        self.bt_sum.ropes         += tim.ropes;
+
+        // ---- per-stage maxima ----
+        self.bt_max.total         = self.bt_max.total.max(tim.total);
+        self.bt_max.height_cache  = self.bt_max.height_cache.max(tim.height_cache);
+        self.bt_max.tree_mask     = self.bt_max.tree_mask.max(tim.tree_mask);
+        self.bt_max.ground_2d     = self.bt_max.ground_2d.max(tim.ground_2d);
+        self.bt_max.ground_mip    = self.bt_max.ground_mip.max(tim.ground_mip);
+        self.bt_max.tree_top      = self.bt_max.tree_top.max(tim.tree_top);
+        self.bt_max.tree_mip      = self.bt_max.tree_mip.max(tim.tree_mip);
+        self.bt_max.material_fill = self.bt_max.material_fill.max(tim.material_fill);
+        self.bt_max.colinfo       = self.bt_max.colinfo.max(tim.colinfo);
+        self.bt_max.prefix_x      = self.bt_max.prefix_x.max(tim.prefix_x);
+        self.bt_max.prefix_y      = self.bt_max.prefix_y.max(tim.prefix_y);
+        self.bt_max.prefix_z      = self.bt_max.prefix_z.max(tim.prefix_z);
+        self.bt_max.macro_occ     = self.bt_max.macro_occ.max(tim.macro_occ);
+        self.bt_max.svo_build     = self.bt_max.svo_build.max(tim.svo_build);
+        self.bt_max.ropes         = self.bt_max.ropes.max(tim.ropes);
+
+        // counters as maxima signal (optional but useful)
+        self.bt_max.cache_w           = self.bt_max.cache_w.max(tim.cache_w);
+        self.bt_max.cache_h           = self.bt_max.cache_h.max(tim.cache_h);
+        self.bt_max.tree_cells_tested = self.bt_max.tree_cells_tested.max(tim.tree_cells_tested);
+        self.bt_max.tree_instances    = self.bt_max.tree_instances.max(tim.tree_instances);
+        self.bt_max.solid_voxels      = self.bt_max.solid_voxels.max(tim.solid_voxels);
+        self.bt_max.nodes             = self.bt_max.nodes.max(tim.nodes);
+    }
+
+    #[inline]
+    pub fn drain(&mut self) -> Self {
+        std::mem::take(self)
     }
 }

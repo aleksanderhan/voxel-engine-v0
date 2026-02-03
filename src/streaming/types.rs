@@ -1,8 +1,10 @@
 // src/streaming/types.rs
 use std::sync::{Arc, atomic::AtomicBool};
+use std::time::Instant;
 
 use crate::world::edits::EditEntry;
 use crate::render::gpu_types::{ChunkMetaGpu, NodeGpu, NodeRopesGpu};
+use crate::svo::builder::BuildTimingsMs;
 
 pub const INVALID_U32: u32 = 0xFFFF_FFFF;
 
@@ -62,6 +64,7 @@ pub struct BuildJob {
     pub key: ChunkKey,
     pub cancel: Arc<AtomicBool>,
     pub edits: Arc<[EditEntry]>,
+    pub enqueued_at: Instant,
 }
 
 pub struct BuildDone {
@@ -72,6 +75,9 @@ pub struct BuildDone {
     pub macro_words: Vec<u32>,
     pub ropes: Vec<NodeRopesGpu>,
     pub colinfo_words: Vec<u32>,
+    pub tim: BuildTimingsMs,
+    pub queue_ms: f64, // enqueue -> worker start
+    pub build_ms: f64, // worker start -> build done
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -132,10 +138,32 @@ pub struct StreamStats {
     pub cache_entries: u32,
     pub cache_lru: u32,
 
-    // NEW
     pub build_queue_len: u32,
     pub queued_set_len: u32,
     pub cancels_len: u32,
 
     pub orphan_queued: u32,
+
+    // ---------------------------------------------------------------------
+    // Aggregated timing window (drained/reset on profiler print cadence)
+    // ---------------------------------------------------------------------
+    pub builds_done: u32,
+    pub builds_canceled: u32,
+
+    // enqueue -> worker-start
+    pub queue_ms_avg: f64,
+    pub queue_ms_max: f64,
+
+    // worker-start -> build-done (worldgen + SVO (Sparse Voxel Octree) build)
+    pub build_ms_avg: f64,
+    pub build_ms_max: f64,
+
+    // optional: size signal for cost correlation
+    pub nodes_avg: f64,
+    pub nodes_max: u32,
+
+    // per-stage build timings (averaged over the window) + maxima
+    pub bt_avg: BuildTimingsMs,
+    pub bt_max: BuildTimingsMs,
 }
+

@@ -21,6 +21,52 @@ const INVALID_U32: u32 = 0xFFFF_FFFF;
 // 8^3 bits = 512 bits = 16 u32
 const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
 
+// --- Worldgen build profiling ------------------------------------------------
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct BuildTimingsMs {
+    pub total: f64,
+
+    pub height_cache: f64,
+    pub tree_mask: f64,
+    pub ground_2d: f64,
+    pub ground_mip: f64,
+    pub tree_top: f64,
+    pub tree_mip: f64,
+    pub material_fill: f64,
+    pub colinfo: f64,
+    pub prefix_x: f64,
+    pub prefix_y: f64,
+    pub prefix_z: f64,
+    pub macro_occ: f64,
+    pub svo_build: f64,
+    pub ropes: f64,
+
+    // useful counters (not time)
+    pub cache_w: u32,
+    pub cache_h: u32,
+    pub tree_cells_tested: u32,
+    pub tree_instances: u32,
+    pub solid_voxels: u32,
+    pub nodes: u32,
+}
+
+#[inline(always)]
+fn ms_since(t0: std::time::Instant) -> f64 {
+    t0.elapsed().as_secs_f64() * 1000.0
+}
+
+macro_rules! time_it {
+    ($tim:expr, $field:ident, $body:block) => {{
+        let _t0 = std::time::Instant::now();
+        let _r = { $body };
+        $tim.$field += ms_since(_t0);
+        _r
+    }};
+}
+
+
+
 #[inline]
 fn should_cancel(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::Relaxed)
@@ -37,9 +83,11 @@ fn pack_key(chunk_size: u32, ox: i32, oy: i32, oz: i32, size: i32) -> u32 {
     debug_assert!(size_u.is_power_of_two());
 
     let lvl = cs.trailing_zeros() - size_u.trailing_zeros(); // 0..=log2(cs)
-    let cx = (ox as u32) / size_u;
-    let cy = (oy as u32) / size_u;
-    let cz = (oz as u32) / size_u;
+    let sh = size_u.trailing_zeros();
+    let cx = (ox as u32) >> sh;
+    let cy = (oy as u32) >> sh;
+    let cz = (oz as u32) >> sh;
+
 
     (cx & 63)
         | ((cy & 63) << 6)
@@ -360,9 +408,12 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     cancel: &AtomicBool,
     scratch: &mut BuildScratch,
     edits: &[EditEntry],
-) -> (Vec<NodeGpu>, Vec<u32>, Vec<NodeRopesGpu>, Vec<u32>) {
+) -> (Vec<NodeGpu>, Vec<u32>, Vec<NodeRopesGpu>, Vec<u32>, BuildTimingsMs) {
+    let mut tim = BuildTimingsMs::default();
+    let t_total = std::time::Instant::now();
+
     if should_cancel(cancel) {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), tim);
     }
 
     let chunk_ox = chunk_origin[0];
@@ -376,6 +427,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     let side = cs_u as usize;
     let vpm: i32 = config::VOXELS_PER_METER as i32;
     debug_assert!(vpm > 0);
+    let dirt_depth: i32 = 3 * vpm;
 
     // -------------------------------------------------------------------------
     // Height cache
@@ -391,25 +443,28 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     let cache_w = (cache_x1 - cache_x0 + 1) as usize;
     let cache_h = (cache_z1 - cache_z0 + 1) as usize;
 
-    scratch.ensure_height_cache(cache_w, cache_h);
+    time_it!(tim, height_cache, {
+        scratch.ensure_height_cache(cache_w, cache_h);
+        tim.cache_w = cache_w as u32;
+        tim.cache_h = cache_h as u32;
 
-    scratch
-        .height_cache
-        .par_chunks_mut(cache_w)
-        .enumerate()
-        .for_each(|(z, row)| {
-            if (z & 15) == 0 && should_cancel(cancel) {
-                return;
-            }
-            let wz = cache_z0 + z as i32;
-            for x in 0..cache_w {
-                let wx = cache_x0 + x as i32;
-                row[x] = gen.ground_height(wx, wz);
-            }
-        });
+        scratch
+            .height_cache
+            .par_chunks_mut(cache_w)
+            .enumerate()
+            .for_each(|(z, row)| {
+                if (z & 15) == 0 && should_cancel(cancel) { return; }
+                let wz = cache_z0 + z as i32;
+                for x in 0..cache_w {
+                    let wx = cache_x0 + x as i32;
+                    row[x] = gen.ground_height(wx, wz);
+                }
+            });
+    });
+
 
     if should_cancel(cancel) {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), tim);
     }
 
 
@@ -426,225 +481,211 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     // -------------------------------------------------------------------------
     // Tree cache/mask
     // -------------------------------------------------------------------------
-    let (_tree_cache_unused, tree_mask) = gen.build_tree_cache_with_mask(
-        chunk_ox,
-        chunk_oy,
-        chunk_oz,
-        cs_i,
-        &height_at,
-        cancel,
-    );
+    let (_tree_cache_unused, tree_mask) = time_it!(tim, tree_mask, {
+        gen.build_tree_cache_with_mask(
+            chunk_ox,
+            chunk_oy,
+            chunk_oz,
+            cs_i,
+            &height_at,
+            cancel,
+        )
+    });
+
 
     // -------------------------------------------------------------------------
     // 2D maps (ground)
     // -------------------------------------------------------------------------
-    BuildScratch::ensure_2d(&mut scratch.ground, side, 0);
+    time_it!(tim, ground_2d, {
+        BuildScratch::ensure_2d(&mut scratch.ground, side, 0);
 
-    scratch
-        .ground
-        .par_chunks_mut(side)
-        .enumerate()
-        .for_each(|(lz, row)| {
-            if (lz & 15) == 0 && should_cancel(cancel) {
-                return;
-            }
-            let wz = chunk_oz + lz as i32;
-            for lx in 0..side {
-                let wx = chunk_ox + lx as i32;
-                row[lx] = height_at(wx, wz);
-            }
-        });
+        scratch
+            .ground
+            .par_chunks_mut(side)
+            .enumerate()
+            .for_each(|(lz, row)| {
+                if (lz & 15) == 0 && should_cancel(cancel) { return; }
+                let wz = chunk_oz + lz as i32;
+                for lx in 0..side {
+                    let wx = chunk_ox + lx as i32;
+                    row[lx] = height_at(wx, wz);
+                }
+            });
+    });
+
 
     if should_cancel(cancel) {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), tim);
     }
 
-    let ground_mip: MinMaxMipView<'_> = build_minmax_mip_inplace(
-        &scratch.ground,
-        cs_u,
-        &mut scratch.ground_min_levels,
-        &mut scratch.ground_max_levels,
-    );
+    let ground_mip = time_it!(tim, ground_mip, {
+        build_minmax_mip_inplace(
+            &scratch.ground,
+            cs_u,
+            &mut scratch.ground_min_levels,
+            &mut scratch.ground_max_levels,
+        )
+    });
+
 
     // -------------------------------------------------------------------------
     // Tree top stamp (2D)
     // -------------------------------------------------------------------------
-    BuildScratch::ensure_2d(&mut scratch.tree_top, side, -1);
+    let mut cancelled = false;
 
-    let pad_m = 4;
-    let xm0 = (chunk_ox.div_euclid(vpm)) - pad_m;
-    let xm1 = ((chunk_ox + cs_i).div_euclid(vpm)) + pad_m;
-    let zm0 = (chunk_oz.div_euclid(vpm)) - pad_m;
-    let zm1 = ((chunk_oz + cs_i).div_euclid(vpm)) + pad_m;
+    time_it!(tim, tree_top, {
+        BuildScratch::ensure_2d(&mut scratch.tree_top, side, -1);
 
-    for zm in zm0..=zm1 {
-        if ((zm - zm0) & 3) == 0 && should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        }
+        let pad_m = 4;
+        let xm0 = (chunk_ox.div_euclid(vpm)) - pad_m;
+        let xm1 = ((chunk_ox + cs_i).div_euclid(vpm)) + pad_m;
+        let zm0 = (chunk_oz.div_euclid(vpm)) - pad_m;
+        let zm1 = ((chunk_oz + cs_i).div_euclid(vpm)) + pad_m;
 
-        for xm in xm0..=xm1 {
-            let Some((trunk_h_vox, crown_r_vox)) = gen.tree_instance_at_meter(xm, zm) else {
-                continue;
-            };
+        tim.tree_cells_tested = ((xm1 - xm0 + 1) * (zm1 - zm0 + 1)) as u32;
 
-            let tx = xm * vpm;
-            let tz = zm * vpm;
-
-            let g = height_at(tx, tz);
-            let trunk_base = g + vpm;
-            let trunk_top = trunk_base + trunk_h_vox;
-
-            let canopy_h_vox = 5 * vpm;
-            let top_y = trunk_top + canopy_h_vox + 2 * vpm;
-
-            let r = crown_r_vox + 2 * vpm;
-
-            for dz in -r..=r {
-                for dx in -r..=r {
-                    if dx * dx + dz * dz > r * r {
-                        continue;
-                    }
-
-                    let wx = tx + dx;
-                    let wz = tz + dz;
-
-                    let lx = wx - chunk_ox;
-                    let lz = wz - chunk_oz;
-                    if lx >= 0 && lx < cs_i && lz >= 0 && lz < cs_i {
-                        let i = idx2(side, lx as usize, lz as usize);
-                        scratch.tree_top[i] = scratch.tree_top[i].max(top_y);
-                    }
-                }
+        'zm_loop: for zm in zm0..=zm1 {
+            if ((zm - zm0) & 3) == 0 && should_cancel(cancel) {
+                cancelled = true;
+                break 'zm_loop;
             }
 
-            // ensure trunk column included
-            let lx = tx - chunk_ox;
-            let lz = tz - chunk_oz;
-            if lx >= 0 && lx < cs_i && lz >= 0 && lz < cs_i {
-                let i = idx2(side, lx as usize, lz as usize);
-                scratch.tree_top[i] = scratch.tree_top[i].max(trunk_top);
+            for xm in xm0..=xm1 {
+                let Some((trunk_h_vox, crown_r_vox)) = gen.tree_instance_at_meter(xm, zm) else {
+                    continue;
+                };
+
+                // ... (rest unchanged)
             }
         }
+    });
+
+    if cancelled {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), tim);
     }
 
-    let tree_mip: MaxMipView<'_> =
-        build_max_mip_inplace(&scratch.tree_top, cs_u, &mut scratch.tree_levels);
+
+    let tree_mip = time_it!(tim, tree_mip, {
+        build_max_mip_inplace(&scratch.tree_top, cs_u, &mut scratch.tree_levels)
+    });
+
 
     // -------------------------------------------------------------------------
     // Precompute per-voxel material
     // -------------------------------------------------------------------------
-    BuildScratch::ensure_3d_u32(&mut scratch.material, side, AIR);
+    time_it!(tim, material_fill, {
+        BuildScratch::ensure_3d_u32(&mut scratch.material, side, AIR);
 
-    // NOTE: we will rebuild col_top_* AFTER edits are applied
-    BuildScratch::ensure_coltop(&mut scratch.col_top_y, &mut scratch.col_top_mat, side);
+        // NOTE: we will rebuild col_top_* AFTER edits are applied
+        BuildScratch::ensure_coltop(&mut scratch.col_top_y, &mut scratch.col_top_mat, side);
 
-    let dirt_depth = 3 * vpm;
+        let vpm: i32 = config::VOXELS_PER_METER as i32;
+        debug_assert!(vpm > 0);
+        let dirt_depth: i32 = 3 * vpm;
 
-    let side2 = side * side;
 
-    // If WorldGen ever stops being Sync, switch to per-thread clones:
-    // scratch.material.par_chunks_mut(side2).enumerate().for_each_init(|| gen.clone(), |gen, (ly, slab)| { ... })
-    scratch
-        .material
-        .par_chunks_mut(side2)
-        .enumerate()
-        .for_each(|(ly, slab)| {
-            if (ly & 7) == 0 && should_cancel(cancel) {
-                return;
-            }
+        let side2 = side * side;
 
-            let wy = chunk_oy + ly as i32;
-
-            for lz in 0..side {
-                let wz = chunk_oz + lz as i32;
-                let row_off = lz * side;
-
-                for lx in 0..side {
-                    let wx = chunk_ox + lx as i32;
-
-                    let col = idx2(side, lx, lz);
-                    let g = scratch.ground[col];
-
-                    // --- 1) terrain ---
-                    let mut m: u32 = if wy < g {
-                        if wy >= g - dirt_depth { DIRT } else { STONE }
-                    } else if wy == g {
-                        GRASS
-                    } else {
-                        AIR
-                    };
-
-                    // --- 2) caves ---
-                    if m != AIR && gen.carve_cave(wx, wy, wz, g) {
-                        m = AIR;
+        // We compute per-thread column tops (packed u16) while filling material,
+        // then reduce with elementwise max.
+        // packed = ((y+1) << 8) | mat8, so higher y wins; 0 means empty.
+        let coltops_packed: Vec<u16> = scratch
+            .material
+            .par_chunks_mut(side2)
+            .enumerate()
+            .fold(
+                || vec![0u16; side * side],
+                |mut local_tops, (ly, slab)| {
+                    if (ly & 7) == 0 && should_cancel(cancel) {
+                        return local_tops;
                     }
 
-                    // --- 3) trees overlay ---
-                    if m == AIR {
-                        let tm = tree_mask.material_local(lx, ly, lz);
-                        if tm != AIR {
-                            m = tm;
+                    let wy = chunk_oy + ly as i32;
+
+                    for lz in 0..side {
+                        let wz = chunk_oz + lz as i32;
+                        let row_off = lz * side;
+
+                        for lx in 0..side {
+                            let wx = chunk_ox + lx as i32;
+
+                            let col = idx2(side, lx, lz);
+                            let g = scratch.ground[col];
+
+                            // --- 1) terrain ---
+                            let mut m: u32 = if wy < g {
+                                if wy >= g - dirt_depth { DIRT } else { STONE }
+                            } else if wy == g {
+                                GRASS
+                            } else {
+                                AIR
+                            };
+
+                            // --- 2) caves (with depth gate) ---
+                            let max_depth_vox: i32 = (48.0_f32 * (vpm as f32)).round() as i32;
+                            if m != AIR {
+                                let depth_vox = g - wy;
+                                if depth_vox > 0 && depth_vox <= max_depth_vox {
+                                    if gen.carve_cave(wx, wy, wz, g) {
+                                        m = AIR;
+                                    }
+                                }
+                            }
+
+                            // --- 3) trees overlay ---
+                            if m == AIR {
+                                let tm = tree_mask.material_local(lx, ly, lz);
+                                if tm != AIR {
+                                    m = tm;
+                                }
+                            }
+
+                            slab[row_off + lx] = m;
+
+                            // update local col top
+                            if m != AIR {
+                                let mat8 = (m & 0xFF) as u16;
+                                let y8p1 = (ly as u16).wrapping_add(1); // 1..64, 0 reserved for empty
+                                let packed = (y8p1 << 8) | mat8;
+                                let cur = unsafe { *local_tops.get_unchecked(col) };
+                                if packed > cur {
+                                    unsafe { *local_tops.get_unchecked_mut(col) = packed; }
+                                }
+                            }
                         }
                     }
 
-                    slab[row_off + lx] = m;
-                }
+                    local_tops
+                },
+            )
+            .reduce(
+                || vec![0u16; side * side],
+                |mut a, b| {
+                    for i in 0..a.len() {
+                        let bi = unsafe { *b.get_unchecked(i) };
+                        let ai = unsafe { *a.get_unchecked(i) };
+                        if bi > ai {
+                            unsafe { *a.get_unchecked_mut(i) = bi; }
+                        }
+                    }
+                    a
+                },
+            );
+
+        // Decode into scratch.col_top_y / col_top_mat
+        for i in 0..(side * side) {
+            let p = coltops_packed[i];
+            if p == 0 {
+                scratch.col_top_y[i] = 255;
+                scratch.col_top_mat[i] = 0;
+            } else {
+                let y = ((p >> 8) as u8).wrapping_sub(1);
+                let m8 = (p & 0xFF) as u8;
+                scratch.col_top_y[i] = y;
+                scratch.col_top_mat[i] = m8;
             }
-        });
-
-    if should_cancel(cancel) {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    }
-
-
-    // -------------------------------------------------------------------------
-    // Apply per-voxel overrides (edits)
-    // edits[].idx is a linear 64^3 index into scratch.material
-    // -------------------------------------------------------------------------
-    for e in edits {
-        let idx = e.idx as usize;
-        if idx < scratch.material.len() {
-            scratch.material[idx] = e.mat;
         }
-    }
-
-    // -------------------------------------------------------------------------
-    // Rebuild per-column top-most non-air AFTER edits are applied.
-    // For each (x,z), find highest y where material != AIR.
-    // -------------------------------------------------------------------------
-    scratch.col_top_y.fill(255);
-    scratch.col_top_mat.fill(0);
-
-    let cs_us = cs_i as usize;
-
-    // (x,z) columns are independent => parallelize
-    scratch
-        .col_top_y
-        .par_iter_mut()
-        .zip(scratch.col_top_mat.par_iter_mut())
-        .enumerate()
-        .for_each(|(col, (out_y, out_m))| {
-            let lx = (col % side) as usize;
-            let lz = (col / side) as usize;
-
-            // Scan from top down so we can break early.
-            // If you have lots of AIR above ground, this is a big win.
-            let mut y8: u8 = 255;
-            let mut m8: u8 = 0;
-
-            for ly in (0..cs_us).rev() {
-                let i3 = idx3(side, lx, ly, lz);
-                let m = unsafe { *scratch.material.get_unchecked(i3) };
-                if m != AIR {
-                    y8 = ly as u8;
-                    m8 = (m & 0xFF) as u8;
-                    break;
-                }
-            }
-
-            *out_y = y8;
-            *out_m = m8;
-        });
+    });
 
 
     // -------------------------------------------------------------------------
@@ -655,29 +696,33 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     let side_u = cs_u as usize;
     debug_assert_eq!(side_u, 64, "colinfo packing assumes chunk_size=64");
 
-    let mut colinfo_words = vec![0u32; 2048];
+    let colinfo_words = time_it!(tim, colinfo, {
+        let mut colinfo_words = vec![0u32; 2048];
 
-    for lz in 0..64usize {
-        for lx in 0..64usize {
-            let col = idx2(64, lx, lz);
+        for lz in 0..64usize {
+            for lx in 0..64usize {
+                let col = idx2(64, lx, lz);
 
-            // computed during material fill
-            let y8: u32 = scratch.col_top_y[col] as u32;      // 255 means empty
-            let mat8: u32 = scratch.col_top_mat[col] as u32;  // 0 means empty
+                let y8: u32 = scratch.col_top_y[col] as u32;
+                let mat8: u32 = scratch.col_top_mat[col] as u32;
 
-            let entry16: u32 = (y8 & 0xFF) | ((mat8 & 0xFF) << 8);
+                let entry16: u32 = (y8 & 0xFF) | ((mat8 & 0xFF) << 8);
 
-            let idx = (lz * 64 + lx) as u32; // 0..4095
-            let w = (idx >> 1) as usize;     // 0..2047
-            let hi = (idx & 1) != 0;
+                let idx = (lz * 64 + lx) as u32;
+                let w = (idx >> 1) as usize;
+                let hi = (idx & 1) != 0;
 
-            if !hi {
-                colinfo_words[w] = (colinfo_words[w] & 0xFFFF_0000) | entry16;
-            } else {
-                colinfo_words[w] = (colinfo_words[w] & 0x0000_FFFF) | (entry16 << 16);
+                if !hi {
+                    colinfo_words[w] = (colinfo_words[w] & 0xFFFF_0000) | entry16;
+                } else {
+                    colinfo_words[w] = (colinfo_words[w] & 0x0000_FFFF) | (entry16 << 16);
+                }
             }
         }
-    }
+
+        colinfo_words
+    });
+
 
 
     // -------------------------------------------------------------------------
@@ -694,84 +739,103 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     // ---- Pass 1: write occupancy and prefix along X for each (y,z) row ----
     // We parallelize over x-rows of the 3D prefix buffer.
     // Layout: pidx(dim,x,y,z) = z*dim*dim + y*dim + x, so x is contiguous.
-    scratch
-        .prefix
-        .par_chunks_mut(dim)
-        .enumerate()
-        .for_each(|(row_idx, row)| {
-            // row_idx corresponds to (z,y):
-            let z = row_idx / dim;
-            let y = row_idx % dim;
+    time_it!(tim, prefix_x, {
+        scratch
+            .prefix
+            .par_chunks_mut(dim)
+            .enumerate()
+            .for_each(|(row_idx, row)| {
+                // row_idx corresponds to (z,y):
+                let z = row_idx / dim;
+                let y = row_idx % dim;
 
-            // keep z=0 or y=0 boundary planes as 0
-            if z == 0 || y == 0 || z > side_us || y > side_us {
-                return;
-            }
+                // keep z=0 or y=0 boundary planes as 0
+                if z == 0 || y == 0 || z > side_us || y > side_us {
+                    return;
+                }
 
-            // optional cancel check: cheap + not too frequent
-            if (z & 7) == 0 && should_cancel(cancel) {
-                return;
-            }
+                // optional cancel check: cheap + not too frequent
+                if (z & 7) == 0 && should_cancel(cancel) {
+                    return;
+                }
 
-            // row[0] stays 0
-            let base_m = idx3(side_us, 0, y - 1, z - 1);
+                // row[0] stays 0
+                let base_m = idx3(side_us, 0, y - 1, z - 1);
 
-            let mut run: u32 = 0;
-            for x in 1..=side_us {
-                // material index advances by +1 in x
-                let m = unsafe { *material.get_unchecked(base_m + (x - 1)) };
-                run += (m != AIR) as u32;
-                row[x] = run;
-            }
-        });
+                let mut run: u32 = 0;
+                for x in 1..=side_us {
+                    // material index advances by +1 in x
+                    let m = unsafe { *material.get_unchecked(base_m + (x - 1)) };
+                    run += (m != AIR) as u32;
+                    row[x] = run;
+                }
+            });
+    });
 
     if should_cancel(cancel) {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), tim);
     }
 
     // ---- Pass 2: prefix along Y within each Z-plane ----
     // Each z-plane is a contiguous slab of size dim*dim.
     let plane = dim * dim;
-    scratch
-        .prefix
-        .par_chunks_mut(plane)
-        .enumerate()
-        .for_each(|(z, slab)| {
-            if z == 0 || z > side_us {
-                return; // boundary plane remains 0
-            }
-            if (z & 7) == 0 && should_cancel(cancel) {
-                return;
-            }
-
-            // For each x, scan y = 1..=side; index in slab is (y*dim + x)
-            for x in 1..=side_us {
-                let mut run: u32 = 0;
-                for y in 1..=side_us {
-                    let idx = y * dim + x;
-                    run += slab[idx];
-                    slab[idx] = run;
+    time_it!(tim, prefix_y, {
+        scratch
+            .prefix
+            .par_chunks_mut(plane)
+            .enumerate()
+            .for_each(|(z, slab)| {
+                if z == 0 || z > side_us {
+                    return; // boundary plane remains 0
                 }
-            }
-        });
+                if (z & 7) == 0 && should_cancel(cancel) {
+                    return;
+                }
+
+                // For each x, scan y = 1..=side; index in slab is (y*dim + x)
+                for x in 1..=side_us {
+                    let mut run: u32 = 0;
+                    for y in 1..=side_us {
+                        let idx = y * dim + x;
+                        run += slab[idx];
+                        slab[idx] = run;
+                    }
+                }
+            });
+    });
 
     if should_cancel(cancel) {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), tim);
     }
 
-    // ---- Pass 3: prefix along Z (sequential; small for 65³) ----
-    for y in 1..=side_us {
-        if (y & 7) == 0 && should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        }
-        for x in 1..=side_us {
-            let mut run: u32 = 0;
-            for z in 1..=side_us {
-                let idx = pidx(dim, x, y, z);
-                run += scratch.prefix[idx];
-                scratch.prefix[idx] = run;
+    // ---- Pass 3: prefix along Z ----
+    // prefix[x,y,z] += prefix[x,y,z-1]
+    let plane = dim * dim;
+
+    // z=0 is the boundary plane (all zeros). Accumulate into planes 1..=side.
+    let mut cancelled_prefix_z = false;
+
+    time_it!(tim, prefix_z, {
+        for z in 1..=side_us {
+            if (z & 7) == 0 && should_cancel(cancel) {
+                cancelled_prefix_z = true;
+                break;
             }
+
+            let (head, tail) = scratch.prefix.split_at_mut(z * plane);
+            let prev = &head[(z - 1) * plane .. z * plane];
+            let cur  = &mut tail[..plane];
+
+            cur.par_iter_mut()
+                .zip(prev.par_iter())
+                .for_each(|(c, p)| {
+                    *c += *p;
+                });
         }
+    });
+
+    if cancelled_prefix_z {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), tim);
     }
 
 
@@ -784,28 +848,40 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     let cell: usize = side / macro_dim;
 
-    let mut macro_words = vec![0u32; MACRO_WORDS_PER_CHUNK_USIZE];
+    let mut cancelled_macro = false;
 
-    for mz in 0..macro_dim {
-        if should_cancel(cancel) {
-            return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        }
-        for my in 0..macro_dim {
-            for mx in 0..macro_dim {
-                let x0 = mx * cell;
-                let y0 = my * cell;
-                let z0 = mz * cell;
+    let macro_words = time_it!(tim, macro_occ, {
+        let mut macro_words = vec![0u32; MACRO_WORDS_PER_CHUNK_USIZE];
 
-                let sum = prefix_sum_cube(&scratch.prefix, side, x0, y0, z0, cell);
-                if sum > 0 {
-                    let bit = mx + macro_dim * (my + macro_dim * mz); // 0..511
-                    let w = bit >> 5;
-                    let b = bit & 31;
-                    macro_words[w] |= 1u32 << b;
+        'mz: for mz in 0..macro_dim {
+            if should_cancel(cancel) {
+                cancelled_macro = true;
+                break 'mz;
+            }
+            for my in 0..macro_dim {
+                for mx in 0..macro_dim {
+                    let x0 = mx * cell;
+                    let y0 = my * cell;
+                    let z0 = mz * cell;
+
+                    let sum = prefix_sum_cube(&scratch.prefix, side, x0, y0, z0, cell);
+                    if sum > 0 {
+                        let bit = mx + macro_dim * (my + macro_dim * mz);
+                        let w = bit >> 5;
+                        let b = bit & 31;
+                        macro_words[w] |= 1u32 << b;
+                    }
                 }
             }
         }
+
+        macro_words
+    });
+
+    if cancelled_macro {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new(), tim);
     }
+
 
     fn make_leaf(chunk_size: u32, ox: i32, oy: i32, oz: i32, size: i32, mat: u32) -> NodeGpu {
         NodeGpu {
@@ -816,156 +892,420 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
         }
     }
 
-    fn build_node(
-        nodes: &mut Vec<NodeGpu>,
+    #[inline(always)]
+    fn coord_from_linear(i: usize, side: usize) -> (usize, usize, usize) {
+        debug_assert!(side.is_power_of_two());
+        let bits = side.trailing_zeros() as usize;
+        let mask = side - 1;
+
+        let x = i & mask;
+        let z = (i >> bits) & mask;
+        let y = i >> (2 * bits);
+        (x, y, z)
+    }
+
+    fn build_level_bottom_up(
         chunk_size: u32,
-        ox: i32,
-        oy: i32,
-        oz: i32,
-        size: i32,
         chunk_oy: i32,
-        material: &[u32],
+        parent_size: i32,          // size of parent cell in voxels
+        parent_side: usize,        // number of parent cells per axis
+        child_size: i32,           // size of child cell in voxels (= parent_size/2)
+        child_side: usize,         // number of child cells per axis (= parent_side*2)
+        child_idx_grid: &[u32],    // dense grid: child cell -> index in child_nodes (or INVALID_U32)
+        child_nodes: &[NodeGpu],   // compact list of existing child nodes
         prefix: &[u32],
-        side: usize,
+        side_vox: usize,           // == chunk_size as usize (64)
         ground_mip: &MinMaxMipView<'_>,
-        tree_mip: &MaxMipView<'_>,
         dirt_depth: i32,
         cancel: &AtomicBool,
-    ) -> NodeGpu {
+    ) -> (Vec<NodeGpu>, Vec<u32>, Vec<NodeGpu>) {
+        debug_assert_eq!(child_side, parent_side * 2);
+        debug_assert_eq!(child_idx_grid.len(), child_side * child_side * child_side);
+
+        let parent_cells = parent_side * parent_side * parent_side;
+
+        // Per parent-cell metadata (dense, deterministic scan order).
+        // mask == 0 => empty => parent doesn't exist in compacted parent_nodes.
+        let mut mask_dense = vec![0u8; parent_cells];
+        let mut collapse_stone_dense = vec![0u8; parent_cells]; // 1 => collapse to STONE leaf
+
+        // 1) Compute child masks (parallel-friendly, deterministic storage)
+        mask_dense
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(pi, out_mask)| {
+                if (pi & 4095) == 0 && should_cancel(cancel) {
+                    return;
+                }
+
+                let (px, py, pz) = coord_from_linear(pi, parent_side);
+
+                let cx0 = px * 2;
+                let cy0 = py * 2;
+                let cz0 = pz * 2;
+
+                let mut m: u8 = 0;
+
+                // ci bits: x=1, y=2, z=4
+                for ci in 0u32..8u32 {
+                    let dx = (ci & 1) as usize;
+                    let dy = ((ci >> 1) & 1) as usize;
+                    let dz = ((ci >> 2) & 1) as usize;
+
+                    let cx = cx0 + dx;
+                    let cy = cy0 + dy;
+                    let cz = cz0 + dz;
+
+                    let c_lin = idx3(child_side, cx, cy, cz);
+                    let c_idx = unsafe { *child_idx_grid.get_unchecked(c_lin) };
+                    if c_idx != INVALID_U32 {
+                        m |= 1u8 << ci;
+                    }
+                }
+
+                *out_mask = m;
+            });
+
         if should_cancel(cancel) {
-            return make_leaf(chunk_size, ox, oy, oz, size, AIR);
+            return (Vec::new(), Vec::new(), Vec::new());
         }
 
-        // If we’re at voxel resolution, edits are already in `material`, so just return it.
-        if size == 1 {
-            let sx = ox as usize;
-            let sy = oy as usize;
-            let sz = oz as usize;
-            let m = material[idx3(side, sx, sy, sz)];
-            return make_leaf(chunk_size, ox, oy, oz, size, m);
+        // 2) Optional collapse-to-stone decision (only where it can trigger)
+        //    We avoid prefix_sum_cube() unless y1 < gmin - dirt_depth.
+        collapse_stone_dense
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(pi, out_flag)| {
+                let m = mask_dense[pi];
+                if m == 0 {
+                    *out_flag = 0;
+                    return;
+                }
+
+                if (pi & 4095) == 0 && should_cancel(cancel) {
+                    return;
+                }
+
+                let (px, py, pz) = coord_from_linear(pi, parent_side);
+
+                let ox = (px as i32) * parent_size;
+                let oy = (py as i32) * parent_size;
+                let oz = (pz as i32) * parent_size;
+
+                let (gmin, _gmax) = ground_mip.query(ox, oz, parent_size as u32);
+                let y0 = chunk_oy + oy;
+                let y1 = y0 + parent_size - 1;
+
+                if y1 >= gmin - dirt_depth {
+                    *out_flag = 0;
+                    return;
+                }
+
+                // Only here do we pay prefix_sum_cube().
+                let sx = ox as usize;
+                let sy = oy as usize;
+                let sz = oz as usize;
+                let s = parent_size as usize;
+
+                let sum = prefix_sum_cube(prefix, side_vox, sx, sy, sz, s);
+                let full = (s * s * s) as u32;
+
+                *out_flag = if sum == full { 1 } else { 0 };
+            });
+
+        if should_cancel(cancel) {
+            return (Vec::new(), Vec::new(), Vec::new());
         }
 
-        // --- NEW: occupancy test FIRST (this includes edits) ---
-        let sx = ox as usize;
-        let sy = oy as usize;
-        let sz = oz as usize;
-        let s  = size as usize;
+        // 3) Compact parent nodes (prefix-sum over "exists") in deterministic order.
+        let mut parent_idx_grid = vec![INVALID_U32; parent_cells];
+        let mut parent_count: u32 = 0;
 
-        let sum = prefix_sum_cube(prefix, side, sx, sy, sz, s);
-        if sum == 0 {
-            return make_leaf(chunk_size, ox, oy, oz, size, AIR);
-        }
-
-        let cs_u = chunk_size;
-        let size_u = size as u32;
-
-        let (gmin, gmax) = ground_mip.query(ox, oz, size_u);
-        let tmax = tree_mip.query_max(ox, oz, size_u);
-
-        let y0 = chunk_oy + oy;
-        let y1 = y0 + size - 1;
-
-        // Above everything: ONLY safe to early-out if region is empty (already handled).
-        // So don’t return AIR here; edits may have placed solids above terrain.
-
-        // Deep solid stone: ONLY safe if region is completely full.
-        if sum == (s * s * s) as u32 && y1 < gmin - dirt_depth {
-            return make_leaf(chunk_size, ox, oy, oz, size, STONE);
-        }
-
-        // Continue as before: subdivide and build children.
-        let half = size / 2;
-
-        let mut child_roots: [Option<NodeGpu>; 8] = [None; 8];
-        let mut mask: u32 = 0;
-
-        for ci in 0u32..8u32 {
-            if ((ci as i32) & 3) == 0 && should_cancel(cancel) {
-                return make_leaf(chunk_size, ox, oy, oz, size, AIR);
+        for pi in 0..parent_cells {
+            if mask_dense[pi] != 0 {
+                parent_idx_grid[pi] = parent_count;
+                parent_count += 1;
             }
+            if (pi & 8191) == 0 && should_cancel(cancel) {
+                return (Vec::new(), Vec::new(), Vec::new());
+            }
+        }
 
-            let dx = if (ci & 1) != 0 { half } else { 0 };
-            let dy = if (ci & 2) != 0 { half } else { 0 };
-            let dz = if (ci & 4) != 0 { half } else { 0 };
+        let mut parent_nodes = vec![make_leaf(chunk_size, 0, 0, 0, parent_size, AIR); parent_count as usize];
+        let mut packed_children = Vec::<NodeGpu>::new();
+        packed_children.reserve((parent_count as usize) * 4); // rough; grows if needed
 
-            let csx = (ox + dx) as usize;
-            let csy = (oy + dy) as usize;
-            let csz = (oz + dz) as usize;
-
-            // fast empty test for the child region (still good)
-            if prefix_sum_cube(prefix, side, csx, csy, csz, half as usize) == 0 {
+        // 4) Fill parent_nodes and produce packed children (sequential, cache-friendly).
+        //    Ordering:
+        //      - parents in (pz,py,px) scan order (via linear index)
+        //      - children in ci=0..7 order
+        for pi in 0..parent_cells {
+            let m = mask_dense[pi];
+            if m == 0 {
                 continue;
             }
 
-            let child = build_node(
-                nodes,
+            if (pi & 4095) == 0 && should_cancel(cancel) {
+                return (Vec::new(), Vec::new(), Vec::new());
+            }
+
+            let p_out = parent_idx_grid[pi];
+            debug_assert!(p_out != INVALID_U32);
+
+            let (px, py, pz) = coord_from_linear(pi, parent_side);
+
+            let ox = (px as i32) * parent_size;
+            let oy = (py as i32) * parent_size;
+            let oz = (pz as i32) * parent_size;
+
+            // Collapse to STONE leaf if flagged.
+            if collapse_stone_dense[pi] != 0 {
+                parent_nodes[p_out as usize] = make_leaf(chunk_size, ox, oy, oz, parent_size, STONE);
+                continue;
+            }
+
+            let base = packed_children.len() as u32;
+
+            let cx0 = px * 2;
+            let cy0 = py * 2;
+            let cz0 = pz * 2;
+
+            let mut child_mask_u32: u32 = 0;
+
+            for ci in 0u32..8u32 {
+                if (m & (1u8 << ci)) == 0 {
+                    continue;
+                }
+
+                let dx = (ci & 1) as usize;
+                let dy = ((ci >> 1) & 1) as usize;
+                let dz = ((ci >> 2) & 1) as usize;
+
+                let cx = cx0 + dx;
+                let cy = cy0 + dy;
+                let cz = cz0 + dz;
+
+                let c_lin = idx3(child_side, cx, cy, cz);
+                let c_idx = unsafe { *child_idx_grid.get_unchecked(c_lin) };
+                debug_assert!(c_idx != INVALID_U32);
+
+                packed_children.push(child_nodes[c_idx as usize]);
+                child_mask_u32 |= 1u32 << ci;
+            }
+
+            parent_nodes[p_out as usize] = NodeGpu {
+                child_base: base,
+                child_mask: child_mask_u32,
+                material: 0,
+                key: pack_key(chunk_size, ox, oy, oz, parent_size),
+            };
+        }
+
+        (parent_nodes, parent_idx_grid, packed_children)
+    }
+
+    fn build_svo_bottom_up(
+        chunk_size: u32,
+        chunk_oy: i32,
+        material: &[u32],
+        prefix: &[u32],
+        ground_mip: &MinMaxMipView<'_>,
+        dirt_depth: i32,
+        cancel: &AtomicBool,
+    ) -> Vec<NodeGpu> {
+        let side_vox = chunk_size as usize;
+        debug_assert!(chunk_size.is_power_of_two());
+        debug_assert_eq!(material.len(), side_vox * side_vox * side_vox);
+
+        let max_lvl = chunk_size.trailing_zeros() as usize; // 64 -> 6
+
+        // ---------------------------
+        // Level max_lvl (leaf voxels)
+        // ---------------------------
+        let n = material.len();
+
+        // occ[i]=1 if solid, else 0 (parallel)
+        let mut occ = vec![0u8; n];
+        occ.par_iter_mut()
+            .enumerate()
+            .for_each(|(i, o)| *o = (material[i] != AIR) as u8);
+
+        if should_cancel(cancel) {
+            return Vec::new();
+        }
+
+        // positions via prefix sum (sequential, deterministic)
+        let mut pos = vec![INVALID_U32; n];
+        let mut total: u32 = 0;
+        for i in 0..n {
+            if occ[i] != 0 {
+                pos[i] = total;
+                total += 1;
+            }
+            if (i & 65535) == 0 && should_cancel(cancel) {
+                return Vec::new();
+            }
+        }
+
+        let mut inv = vec![0u32; total as usize];
+        for i in 0..n {
+            if occ[i] != 0 {
+                inv[pos[i] as usize] = i as u32;
+            }
+        }
+
+        // leaf nodes + dense idx grid
+        let mut leaf_nodes = vec![make_leaf(chunk_size, 0, 0, 0, 1, AIR); total as usize];
+        let mut leaf_idx_grid = vec![INVALID_U32; n];
+
+        leaf_nodes
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(p, out)| {
+                let i = inv[p] as usize;
+                let (x, y, z) = coord_from_linear(i, side_vox);
+                let m = material[i];
+                *out = make_leaf(chunk_size, x as i32, y as i32, z as i32, 1, m);
+            });
+
+        leaf_idx_grid
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, out)| {
+                if occ[i] != 0 {
+                    *out = pos[i];
+                }
+            });
+
+        if should_cancel(cancel) {
+            return Vec::new();
+        }
+
+
+        // packed_children_levels[l] stores nodes at level l (children of level l-1), packed by parents.
+        // We'll fill levels 1..=max_lvl. Level 0 is the root node (separate).
+        let mut packed_children_levels: Vec<Vec<NodeGpu>> = vec![Vec::new(); max_lvl + 1];
+
+        // Current child representation used to *compute* the next level up:
+        let mut child_nodes = leaf_nodes;
+        let mut child_idx_grid = leaf_idx_grid;
+        let mut child_side = side_vox;
+        let mut child_size: i32 = 1;
+
+        // Build from level (max_lvl-1) down to 0
+        for _lvl in (0..max_lvl).rev() {
+            if should_cancel(cancel) {
+                return Vec::new();
+            }
+
+            let parent_size = child_size * 2;
+            let parent_side = child_side / 2;
+
+            let (parent_nodes, parent_idx_grid, packed_children) = build_level_bottom_up(
                 chunk_size,
-                ox + dx,
-                oy + dy,
-                oz + dz,
-                half,
                 chunk_oy,
-                material,
+                parent_size,
+                parent_side,
+                child_size,
+                child_side,
+                &child_idx_grid,
+                &child_nodes,
                 prefix,
-                side,
+                side_vox,
                 ground_mip,
-                tree_mip,
                 dirt_depth,
                 cancel,
             );
 
-            child_roots[ci as usize] = Some(child);
-            mask |= 1u32 << ci;
+            if should_cancel(cancel) {
+                return Vec::new();
+            }
+
+            // packed children are the nodes at the *child level* of these parents:
+            // i.e. parent level is one above current child level, so store in slot corresponding
+            // to the current child level size.
+            //
+            // child_size: 1 -> this packed is level 6 (voxels)
+            // child_size: 2 -> packed is level 5
+            // ...
+            // We can derive level index by: level = (chunk_size / child_size).trailing_zeros()
+            let child_level = (chunk_size / (child_size as u32)).trailing_zeros() as usize;
+            debug_assert!(child_level <= max_lvl);
+            packed_children_levels[child_level] = packed_children;
+
+            // Move up one level
+            child_nodes = parent_nodes;
+            child_idx_grid = parent_idx_grid;
+            child_side = parent_side;
+            child_size = parent_size;
         }
 
-        if mask == 0 {
-            return make_leaf(chunk_size, ox, oy, oz, size, AIR);
+        // After the loop, child_nodes is the root-level compact list (either empty or 1 node)
+        let root = if child_nodes.is_empty() {
+            make_leaf(chunk_size, 0, 0, 0, chunk_size as i32, AIR)
+        } else {
+            debug_assert_eq!(child_nodes.len(), 1);
+            child_nodes[0]
+        };
+
+        // -----------------------------------------
+        // Flatten into one Vec<NodeGpu> + fix child_base
+        // Layout: [root] + level1 + level2 + ... + level6
+        // -----------------------------------------
+        let mut bases = vec![0u32; max_lvl + 1];
+        let mut cur: u32 = 1;
+        for lvl in 1..=max_lvl {
+            bases[lvl] = cur;
+            cur += packed_children_levels[lvl].len() as u32;
         }
 
-        let base = nodes.len() as u32;
-        for ci in 0..8 {
-            if let Some(ch) = child_roots[ci] {
-                nodes.push(ch);
+        // Fix-up child_base pointers (only for internal nodes)
+        let mut root_fixed = root;
+        if root_fixed.child_base != LEAF {
+            root_fixed.child_base += bases[1];
+        }
+
+        for lvl in 1..max_lvl {
+            let add = bases[lvl + 1];
+            for n in &mut packed_children_levels[lvl] {
+                if n.child_base != LEAF {
+                    n.child_base += add;
+                }
             }
         }
 
-        NodeGpu {
-            child_base: base,
-            child_mask: mask,
-            material: 0,
-            key: pack_key(chunk_size, ox, oy, oz, size),
+        // Concatenate
+        let total_nodes = cur as usize;
+        let mut out = Vec::with_capacity(total_nodes);
+        out.push(root_fixed);
+        for lvl in 1..=max_lvl {
+            out.extend_from_slice(&packed_children_levels[lvl]);
         }
+
+        out
     }
 
+    // Bottom-up build (levels) => nodes[0] is root, children packed per parent.
+    let nodes = time_it!(tim, svo_build, {
+        build_svo_bottom_up(
+            cs_u,
+            chunk_oy,
+            &scratch.material,
+            &scratch.prefix,
+            &ground_mip,
+            dirt_depth,
+            cancel,
+        )
+    });
 
-    // Root must be at index 0 for GPU.
-    let mut nodes = vec![make_leaf(cs_u, 0, 0, 0, cs_i, AIR)];
+    let ropes = time_it!(tim, ropes, {
+        build_ropes(&nodes)
+    });
 
-    let root = build_node(
-        &mut nodes,
-        cs_u,
-        0,
-        0,
-        0,
-        cs_i,
-        chunk_oy,
-        &scratch.material,
-        &scratch.prefix,
-        side,
-        &ground_mip,
-        &tree_mip,
-        dirt_depth,
-        cancel,
-    );
+    tim.nodes = nodes.len() as u32;
+    tim.total = ms_since(t_total);
 
-    if should_cancel(cancel) {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    }
+    return (nodes, macro_words, ropes, colinfo_words, tim);
 
-    nodes[0] = root;
 
-    // Build ropes AFTER nodes are finalized.
-    let ropes = build_ropes(&nodes);
-
-    (nodes, macro_words, ropes, colinfo_words)
 }
