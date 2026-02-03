@@ -6,12 +6,13 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::app::config;
 use crate::{
-    svo::{build_chunk_svo_sparse_cancelable_with_scratch, BuildScratch},
+    svo::{BuildScratch},
     world::WorldGen,
 };
 use crate::svo::builder::{BuildOutput, BuildTimingsMs};
-
+use crate::streaming::build_pool::build_chunk_svo_sparse_cancelable_tls;
 use super::types::{BuildDone, BuildJob};
+use crate::streaming::build_pool::BUILD_POOL;
 
 pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender<BuildDone>) {
     for _ in 0..config::WORKER_THREADS {
@@ -20,8 +21,6 @@ pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Se
         let tx_done = tx_done.clone();
 
         std::thread::spawn(move || {
-            let mut scratch = BuildScratch::new();
-
             while let Ok(job) = rx_job.recv() {
                 let k = job.key;
 
@@ -57,16 +56,13 @@ pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Se
                     ropes,
                     colinfo_words,
                     timings: tim,
-                } = build_chunk_svo_sparse_cancelable_with_scratch(
+                } = BUILD_POOL.install(|| {build_chunk_svo_sparse_cancelable_tls(
                     &gen,
                     [origin[0], origin[1], origin[2]],
                     config::CHUNK_SIZE,
                     &job.cancel,
-                    &mut scratch,
                     &job.edits,
-                );
-
-
+                )});
 
                 let canceled = job.cancel.load(Ordering::Relaxed);
                 let (nodes, macro_words, ropes) = if canceled {

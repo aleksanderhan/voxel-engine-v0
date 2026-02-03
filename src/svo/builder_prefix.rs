@@ -54,35 +54,40 @@ pub fn prefix_sum_cube(prefix: &[u32], side: usize, x0: usize, y0: usize, z0: us
 /// Layout: idx_prefix(dim,x,y,z) => x contiguous.
 pub fn prefix_pass_x(prefix: &mut [u32], material: &[u8], side: usize, cancel: &AtomicBool) {
     let dim = side + 1;
+    let plane = dim * dim;
 
+    // Parallelize by z-plane (coarse tasks), do y-rows sequentially inside.
     prefix
-        .par_chunks_mut(dim)
+        .par_chunks_mut(plane)
         .enumerate()
-        .for_each(|(row_idx, row)| {
-            let z = row_idx / dim;
-            let y = row_idx % dim;
-
-            // boundary planes remain 0
-            if z == 0 || y == 0 || z > side || y > side {
+        .for_each(|(z, slab)| {
+            // boundary plane z=0 stays 0
+            if z == 0 || z > side {
                 return;
             }
-
             if (z & 7) == 0 && should_cancel(cancel) {
                 return;
             }
 
-            // material index base for (x=0, y-1, z-1)
-            let base_m = ((y - 1) * side * side) + ((z - 1) * side);
+            // y=0 boundary row stays 0
+            for y in 1..=side {
+                // prefix row slice for this (y,z): x contiguous
+                let row = &mut slab[y * dim .. (y + 1) * dim];
 
-            let mut run: u32 = 0;
-            // row[0] stays 0
-            for x in 1..=side {
-                let m = unsafe { *material.get_unchecked(base_m + (x - 1)) };
-                run += (m != (AIR as u8)) as u32;
-                row[x] = run;
+                let base_m = ((y - 1) * side * side) + ((z - 1) * side);
+
+                let mut run: u32 = 0;
+                row[0] = 0;
+
+                for x in 1..=side {
+                    let m = unsafe { *material.get_unchecked(base_m + (x - 1)) };
+                    run += (m != (AIR as u8)) as u32;
+                    row[x] = run;
+                }
             }
         });
 }
+
 
 
 /// Pass 2: prefix along Y within each Z-plane.

@@ -28,6 +28,7 @@ use super::builder_svo as svo;
 // 8^3 bits = 512 bits = 16 u32
 const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
 
+
 // --- Worldgen build profiling ------------------------------------------------
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -336,6 +337,15 @@ fn build_height_cache<'g>(
         tim.cache_w = cache_w as u32;
         tim.cache_h = cache_h as u32;
 
+        let xs_m: Vec<f64> = (0..cache_w)
+            .map(|x| (cache_x0 + x as i32) as f64 * config::VOXEL_SIZE_M_F64)
+            .collect();
+
+        let zs_m: Vec<f64> = (0..cache_h)
+            .map(|z| (cache_z0 + z as i32) as f64 * config::VOXEL_SIZE_M_F64)
+            .collect();
+
+
         scratch.height_cache
             .par_chunks_mut(cache_w)
             .enumerate()
@@ -343,12 +353,12 @@ fn build_height_cache<'g>(
                 if (z & 15) == 0 && should_cancel(cancel) {
                     return;
                 }
-                let wz = cache_z0 + z as i32;
+                let zm = zs_m[z];
                 for x in 0..cache_w {
-                    let wx = cache_x0 + x as i32;
-                    row[x] = gen.ground_height(wx, wz);
+                    row[x] = gen.ground_height_m(xs_m[x], zm);
                 }
             });
+
 
         scratch.height_cache_x0 = cache_x0;
         scratch.height_cache_z0 = cache_z0;
@@ -693,7 +703,6 @@ fn build_macro_occ(ctx: ChunkCtx, prefix_buf: &[u32], cancel: &AtomicBool) -> Ve
 // -----------------------------------------------------------------------------
 // Public entrypoint (pipeline)
 // -----------------------------------------------------------------------------
-
 pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     gen: &WorldGen,
     chunk_origin: [i32; 3],
@@ -754,19 +763,17 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     });
     cancel_if!(cancel, tim);
 
-    // Replaces the old coltops fold/reduce
+    // Column tops
     time_it!(tim, colinfo, {
         build_col_tops(ctx, scratch, cancel, &mut tim);
     });
     cancel_if!(cancel, tim);
 
-    // Then pack colinfo_words (still small)
-    let colinfo_words = build_colinfo_words(ctx, scratch);
-
+    // Pack colinfo words
+    let colinfo_words = time_it!(tim, colinfo, {
+        build_colinfo_words(ctx, scratch)
+    });
     cancel_if!(cancel, tim);
-
-    // Colinfo words
-    let colinfo_words = time_it!(tim, colinfo, { build_colinfo_words(ctx, scratch) });
 
     // Prefix sum (summed-volume table)
     prefix::ensure_prefix(&mut scratch.prefix, ctx.side);

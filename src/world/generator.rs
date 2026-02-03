@@ -44,12 +44,8 @@ impl WorldGen {
 
     }
 
-
-    #[inline]
-    pub fn ground_height(&self, x_vox: i32, z_vox: i32) -> i32 {
-        let xm = (x_vox as f64) * config::VOXEL_SIZE_M_F64;
-        let zm = (z_vox as f64) * config::VOXEL_SIZE_M_F64;
-
+    #[inline(always)]
+    pub fn ground_height_m(&self, xm: f64, zm: f64) -> i32 {
         let h0 = self.height.get([xm, zm]) as f32;
         let h1 = self.detail.get([xm, zm]) as f32;
 
@@ -59,6 +55,14 @@ impl WorldGen {
 
         ((base_m + hills_m) * self.voxels_per_meter).round() as i32
     }
+
+    #[inline]
+    pub fn ground_height(&self, x_vox: i32, z_vox: i32) -> i32 {
+        let xm = (x_vox as f64) * config::VOXEL_SIZE_M_F64;
+        let zm = (z_vox as f64) * config::VOXEL_SIZE_M_F64;
+        self.ground_height_m(xm, zm)
+    }
+
 
     #[inline(always)]
     fn cave_ridged_pair_scaled(&self, wx: i32, wy: i32, wz: i32, scale: f64) -> (f32, f32) {

@@ -15,7 +15,7 @@ pub const VOXELS_PER_METER: i32 = 10; // 1.0 / 0.10
 
 pub const RENDER_SCALE: f32 = 0.5;
 
-pub const WORKER_THREADS: usize = 8;
+pub const WORKER_THREADS: usize = 4;
 pub const MAX_IN_FLIGHT: usize = 16;
 
 // GPU node arena budget (storage buffer capacity).
