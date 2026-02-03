@@ -591,13 +591,12 @@ fn fill_material(
                     // 2) caves (depth gate)
                     if m != AIR8 {
                         let depth_vox = g - wy;
-                        if depth_vox > 0 && depth_vox <= max_depth_vox {
+                        if depth_vox >= 0 && depth_vox <= max_depth_vox {
                             if cave_mask_at_shifted(cave_mask, cave_dim, cave_shift, lx, ly, lz) {
                                 m = AIR8;
                             }
                         }
                     }
-
 
                     // 3) trees overlay
                     if m == AIR8 {
@@ -657,29 +656,58 @@ fn build_cave_mask_coarse(
             let ly = (sy * step + (step / 2)).min(side - 1);
             let wy = ctx.oy + ly as i32;
 
-            for sz in 0..dim {
-                let lz = (sz * step + (step / 2)).min(side - 1);
-                let wz = ctx.oz + lz as i32;
+            // sample y in voxel coords (center of the step cell)
+            let ly = (sy * step + (step / 2)).min(side - 1);
+            let wy = ctx.oy + ly as i32;
 
+            for sz in 0..dim {
                 let row_off = sz * dim;
 
+                // coarse cell z-range
+                let z0 = sz * step;
+                let z1 = (z0 + step - 1).min(side - 1);
+
                 for sx in 0..dim {
-                    let lx = (sx * step + (step / 2)).min(side - 1);
-                    let wx = ctx.ox + lx as i32;
+                    // coarse cell x-range
+                    let x0 = sx * step;
+                    let x1 = (x0 + step - 1).min(side - 1);
 
-                    // ground for this (x,z) column
-                    let g = scratch.ground[idx_xz(side, lx, lz)];
+                    // coarse cell y-range
+                    let y0 = sy * step;
+                    let y1 = (y0 + step - 1).min(side - 1);
 
-                    // only bother where caves can exist
-                    let depth_vox = g - wy;
-                    let carve =
-                        depth_vox > 0 &&
-                        depth_vox <= max_depth_vox &&
-                        gen.carve_cave(wx, wy, wz, g);
+                    let mut carve = false;
+
+                    // Test the 8 corners of the step-cube.
+                    // If ANY corner wants carving, mark this coarse cell carved.
+                    for &ly in &[y0, y1] {
+                        let wy = ctx.oy + ly as i32;
+                        for &lz in &[z0, z1] {
+                            let wz = ctx.oz + lz as i32;
+                            for &lx in &[x0, x1] {
+                                let wx = ctx.ox + lx as i32;
+
+                                // ground for this (x,z) column
+                                let g = scratch.ground[idx_xz(side, lx, lz)];
+
+                                let depth_vox = g - wy;
+                                if depth_vox > 0 && depth_vox <= max_depth_vox {
+                                    if gen.carve_cave(wx, wy, wz, g) {
+                                        carve = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if carve { break; }
+                        }
+                        if carve { break; }
+                    }
 
                     slab[row_off + sx] = carve as u8;
                 }
             }
+
+
         });
 }
 
