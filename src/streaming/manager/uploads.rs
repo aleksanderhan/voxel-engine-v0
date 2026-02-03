@@ -165,11 +165,11 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
     let mut out = Vec::new();
     let mut bytes = 0usize;
 
-    // ---------------------------------------------------------------------
-    // 0) SLOT REWRITES FIRST (deduped). This is what fixes the “trail”.
-    //     These are always RewriteResident uploads that refresh per-slot meta/macro/colinfo.
-    // ---------------------------------------------------------------------
-    while out.len() < max_uploads {
+    // 0) SLOT REWRITES FIRST
+    let slot_rewrite_cap = (256 + backlog).min(2048); // cheap uploads; keep GPU view consistent
+
+    let mut slot_rewrites_taken = 0usize;
+    while slot_rewrites_taken < slot_rewrite_cap {
         let Some(slot) = mgr.uploads.slot_rewrite_q.pop_front() else { break; };
         mgr.uploads.slot_rewrite_set.remove(&slot);
 
@@ -179,9 +179,8 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
 
         let ub = upload_bytes(&u);
 
-        // Always allow at least ONE upload per frame even if it exceeds the byte budget.
+        // still obey byte budget, but always allow at least one upload per frame
         if bytes + ub > max_bytes && !out.is_empty() {
-            // Put it back at the front so it stays highest priority next frame.
             mgr.uploads.slot_rewrite_set.insert(slot);
             mgr.uploads.slot_rewrite_q.push_front(slot);
             break;
@@ -189,7 +188,9 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
 
         bytes += ub;
         out.push(u);
+        slot_rewrites_taken += 1;
     }
+
 
     // ---------------------------------------------------------------------
     // 1) EXISTING BUDGETED UPLOADS (chunk-content rewrites, promotes, etc.)

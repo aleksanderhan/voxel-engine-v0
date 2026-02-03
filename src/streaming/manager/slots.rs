@@ -522,21 +522,22 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
         return true;
     }
 
-    // Pass 2: if everything is inside ACTIVE, evict farthest overall.
+    // Pass 2: if everything is inside ACTIVE, do NOT create holes.
+    // Just fail; try_make_uploading() will defer the build instead of evicting ACTIVE.
     let mut best_any: Option<(f32, ChunkKey)> = None;
 
     for &k in &mgr.slots.slot_to_key {
-        if k == protect {
-            continue;
-        }
+        if mgr.pinned.contains(&k) { continue; }   // <-- add (was missing in pass 2)
+        if k == protect { continue; }
+
         if let Some(ChunkState::Resident(r)) = mgr.build.chunks.get(&k) {
-            if r.rewrite_in_flight {
-                continue;
-            }
+            if r.rewrite_in_flight { continue; }
         }
 
-        // REMOVE this line for pass 2:
-        // if keep::in_active_xz(center, k) { continue; }
+        // <-- put this back: never evict ACTIVE in pass 2
+        if keep::in_active_xz(center, k) {
+            continue;
+        }
 
         let dx = (k.x - center.x) as f32;
         let dz = (k.z - center.z) as f32;
@@ -554,6 +555,7 @@ fn evict_one_farthest(mgr: &mut ChunkManager, center: ChunkKey, protect: ChunkKe
     }
 
     false
+
 }
 
 #[cfg(debug_assertions)]
