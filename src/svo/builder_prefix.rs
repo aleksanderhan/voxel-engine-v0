@@ -52,7 +52,7 @@ pub fn prefix_sum_cube(prefix: &[u32], side: usize, x0: usize, y0: usize, z0: us
 
 /// Pass 1: write occupancy and prefix along X for each (y,z) row.
 /// Layout: idx_prefix(dim,x,y,z) => x contiguous.
-pub fn prefix_pass_x(prefix: &mut [u32], material: &[u32], side: usize, cancel: &AtomicBool) {
+pub fn prefix_pass_x(prefix: &mut [u32], material: &[u8], side: usize, cancel: &AtomicBool) {
     let dim = side + 1;
 
     prefix
@@ -78,11 +78,12 @@ pub fn prefix_pass_x(prefix: &mut [u32], material: &[u32], side: usize, cancel: 
             // row[0] stays 0
             for x in 1..=side {
                 let m = unsafe { *material.get_unchecked(base_m + (x - 1)) };
-                run += (m != AIR) as u32;
+                run += (m != (AIR as u8)) as u32;
                 row[x] = run;
             }
         });
 }
+
 
 /// Pass 2: prefix along Y within each Z-plane.
 pub fn prefix_pass_y(prefix: &mut [u32], side: usize, cancel: &AtomicBool) {
@@ -111,24 +112,54 @@ pub fn prefix_pass_y(prefix: &mut [u32], side: usize, cancel: &AtomicBool) {
         });
 }
 
-/// Pass 3: prefix along Z, i.e. prefix[x,y,z] += prefix[x,y,z-1].
+/// Pass 3: prefix along Z: prefix[x,y,z] += prefix[x,y,z-1].
+/// Much faster than launching a Rayon job per z-slice.
+/// Pass 3: prefix along Z: prefix[x,y,z] += prefix[x,y,z-1].
+/// Parallelized by x-columns (disjoint writes), z sequential in each column.
 pub fn prefix_pass_z(prefix: &mut [u32], side: usize, cancel: &AtomicBool) {
     let dim = side + 1;
     let plane = dim * dim;
 
-    for z in 1..=side {
-        if (z & 7) == 0 && should_cancel(cancel) {
-            return;
-        }
+    // Split prefix into per-plane mutable slices (each plane is independent for writes at fixed z),
+    // BUT we need z dependency, so we keep whole prefix and parallelize by x using a scope.
+    rayon::scope(|s| {
+        // chunk x range into blocks
+        const X_BLOCK: usize = 4;
+        let mut x0 = 1;
+        while x0 <= side {
+            let x1 = (x0 + X_BLOCK - 1).min(side);
+            let xs = x0..=x1;
 
-        let (head, tail) = prefix.split_at_mut(z * plane);
-        let prev = &head[(z - 1) * plane..z * plane];
-        let cur = &mut tail[..plane];
+            // SAFETY: tasks are disjoint by x, so they write disjoint indices.
+            // We avoid capturing &mut prefix directly by using a raw ptr *inside* the scope
+            // but we do NOT share the ptr type across threads; we pass it as usize.
+            let p = prefix.as_mut_ptr() as usize;
 
-        cur.par_iter_mut()
-            .zip(prev.par_iter())
-            .for_each(|(c, p)| {
-                *c += *p;
+            s.spawn(move |_| {
+                if should_cancel(cancel) {
+                    return;
+                }
+
+                let p = p as *mut u32;
+
+                for x in xs {
+                    for y in 1..=side {
+                        let base = y * dim + x;
+                        let mut run = unsafe { *p.add(base) };
+                        for z in 1..=side {
+                            let idx = z * plane + base;
+                            unsafe {
+                                run += *p.add(idx);
+                                *p.add(idx) = run;
+                            }
+                        }
+                    }
+                }
             });
-    }
+
+            x0 = x1 + 1;
+        }
+    });
 }
+
+

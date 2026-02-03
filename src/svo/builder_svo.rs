@@ -271,7 +271,7 @@ fn build_level_bottom_up(
 pub fn build_svo_bottom_up(
     chunk_size: u32,
     chunk_oy: i32,
-    material: &[u32],
+    material: &[u8],
     prefix: &[u32],
     ground_mip: &MinMaxMipView<'_>,
     dirt_depth: i32,
@@ -292,7 +292,8 @@ pub fn build_svo_bottom_up(
     let mut occ = vec![0u8; n];
     occ.par_iter_mut()
         .enumerate()
-        .for_each(|(i, o)| *o = (material[i] != AIR) as u8);
+        .for_each(|(i, o)| *o = (material[i] != (AIR as u8)) as u8);
+
 
     if should_cancel(cancel) {
         return Vec::new();
@@ -328,7 +329,7 @@ pub fn build_svo_bottom_up(
         .for_each(|(p, out)| {
             let i = inv[p] as usize;
             let (x, y, z) = coord_from_linear(i, side_vox);
-            let m = material[i];
+            let m = material[i] as u32;
             *out = make_leaf(chunk_size, x as i32, y as i32, z as i32, 1, m);
         });
 

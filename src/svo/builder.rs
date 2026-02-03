@@ -215,7 +215,7 @@ pub struct BuildScratch {
     height_cache_h: usize,
 
     // 3D (side^3)
-    material: Vec<u32>,
+    material: Vec<u8>,
     prefix: Vec<u32>,
 
     // mip storage
@@ -226,6 +226,11 @@ pub struct BuildScratch {
     // per-column top-most non-air (y, mat)
     col_top_y: Vec<u8>,   // 255 = empty
     col_top_mat: Vec<u8>, // low 8 bits of material id
+
+    height_cache_x0: i32,
+    height_cache_z0: i32,
+    height_cache_valid: bool,
+
 }
 
 impl BuildScratch {
@@ -243,6 +248,9 @@ impl BuildScratch {
             tree_levels: Vec::new(),
             col_top_y: Vec::new(),
             col_top_mat: Vec::new(),
+            height_cache_x0: 0,
+            height_cache_z0: 0,
+            height_cache_valid: false,
         }
     }
 
@@ -263,12 +271,11 @@ impl BuildScratch {
         let need = w * h;
         if self.height_cache.len() != need {
             self.height_cache.resize(need, 0);
-        } else {
-            self.height_cache.fill(0);
         }
         self.height_cache_w = w;
         self.height_cache_h = h;
     }
+
 
     #[inline]
     fn ensure_2d_i32(v: &mut Vec<i32>, side: usize, fill: i32) {
@@ -281,7 +288,7 @@ impl BuildScratch {
     }
 
     #[inline]
-    fn ensure_3d_u32(v: &mut Vec<u32>, side: usize, fill: u32) {
+    fn ensure_3d_u8(v: &mut Vec<u8>, side: usize, fill: u8) {
         let need = side * side * side;
         if v.len() != need {
             v.resize(need, fill);
@@ -289,6 +296,7 @@ impl BuildScratch {
             v.fill(fill);
         }
     }
+
 }
 
 // -----------------------------------------------------------------------------
@@ -302,36 +310,51 @@ fn build_height_cache<'g>(
     cancel: &AtomicBool,
     tim: &mut BuildTimingsMs,
 ) -> HeightSampler<'g> {
-    // cache margin in meters
-    let margin_m: i32 = 6;
-    let margin: i32 = margin_m * ctx.vpm + (ctx.vpm - 1);
+    // Only cache the chunk footprint (+ optional small margin).
+    // If you want a tiny safety halo, set margin_vox = ctx.vpm (1 meter).
+    let margin_vox: i32 = 0;
 
-    let cache_x0 = ctx.ox - margin;
-    let cache_z0 = ctx.oz - margin;
-    let cache_x1 = ctx.ox + ctx.size_i + margin; // inclusive
-    let cache_z1 = ctx.oz + ctx.size_i + margin; // inclusive
+    let cache_x0 = ctx.ox - margin_vox;
+    let cache_z0 = ctx.oz - margin_vox;
+
+    // inclusive max (so +1 sizing)
+    let cache_x1 = ctx.ox + (ctx.size_i - 1) + margin_vox;
+    let cache_z1 = ctx.oz + (ctx.size_i - 1) + margin_vox;
 
     let cache_w = (cache_x1 - cache_x0 + 1) as usize;
     let cache_h = (cache_z1 - cache_z0 + 1) as usize;
 
-    scratch.ensure_height_cache(cache_w, cache_h);
-    tim.cache_w = cache_w as u32;
-    tim.cache_h = cache_h as u32;
+    let same =
+        scratch.height_cache_valid &&
+        scratch.height_cache_x0 == cache_x0 &&
+        scratch.height_cache_z0 == cache_z0 &&
+        scratch.height_cache_w == cache_w &&
+        scratch.height_cache_h == cache_h;
 
-    scratch
-        .height_cache
-        .par_chunks_mut(cache_w)
-        .enumerate()
-        .for_each(|(z, row)| {
-            if (z & 15) == 0 && should_cancel(cancel) {
-                return;
-            }
-            let wz = cache_z0 + z as i32;
-            for x in 0..cache_w {
-                let wx = cache_x0 + x as i32;
-                row[x] = gen.ground_height(wx, wz);
-            }
-        });
+    if !same {
+        scratch.ensure_height_cache(cache_w, cache_h);
+        tim.cache_w = cache_w as u32;
+        tim.cache_h = cache_h as u32;
+
+        scratch.height_cache
+            .par_chunks_mut(cache_w)
+            .enumerate()
+            .for_each(|(z, row)| {
+                if (z & 15) == 0 && should_cancel(cancel) {
+                    return;
+                }
+                let wz = cache_z0 + z as i32;
+                for x in 0..cache_w {
+                    let wx = cache_x0 + x as i32;
+                    row[x] = gen.ground_height(wx, wz);
+                }
+            });
+
+        scratch.height_cache_x0 = cache_x0;
+        scratch.height_cache_z0 = cache_z0;
+        scratch.height_cache_valid = true;
+    }
+
 
     HeightSampler {
         gen,
@@ -342,8 +365,8 @@ fn build_height_cache<'g>(
         z0: cache_z0,
         z1: cache_z1,
     }
-
 }
+
 
 fn build_ground_2d(
     ctx: ChunkCtx,
@@ -353,6 +376,34 @@ fn build_ground_2d(
 ) {
     BuildScratch::ensure_2d_i32(&mut scratch.ground, ctx.side, 0);
 
+    // Fast path: cache exactly covers the chunk footprint.
+    // If it doesn't, fall back to sampling.
+    let want_w = ctx.side;
+    let want_h = ctx.side;
+
+    let cache_ok =
+        scratch.height_cache_w == want_w &&
+        scratch.height_cache_h == want_h &&
+        height.x0 == ctx.ox &&
+        height.z0 == ctx.oz;
+
+    if cache_ok {
+        // memcpy per row (parallel)
+        scratch
+            .ground
+            .par_chunks_mut(ctx.side)
+            .zip(scratch.height_cache.par_chunks(ctx.side))
+            .enumerate()
+            .for_each(|(lz, (dst, src))| {
+                if (lz & 15) == 0 && should_cancel(cancel) {
+                    return;
+                }
+                dst.copy_from_slice(src);
+            });
+        return;
+    }
+
+    // Fallback (should be rare if you keep margin_vox = 0)
     scratch
         .ground
         .par_chunks_mut(ctx.side)
@@ -368,6 +419,7 @@ fn build_ground_2d(
             }
         });
 }
+
 
 /// Fills `tree_top` with an estimated top-of-tree Y (in voxel coords relative to chunk),
 /// using `tree_instance_at_meter` and cached ground heights.
@@ -451,125 +503,85 @@ fn fill_material(
     ctx: ChunkCtx,
     scratch: &mut BuildScratch,
     cancel: &AtomicBool,
-    tree_material_local: &(dyn Fn(usize, usize, usize) -> u32 + Sync),
-    _edits: &[EditEntry],
-    tim: &mut BuildTimingsMs,
+    tree_material_local: &(dyn Fn(usize, usize, usize) -> u8 + Sync),
+    edits: &[EditEntry],
 ) {
-    BuildScratch::ensure_3d_u32(&mut scratch.material, ctx.side, AIR);
-    scratch.ensure_coltop(ctx.side);
+    const AIR8: u8 = AIR as u8;
+    const DIRT8: u8 = DIRT as u8;
+    const GRASS8: u8 = GRASS as u8;
+    const STONE8: u8 = STONE as u8;
+
+    BuildScratch::ensure_3d_u8(&mut scratch.material, ctx.side, AIR8);
 
     let side = ctx.side;
     let side2 = side * side;
 
-    // (Optional) cave depth gate in voxels (matches your original constant).
+    // cave depth gate (same as before)
     let max_depth_vox: i32 = (48.0_f32 * (ctx.vpm as f32)).round() as i32;
 
-    // Per-thread column tops (packed u16), reduced by max.
-    // packed = ((y+1) << 8) | mat8, so higher y wins; 0 means empty.
-    let coltops_packed: Vec<u16> = scratch
+    scratch
         .material
         .par_chunks_mut(side2)
         .enumerate()
-        .fold(
-            || vec![0u16; side * side],
-            |mut local_tops, (ly, slab)| {
-                if (ly & 7) == 0 && should_cancel(cancel) {
-                    return local_tops;
-                }
+        .for_each(|(ly, slab)| {
+            if (ly & 7) == 0 && should_cancel(cancel) {
+                return;
+            }
 
-                let wy = ctx.oy + ly as i32;
+            let wy = ctx.oy + ly as i32;
 
-                for lz in 0..side {
-                    let wz = ctx.oz + lz as i32;
-                    let row_off = lz * side;
+            for lz in 0..side {
+                let wz = ctx.oz + lz as i32;
+                let row_off = lz * side;
 
-                    for lx in 0..side {
-                        let wx = ctx.ox + lx as i32;
+                for lx in 0..side {
+                    let wx = ctx.ox + lx as i32;
 
-                        let col = idx_xz(side, lx, lz);
-                        let g = scratch.ground[col];
+                    let col = idx_xz(side, lx, lz);
+                    let g = scratch.ground[col];
 
-                        // --- 1) terrain ---
-                        let mut m: u32 = if wy < g {
-                            if wy >= g - ctx.dirt_depth {
-                                DIRT
-                            } else {
-                                STONE
-                            }
-                        } else if wy == g {
-                            GRASS
-                        } else {
-                            AIR
-                        };
+                    // 1) terrain
+                    let mut m: u8 = if wy < g {
+                        if wy >= g - ctx.dirt_depth { DIRT8 } else { STONE8 }
+                    } else if wy == g {
+                        GRASS8
+                    } else {
+                        AIR8
+                    };
 
-                        // --- 2) caves (with depth gate) ---
-                        if m != AIR {
-                            let depth_vox = g - wy;
-                            if depth_vox > 0 && depth_vox <= max_depth_vox {
-                                if gen.carve_cave(wx, wy, wz, g) {
-                                    m = AIR;
-                                }
-                            }
-                        }
-
-                        // --- 3) trees overlay ---
-                        if m == AIR {
-                            let tm = tree_material_local(lx, ly, lz);
-                            if tm != AIR {
-                                m = tm;
-                            }
-                        }
-
-                        slab[row_off + lx] = m;
-
-                        // update local col top
-                        if m != AIR {
-                            let mat8 = (m & 0xFF) as u16;
-                            let y8p1 = (ly as u16).wrapping_add(1); // 1..64, 0 reserved for empty
-                            let packed = (y8p1 << 8) | mat8;
-                            let cur = unsafe { *local_tops.get_unchecked(col) };
-                            if packed > cur {
-                                unsafe { *local_tops.get_unchecked_mut(col) = packed };
+                    // 2) caves (depth gate)
+                    if m != AIR8 {
+                        let depth_vox = g - wy;
+                        if depth_vox > 0 && depth_vox <= max_depth_vox {
+                            if gen.carve_cave(wx, wy, wz, g) {
+                                m = AIR8;
                             }
                         }
                     }
-                }
 
-                local_tops
-            },
-        )
-        .reduce(
-            || vec![0u16; side * side],
-            |mut a, b| {
-                for i in 0..a.len() {
-                    let bi = unsafe { *b.get_unchecked(i) };
-                    let ai = unsafe { *a.get_unchecked(i) };
-                    if bi > ai {
-                        unsafe { *a.get_unchecked_mut(i) = bi };
+                    // 3) trees overlay
+                    if m == AIR8 {
+                        let tm = tree_material_local(lx, ly, lz);
+                        if tm != AIR8 {
+                            m = tm;
+                        }
                     }
-                }
-                a
-            },
-        );
 
-    // Decode into scratch.col_top_y / col_top_mat
-    for i in 0..(side * side) {
-        let p = coltops_packed[i];
-        if p == 0 {
-            scratch.col_top_y[i] = 255;
-            scratch.col_top_mat[i] = 0;
-        } else {
-            let y = ((p >> 8) as u8).wrapping_sub(1);
-            let m8 = (p & 0xFF) as u8;
-            scratch.col_top_y[i] = y;
-            scratch.col_top_mat[i] = m8;
-            tim.solid_voxels += 1;
+                    slab[row_off + lx] = m;
+                }
+            }
+        });
+
+    // 4) apply edits (edits win)
+    // NOTE: your edits are chunk-local linear indices; this is O(#edits).
+    for e in edits {
+        let i = e.idx as usize;
+        if i < scratch.material.len() {
+            scratch.material[i] = (e.mat & 0xFF) as u8;
         }
     }
-
-    // NOTE: edits are intentionally not applied here because the original snippet
-    // didn’t show how edits are represented. Hook is left in place.
 }
+
 
 fn build_colinfo_words(ctx: ChunkCtx, scratch: &BuildScratch) -> Vec<u32> {
     debug_assert_eq!(ctx.side, 64, "colinfo packing assumes chunk_size=64");
@@ -601,6 +613,48 @@ fn build_colinfo_words(ctx: ChunkCtx, scratch: &BuildScratch) -> Vec<u32> {
 
     colinfo_words
 }
+
+fn build_col_tops(ctx: ChunkCtx, scratch: &mut BuildScratch, cancel: &AtomicBool, tim: &mut BuildTimingsMs) {
+    const AIR8: u8 = AIR as u8;
+
+    scratch.ensure_coltop(ctx.side);
+
+    let side = ctx.side;
+    let side2 = side * side;
+
+    // Parallel over columns (x,z)
+    scratch
+        .col_top_y
+        .par_iter_mut()
+        .zip(scratch.col_top_mat.par_iter_mut())
+        .enumerate()
+        .for_each(|(col, (out_y, out_m))| {
+            if (col & 1023) == 0 && should_cancel(cancel) {
+                return;
+            }
+
+            let lx = col % side;
+            let lz = col / side;
+
+            // scan from top to bottom
+            for ly in (0..side).rev() {
+                let idx = ly * side2 + lz * side + lx;
+                let m = unsafe { *scratch.material.get_unchecked(idx) };
+                if m != AIR8 {
+                    *out_y = ly as u8;
+                    *out_m = m;
+                    return;
+                }
+            }
+
+            *out_y = 255;
+            *out_m = 0;
+        });
+
+    // If you want a “non-empty columns” counter:
+    tim.solid_voxels = scratch.col_top_y.iter().filter(|&&y| y != 255).count() as u32;
+}
+
 
 fn build_macro_occ(ctx: ChunkCtx, prefix_buf: &[u32], cancel: &AtomicBool) -> Vec<u32> {
     let side = ctx.side;
@@ -693,11 +747,22 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
 
     // Material fill
     time_it!(tim, material_fill, {
-        let tree_mat = |lx: usize, ly: usize, lz: usize| -> u32 {
-            tree_mask.material_local(lx, ly, lz)
+        let tree_mat = |lx: usize, ly: usize, lz: usize| -> u8 {
+            (tree_mask.material_local(lx, ly, lz) & 0xFF) as u8
         };
-        fill_material(gen, ctx, scratch, cancel, &tree_mat, edits, &mut tim);
+        fill_material(gen, ctx, scratch, cancel, &tree_mat, edits);
     });
+    cancel_if!(cancel, tim);
+
+    // Replaces the old coltops fold/reduce
+    time_it!(tim, colinfo, {
+        build_col_tops(ctx, scratch, cancel, &mut tim);
+    });
+    cancel_if!(cancel, tim);
+
+    // Then pack colinfo_words (still small)
+    let colinfo_words = build_colinfo_words(ctx, scratch);
+
     cancel_if!(cancel, tim);
 
     // Colinfo words
