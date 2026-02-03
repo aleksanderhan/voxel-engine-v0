@@ -45,6 +45,9 @@ fn main_primary(
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
 
+  let frame = cam.frame_index; // or whatever you already have
+  let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
+
   // ------------------------------------------------------------
   // Case 1: no voxel chunks => heightfield or sky
   // ------------------------------------------------------------
@@ -52,7 +55,7 @@ fn main_primary(
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      let surface = shade_clip_hit(ro, rd, hf, sky_up);
+      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
@@ -78,7 +81,7 @@ fn main_primary(
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      let surface = shade_clip_hit(ro, rd, hf, sky_up);
+      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
@@ -95,7 +98,7 @@ fn main_primary(
 
   // In grid: voxel hit?
   if (vt.best.hit != 0u) {
-    let surface = shade_hit(ro, rd, vt.best, sky_up);
+    let surface = shade_hit(ro, rd, vt.best, sky_up, seed);
     let t_scene = min(vt.best.t, FOG_MAX_DIST);
     let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
@@ -108,7 +111,7 @@ fn main_primary(
   let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
   if (hf.hit) {
-    let surface = shade_clip_hit(ro, rd, hf, sky_up);
+    let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
     let t_scene = min(hf.t, FOG_MAX_DIST);
     let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 

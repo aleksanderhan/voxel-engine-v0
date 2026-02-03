@@ -252,65 +252,6 @@ fn apply_material_variation_clip(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> ve
   return c;
 }
 
-fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>) -> vec3<f32> {
-  let hp = ro + ch.t * rd;
-
-  var base = color_for_material(ch.mat);
-  base = apply_material_variation_clip(base, ch.mat, hp);
-
-  let voxel_size = cam.voxel_params.x;
-  let hp_shadow  = hp + ch.n * (0.75 * voxel_size);
-
-  let vis  = sun_transmittance(hp_shadow, SUN_DIR);
-  let diff = max(dot(ch.n, SUN_DIR), 0.0);
-
-  // AO-lite for terrain: cheap taps against heightfield itself (fixed lvl)
-  let lvl = clip_best_level(hp.xz, 2);
-  let cell = clip.level[lvl].z;
-
-
-  let h0  = clip_height_at_level(hp.xz, lvl);
-  let hx1 = clip_height_at_level(hp.xz + vec2<f32>( cell, 0.0), lvl);
-  let hx0 = clip_height_at_level(hp.xz + vec2<f32>(-cell, 0.0), lvl);
-  let hz1 = clip_height_at_level(hp.xz + vec2<f32>(0.0,  cell), lvl);
-  let hz0 = clip_height_at_level(hp.xz + vec2<f32>(0.0, -cell), lvl);
-
-  let occ =
-    max(0.0, hx1 - h0) +
-    max(0.0, hx0 - h0) +
-    max(0.0, hz1 - h0) +
-    max(0.0, hz0 - h0);
-
-  let ao = clamp(1.0 - 0.65 * occ / max(cell, 1e-3), 0.45, 1.0);
-
-  let amb_col = hemi_ambient(ch.n, sky_up);
-  let amb_strength = 0.10;
-  let ambient = amb_col * amb_strength * ao;
-
-  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis;
-
-  let vdir = normalize(-rd);
-  let hdir = normalize(vdir + SUN_DIR);
-  let ndv  = max(dot(ch.n, vdir), 0.0);
-  let ndh  = max(dot(ch.n, hdir), 0.0);
-
-  var rough = 0.85;
-  if (ch.mat == MAT_STONE) { rough = 0.50; }
-  if (ch.mat == MAT_DIRT)  { rough = 0.90; }
-  if (ch.mat == MAT_GRASS) { rough = 0.88; }
-
-  let shininess = mix(8.0, 96.0, 1.0 - rough);
-  let spec = pow(ndh, shininess);
-
-  var f0 = 0.03;
-  if (ch.mat == MAT_STONE) { f0 = 0.04; }
-  let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(ndv, 0.0, 1.0), 5.0);
-
-  let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis;
-
-  return base * (ambient + direct) + 0.18 * spec_col;
-}
-
 fn clip_level_contains(xz: vec2<f32>, level: u32, guard: i32) -> bool {
   let res_i = max(i32(clip.res), 1);
   let p = clip.level[level];

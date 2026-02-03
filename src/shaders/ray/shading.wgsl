@@ -109,30 +109,34 @@ fn material_f0(mat: u32) -> f32 {
   return 0.02;
 }
 
-fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>) -> vec3<f32> {
+fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
   let hp = ro + hg.t * rd;
 
   var base = color_for_material(hg.mat);
   base = apply_material_variation(base, hg.mat, hp);
 
+  // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
-    let vs = cam.voxel_params.x;
-    let tip = clamp(fract(hp.y / max(vs, 1e-6)), 0.0, 1.0);
+    if (grass_allowed_primary(hg.t, hg.n, seed)) {
+      let vs  = cam.voxel_params.x;
+      let tip = clamp(fract(hp.y / max(vs, 1e-6)), 0.0, 1.0);
 
-    base = mix(base, base + vec3<f32>(0.10, 0.10, 0.02), 0.35 * tip);
+      base = mix(base, base + vec3<f32>(0.10, 0.10, 0.02), 0.35 * tip);
 
-    let back = pow(clamp(dot(-SUN_DIR, hg.n), 0.0, 1.0), 2.0);
-    base += 0.22 * back * vec3<f32>(0.18, 0.35, 0.10);
+      let back = pow(clamp(dot(-SUN_DIR, hg.n), 0.0, 1.0), 2.0);
+      base += 0.22 * back * vec3<f32>(0.18, 0.35, 0.10);
+    }
   }
 
-  let vs = cam.voxel_params.x;
-  let hp_shadow  = hp + hg.n * (0.75 * vs);
+  let vs        = cam.voxel_params.x;
+  let hp_shadow = hp + hg.n * (0.75 * vs);
 
-  let Tc  = cloud_sun_transmittance(hp_shadow, SUN_DIR);
+  let Tc       = cloud_sun_transmittance(hp_shadow, SUN_DIR);
   let vis_geom = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
 
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
+  // AO for voxels: only when the hit is a real voxel hit (not sky / miss)
   let ao = select(1.0, voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base), hg.hit != 0u);
 
   let amb_col      = hemi_ambient(hg.n, sky_up);
@@ -143,6 +147,7 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>) -> ve
     ambient *= vec3<f32>(0.92, 0.95, 1.05);
   }
 
+  // Leaf dapple (cheap) - keep as-is
   var dapple = 1.0;
   if (hg.mat == MAT_LEAF) {
     let time_s = cam.voxel_params.y;
@@ -164,8 +169,69 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>) -> ve
   let f0   = material_f0(hg.mat);
   let fres = fresnel_schlick(ndv, f0);
 
-  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis_geom * Tc * dapple;
+  let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis_geom * Tc * dapple;
   let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis_geom * Tc;
 
   return base * (ambient + direct) + 0.20 * spec_col;
+}
+
+fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
+  let hp = ro + ch.t * rd;
+
+  var base = color_for_material(ch.mat);
+  base = apply_material_variation_clip(base, ch.mat, hp);
+
+  let voxel_size = cam.voxel_params.x;
+  let hp_shadow  = hp + ch.n * (0.75 * voxel_size);
+
+  let vis  = sun_transmittance(hp_shadow, SUN_DIR);
+  let diff = max(dot(ch.n, SUN_DIR), 0.0);
+
+  // AO-lite for terrain: gate hard for grass in primary
+  var ao = 1.0;
+  if (ch.mat == MAT_GRASS && grass_allowed_primary(ch.t, ch.n, seed)) {
+    let lvl  = clip_best_level(hp.xz, 2);
+    let cell = clip.level[lvl].z;
+
+    let h0  = clip_height_at_level(hp.xz, lvl);
+    let hx1 = clip_height_at_level(hp.xz + vec2<f32>( cell, 0.0), lvl);
+    let hx0 = clip_height_at_level(hp.xz + vec2<f32>(-cell, 0.0), lvl);
+    let hz1 = clip_height_at_level(hp.xz + vec2<f32>(0.0,  cell), lvl);
+    let hz0 = clip_height_at_level(hp.xz + vec2<f32>(0.0, -cell), lvl);
+
+    let occ =
+      max(0.0, hx1 - h0) +
+      max(0.0, hx0 - h0) +
+      max(0.0, hz1 - h0) +
+      max(0.0, hz0 - h0);
+
+    ao = clamp(1.0 - 0.65 * occ / max(cell, 1e-3), 0.45, 1.0);
+  }
+
+  let amb_col      = hemi_ambient(ch.n, sky_up);
+  let amb_strength = 0.10;
+  let ambient      = amb_col * amb_strength * ao;
+
+  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis;
+
+  let vdir = normalize(-rd);
+  let hdir = normalize(vdir + SUN_DIR);
+  let ndv  = max(dot(ch.n, vdir), 0.0);
+  let ndh  = max(dot(ch.n, hdir), 0.0);
+
+  var rough = 0.85;
+  if (ch.mat == MAT_STONE) { rough = 0.50; }
+  if (ch.mat == MAT_DIRT)  { rough = 0.90; }
+  if (ch.mat == MAT_GRASS) { rough = 0.88; }
+
+  let shininess = mix(8.0, 96.0, 1.0 - rough);
+  let spec      = pow(ndh, shininess);
+
+  var f0 = 0.03;
+  if (ch.mat == MAT_STONE) { f0 = 0.04; }
+  let fres = f0 + (1.0 - f0) * pow(1.0 - clamp(ndv, 0.0, 1.0), 5.0);
+
+  let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis;
+
+  return base * (ambient + direct) + 0.18 * spec_col;
 }
