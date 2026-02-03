@@ -203,7 +203,7 @@ impl OverlayGpu {
             crate::world::materials::STONE => "STONE",
             crate::world::materials::WOOD  => "WOOD",
             crate::world::materials::LIGHT => "LIGHT",
-            _ => "DIG", // fallback; you can change to "UNKNOWN"
+            _ => "UNKNOWN", // fallback;
         };
 
         let (text_len, text_p0, text_p1, text_p2) = pack_text_12(label);

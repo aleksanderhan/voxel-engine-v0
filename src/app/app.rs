@@ -175,7 +175,6 @@ impl App {
 
         let edit_modes = vec![
             EditMode::Dig,
-            EditMode::Place(AIR), // “place air” mode if you want it explicitly
             EditMode::Place(DIRT),
             EditMode::Place(STONE),
             EditMode::Place(WOOD),
