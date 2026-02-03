@@ -176,7 +176,12 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
 
   let amb_col      = hemi_ambient(hg.n, sky_up);
   let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
-  var ambient      = amb_col * amb_strength * ao;
+
+  // NEW: kill ambient when no sky is visible
+  let sv = sky_visibility(hp_shadow); // or hp
+
+  var ambient = amb_col * amb_strength * ao * sv;
+
 
   if (hg.mat == MAT_STONE) {
     ambient *= vec3<f32>(0.92, 0.95, 1.05);
@@ -275,4 +280,12 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
   let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis;
 
   return base * (ambient + direct) + 0.18 * spec_col;
+}
+
+fn sky_visibility(p: vec3<f32>) -> f32 {
+  // Up ray: if blocked, returns ~0. If open, returns ~1.
+  // Small bias to avoid self-intersection
+  let vs = cam.voxel_params.x;
+  let pu = p + vec3<f32>(0.0, 1.0, 0.0) * (0.75 * vs);
+  return sun_transmittance_geom_only(pu, vec3<f32>(0.0, 1.0, 0.0));
 }

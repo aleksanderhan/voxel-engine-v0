@@ -96,3 +96,35 @@ fn query_leaf_at(
 
   return LeafQuery(bmin, size, MAT_AIR);
 }
+
+
+fn make_air_leaf(bmin: vec3<f32>, size: f32) -> LeafQuery {
+  return LeafQuery(bmin, size, MAT_AIR);
+}
+
+// Returns leaf material at world position by first locating the chunk.
+fn query_leaf_world(p: vec3<f32>) -> LeafQuery {
+  // You need a leaf return type here that at least includes .mat.
+  // If your existing query_leaf_at returns a struct with .mat/.bmin/.size, reuse that type.
+
+  let vs = cam.voxel_params.x;
+  let chunk_size_m = f32(cam.chunk_size) * vs;
+
+  // Convert world meters -> chunk coords
+  let c = chunk_coord_from_pos(p, chunk_size_m);
+
+  // Look up streamed chunk slot
+  let slot = grid_lookup_slot(c.x, c.y, c.z);
+  if (slot == INVALID_U32 || slot >= cam.chunk_count) {
+    // Outside loaded grid => air
+    return make_air_leaf(p, vs); // implement as your leaf struct with mat=MAT_AIR
+  }
+
+  let ch = chunks[slot];
+
+  // Build the chunk's root box in meters
+  let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * vs;
+  let root_size = f32(cam.chunk_size) * vs;
+
+  return query_leaf_at(p, root_bmin, root_size, ch.node_base, ch.macro_base);
+}
