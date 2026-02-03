@@ -9,7 +9,7 @@ use std::time::Instant;
 use crossbeam_channel::TrySendError;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 
 use crate::streaming::types::*;
 use crate::{render::gpu_types::{NodeGpu, NodeRopesGpu}};
@@ -17,7 +17,7 @@ use crate::app::config;
 
 use super::{ground, keep, slots};
 use super::ChunkManager;
-use crate::streaming::priority::priority_score;
+use crate::streaming::priority::{priority_score_streaming};
 
 // src/streaming/manager/build.rs
 
@@ -483,7 +483,7 @@ fn make_prio(score: f32) -> u32 {
 #[inline]
 fn heap_push(mgr: &mut ChunkManager, center: ChunkKey, k: ChunkKey, boost: f32) {
     let cam_fwd = mgr.build.last_cam_fwd;
-    let mut s = priority_score(k, center, cam_fwd) - boost;
+    let mut s = priority_score_streaming(mgr, k, center, cam_fwd) - boost;
 
     if super::keep::in_active_xz(center, k) {
         s -= 10_000.0;
@@ -573,7 +573,7 @@ pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec
     // Score + heapify
     let mut items: Vec<HeapItem> = Vec::with_capacity(kept.len());
     for (i, k) in kept.into_iter().enumerate() {
-        let mut s = priority_score(k, center, cam_fwd);
+        let mut s = priority_score_streaming(mgr, k, center, cam_fwd);
 
         if super::keep::in_active_xz(center, k) {
             s -= 10_000.0;

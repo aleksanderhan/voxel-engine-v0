@@ -5,7 +5,7 @@ mod grid;
 mod slots;
 mod stats;
 mod visibility;
-mod ground;
+pub mod ground;
 mod keep;
 mod uploads;
 
@@ -225,6 +225,8 @@ impl ChunkManager {
 
         self.build.last_cam_fwd = cam_fwd;
 
+        let prev_cam_below_ground = self.build.cam_below_ground;
+        let prev_cam_fwd = self.build.last_cam_fwd;
         
         // 2) ensure ground cache (only does real work when origin changes)
         ground::ensure_column_cache(self, world.as_ref(), center);
@@ -244,27 +246,45 @@ impl ChunkManager {
         // small margin to avoid flicker when standing exactly on the surface
         self.build.cam_below_ground = cam_y_vox < (ground_y_vox - 1.0);
 
+        let cam_below_ground_changed = self.build.cam_below_ground != prev_cam_below_ground;
+
+        // rebuild heap when turning a lot (avoids “I turned to look at it” starvation)
+        let cam_fwd_changed = {
+            let a = glam::Vec2::new(prev_cam_fwd.x, prev_cam_fwd.z);
+            let b = glam::Vec2::new(cam_fwd.x, cam_fwd.z);
+            if a.length_squared() < 1e-6 || b.length_squared() < 1e-6 {
+                false
+            } else {
+                let da = a.normalize();
+                let db = b.normalize();
+                da.dot(db) < 0.90 // ~25° turn threshold; tune
+            }
+        };
+
+
 
         // 3) publish center (rebuckets uploads only if changed)
         let center_changed = keep::publish_center_and_rebucket(self, center);
 
-        if center_changed {
+        let planning_changed = center_changed || cam_below_ground_changed || cam_fwd_changed;
+
+        if planning_changed {
             visibility::ensure_visible_columns(self, center, cam_pos_m);
         }
-
 
         // Always do cheap “keep things moving”
         build::harvest_done_builds(self, center);
         build::dispatch_builds(self, center);
 
-        // Only do the expensive global planning when the center changes
-        if center_changed {
+        // Do planning when needed (not only on center change)
+        if planning_changed {
             build::enqueue_active_ring(self, center);
             build::unload_outside_keep(self, center);
 
-            // heap rebuild is expensive; only do it on center change
+            // heap rebuild is the expensive part; only when we detect a meaningful change
             build::rebuild_build_heap(self, center, cam_fwd);
         }
+
 
         let changed = grid::rebuild_if_dirty(self, center);
 
