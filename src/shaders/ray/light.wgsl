@@ -3,8 +3,8 @@
 //// --------------------------------------------------------------------------
 
 const LIGHT_MAX_DIST_VOX : f32 = 14.0; // reach in voxels
-const LIGHT_RAYS         : u32 = 18u;  // # of probe rays (tune 12..32)
-const LIGHT_STEPS        : u32 = 10u;  // steps along each ray
+const LIGHT_RAYS         : u32 = 32u;  // # of probe rays (tune 12..32)
+const LIGHT_STEPS        : u32 = 12u;  // steps along each ray
 const LIGHT_INTENSITY    : f32 = 32.0; // overall brightness (tune)
 
 fn light_emission_color() -> vec3<f32> {
@@ -79,7 +79,16 @@ fn gather_voxel_lights(
   let nxq = u32(select(0, 1, n.x > 0.0)) | (u32(select(0, 1, n.y > 0.0)) << 1u) | (u32(select(0, 1, n.z > 0.0)) << 2u);
   var seed: u32 = hash3_u32(bitcast<u32>(cell.x), bitcast<u32>(cell.y), bitcast<u32>(cell.z));
   seed = hash_u32_2(seed, nxq);
-  seed = hash_u32_2(seed, cam.frame_index & 255u); // tiny temporal dither
+
+  // Optional: add a *spatial* per-pixel/per-hit decorrelation that is still stable.
+  // Quantize hitpoint to avoid shimmering with tiny camera motion.
+  let hpq = vec3<i32>(
+    i32(floor(hp.x / (vs * 0.25))),
+    i32(floor(hp.y / (vs * 0.25))),
+    i32(floor(hp.z / (vs * 0.25)))
+  );
+  seed = hash_u32_2(seed, hash3_u32(bitcast<u32>(hpq.x), bitcast<u32>(hpq.y), bitcast<u32>(hpq.z)));
+
 
   let tbn = make_tbn(n);
 
@@ -139,7 +148,7 @@ fn gather_voxel_lights(
   sum *= (1.0 / f32(LIGHT_RAYS));
 
   // Optional gentle boost if we got any hits, helps small lamps
-  sum *= (1.0 + 0.25 * clamp(hits / 4.0, 0.0, 1.0));
+  sum *= (1.0 + 0.10 * clamp(hits / 6.0, 0.0, 1.0));
 
   return sum;
 }
