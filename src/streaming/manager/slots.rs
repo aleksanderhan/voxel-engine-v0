@@ -646,9 +646,9 @@ pub fn replace_chunk_contents(
     mgr: &mut ChunkManager,
     center: ChunkKey,
     key: ChunkKey,
-    mut nodes: Arc<[NodeGpu]>,
+    nodes: Arc<[NodeGpu]>,
     macro_words: Arc<[u32]>,
-    mut ropes: Arc<[NodeRopesGpu]>,
+    ropes: Arc<[NodeRopesGpu]>,
     colinfo_words: Arc<[u32]>,
 ) -> bool {
     // (node_base, allocated_capacity, is_resident_now)

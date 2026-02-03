@@ -663,6 +663,9 @@ impl App {
             return;
         };
 
+        let hit_mat = self.sample_voxel_material(hit_w.0, hit_w.1, hit_w.2);
+        println!("hit voxel {:?} mat={}", hit_w, hit_mat);
+
         // choose target voxel depending on mode
         let (tx, ty, tz, mat) = match self.edit_modes[self.edit_mode] {
             EditMode::Dig => (hit_w.0, hit_w.1, hit_w.2, crate::world::materials::AIR),
@@ -670,7 +673,7 @@ impl App {
         };
 
         // chunk key + local coords
-        let (key, lx, ly, lz) = crate::world::edits::voxel_to_chunk_local(tx, ty, tz);
+        let (key, lx, ly, lz) = crate::world::edits::voxel_to_chunk_local( &self.world, tx, ty, tz);
 
         println!("edit key={:?} state={:?}", key, self.chunks.build.chunks.get(&key));
 
@@ -795,10 +798,11 @@ impl App {
             return m;
         }
 
-        // You need a single-voxel “procedural material” function.
-        // Implement this in WorldGen to match your builder logic.
-        self.world.material_at_voxel(wx, wy, wz)
+        // Procedural fallback (with edits context available, if WorldGen uses it)
+        self.world
+            .material_at_voxel_with_edits(&self.chunks.edits, wx, wy, wz)
     }
+
 }
 
 fn choose_present_mode(surface_caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
