@@ -148,7 +148,7 @@ impl App {
             present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 3,
+            desired_maximum_frame_latency: 2,
         };
 
         let renderer =
@@ -296,7 +296,9 @@ impl App {
         self.prev_view_proj = glam::Mat4::from_cols_array_2d(&camera_gpu.view_proj);
         self.has_prev_view_proj = true;
 
-        self.finish_frame_profiling(frame_start);
+        // IMPORTANT: "render_ms" should exclude finish_frame_profiling overhead
+        let render_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+        self.finish_frame_profiling(render_ms);
     }
 
     fn compute_frame_dt_seconds(&mut self) -> f32 {
@@ -614,12 +616,13 @@ impl App {
         self.profiler.present(profiler::FrameProf::end_ms(t0));
     }
 
-    fn finish_frame_profiling(&mut self, frame_start: Instant) {
+    fn finish_frame_profiling(&mut self, render_ms: f64) {
         if !self.profiler.enabled() {
             return;
         }
 
-        // Readback timings only when printing; keep default path cheap.
+        let prof_start = Instant::now();
+
         let gpu_timings_ms = if self.profiler.should_print() {
             self.renderer.read_gpu_timings_ms_blocking()
         } else {
@@ -632,9 +635,10 @@ impl App {
             None
         };
 
-        let frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
-        self.profiler.end_frame(frame_ms, streaming_stats, gpu_timings_ms);
+        let prof_overhead_ms = prof_start.elapsed().as_secs_f64() * 1000.0;
+        self.profiler.end_frame(render_ms, prof_overhead_ms, streaming_stats, gpu_timings_ms);
     }
+
 
     fn update_editor(&mut self) {
         // scroll wheel selects mode
