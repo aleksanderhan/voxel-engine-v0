@@ -21,12 +21,12 @@
 // Tunables
 // -----------------------------------------------------------------------------
 
-const LIGHT_MAX_DIST_VOX : u32 = 48u;   // shorter is cheaper (try 24..64)
-const LIGHT_RAYS         : u32 = 8u;    // 6..12 is usually enough
-const LIGHT_INTENSITY    : f32 = 22.0;  // tune for your scene scale
+const LIGHT_MAX_DIST_VOX : u32 = 72u;   // shorter is cheaper (try 24..64)
+const LIGHT_RAYS         : u32 = 12u;    // 6..12 is usually enough
+const LIGHT_INTENSITY    : f32 = 60.0;  // tune for your scene scale
 
 // Softens 1/r^2 so it doesn't blow up near the source.
-const LIGHT_SOFT_RADIUS_VOX : f32 = 6.0; // in voxels
+const LIGHT_SOFT_RADIUS_VOX : f32 = 3.0; // in voxels
 
 // -----------------------------------------------------------------------------
 // Emission
@@ -66,23 +66,30 @@ fn rot_about_axis(v: vec3<f32>, axis: vec3<f32>, ang: f32) -> vec3<f32> {
 // Fixed direction set (very cheap, deterministic)
 // -----------------------------------------------------------------------------
 
-// A tiny fixed cosine-ish hemisphere set around +Z.
-// These are hand-picked unit-ish vectors; we normalize anyway.
-fn hemi_dir_local(i: u32) -> vec3<f32> {
-  // 8 directions: one near normal + 7 spread.
-  // All have z >= 0 (hemisphere).
+// A tiny fixed direction set over the *sphere* (cheap, deterministic).
+// 12 dirs = 6 axis + 6 diagonals. Normalize anyway.
+fn sphere_dir_local(i: u32) -> vec3<f32> {
   switch(i) {
     default: { return vec3<f32>(0.0, 0.0, 1.0); }
-    case 0u: { return vec3<f32>(0.0, 0.0, 1.0); }
-    case 1u: { return vec3<f32>(0.65, 0.00, 0.76); }
-    case 2u: { return vec3<f32>(-0.65, 0.00, 0.76); }
-    case 3u: { return vec3<f32>(0.00, 0.65, 0.76); }
-    case 4u: { return vec3<f32>(0.00, -0.65, 0.76); }
-    case 5u: { return vec3<f32>(0.46, 0.46, 0.76); }
-    case 6u: { return vec3<f32>(-0.46, 0.46, 0.76); }
-    case 7u: { return vec3<f32>(0.46, -0.46, 0.76); }
+
+    // axis
+    case 0u: { return vec3<f32>( 1.0,  0.0,  0.0); }
+    case 1u: { return vec3<f32>(-1.0,  0.0,  0.0); }
+    case 2u: { return vec3<f32>( 0.0,  1.0,  0.0); }
+    case 3u: { return vec3<f32>( 0.0, -1.0,  0.0); }
+    case 4u: { return vec3<f32>( 0.0,  0.0,  1.0); }
+    case 5u: { return vec3<f32>( 0.0,  0.0, -1.0); }
+
+    // diagonals (roughly distributed)
+    case 6u:  { return vec3<f32>( 1.0,  1.0,  1.0); }
+    case 7u:  { return vec3<f32>(-1.0,  1.0,  1.0); }
+    case 8u:  { return vec3<f32>( 1.0, -1.0,  1.0); }
+    case 9u:  { return vec3<f32>(-1.0, -1.0,  1.0); }
+    case 10u: { return vec3<f32>( 1.0,  1.0, -1.0); }
+    case 11u: { return vec3<f32>(-1.0,  1.0, -1.0); }
   }
 }
+
 
 // -----------------------------------------------------------------------------
 // 3D DDA: walk voxels along ray without skipping 1-voxel lights
@@ -197,7 +204,7 @@ fn gather_voxel_lights(
   let soft_r2 = soft_r * soft_r;
 
   for (var i: u32 = 0u; i < LIGHT_RAYS; i = i + 1u) {
-    var ldir = normalize(tbn * normalize(hemi_dir_local(i)));
+    var ldir = normalize(tbn * normalize(sphere_dir_local(i)));
 
     // optional: rotate around normal for de-patterning
     ldir = normalize(rot_about_axis(ldir, n, rot));
@@ -211,8 +218,10 @@ fn gather_voxel_lights(
       let r = sqrt(r2);
       let ldir_ws = L / r;
 
-      // Simple lambert (no wrap, no fill, no backside)
-      let ndl = max(dot(n, ldir_ws), 0.0);
+      // Half-lambert: keeps some energy even when the light is slightly behind the normal.
+      // This fakes a bit of bounce in caves without doing GI.
+      let ndl_raw = dot(n, ldir_ws);
+      let ndl = clamp(0.5 * ndl_raw + 0.5, 0.0, 1.0);
       if (ndl > 0.0) {
         // Softened inverse-square
         let falloff = 1.0 / (r2 + soft_r2);

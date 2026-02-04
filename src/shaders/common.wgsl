@@ -127,7 +127,7 @@ const CLOUD_UV_SCALE : f32       = 0.0016;
 const CLOUD_WIND     : vec2<f32> = vec2<f32>(0.020, 0.012);
 
 // Coverage thresholding (raise coverage => fewer clouds)
-const CLOUD_COVERAGE : f32 = 0.30;
+const CLOUD_COVERAGE : f32 = 0.40;
 const CLOUD_SOFTNESS : f32 = 0.08;
 
 // Density + shaping

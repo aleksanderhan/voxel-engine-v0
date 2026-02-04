@@ -177,12 +177,13 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   let amb_col      = hemi_ambient(hg.n, sky_up);
   let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
 
-  // NEW: kill ambient when no sky is visible
-  let sv = sky_visibility(hp_shadow); // or hp
+  let sv_raw = sky_visibility(hp_shadow);
+
+  // Keep a small ambient floor so caves aren’t pure black.
+  // 0.06..0.12 is a decent range.
+  let sv = max(sv_raw, 0.08);
 
   var ambient = amb_col * amb_strength * ao * sv;
-
-
   if (hg.mat == MAT_STONE) {
     ambient *= vec3<f32>(0.92, 0.95, 1.05);
   }
