@@ -156,9 +156,9 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   var base = color_for_material(hg.mat);
   base = apply_material_variation(base, hg.mat, hp);
 
-  let local_light = vec3<f32>(0.0);
+  var local_light = vec3<f32>(0.0);
   if (hg.t < 25.0) {
-    let local_light = gather_voxel_lights(
+    local_light = gather_voxel_lights(
       hp,
       hg.n,
       hg.root_bmin,
