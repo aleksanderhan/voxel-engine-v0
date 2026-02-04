@@ -682,7 +682,7 @@ impl App {
             EditMode::Dig => (hit_w.0, hit_w.1, hit_w.2, crate::world::materials::AIR),
 
             EditMode::Place(m) => {
-                let place_w = (hit_w.0 + enter_n.0, hit_w.1 + enter_n.1, hit_w.2 + enter_n.2);
+                let place_w = prev_w;
 
                 // Only place into empty space; never overwrite solids.
                 let place_mat = self.sample_voxel_material(place_w.0, place_w.1, place_w.2);
