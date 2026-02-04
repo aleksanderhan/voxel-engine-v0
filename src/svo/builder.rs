@@ -667,75 +667,124 @@ fn fill_material(
     BuildScratch::ensure_3d_u8(&mut scratch.material, ctx.side, AIR8);
 
     let side = ctx.side;
+    debug_assert!(side <= 64, "LUTs below assume chunk_size<=64");
     let side2 = side * side;
 
     let ground: &[i32] = &scratch.ground;
     let tree_top: &[i32] = &scratch.tree_top;
 
-    let cave_mask: &[u8] = &scratch.cave_mask;
-    let cave_shift: u32 = scratch.cave_shift;
-    let cave_dim: usize = scratch.cave_dim;
-
-
     // cave depth gate (same as before)
     let max_depth_vox: i32 = (48.0_f32 * (ctx.vpm as f32)).round() as i32;
 
-    scratch
-        .material
-        .par_chunks_mut(side2)
-        .enumerate()
-        .for_each(|(ly, slab)| {
-            if (ly & 7) == 0 && should_cancel(cancel) {
-                return;
+    // -------------------------------------------------------------------------
+    // Cave mask LUTs: avoid per-voxel shifts/mins + idx3()
+    // -------------------------------------------------------------------------
+    let cave_mask: &[u8] = &scratch.cave_mask;
+    let cave_dim: usize = scratch.cave_dim;
+    let cave_shift: u32 = scratch.cave_shift;
+
+    let caves_enabled = !cave_mask.is_empty() && cave_dim != 0;
+
+    // sx(lx), sz(lz), sy(ly)  (u8 is enough: cave_dim is 8 or 16 typically)
+    let mut sx_lut = [0u8; 64];
+    let mut sz_lut = [0u8; 64];
+    let mut sy_lut = [0u8; 64];
+
+    if caves_enabled {
+        let cdm1 = (cave_dim - 1) as usize;
+
+        for lx in 0..side {
+            sx_lut[lx] = ((lx >> cave_shift) as usize).min(cdm1) as u8;
+        }
+        for lz in 0..side {
+            sz_lut[lz] = ((lz >> cave_shift) as usize).min(cdm1) as u8;
+        }
+        for ly in 0..side {
+            sy_lut[ly] = ((ly >> cave_shift) as usize).min(cdm1) as u8;
+        }
+    }
+
+    // plane[col] = sz*dim + sx  (fits in u16)
+    let mut cave_plane: Vec<u16> = Vec::new();
+    if caves_enabled {
+        cave_plane.resize(side2, 0);
+        for lz in 0..side {
+            let sz = sz_lut[lz] as usize;
+            let row0 = lz * side;
+            for lx in 0..side {
+                let sx = sx_lut[lx] as usize;
+                cave_plane[row0 + lx] = (sz * cave_dim + sx) as u16;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Main fill (single-threaded: outer chunk build is already parallel)
+    // Layout: y-slabs contiguous, each slab length = side2.
+    // -------------------------------------------------------------------------
+    for ly in 0..side {
+        if (ly & 7) == 0 && should_cancel(cancel) {
+            return;
+        }
+
+        let wy = ctx.oy + ly as i32;
+
+        let slab0 = ly * side2;
+        let slab = &mut scratch.material[slab0..slab0 + side2];
+
+        let sy = if caves_enabled { sy_lut[ly] as usize } else { 0 };
+        let sy_off = sy * cave_dim * cave_dim;
+
+        // Each `col` corresponds to (lx = col % side, lz = col / side)
+        for col in 0..side2 {
+            let g = unsafe { *ground.get_unchecked(col) };
+
+            // 1) terrain (minimize branches)
+            let mut m: u8;
+            if wy < g {
+                if wy >= g - ctx.dirt_depth {
+                    m = DIRT8;
+                } else {
+                    m = STONE8;
+                }
+            } else if wy == g {
+                m = GRASS8;
+            } else {
+                m = AIR8;
             }
 
-            let wy = ctx.oy + ly as i32;
-
-            for lz in 0..side {
-                let row_off = lz * side;
-
-                for lx in 0..side {
-                    let col = row_off + lx;
-                    let g = ground[col];
-
-                    // 1) terrain
-                    let mut m: u8 = if wy < g {
-                        if wy >= g - ctx.dirt_depth { DIRT8 } else { STONE8 }
-                    } else if wy == g {
-                        GRASS8
-                    } else {
-                        AIR8
-                    };
-
-                    // 2) caves (depth gate)
-                    if m != AIR8 {
-                        let depth_vox = g - wy;
-                        if depth_vox >= 0 && depth_vox <= max_depth_vox {
-                            if cave_mask_at_shifted(cave_mask, cave_dim, cave_shift, lx, ly, lz) {
-                                m = AIR8;
-                            }
-                        }
+            // 2) caves (only if solid and within depth gate)
+            if caves_enabled && m != AIR8 {
+                let depth_vox = g - wy;
+                if depth_vox >= 0 && depth_vox <= max_depth_vox {
+                    let plane = unsafe { *cave_plane.get_unchecked(col) as usize };
+                    if unsafe { *cave_mask.get_unchecked(sy_off + plane) } != 0 {
+                        m = AIR8;
                     }
-
-                    // 3) trees overlay
-                    if m == AIR8 {
-                        let ttop = tree_top[col]; // -1 means no tree influence in this column
-                        if ttop >= 0 && (ly as i32) <= ttop {
-                            let tm = tree_material_local(lx, ly, lz);
-                            if tm != AIR8 {
-                                m = tm;
-                            }
-                        }
-                    }
-
-
-                    slab[row_off + lx] = m;
                 }
             }
-        });
+
+            // 3) trees overlay (only when AIR and this column is influenced)
+            if m == AIR8 {
+                let ttop = unsafe { *tree_top.get_unchecked(col) };
+                if ttop >= 0 && (ly as i32) <= ttop {
+                    let lx = col % side;
+                    let lz = col / side;
+
+                    let tm = tree_material_local(lx, ly, lz);
+                    if tm != AIR8 {
+                        m = tm;
+                    }
+                }
+            }
+
+            unsafe {
+                *slab.get_unchecked_mut(col) = m;
+            }
+        }
+    }
 
     // 4) apply edits (edits win)
-    // NOTE: your edits are chunk-local linear indices; this is O(#edits).
     for e in edits {
         let i = e.idx as usize;
         if i < scratch.material.len() {
@@ -745,14 +794,16 @@ fn fill_material(
 }
 
 
+
 fn build_cave_mask_coarse(
     gen: &WorldGen,
     ctx: ChunkCtx,
     scratch: &mut BuildScratch,
     cancel: &AtomicBool,
 ) {
-    // Tune: 2 = higher quality, 4 = much faster, 8 = very blocky but extremely fast.
-    let step: usize = 4;
+    // Adaptive: higher VPM => we can sample caves coarser.
+    // 4 = decent, 8 = much cheaper.
+    let step: usize = if ctx.vpm >= 8 { 8 } else { 4 };
 
     scratch.ensure_cave_mask(ctx.side, step);
 
@@ -763,46 +814,54 @@ fn build_cave_mask_coarse(
     let max_depth_vox: i32 = (48.0_f32 * (ctx.vpm as f32)).round() as i32;
 
     let ground = &scratch.ground;
+    let out = &mut scratch.cave_mask;
 
-    scratch
-        .cave_mask
-        .par_chunks_mut(dim * dim) // y-slabs in the coarse grid
-        .enumerate()
-        .for_each(|(sy, slab)| {
-            if (sy & 3) == 0 && should_cancel(cancel) {
-                return;
-            }
+    // Precompute center coords in voxel-space for sx/sz/sy to avoid min() in inner loops.
+    // dim is tiny (8 or 16), so this is basically free.
+    let mut centers: Vec<usize> = Vec::with_capacity(dim);
+    for s in 0..dim {
+        let c = s * step + (step / 2);
+        centers.push(c.min(side - 1));
+    }
 
-            // center voxel y for this coarse slab
-            let cy = (sy * step + (step / 2)).min(side - 1);
-            let wy = ctx.oy + cy as i32;
+    let plane = dim * dim;
 
-            for sz in 0..dim {
-                let row_off = sz * dim;
+    for sy in 0..dim {
+        if (sy & 3) == 0 && should_cancel(cancel) {
+            return;
+        }
 
-                // center voxel z for this coarse cell row
-                let cz = (sz * step + (step / 2)).min(side - 1);
-                let wz = ctx.oz + cz as i32;
+        let cy = centers[sy];
+        let wy = ctx.oy + cy as i32;
 
-                for sx in 0..dim {
-                    // center voxel x for this coarse cell
-                    let cx = (sx * step + (step / 2)).min(side - 1);
-                    let wx = ctx.ox + cx as i32;
+        let slab0 = sy * plane;
 
-                    // depth gate using cached ground height at (cx, cz)
-                    let g = unsafe { *ground.get_unchecked(idx_xz(side, cx, cz)) };
-                    let depth_vox = g - wy;
+        for sz in 0..dim {
+            let cz = centers[sz];
+            let wz = ctx.oz + cz as i32;
 
-                    let carve = if depth_vox > 0 && depth_vox <= max_depth_vox {
-                        gen.carve_cave(wx, wy, wz, g)
-                    } else {
-                        false
-                    };
+            let row0 = slab0 + sz * dim;
 
-                    slab[row_off + sx] = carve as u8;
+            for sx in 0..dim {
+                let cx = centers[sx];
+                let wx = ctx.ox + cx as i32;
+
+                // depth gate using cached ground height at (cx, cz)
+                let g = unsafe { *ground.get_unchecked(idx_xz(side, cx, cz)) };
+                let depth_vox = g - wy;
+
+                let carve = if depth_vox > 0 && depth_vox <= max_depth_vox {
+                    gen.carve_cave(wx, wy, wz, g)
+                } else {
+                    false
+                };
+
+                unsafe {
+                    *out.get_unchecked_mut(row0 + sx) = carve as u8;
                 }
             }
-        });
+        }
+    }
 }
 
 

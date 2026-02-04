@@ -56,115 +56,84 @@ pub fn prefix_pass_x(prefix: &mut [u32], material: &[u8], side: usize, cancel: &
     let dim = side + 1;
     let plane = dim * dim;
 
-    // Parallelize by z-plane (coarse tasks), do y-rows sequentially inside.
-    prefix
-        .par_chunks_mut(plane)
-        .enumerate()
-        .for_each(|(z, slab)| {
-            // boundary plane z=0 stays 0
-            if z == 0 || z > side {
-                return;
-            }
-            if (z & 7) == 0 && should_cancel(cancel) {
-                return;
-            }
+    for z in 1..=side {
+        if (z & 7) == 0 && should_cancel(cancel) {
+            return;
+        }
 
-            // y=0 boundary row stays 0
-            for y in 1..=side {
-                // prefix row slice for this (y,z): x contiguous
-                let row = &mut slab[y * dim .. (y + 1) * dim];
+        let slab0 = z * plane;
+        let slab = &mut prefix[slab0..slab0 + plane];
 
-                let base_m = ((y - 1) * side * side) + ((z - 1) * side);
+        for y in 1..=side {
+            // prefix row slice for this (y,z): x contiguous
+            let row = &mut slab[y * dim..(y + 1) * dim];
 
-                let mut run: u32 = 0;
-                row[0] = 0;
+            let base_m = ((y - 1) * side * side) + ((z - 1) * side);
 
-                for x in 1..=side {
-                    let m = unsafe { *material.get_unchecked(base_m + (x - 1)) };
-                    run += (m != (AIR as u8)) as u32;
-                    row[x] = run;
+            let mut run: u32 = 0;
+            row[0] = 0;
+
+            // x = 1..=side writes row[x]
+            for x in 1..=side {
+                let m = unsafe { *material.get_unchecked(base_m + (x - 1)) };
+                run += (m != (AIR as u8)) as u32;
+                unsafe {
+                    *row.get_unchecked_mut(x) = run;
                 }
             }
-        });
+        }
+    }
 }
-
-
 
 /// Pass 2: prefix along Y within each Z-plane.
 pub fn prefix_pass_y(prefix: &mut [u32], side: usize, cancel: &AtomicBool) {
     let dim = side + 1;
     let plane = dim * dim;
 
-    prefix
-        .par_chunks_mut(plane)
-        .enumerate()
-        .for_each(|(z, slab)| {
-            if z == 0 || z > side {
-                return;
-            }
-            if (z & 7) == 0 && should_cancel(cancel) {
-                return;
-            }
+    for z in 1..=side {
+        if (z & 7) == 0 && should_cancel(cancel) {
+            return;
+        }
 
-            for x in 1..=side {
-                let mut run: u32 = 0;
-                for y in 1..=side {
-                    let idx = y * dim + x;
-                    run += slab[idx];
-                    slab[idx] = run;
+        let slab0 = z * plane;
+        let slab = &mut prefix[slab0..slab0 + plane];
+
+        for x in 1..=side {
+            let mut run: u32 = 0;
+            for y in 1..=side {
+                let idx = y * dim + x;
+                unsafe {
+                    run += *slab.get_unchecked(idx);
+                    *slab.get_unchecked_mut(idx) = run;
                 }
             }
-        });
+        }
+    }
 }
 
+
 /// Pass 3: prefix along Z: prefix[x,y,z] += prefix[x,y,z-1].
-/// Much faster than launching a Rayon job per z-slice.
-/// Pass 3: prefix along Z: prefix[x,y,z] += prefix[x,y,z-1].
-/// Parallelized by x-columns (disjoint writes), z sequential in each column.
 pub fn prefix_pass_z(prefix: &mut [u32], side: usize, cancel: &AtomicBool) {
     let dim = side + 1;
     let plane = dim * dim;
 
-    // Split prefix into per-plane mutable slices (each plane is independent for writes at fixed z),
-    // BUT we need z dependency, so we keep whole prefix and parallelize by x using a scope.
-    rayon::scope(|s| {
-        // chunk x range into blocks
-        const X_BLOCK: usize = 4;
-        let mut x0 = 1;
-        while x0 <= side {
-            let x1 = (x0 + X_BLOCK - 1).min(side);
-            let xs = x0..=x1;
-
-            // SAFETY: tasks are disjoint by x, so they write disjoint indices.
-            // We avoid capturing &mut prefix directly by using a raw ptr *inside* the scope
-            // but we do NOT share the ptr type across threads; we pass it as usize.
-            let p = prefix.as_mut_ptr() as usize;
-
-            s.spawn(move |_| {
-                if should_cancel(cancel) {
-                    return;
-                }
-
-                let p = p as *mut u32;
-
-                for x in xs {
-                    for y in 1..=side {
-                        let base = y * dim + x;
-                        let mut run = unsafe { *p.add(base) };
-                        for z in 1..=side {
-                            let idx = z * plane + base;
-                            unsafe {
-                                run += *p.add(idx);
-                                *p.add(idx) = run;
-                            }
-                        }
-                    }
-                }
-            });
-
-            x0 = x1 + 1;
+    for x in 1..=side {
+        if (x & 7) == 0 && should_cancel(cancel) {
+            return;
         }
-    });
+        for y in 1..=side {
+            let base = y * dim + x;
+            let mut run = unsafe { *prefix.get_unchecked(base) };
+            for z in 1..=side {
+                let idx = z * plane + base;
+                unsafe {
+                    run += *prefix.get_unchecked(idx);
+                    *prefix.get_unchecked_mut(idx) = run;
+                }
+            }
+        }
+    }
 }
+
 
 

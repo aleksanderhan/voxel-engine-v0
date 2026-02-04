@@ -97,41 +97,38 @@ fn build_level_bottom_up(
 
 
     // 1) Compute child masks (parallel-friendly, deterministic storage)
-    mask_dense
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(pi, out_mask)| {
-            if (pi & 4095) == 0 && should_cancel(cancel) {
-                return;
+    for pi in 0..parent_cells {
+        if (pi & 4095) == 0 && should_cancel(cancel) {
+            break;
+        }
+
+        let (px, py, pz) = coord_from_linear(pi, parent_side);
+
+        let cx0 = px * 2;
+        let cy0 = py * 2;
+        let cz0 = pz * 2;
+
+        let mut m: u8 = 0;
+
+        for ci in 0u32..8u32 {
+            let dx = (ci & 1) as usize;
+            let dy = ((ci >> 1) & 1) as usize;
+            let dz = ((ci >> 2) & 1) as usize;
+
+            let cx = cx0 + dx;
+            let cy = cy0 + dy;
+            let cz = cz0 + dz;
+
+            let c_lin = idx_xyz(child_side, cx, cy, cz);
+            let c_idx = unsafe { *child_idx_grid.get_unchecked(c_lin) };
+            if c_idx != INVALID {
+                m |= 1u8 << ci;
             }
+        }
 
-            let (px, py, pz) = coord_from_linear(pi, parent_side);
+        mask_dense[pi] = m;
+    }
 
-            let cx0 = px * 2;
-            let cy0 = py * 2;
-            let cz0 = pz * 2;
-
-            let mut m: u8 = 0;
-
-            // ci bits: x=1, y=2, z=4
-            for ci in 0u32..8u32 {
-                let dx = (ci & 1) as usize;
-                let dy = ((ci >> 1) & 1) as usize;
-                let dz = ((ci >> 2) & 1) as usize;
-
-                let cx = cx0 + dx;
-                let cy = cy0 + dy;
-                let cz = cz0 + dz;
-
-                let c_lin = idx_xyz(child_side, cx, cy, cz);
-                let c_idx = unsafe { *child_idx_grid.get_unchecked(c_lin) };
-                if c_idx != INVALID {
-                    m |= 1u8 << ci;
-                }
-            }
-
-            *out_mask = m;
-        });
 
     if should_cancel(cancel) {
         return (Vec::new(), Vec::new(), Vec::new());
@@ -148,46 +145,43 @@ fn build_level_bottom_up(
 
     // 2) Optional collapse-to-stone decision (only where it can trigger)
     //    We avoid prefix_sum_cube() unless y1 < gmin - dirt_depth.
-    collapse_stone_dense
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(pi, out_flag)| {
-            let m = mask_dense[pi];
-            if m == 0 {
-                *out_flag = 0;
-                return;
-            }
+    for pi in 0..parent_cells {
+        if (pi & 4095) == 0 && should_cancel(cancel) {
+            break;
+        }
 
-            if (pi & 4095) == 0 && should_cancel(cancel) {
-                return;
-            }
+        let m = mask_dense[pi];
+        if m == 0 {
+            collapse_stone_dense[pi] = 0;
+            continue;
+        }
 
-            let (px, py, pz) = coord_from_linear(pi, parent_side);
+        let (px, py, pz) = coord_from_linear(pi, parent_side);
 
-            let ox = (px as i32) * parent_size;
-            let oy = (py as i32) * parent_size;
-            let oz = (pz as i32) * parent_size;
+        let ox = (px as i32) * parent_size;
+        let oy = (py as i32) * parent_size;
+        let oz = (pz as i32) * parent_size;
 
-            let (gmin, _gmax) = ground_mip.query(ox, oz, parent_size as u32);
-            let y0 = chunk_oy + oy;
-            let y1 = y0 + parent_size - 1;
+        let (gmin, _gmax) = ground_mip.query(ox, oz, parent_size as u32);
+        let y0 = chunk_oy + oy;
+        let y1 = y0 + parent_size - 1;
 
-            if y1 >= gmin - dirt_depth {
-                *out_flag = 0;
-                return;
-            }
+        if y1 >= gmin - dirt_depth {
+            collapse_stone_dense[pi] = 0;
+            continue;
+        }
 
-            // Only here do we pay prefix_sum_cube().
-            let sx = ox as usize;
-            let sy = oy as usize;
-            let sz = oz as usize;
-            let s = parent_size as usize;
+        let sx = ox as usize;
+        let sy = oy as usize;
+        let sz = oz as usize;
+        let s = parent_size as usize;
 
-            let sum = prefix_sum_cube(prefix, side_vox, sx, sy, sz, s);
-            let full = (s * s * s) as u32;
+        let sum = prefix_sum_cube(prefix, side_vox, sx, sy, sz, s);
+        let full = (s * s * s) as u32;
 
-            *out_flag = if sum == full { 1 } else { 0 };
-        });
+        collapse_stone_dense[pi] = if sum == full { 1 } else { 0 };
+    }
+
 
     if should_cancel(cancel) {
         return (Vec::new(), Vec::new(), Vec::new());
@@ -374,23 +368,20 @@ pub fn build_svo_bottom_up(
     scratch.block_offsets.resize(nb, 0);
 
     // Pass 1: count solid voxels per block (parallel)
-    scratch
-        .block_counts
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(bi, out)| {
-            if (bi & 63) == 0 && should_cancel(cancel) {
-                return;
-            }
-            let i0 = bi * BLOCK;
-            let i1 = (i0 + BLOCK).min(n);
+    for bi in 0..nb {
+        if (bi & 63) == 0 && should_cancel(cancel) {
+            break;
+        }
+        let i0 = bi * BLOCK;
+        let i1 = (i0 + BLOCK).min(n);
 
-            let mut c: u32 = 0;
-            for i in i0..i1 {
-                c += (material[i] != (AIR as u8)) as u32;
-            }
-            *out = c;
-        });
+        let mut c: u32 = 0;
+        for i in i0..i1 {
+            c += (material[i] != (AIR as u8)) as u32;
+        }
+        scratch.block_counts[bi] = c;
+    }
+
 
     if should_cancel(cancel) {
         return Vec::new();
@@ -420,51 +411,35 @@ pub fn build_svo_bottom_up(
     let idx_ptr = scratch.child_idx_grid.as_mut_ptr() as usize;
     let node_ptr = scratch.child_nodes.as_mut_ptr() as usize;
 
-    scratch
-        .block_counts
-        .par_iter()
-        .zip(scratch.block_offsets.par_iter())
-        .enumerate()
-        .for_each(|(bi, (&count, &base))| {
-            if count == 0 {
-                return;
-            }
-            if (bi & 63) == 0 && should_cancel(cancel) {
-                return;
-            }
+    for bi in 0..nb {
+        let count = scratch.block_counts[bi];
+        if count == 0 { continue; }
+        if (bi & 63) == 0 && should_cancel(cancel) {
+            break;
+        }
 
-            let i0 = bi * BLOCK;
-            let i1 = (i0 + BLOCK).min(n);
+        let base = scratch.block_offsets[bi];
+        let i0 = bi * BLOCK;
+        let i1 = (i0 + BLOCK).min(n);
 
-            let idx_ptr = idx_ptr as *mut u32;
-            let node_ptr = node_ptr as *mut NodeGpu;
+        let mut local: u32 = 0;
+        for i in i0..i1 {
+            let m = unsafe { *material.get_unchecked(i) };
+            if m == (AIR as u8) { continue; }
 
-            let mut local: u32 = 0;
-            for i in i0..i1 {
-                let m = unsafe { *material.get_unchecked(i) };
-                if m == (AIR as u8) {
-                    continue;
-                }
+            let out_idx = base + local;
+            local += 1;
 
-                let out_idx = base + local;
-                local += 1;
+            scratch.child_idx_grid[i] = out_idx;
 
-                unsafe {
-                    // i is unique per block => disjoint writes across threads
-                    *idx_ptr.add(i) = out_idx;
-                }
+            let (x, y, z) = coord_from_linear(i, side_vox);
+            scratch.child_nodes[out_idx as usize] =
+                make_leaf(chunk_size, x as i32, y as i32, z as i32, 1, m as u32);
+        }
 
-                let (x, y, z) = coord_from_linear(i, side_vox);
-                let leaf = make_leaf(chunk_size, x as i32, y as i32, z as i32, 1, m as u32);
+        debug_assert_eq!(local, count);
+    }
 
-                unsafe {
-                    // out_idx range [base..base+count) is unique per block => disjoint writes
-                    *node_ptr.add(out_idx as usize) = leaf;
-                }
-            }
-
-            debug_assert_eq!(local, count);
-        });
 
     if should_cancel(cancel) {
         return Vec::new();
