@@ -671,13 +671,13 @@ impl App {
         let max_dist_m = 80.0;
         let voxel = config::VOXEL_SIZE_M_F32;
 
-        let Some((hit_w, prev_w, enter_n)) = self.raycast_voxel(eye, dir, max_dist_m, voxel) else {
+        let Some((hit_w, place_w, enter_n)) = self.raycast_voxel(eye, dir, max_dist_m, voxel) else {
             return;
         };
 
-
-        let hit_mat = self.sample_voxel_material(hit_w.0, hit_w.1, hit_w.2);
-        println!("hit voxel {:?} mat={}", hit_w, hit_mat);
+        println!("HIT  = {:?} mat={}", hit_w, self.sample_voxel_material(hit_w.0, hit_w.1, hit_w.2));
+        println!("PLACE= {:?} mat={}", place_w, self.sample_voxel_material(place_w.0, place_w.1, place_w.2));
+        println!("enter_n = {:?}", enter_n);
 
         // Decide edit operation.
         // Rule:
@@ -687,11 +687,15 @@ impl App {
             EditMode::Dig => (hit_w.0, hit_w.1, hit_w.2, crate::world::materials::AIR),
 
             EditMode::Place(m) => {
-                let place_w = prev_w;
+                // Absolute guarantee: we never write into hit voxel when placing.
+                if place_w == hit_w {
+                    panic!("BUG: place_w == hit_w  hit={:?} place={:?} enter_n={:?}", hit_w, place_w, enter_n);
+                }
 
-                // Only place into empty space; never overwrite solids.
+                // Only place into empty.
                 let place_mat = self.sample_voxel_material(place_w.0, place_w.1, place_w.2);
-                if place_mat != crate::world::materials::AIR {
+                if place_mat != AIR {
+                    println!("blocked: place_w {:?} is not AIR (mat={})", place_w, place_mat);
                     return;
                 }
 
@@ -711,6 +715,18 @@ impl App {
         // write edit override
         self.chunks.edits.apply_voxel(key, lx, ly, lz, mat);
 
+        let (hit_key, hit_lx, hit_ly, hit_lz) =
+            crate::world::edits::voxel_to_chunk_local(&self.world, hit_w.0, hit_w.1, hit_w.2);
+        let (pl_key, pl_lx, pl_ly, pl_lz) =
+            crate::world::edits::voxel_to_chunk_local(&self.world, tx, ty, tz);
+
+        let hit_override = self.chunks.edits.get_override(hit_key, hit_lx, hit_ly, hit_lz);
+        let pl_override  = self.chunks.edits.get_override(pl_key, pl_lx, pl_ly, pl_lz);
+
+        println!("override hit  {:?} local=({}, {}, {}) -> {:?}", hit_key, hit_lx, hit_ly, hit_lz, hit_override);
+        println!("override place {:?} local=({}, {}, {}) -> {:?}", pl_key, pl_lx, pl_ly, pl_lz, pl_override);
+
+
         let verify = self.chunks.edits.get_override(key, lx, ly, lz);
         println!(
             "edit verify key={:?} local=({}, {}, {}) wrote={} readback={:?}",
@@ -721,7 +737,6 @@ impl App {
         self.enqueue_chunk_rebuild_now(key);
     }
 
-
     fn raycast_voxel(
         &self,
         origin_m: glam::Vec3,
@@ -730,9 +745,11 @@ impl App {
         voxel_m: f32,
     ) -> Option<((i32, i32, i32), (i32, i32, i32), (i32, i32, i32))> {
         let dir = dir_m.normalize();
-        let mut t = 0.0f32;
 
-        // start voxel
+        // Nudge origin slightly along the ray to avoid starting exactly on voxel boundaries.
+        let origin_m = origin_m + dir * (voxel_m * 1e-4);
+
+        // Start voxel (cell containing origin)
         let mut vx = (origin_m.x / voxel_m).floor() as i32;
         let mut vy = (origin_m.y / voxel_m).floor() as i32;
         let mut vz = (origin_m.z / voxel_m).floor() as i32;
@@ -765,45 +782,74 @@ impl App {
             (next_boundary(vz, step_z) - origin_m.z) / dir.z
         };
 
-        let t_delta_x = if dir.x.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.x.abs() };
-        let t_delta_y = if dir.y.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.y.abs() };
-        let t_delta_z = if dir.z.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.z.abs() };
-
-        // prev voxel + the face normal used to ENTER the current voxel
-        let mut prev = (vx, vy, vz);
-        let mut enter_n = (0, 0, 0);
+        let t_delta_x = if dir.x.abs() < 1e-6 {
+            f32::INFINITY
+        } else {
+            voxel_m / dir.x.abs()
+        };
+        let t_delta_y = if dir.y.abs() < 1e-6 {
+            f32::INFINITY
+        } else {
+            voxel_m / dir.y.abs()
+        };
+        let t_delta_z = if dir.z.abs() < 1e-6 {
+            f32::INFINITY
+        } else {
+            voxel_m / dir.z.abs()
+        };
 
         let max_t = max_dist_m;
+        let mut t = 0.0f32;
 
+        // Deterministic single-axis stepping:
+        // - We step EXACTLY ONE axis per iteration.
+        // - On ties we use a stable priority (X then Y then Z).
+        // This removes edge/corner ambiguity that causes placement to "flip".
         for _ in 0..512 {
-            // If current voxel is solid, we hit it.
-            if self.sample_voxel_material(vx, vy, vz) != crate::world::materials::AIR {
-                return Some(((vx, vy, vz), prev, enter_n));
+            // Choose next crossing axis (stable tie-break)
+            let mut axis = 0; // 0=x, 1=y, 2=z
+            let mut t_next = t_max_x;
+
+            if t_max_y < t_next || (t_max_y == t_next && axis > 1) {
+                axis = 1;
+                t_next = t_max_y;
+            }
+            if t_max_z < t_next || (t_max_z == t_next && axis > 2) {
+                axis = 2;
+                t_next = t_max_z;
             }
 
-            // Current voxel is air => it becomes "prev" before stepping into the next voxel
-            prev = (vx, vy, vz);
-
-            // Advance along smallest t_max; record which face we crossed.
-            if t_max_x < t_max_y && t_max_x < t_max_z {
-                vx += step_x;
-                t = t_max_x;
-                t_max_x += t_delta_x;
-                enter_n = (-step_x, 0, 0); // we entered new cell through its -/+X face
-            } else if t_max_y < t_max_z {
-                vy += step_y;
-                t = t_max_y;
-                t_max_y += t_delta_y;
-                enter_n = (0, -step_y, 0);
-            } else {
-                vz += step_z;
-                t = t_max_z;
-                t_max_z += t_delta_z;
-                enter_n = (0, 0, -step_z);
-            }
-
-            if t > max_t {
+            if t_next > max_t {
                 break;
+            }
+
+            // Step exactly one axis, and set enter_n to the face we crossed.
+            let enter_n = match axis {
+                0 => {
+                    vx += step_x;
+                    t_max_x += t_delta_x;
+                    (-step_x, 0, 0)
+                }
+                1 => {
+                    vy += step_y;
+                    t_max_y += t_delta_y;
+                    (0, -step_y, 0)
+                }
+                _ => {
+                    vz += step_z;
+                    t_max_z += t_delta_z;
+                    (0, 0, -step_z)
+                }
+            };
+
+            t = t_next;
+
+            // Now inside the newly-entered voxel.
+            if self.sample_voxel_material(vx, vy, vz) != AIR {
+                let hit_w = (vx, vy, vz);
+                // Place in the adjacent voxel on the entered face (outside the solid).
+                let place_w = (vx + enter_n.0, vy + enter_n.1, vz + enter_n.2);
+                return Some((hit_w, place_w, enter_n));
             }
         }
 

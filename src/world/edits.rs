@@ -13,6 +13,13 @@ use crate::app::config;
 use crate::streaming::types::ChunkKey;
 use crate::world::WorldGen;
 
+#[inline(always)]
+pub fn idx_xyz(lx: i32, ly: i32, lz: i32, cs: i32) -> u32 {
+    // Choose ONE layout and use it everywhere.
+    // I strongly recommend x + y*cs + z*cs*cs (x,y,z) because it's the usual row-major 3D.
+    (lx as u32) + (ly as u32) * (cs as u32) + (lz as u32) * (cs as u32) * (cs as u32)
+}
+
 #[inline]
 pub fn voxel_to_chunk_local(
     _world: &WorldGen,
