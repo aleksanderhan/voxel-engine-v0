@@ -21,8 +21,8 @@
 // Tunables
 // -----------------------------------------------------------------------------
 
-const LIGHT_MAX_DIST_VOX : u32 = 72u;   // shorter is cheaper (try 24..64)
-const LIGHT_RAYS         : u32 = 12u;    // 6..12 is usually enough
+const LIGHT_MAX_DIST_VOX : u32 = 32u;   // shorter is cheaper (try 24..64)
+const LIGHT_RAYS         : u32 = 8u;    // 6..12 is usually enough
 const LIGHT_INTENSITY    : f32 = 60.0;  // tune for your scene scale
 
 // Softens 1/r^2 so it doesn't blow up near the source.

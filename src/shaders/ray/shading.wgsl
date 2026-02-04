@@ -49,45 +49,60 @@ fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f3
   return clamp(c, vec3<f32>(0.0), vec3<f32>(1.5));
 }
 
-fn voxel_ao_local(
+// Small helper: macro bit test at position p
+// returns 1.0 if occupied, 0.0 if empty
+fn occ_at(p: vec3<f32>, root_bmin: vec3<f32>, root_size: f32, macro_base: u32) -> f32 {
+  let cell = macro_cell_size(root_size);
+  let lp   = p - root_bmin;
+
+  // macro coords 0..7
+  let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
+  let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
+  let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
+
+  let bit = macro_bit_index(mx, my, mz);
+  return select(0.0, 1.0, macro_test(macro_base, bit));
+}
+
+// --- NEW: ultra-cheap AO using only macro occupancy bits ---
+// 4 taps instead of 6, and no SVO descent.
+// If macro_base is INVALID => returns 1 (no occlusion info available).
+fn voxel_ao_macro4(
   hp: vec3<f32>,
   n: vec3<f32>,
   root_bmin: vec3<f32>,
   root_size: f32,
-  node_base: u32,
   macro_base: u32
 ) -> f32 {
-  let r = 0.75 * cam.voxel_params.x;
+  if (macro_base == INVALID_U32) { return 1.0; }
 
+  let vs = cam.voxel_params.x;
+
+  // AO radius: tie it to macro cell size (AO is low-frequency anyway)
+  let cell = macro_cell_size(root_size);
+  let r = max(0.75 * cell, 1.25 * vs);
+
+  // Build a stable TBN
   let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
   let t = normalize(cross(up_ref, n));
   let b = normalize(cross(n, t));
 
-  var occ = 0.0;
+  // 4 taps: +/-t, +/-b (you can swap one for +n if you prefer)
+  var occ: f32 = 0.0;
 
-  let q0 = query_leaf_at(hp + t * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q0.mat != MAT_AIR);
+  // Nudge off surface
+  let p0 = hp + n * (0.75 * vs);
 
-  let q1 = query_leaf_at(hp - t * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q1.mat != MAT_AIR);
+  occ += occ_at(p0 + t * r, root_bmin, root_size, macro_base);
+  occ += occ_at(p0 - t * r, root_bmin, root_size, macro_base);
+  occ += occ_at(p0 + b * r, root_bmin, root_size, macro_base);
+  occ += occ_at(p0 - b * r, root_bmin, root_size, macro_base);
 
-  let q2 = query_leaf_at(hp + b * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q2.mat != MAT_AIR);
-
-  let q3 = query_leaf_at(hp - b * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q3.mat != MAT_AIR);
-
-  let h0 = normalize(n + 0.65 * t + 0.35 * b);
-  let q4 = query_leaf_at(hp + h0 * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q4.mat != MAT_AIR);
-
-  let h1 = normalize(n - 0.65 * t + 0.35 * b);
-  let q5 = query_leaf_at(hp + h1 * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q5.mat != MAT_AIR);
-
-  let occ_n = occ * (1.0 / 6.0);
+  // Map 0..4 -> AO. Tune the 0.70 if you want darker/lighter.
+  let occ_n = occ * 0.25;
   return clamp(1.0 - 0.70 * occ_n, 0.35, 1.0);
 }
+
 
 fn fresnel_schlick(ndv: f32, f0: f32) -> f32 {
   return f0 + (1.0 - f0) * pow(1.0 - clamp(ndv, 0.0, 1.0), 5.0);
@@ -141,14 +156,17 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   var base = color_for_material(hg.mat);
   base = apply_material_variation(base, hg.mat, hp);
 
-  let local_light = gather_voxel_lights(
-    hp,
-    hg.n,
-    hg.root_bmin,
-    hg.root_size,
-    hg.node_base,
-    hg.macro_base
-  );
+  let local_light = vec3<f32>(0.0);
+  if (hg.t < 25.0) {
+    let local_light = gather_voxel_lights(
+      hp,
+      hg.n,
+      hg.root_bmin,
+      hg.root_size,
+      hg.node_base,
+      hg.macro_base
+    );
+  }
 
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
@@ -172,7 +190,16 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
   // AO for voxels: only when the hit is a real voxel hit (not sky / miss)
-  let ao = select(1.0, voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base), hg.hit != 0u);
+  // Optional distance gate: AO fades out / skips far away
+  var ao = 1.0;
+  if (hg.hit != 0u) {
+    // If you want, gate AO by distance to cut work further:
+    // AO is mostly noticeable near camera anyway.
+    if (hg.t < 45.0) {
+      ao = voxel_ao_macro4(hp, hg.n, hg.root_bmin, hg.root_size, hg.macro_base);
+    }
+  }
+
 
   let amb_col      = hemi_ambient(hg.n, sky_up);
   let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
