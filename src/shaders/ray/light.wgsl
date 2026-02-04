@@ -17,7 +17,7 @@
 //// Voxel light sources (local lighting from MAT_LIGHT voxels)
 //// --------------------------------------------------------------------------
 
-const LIGHT_MAX_DIST_VOX : f32 = 48.0; // reach in voxels
+const LIGHT_MAX_DIST_VOX : f32 = 64.0; // reach in voxels
 const LIGHT_RAYS         : u32 = 32u;  // # of probe rays (tune 12..64)
 const LIGHT_STEPS        : u32 = u32(LIGHT_MAX_DIST_VOX);  // steps along each ray
 const LIGHT_INTENSITY    : f32 = 128.0; // overall brightness (tune)
@@ -126,12 +126,10 @@ fn light_visibility_segment(
 
     // Sample at voxel center in world space
     let center_ws = root_bmin + (vec3<f32>(f32(ix), f32(iy), f32(iz)) + vec3<f32>(0.5)) * vs;
-    let leaf = query_leaf_at(center_ws, root_bmin, root_size, node_base, macro_base);
+    let leaf = query_leaf_world(center_ws);
 
     // Blocked by any solid that isn't the light material itself
-    if (leaf.mat != MAT_AIR && leaf.mat != MAT_LIGHT) {
-      return 0.0;
-    }
+    if (leaf.mat != MAT_AIR && leaf.mat != MAT_LIGHT) { return 0.0; }
 
     // Advance to next voxel boundary
     if (tMaxX < tMaxY) {
@@ -175,7 +173,7 @@ fn gather_voxel_lights(
 
   // Tunables (keep your constants, but this version is less sensitive)
   let max_dist_vox: f32 = LIGHT_MAX_DIST_VOX;
-  let falloff_radius = 10.0 * vs;                // a bit larger helps caves feel “filled”
+  let falloff_radius = 24.0 * vs;                // a bit larger helps caves feel “filled”
   let inv_r2 = 1.0 / max(falloff_radius * falloff_radius, 1e-6);
 
   var sum = vec3<f32>(0.0);
@@ -194,7 +192,7 @@ fn gather_voxel_lights(
       let p = p0 + ldir_ws * (t_vox * vs);
 
       // Query leaf at this sample point
-      let leaf = query_leaf_at(p, root_bmin, root_size, node_base, macro_base);
+      let leaf = query_leaf_world(p);
 
       // If we hit solid that isn't light: ray is blocked
       if (leaf.mat != MAT_AIR && leaf.mat != MAT_LIGHT) {

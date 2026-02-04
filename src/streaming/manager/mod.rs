@@ -402,7 +402,9 @@ impl StreamTimingWindow {
         self.bt_sum.tree_top      += tim.tree_top;
         self.bt_sum.tree_mip      += tim.tree_mip;
         self.bt_sum.material_fill += tim.material_fill;
+        self.bt_sum.cave_mask     += tim.cave_mask;
         self.bt_sum.colinfo       += tim.colinfo;
+        self.bt_sum.colinfo_pack  += tim.colinfo_pack;
         self.bt_sum.prefix_x      += tim.prefix_x;
         self.bt_sum.prefix_y      += tim.prefix_y;
         self.bt_sum.prefix_z      += tim.prefix_z;
@@ -419,7 +421,9 @@ impl StreamTimingWindow {
         self.bt_max.tree_top      = self.bt_max.tree_top.max(tim.tree_top);
         self.bt_max.tree_mip      = self.bt_max.tree_mip.max(tim.tree_mip);
         self.bt_max.material_fill = self.bt_max.material_fill.max(tim.material_fill);
+        self.bt_max.cave_mask     = self.bt_max.cave_mask.max(tim.cave_mask);
         self.bt_max.colinfo       = self.bt_max.colinfo.max(tim.colinfo);
+        self.bt_max.colinfo_pack  = self.bt_max.colinfo_pack.max(tim.colinfo_pack);
         self.bt_max.prefix_x      = self.bt_max.prefix_x.max(tim.prefix_x);
         self.bt_max.prefix_y      = self.bt_max.prefix_y.max(tim.prefix_y);
         self.bt_max.prefix_z      = self.bt_max.prefix_z.max(tim.prefix_z);

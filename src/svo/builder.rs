@@ -42,7 +42,9 @@ pub struct BuildTimingsMs {
     pub tree_top: f64,
     pub tree_mip: f64,
     pub material_fill: f64,
-    pub colinfo: f64,
+    pub cave_mask: f64,
+    pub colinfo: f64, // build_col_tops
+    pub colinfo_pack: f64, // build_colinfo_words
     pub prefix_x: f64,
     pub prefix_y: f64,
     pub prefix_z: f64,
@@ -237,6 +239,13 @@ pub struct BuildScratch {
     cave_dim: usize,      // side / step
 
     svo: svo::SvoScratch,
+
+    hm: Vec<i32>,
+    hm_w: usize,
+    hm_h: usize,
+    hm_xm0: i32,
+    hm_zm0: i32,
+    hm_valid: bool,
 }
 
 impl BuildScratch {
@@ -261,7 +270,24 @@ impl BuildScratch {
             cave_shift: 0,
             cave_dim: 0,
             svo: svo::SvoScratch::new(),
+            hm: Vec::new(),
+            hm_w: 0,
+            hm_h: 0,
+            hm_xm0: 0,
+            hm_zm0: 0,
+            hm_valid: false,
+
         }
+    }
+
+    #[inline]
+    fn ensure_hm(&mut self, w: usize, h: usize) {
+        let need = w * h;
+        if self.hm.len() != need {
+            self.hm.resize(need, 0);
+        }
+        self.hm_w = w;
+        self.hm_h = h;
     }
 
     #[inline]
@@ -337,13 +363,11 @@ fn build_height_cache<'g>(
     tim: &mut BuildTimingsMs,
 ) -> HeightSampler<'g> {
     // Only cache the chunk footprint (+ optional small margin).
-    // If you want a tiny safety halo, set margin_vox = ctx.vpm (1 meter).
     let margin_vox: i32 = 0;
 
     let cache_x0 = ctx.ox - margin_vox;
     let cache_z0 = ctx.oz - margin_vox;
 
-    // inclusive max (so +1 sizing)
     let cache_x1 = ctx.ox + (ctx.size_i - 1) + margin_vox;
     let cache_z1 = ctx.oz + (ctx.size_i - 1) + margin_vox;
 
@@ -362,33 +386,127 @@ fn build_height_cache<'g>(
         tim.cache_w = cache_w as u32;
         tim.cache_h = cache_h as u32;
 
-        let step_m = config::VOXEL_SIZE_M_F64;
-        let x0m = (cache_x0 as f64) * step_m;
-        let z0m = (cache_z0 as f64) * step_m;
+        // If vpm == 1, meter-grid == voxel-grid: just do the old direct fill (exact + simple).
+        if ctx.vpm <= 1 {
+            scratch.height_cache
+                .par_chunks_mut(cache_w)
+                .enumerate()
+                .for_each(|(z, row)| {
+                    if (z & 15) == 0 && should_cancel(cancel) {
+                        return;
+                    }
+                    let wz = cache_z0 + z as i32;
+                    for x in 0..cache_w {
+                        let wx = cache_x0 + x as i32;
+                        row[x] = gen.ground_height(wx, wz);
+                    }
+                });
 
-        scratch.height_cache
-            .par_chunks_mut(cache_w)
-            .enumerate()
-            .for_each(|(z, row)| {
-                if (z & 15) == 0 && should_cancel(cancel) {
-                    return;
+            scratch.height_cache_x0 = cache_x0;
+            scratch.height_cache_z0 = cache_z0;
+            scratch.height_cache_valid = true;
+        } else {
+            // Meter-grid bounds (inclusive), with +1 halo for bilinear.
+            // We sample integer meter coordinates, then upsample to voxels.
+            let xm0 = cache_x0.div_euclid(ctx.vpm);
+            let zm0 = cache_z0.div_euclid(ctx.vpm);
+            let xm1 = cache_x1.div_euclid(ctx.vpm) + 1;
+            let zm1 = cache_z1.div_euclid(ctx.vpm) + 1;
+
+            let hm_w = (xm1 - xm0 + 1) as usize;
+            let hm_h = (zm1 - zm0 + 1) as usize;
+
+            let hm_same =
+                scratch.hm_valid &&
+                scratch.hm_xm0 == xm0 &&
+                scratch.hm_zm0 == zm0 &&
+                scratch.hm_w == hm_w &&
+                scratch.hm_h == hm_h;
+
+            if !hm_same {
+                scratch.ensure_hm(hm_w, hm_h);
+
+                for j in 0..hm_h {
+                    if (j & 15) == 0 && should_cancel(cancel) {
+                        break;
+                    }
+                    let zm = zm0 + j as i32;
+                    let row0 = j * hm_w;
+                    for i in 0..hm_w {
+                        let xm = xm0 + i as i32;
+                        scratch.hm[row0 + i] = gen.ground_height_m(xm as f64, zm as f64);
+                    }
                 }
 
-                let zm = z0m + (z as f64) * step_m;
-                let mut xm = x0m;
+                scratch.hm_xm0 = xm0;
+                scratch.hm_zm0 = zm0;
+                scratch.hm_valid = true;
+            }
 
-                // tight inner loop: no indexing into xs_m
+            // Bilinear upsample into per-voxel height_cache
+            let hm = &scratch.hm;
+            let hm_wu = scratch.hm_w;
+            let hm_hu = scratch.hm_h;
+
+            let vpm = ctx.vpm as usize;
+            let inv_vpm = 1.0f32 / (ctx.vpm as f32);
+
+            for z in 0..cache_h {
+                if (z & 31) == 0 && should_cancel(cancel) {
+                    break;
+                }
+
+                let wz = cache_z0 + z as i32;
+
+                // meter row + fractional within the meter cell (incremental would be possible too,
+                // but z is only 64, so one div+rem per row is fine).
+                let mz = (wz.div_euclid(ctx.vpm) - scratch.hm_zm0) as i32;
+                let rz = wz.rem_euclid(ctx.vpm) as usize;
+
+                let mz0 = (mz.max(0) as usize).min(hm_hu - 1);
+                let mz1 = (mz0 + 1).min(hm_hu - 1);
+                let fz = (rz as f32) * inv_vpm;
+
+                let row_off = z * cache_w;
+
+                // Incremental x mapping: avoid div/rem per voxel.
+                let mut wx = cache_x0;
+                let mut mx = (wx.div_euclid(ctx.vpm) - scratch.hm_xm0) as i32;
+                let mut rx = wx.rem_euclid(ctx.vpm) as i32;
+                if rx < 0 { rx += ctx.vpm; mx -= 1; } // just in case cache_x0 can be negative
+
                 for x in 0..cache_w {
-                    row[x] = gen.ground_height_m(xm, zm);
-                    xm += step_m;
+                    let mx0 = (mx.max(0) as usize).min(hm_wu - 1);
+                    let mx1 = (mx0 + 1).min(hm_wu - 1);
+                    let fx = (rx as f32) * inv_vpm;
+
+                    let a = hm[mz0 * hm_wu + mx0] as f32;
+                    let b = hm[mz0 * hm_wu + mx1] as f32;
+                    let c = hm[mz1 * hm_wu + mx0] as f32;
+                    let d = hm[mz1 * hm_wu + mx1] as f32;
+
+                    let ab = a + (b - a) * fx;
+                    let cd = c + (d - c) * fx;
+                    let h = ab + (cd - ab) * fz;
+
+                    scratch.height_cache[row_off + x] = h.round() as i32;
+
+                    // advance x
+                    wx += 1;
+                    rx += 1;
+                    if rx == ctx.vpm {
+                        rx = 0;
+                        mx += 1;
+                    }
                 }
-            });
+            }
 
-        scratch.height_cache_x0 = cache_x0;
-        scratch.height_cache_z0 = cache_z0;
-        scratch.height_cache_valid = true;
+
+            scratch.height_cache_x0 = cache_x0;
+            scratch.height_cache_z0 = cache_z0;
+            scratch.height_cache_valid = true;
+        }
     }
-
 
     HeightSampler {
         gen,
@@ -400,6 +518,7 @@ fn build_height_cache<'g>(
         z1: cache_z1,
     }
 }
+
 
 
 fn build_ground_2d(
@@ -643,6 +762,8 @@ fn build_cave_mask_coarse(
     // constants mirrored from WorldGen::carve_cave
     let max_depth_vox: i32 = (48.0_f32 * (ctx.vpm as f32)).round() as i32;
 
+    let ground = &scratch.ground;
+
     scratch
         .cave_mask
         .par_chunks_mut(dim * dim) // y-slabs in the coarse grid
@@ -652,64 +773,38 @@ fn build_cave_mask_coarse(
                 return;
             }
 
-            // sample y in voxel coords (center of the step cell)
-            let ly = (sy * step + (step / 2)).min(side - 1);
-            let wy = ctx.oy + ly as i32;
-
-            // sample y in voxel coords (center of the step cell)
-            let ly = (sy * step + (step / 2)).min(side - 1);
-            let wy = ctx.oy + ly as i32;
+            // center voxel y for this coarse slab
+            let cy = (sy * step + (step / 2)).min(side - 1);
+            let wy = ctx.oy + cy as i32;
 
             for sz in 0..dim {
                 let row_off = sz * dim;
 
-                // coarse cell z-range
-                let z0 = sz * step;
-                let z1 = (z0 + step - 1).min(side - 1);
+                // center voxel z for this coarse cell row
+                let cz = (sz * step + (step / 2)).min(side - 1);
+                let wz = ctx.oz + cz as i32;
 
                 for sx in 0..dim {
-                    // coarse cell x-range
-                    let x0 = sx * step;
-                    let x1 = (x0 + step - 1).min(side - 1);
+                    // center voxel x for this coarse cell
+                    let cx = (sx * step + (step / 2)).min(side - 1);
+                    let wx = ctx.ox + cx as i32;
 
-                    // coarse cell y-range
-                    let y0 = sy * step;
-                    let y1 = (y0 + step - 1).min(side - 1);
+                    // depth gate using cached ground height at (cx, cz)
+                    let g = unsafe { *ground.get_unchecked(idx_xz(side, cx, cz)) };
+                    let depth_vox = g - wy;
 
-                    let mut carve = false;
-
-                    // Test the 8 corners of the step-cube.
-                    // If ANY corner wants carving, mark this coarse cell carved.
-                    for &ly in &[y0, y1] {
-                        let wy = ctx.oy + ly as i32;
-                        for &lz in &[z0, z1] {
-                            let wz = ctx.oz + lz as i32;
-                            for &lx in &[x0, x1] {
-                                let wx = ctx.ox + lx as i32;
-
-                                // ground for this (x,z) column
-                                let g = scratch.ground[idx_xz(side, lx, lz)];
-
-                                let depth_vox = g - wy;
-                                if depth_vox > 0 && depth_vox <= max_depth_vox {
-                                    if gen.carve_cave(wx, wy, wz, g) {
-                                        carve = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if carve { break; }
-                        }
-                        if carve { break; }
-                    }
+                    let carve = if depth_vox > 0 && depth_vox <= max_depth_vox {
+                        gen.carve_cave(wx, wy, wz, g)
+                    } else {
+                        false
+                    };
 
                     slab[row_off + sx] = carve as u8;
                 }
             }
-
-
         });
 }
+
 
 #[inline(always)]
 fn idx3(dim: usize, x: usize, y: usize, z: usize) -> usize {
@@ -772,38 +867,32 @@ fn build_col_tops(ctx: ChunkCtx, scratch: &mut BuildScratch, cancel: &AtomicBool
     let side = ctx.side;
     let side2 = side * side;
 
-    // Parallel over columns (x,z)
-    scratch
-        .col_top_y
-        .par_iter_mut()
-        .zip(scratch.col_top_mat.par_iter_mut())
-        .enumerate()
-        .for_each(|(col, (out_y, out_m))| {
-            if (col & 1023) == 0 && should_cancel(cancel) {
-                return;
-            }
+    // Cache-friendly: iterate y slabs, each slab is contiguous [side2] bytes.
+    // Overwrite as y increases => final value is the top-most non-air.
+    for ly in 0..side {
+        if (ly & 7) == 0 && should_cancel(cancel) {
+            return;
+        }
 
-            let lx = col % side;
-            let lz = col / side;
+        let slab0 = ly * side2;
+        let slab = &scratch.material[slab0 .. slab0 + side2];
 
-            // scan from top to bottom
-            for ly in (0..side).rev() {
-                let idx = ly * side2 + lz * side + lx;
-                let m = unsafe { *scratch.material.get_unchecked(idx) };
-                if m != AIR8 {
-                    *out_y = ly as u8;
-                    *out_m = m;
-                    return;
+        // `col` is (lz*side + lx)
+        for col in 0..side2 {
+            let m = unsafe { *slab.get_unchecked(col) };
+            if m != AIR8 {
+                unsafe {
+                    *scratch.col_top_y.get_unchecked_mut(col) = ly as u8;
+                    *scratch.col_top_mat.get_unchecked_mut(col) = m;
                 }
             }
+        }
+    }
 
-            *out_y = 255;
-            *out_m = 0;
-        });
-
-    // If you want a “non-empty columns” counter:
+    // Non-empty columns counter (optional)
     tim.solid_voxels = scratch.col_top_y.iter().filter(|&&y| y != 255).count() as u32;
 }
+
 
 
 fn build_macro_occ(ctx: ChunkCtx, prefix_buf: &[u32], cancel: &AtomicBool) -> Vec<u32> {
@@ -895,15 +984,18 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     });
 
     // Material fill
-    time_it!(tim, material_fill, {
-        // Build coarse cave mask FIRST (included in material_fill time for now)
+    // Build coarse cave mask FIRST (timed separately)
+    time_it!(tim, cave_mask, {
         build_cave_mask_coarse(gen, ctx, scratch, cancel);
+    });
 
+    time_it!(tim, material_fill, {
         let tree_mat = |lx: usize, ly: usize, lz: usize| -> u8 {
             (tree_mask.material_local(lx, ly, lz) & 0xFF) as u8
         };
         fill_material(gen, ctx, scratch, cancel, &tree_mat, edits);
     });
+
     cancel_if!(cancel, tim);
 
     // Column tops
@@ -913,7 +1005,7 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     cancel_if!(cancel, tim);
 
     // Pack colinfo words
-    let colinfo_words = time_it!(tim, colinfo, {
+    let colinfo_words = time_it!(tim, colinfo_pack, {
         build_colinfo_words(ctx, scratch)
     });
     cancel_if!(cancel, tim);

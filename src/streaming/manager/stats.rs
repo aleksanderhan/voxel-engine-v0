@@ -76,7 +76,9 @@ pub fn stats(mgr: &mut ChunkManager) -> Option<StreamStats> {
         bt_avg.tree_top      /= n;
         bt_avg.tree_mip      /= n;
         bt_avg.material_fill /= n;
+        bt_avg.cave_mask     /= n; 
         bt_avg.colinfo       /= n;
+        bt_avg.colinfo_pack  /= n;
         bt_avg.prefix_x      /= n;
         bt_avg.prefix_y      /= n;
         bt_avg.prefix_z      /= n;

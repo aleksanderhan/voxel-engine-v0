@@ -241,7 +241,8 @@ impl FrameProf {
                     concat!(
                         "           bt_ms(avg/max): total={:.2}/{:.2} height_cache={:.2}/{:.2} tree_mask={:.2}/{:.2}\n",
                         "                         ground_2d={:.2}/{:.2} ground_mip={:.2}/{:.2} tree_top={:.2}/{:.2} tree_mip={:.2}/{:.2}\n",
-                        "                         material_fill={:.2}/{:.2} colinfo={:.2}/{:.2} prefix_x={:.2}/{:.2} prefix_y={:.2}/{:.2} prefix_z={:.2}/{:.2}\n",
+                        "                         cave_mask={:.2}/{:.2} material_fill={:.2}/{:.2} colinfo={:.2}/{:.2} colinfo_pack={:.2}/{:.2}\n",
+                        "                         prefix_x={:.2}/{:.2} prefix_y={:.2}/{:.2} prefix_z={:.2}/{:.2}\n",
                         "                         macro_occ={:.2}/{:.2} svo_build={:.2}/{:.2} ropes={:.2}/{:.2}\n",
                         "           bt_cnt(max): cache_w={} cache_h={} tree_cells_tested={} tree_instances={} solid_voxels={} nodes={}\n"
                     ),
@@ -254,8 +255,10 @@ impl FrameProf {
                     s.bt_avg.tree_top,      s.bt_max.tree_top,
                     s.bt_avg.tree_mip,      s.bt_max.tree_mip,
 
+                    s.bt_avg.cave_mask,     s.bt_max.cave_mask,
                     s.bt_avg.material_fill, s.bt_max.material_fill,
                     s.bt_avg.colinfo,       s.bt_max.colinfo,
+                    s.bt_avg.colinfo_pack,   s.bt_max.colinfo_pack,
                     s.bt_avg.prefix_x,      s.bt_max.prefix_x,
                     s.bt_avg.prefix_y,      s.bt_max.prefix_y,
                     s.bt_avg.prefix_z,      s.bt_max.prefix_z,
@@ -271,6 +274,7 @@ impl FrameProf {
                     s.bt_max.solid_voxels,
                     s.bt_max.nodes,
                 );
+
             }
 
 

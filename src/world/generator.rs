@@ -84,41 +84,6 @@ impl WorldGen {
         self.ground_height_m(xm, zm)
     }
 
-
-    #[inline(always)]
-    fn cave_ridged_pair_scaled(&self, wx: i32, wy: i32, wz: i32, scale: f64) -> (f32, f32) {
-        // Sample in meters so frequencies are stable even if VOXEL_SIZE changes.
-        let xm = (wx as f64) * config::VOXEL_SIZE_M_F64 * scale;
-        let ym = (wy as f64) * config::VOXEL_SIZE_M_F64 * scale;
-        let zm = (wz as f64) * config::VOXEL_SIZE_M_F64 * scale;
-
-        // Domain warp (shared), but decorrelate the two fields slightly.
-        let w0 = self.cave_warp.get([xm, ym, zm]) as f32; // ~[-1,1]
-        let w1 = self.cave_warp.get([xm + 31.7, ym - 12.4, zm + 8.9]) as f32;
-
-        let warp_m = 2.8; // meters; lower => fewer huge open spaces
-        let xw0 = xm + (w0 as f64) * (warp_m as f64);
-        let yw0 = ym + (w0 as f64) * (warp_m as f64) * 0.30; // less vertical warp
-        let zw0 = zm - (w0 as f64) * (warp_m as f64);
-
-        let xw1 = xm + (w1 as f64) * (warp_m as f64);
-        let yw1 = ym + (w1 as f64) * (warp_m as f64) * 0.30;
-        let zw1 = zm - (w1 as f64) * (warp_m as f64);
-
-        let n0 = self.cave_a.get([xw0, yw0, zw0]) as f32; // ~[-1,1]
-        let n1 = self.cave_b.get([xw1, yw1, zw1]) as f32;
-
-        // Ridged: high near zero-crossings.
-        let r0 = 1.0 - n0.abs();
-        let r1 = 1.0 - n1.abs();
-        (r0, r1)
-    }
-
-    #[inline(always)]
-    fn cave_ridged_pair(&self, wx: i32, wy: i32, wz: i32) -> (f32, f32) {
-        self.cave_ridged_pair_scaled(wx, wy, wz, 1.0)
-    }
-
     #[inline(always)]
     pub fn carve_cave(&self, wx: i32, wy: i32, wz: i32, ground_y_vox: i32) -> bool {
         let vpm = config::VOXELS_PER_METER as f32;
