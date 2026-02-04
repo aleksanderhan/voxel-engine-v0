@@ -471,7 +471,7 @@ pub fn settings_from_args() -> (bool, Duration) {
             }
         }
 
-        let print_every = Duration::from_millis(every_ms.unwrap_or(500));
+        let print_every = Duration::from_millis(every_ms.unwrap_or(2000));
         (enabled, print_every)
     }
 }

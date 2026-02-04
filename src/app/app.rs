@@ -139,6 +139,7 @@ impl App {
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps.formats[0];
         let present_mode = choose_present_mode(&surface_caps);
+        println!("present_mode = {:?}", present_mode);
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -833,23 +834,24 @@ impl App {
 
 }
 
-fn choose_present_mode(surface_caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
-    // Mailbox: low latency + avoids tearing (if supported).
-    // Fifo: always supported, vsync.
-    // Immediate: lowest latency but can tear.
-    if surface_caps
-        .present_modes
-        .contains(&wgpu::PresentMode::Mailbox)
-    {
+fn choose_present_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
+    // For profiling: avoid vsync blocking.
+    // Use --profile as the switch (or add a dedicated flag).
+    let profiling = std::env::args().any(|a| a == "--profile");
+
+    if profiling && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+        return wgpu::PresentMode::Immediate;
+    }
+
+    if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
         wgpu::PresentMode::Mailbox
-    } else if surface_caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+    } else if caps.present_modes.contains(&wgpu::PresentMode::FifoRelaxed) {
+        wgpu::PresentMode::FifoRelaxed
+    } else if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
         wgpu::PresentMode::Fifo
-    } else if surface_caps
-        .present_modes
-        .contains(&wgpu::PresentMode::Immediate)
-    {
+    } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
         wgpu::PresentMode::Immediate
     } else {
-        surface_caps.present_modes[0]
+        caps.present_modes[0]
     }
 }
