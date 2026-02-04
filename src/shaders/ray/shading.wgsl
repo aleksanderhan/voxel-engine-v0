@@ -156,19 +156,6 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   var base = color_for_material(hg.mat);
   base = apply_material_variation(base, hg.mat, hp);
 
-  var local_light = vec3<f32>(0.0);
-  if (hg.t < 25.0) {
-    local_light = gather_voxel_lights(
-      hp,
-      hg.n,
-      hg.root_bmin,
-      hg.root_size,
-      hg.node_base,
-      hg.macro_base,
-      seed
-    );
-  }
-
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
     if (grass_allowed_primary(hg.t, hg.n, seed)) {
@@ -206,6 +193,19 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
 
   let sv_raw = sky_visibility(hp_shadow);
+
+  var local_light = vec3<f32>(0.0);
+  if (hg.t < 35.0) {
+    // “Cave detector”: low sky visibility => don’t subsample
+    let cave = (sv_raw < 0.20);
+
+    let m = select(3u, 0u, cave); // 3=quarter-rate outdoors, 0=full-rate in caves
+    if ( (seed & m) == 0u ) {
+      local_light = gather_voxel_lights(
+        hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base, seed
+      );
+    }
+  }
 
   // Keep a small ambient floor so caves aren’t pure black.
   // 0.06..0.12 is a decent range.

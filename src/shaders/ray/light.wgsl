@@ -22,7 +22,7 @@
 // -----------------------------------------------------------------------------
 
 // How far rays march in voxels (controls “search radius” for lights)
-const LIGHT_MAX_DIST_VOX : u32 = 48u;   // try 24..80
+const LIGHT_MAX_DIST_VOX : u32 = 32u;   // try 24..80
 
 // Number of rays. 12 is a big quality bump vs 8.
 const LIGHT_RAYS : u32 = 12u;           // try 8..16
@@ -42,6 +42,12 @@ const LIGHT_WRAP : f32 = 0.15;
 // Gains
 const LIGHT_DIRECT_GAIN   : f32 = 1.00;
 const LIGHT_INDIRECT_GAIN : f32 = 0.65; // cheap “bounce fill” (0..1.5)
+
+const LIGHT_EARLY_HITS : u32 = 3u;   // stop after N light hits
+const LIGHT_SKIP_MASK  : u32 = 1u;   // 0=all pixels, 1=half, 3=quarter... (used by caller)
+
+const LIGHT_EMPTY_BAIL_STEPS : u32 = 10u; // after this many empty steps, assume no nearby light
+
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -143,6 +149,7 @@ fn dda_hit_light(p0: vec3<f32>, dir: vec3<f32>, max_steps: u32, vs: f32) -> vec4
 
   let tDelta = inv;
 
+  var empty_steps: u32 = 0u;
   for (var s: u32 = 0u; s < max_steps; s = s + 1u) {
     let center_ws = (vec3<f32>(f32(cell.x) + 0.5, f32(cell.y) + 0.5, f32(cell.z) + 0.5)) * vs;
     let leaf = query_leaf_world(center_ws);
@@ -150,10 +157,17 @@ fn dda_hit_light(p0: vec3<f32>, dir: vec3<f32>, max_steps: u32, vs: f32) -> vec4
     if (leaf.mat == MAT_LIGHT) {
       return vec4<f32>(center_ws, 1.0);
     }
-    if (leaf.mat != MAT_AIR) {
-      // solid blocks the ray
+
+    if (leaf.mat == MAT_AIR) {
+      empty_steps += 1u;
+      if (empty_steps >= LIGHT_EMPTY_BAIL_STEPS) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+      }
+    } else {
+      // SOLID blocks the ray
       return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
+
 
     // step to next voxel boundary (smallest tMax)
     if (tMax.x < tMax.y) {
@@ -191,6 +205,9 @@ fn gather_voxel_lights(
   macro_base: u32,
   seed: u32
 ) -> vec3<f32> {
+  var rays_cast: u32 = 0u;
+  var hits: u32 = 0u;
+
   let vs = cam.voxel_params.x;
 
   // nudge off surface to reduce self hits
@@ -220,14 +237,14 @@ fn gather_voxel_lights(
   var sum = vec3<f32>(0.0);
 
   for (var i: u32 = 0u; i < LIGHT_RAYS; i = i + 1u) {
-    // fixed direction set -> orient to normal hemisphere-ish via TBN
-    var ldir = normalize(tbn * normalize(sphere_dir_local(i)));
+    rays_cast += 1u;
 
-    // rotate around normal to break visible structure
+    var ldir = normalize(tbn * normalize(sphere_dir_local(i)));
     ldir = normalize(rot_about_axis(ldir, n, rot));
 
     let hit = dda_hit_light(p0, ldir, LIGHT_MAX_DIST_VOX, vs);
     if (hit.w > 0.5) {
+      hits += 1u;
       let pL = hit.xyz;
 
       let L  = pL - hp;
@@ -251,10 +268,18 @@ fn gather_voxel_lights(
 
       // INDIRECT FILL (cheap “bounce”): proximity-based, weakly directional
       // This is what makes caves readable without uniform fake backside lighting.
-      let bounce = LIGHT_INDIRECT_GAIN * falloff * att_range;
-      sum += Le * (0.25 * bounce);
+      // only add bounce if close enough to matter
+      if (r2 < 0.35 * range2) {
+        let bounce = LIGHT_INDIRECT_GAIN * falloff * att_range;
+        sum += Le * (0.25 * bounce);
+      }
+      if (hits >= LIGHT_EARLY_HITS) {
+        break;
+      }
     }
+
   }
 
-  return sum * (1.0 / f32(LIGHT_RAYS));
+  let denom = max(1.0, f32(rays_cast));
+  return sum * (1.0 / denom);
 }
