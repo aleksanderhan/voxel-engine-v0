@@ -666,21 +666,37 @@ impl App {
         let max_dist_m = 80.0;
         let voxel = config::VOXEL_SIZE_M_F32;
 
-        let Some((hit_w, prev_w)) = self.raycast_voxel(eye, dir, max_dist_m, voxel) else {
+        let Some((hit_w, prev_w, enter_n)) = self.raycast_voxel(eye, dir, max_dist_m, voxel) else {
             return;
         };
+
 
         let hit_mat = self.sample_voxel_material(hit_w.0, hit_w.1, hit_w.2);
         println!("hit voxel {:?} mat={}", hit_w, hit_mat);
 
-        // choose target voxel depending on mode
+        // Decide edit operation.
+        // Rule:
+        // - Dig replaces the HIT voxel with AIR.
+        // - Place writes ONLY into the PREV voxel (adjacent empty). Never overwrite solids.
         let (tx, ty, tz, mat) = match self.edit_modes[self.edit_mode] {
             EditMode::Dig => (hit_w.0, hit_w.1, hit_w.2, crate::world::materials::AIR),
-            EditMode::Place(m) => (prev_w.0, prev_w.1, prev_w.2, m),
+
+            EditMode::Place(m) => {
+                let place_w = (hit_w.0 + enter_n.0, hit_w.1 + enter_n.1, hit_w.2 + enter_n.2);
+
+                // Only place into empty space; never overwrite solids.
+                let place_mat = self.sample_voxel_material(place_w.0, place_w.1, place_w.2);
+                if place_mat != crate::world::materials::AIR {
+                    return;
+                }
+
+                (place_w.0, place_w.1, place_w.2, m)
+            }
+
         };
 
         // chunk key + local coords
-        let (key, lx, ly, lz) = crate::world::edits::voxel_to_chunk_local( &self.world, tx, ty, tz);
+        let (key, lx, ly, lz) = crate::world::edits::voxel_to_chunk_local(&self.world, tx, ty, tz);
 
         println!("edit key={:?} state={:?}", key, self.chunks.build.chunks.get(&key));
 
@@ -691,14 +707,15 @@ impl App {
         self.chunks.edits.apply_voxel(key, lx, ly, lz, mat);
 
         let verify = self.chunks.edits.get_override(key, lx, ly, lz);
-        println!("edit verify key={:?} local=({}, {}, {}) wrote={} readback={:?}",
+        println!(
+            "edit verify key={:?} local=({}, {}, {}) wrote={} readback={:?}",
             key, lx, ly, lz, mat, verify
         );
-
 
         // force a rebuild soon
         self.enqueue_chunk_rebuild_now(key);
     }
+
 
     fn raycast_voxel(
         &self,
@@ -706,7 +723,7 @@ impl App {
         dir_m: glam::Vec3,
         max_dist_m: f32,
         voxel_m: f32,
-    ) -> Option<((i32, i32, i32), (i32, i32, i32))> {
+    ) -> Option<((i32, i32, i32), (i32, i32, i32), (i32, i32, i32))> {
         let dir = dir_m.normalize();
         let mut t = 0.0f32;
 
@@ -743,48 +760,41 @@ impl App {
             (next_boundary(vz, step_z) - origin_m.z) / dir.z
         };
 
-        let t_delta_x = if dir.x.abs() < 1e-6 {
-            f32::INFINITY
-        } else {
-            voxel_m / dir.x.abs()
-        };
-        let t_delta_y = if dir.y.abs() < 1e-6 {
-            f32::INFINITY
-        } else {
-            voxel_m / dir.y.abs()
-        };
-        let t_delta_z = if dir.z.abs() < 1e-6 {
-            f32::INFINITY
-        } else {
-            voxel_m / dir.z.abs()
-        };
+        let t_delta_x = if dir.x.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.x.abs() };
+        let t_delta_y = if dir.y.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.y.abs() };
+        let t_delta_z = if dir.z.abs() < 1e-6 { f32::INFINITY } else { voxel_m / dir.z.abs() };
 
+        // prev voxel + the face normal used to ENTER the current voxel
         let mut prev = (vx, vy, vz);
+        let mut enter_n = (0, 0, 0);
 
-        // march
         let max_t = max_dist_m;
+
         for _ in 0..512 {
-            // hard cap
-            // sample voxel (worldgen + edits)
+            // If current voxel is solid, we hit it.
             if self.sample_voxel_material(vx, vy, vz) != crate::world::materials::AIR {
-                return Some(((vx, vy, vz), prev));
+                return Some(((vx, vy, vz), prev, enter_n));
             }
 
+            // Current voxel is air => it becomes "prev" before stepping into the next voxel
             prev = (vx, vy, vz);
 
-            // advance along smallest t_max
+            // Advance along smallest t_max; record which face we crossed.
             if t_max_x < t_max_y && t_max_x < t_max_z {
                 vx += step_x;
                 t = t_max_x;
                 t_max_x += t_delta_x;
+                enter_n = (-step_x, 0, 0); // we entered new cell through its -/+X face
             } else if t_max_y < t_max_z {
                 vy += step_y;
                 t = t_max_y;
                 t_max_y += t_delta_y;
+                enter_n = (0, -step_y, 0);
             } else {
                 vz += step_z;
                 t = t_max_z;
                 t_max_z += t_delta_z;
+                enter_n = (0, 0, -step_z);
             }
 
             if t > max_t {
@@ -794,6 +804,7 @@ impl App {
 
         None
     }
+
 
     fn sample_voxel_material(&self, wx: i32, wy: i32, wz: i32) -> u32 {
         let cs = config::CHUNK_SIZE as i32;

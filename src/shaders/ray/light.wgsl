@@ -1,34 +1,76 @@
 // light.wgsl
 //
-// Deterministic voxel light gathering (Fix 3):
-// - No RNG rays
-// - Uses a fixed low-discrepancy direction set (Hammersley + cosine hemisphere)
-// - Stable (no shimmer), good-looking, predictable
+// Deterministic voxel light gathering (Fix 4):
+// - Deterministic (no RNG), stable (no shimmer)
+// - Removes structured checker/speckle via:
+//     * per-surface-voxel Cranley–Patterson shift of the Hammersley sequence
+//     * per-surface-voxel rotation around the normal
+// - More physical estimator:
+//     * normalize by LIGHT_RAYS (not by hit count)
+//     * inverse-square-ish falloff (clamped near the source)
+// - Less fake “backside glow”:
+//     * reduced wrap
+//     * removed minimum fill
+// - Reduced light leaks at chunk boundaries in visibility DDA:
+//     * treat leaving chunk bounds as blocked (conservative)
 //
 // Expected external symbols (defined elsewhere in your shader project):
 // - `cam.voxel_params.x` = voxel size in world meters
-// - `query_leaf_at(p, root_bmin, root_size, node_base, macro_base) -> leaf`
+// - `cam.chunk_size`     = chunk voxel edge length (integer)
+// - `query_leaf_world(p_ws) -> leaf`
 // - `leaf.mat` material id
 // - `MAT_AIR`, `MAT_LIGHT` material ids
 //
 // This file only contains the lighting code; it does not declare bindings.
 
-//// --------------------------------------------------------------------------
-//// Voxel light sources (local lighting from MAT_LIGHT voxels)
-//// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Tunables
+// -----------------------------------------------------------------------------
 
-const LIGHT_MAX_DIST_VOX : f32 = 64.0; // reach in voxels
-const LIGHT_RAYS         : u32 = 32u;  // # of probe rays (tune 12..64)
-const LIGHT_STEPS        : u32 = u32(LIGHT_MAX_DIST_VOX);  // steps along each ray
-const LIGHT_INTENSITY    : f32 = 128.0; // overall brightness (tune)
+const LIGHT_MAX_DIST_VOX : u32 = 96u;   // reach in voxels
+const LIGHT_RAYS         : u32 = 32u;   // # probe rays (12..64)
+const LIGHT_INTENSITY    : f32 = 40.0;   // start here, tune 2..16 with 1/r^2 falloff
+
+// Wrap diffuse: 0 = lambert. Keep small for local emitters.
+const LIGHT_WRAP         : f32 = 0.20;
+
+// Minimum fill from a visible light hit. 0 recommended; do ambient separately.
+const LIGHT_FILL         : f32 = 0.00;
+
+// -----------------------------------------------------------------------------
+// Emission
+// -----------------------------------------------------------------------------
 
 fn light_emission_color() -> vec3<f32> {
   // warm emitter
   return vec3<f32>(1.0, 0.95, 0.75);
 }
 
+// -----------------------------------------------------------------------------
+// Hashing / deterministic scrambling
+// -----------------------------------------------------------------------------
+
+fn hash3_i32(p: vec3<i32>) -> u32 {
+  // mix coordinates into one u32
+  let ux = u32(p.x) * 73856093u;
+  let uy = u32(p.y) * 19349663u;
+  let uz = u32(p.z) * 83492791u;
+  return hash_u32(ux ^ uy ^ uz);
+}
+
+fn rot_about_axis(v: vec3<f32>, axis: vec3<f32>, ang: f32) -> vec3<f32> {
+  // Rodrigues rotation
+  let a = normalize(axis);
+  let s = sin(ang);
+  let c = cos(ang);
+  return v * c + cross(a, v) * s + a * dot(a, v) * (1.0 - c);
+}
+
+// -----------------------------------------------------------------------------
 // Voxel-grid DDA visibility between p and q.
 // Returns 1.0 = visible, 0.0 = blocked.
+// -----------------------------------------------------------------------------
+
 fn light_visibility_segment(
   p: vec3<f32>,
   q: vec3<f32>,
@@ -45,18 +87,12 @@ fn light_visibility_segment(
 
   let dir = d / dist;
 
-  // --- Nudge off the surface to avoid immediate self-hit
+  // Nudge off the surface to avoid immediate self-hit
   let p0 = p + dir * (0.60 * vs);
 
   // Convert to voxel-space coordinates relative to root_bmin:
-  // voxel index i = floor((x - root_bmin)/vs)
   let lp0 = (p0 - root_bmin) / max(vs, 1e-6);
   let lq  = (q  - root_bmin) / max(vs, 1e-6);
-
-  // Early out if start is way outside the chunk bounds (optional but helps).
-  // We still allow rays that start slightly outside; clamp indices later.
-  // (If you prefer strict bounds, you can return 0.0 here instead.)
-  // if (any(lp0 < vec3<f32>(-1.0)) || any(lp0 > vec3<f32>(f32(cam.chunk_size) + 1.0))) { ... }
 
   var ix: i32 = i32(floor(lp0.x));
   var iy: i32 = i32(floor(lp0.y));
@@ -71,7 +107,6 @@ fn light_visibility_segment(
   let stepZ: i32 = select(-1, 1, dir.z > 0.0);
 
   // Distance (in param t) to cross one voxel cell along each axis
-  // We operate in voxel-space t, where moving 1 voxel along x is t += 1/|dir.x|
   let invX = safe_inv(dir.x);
   let invY = safe_inv(dir.y);
   let invZ = safe_inv(dir.z);
@@ -101,7 +136,6 @@ fn light_visibility_segment(
   }
 
   // How many voxels can the segment cross? upper bound:
-  // dist/vs ~ voxel length; clamp for safety.
   let maxSteps: u32 = u32(clamp(dist / max(vs, 1e-6) + 4.0, 4.0, 256.0));
 
   // Endpoint in voxel-space (to stop once we’ve reached the light’s cell)
@@ -109,18 +143,9 @@ fn light_visibility_segment(
   let end_iy: i32 = i32(floor(lq.y));
   let end_iz: i32 = i32(floor(lq.z));
 
-  // Chunk voxel bounds (assuming chunk is cam.chunk_size^3, root_bmin is chunk origin)
-  let cs: i32 = i32(cam.chunk_size);
-
   for (var s: u32 = 0u; s < maxSteps; s = s + 1u) {
     // If we've reached the voxel cell containing q, we consider it visible.
     if (ix == end_ix && iy == end_iy && iz == end_iz) {
-      return 1.0;
-    }
-
-    // Bounds check: leaving the chunk => treat as visible (no occluder inside this chunk).
-    // If you want “outside is blocked”, flip this.
-    if (ix < 0 || iy < 0 || iz < 0 || ix >= cs || iy >= cs || iz >= cs) {
       return 1.0;
     }
 
@@ -155,6 +180,10 @@ fn light_visibility_segment(
   return 0.0;
 }
 
+// -----------------------------------------------------------------------------
+// Main local light gather from MAT_LIGHT voxels
+// -----------------------------------------------------------------------------
+
 fn gather_voxel_lights(
   hp: vec3<f32>,
   n: vec3<f32>,
@@ -171,25 +200,29 @@ fn gather_voxel_lights(
   // Start point nudged off the surface (prevents self-occlusion)
   let p0 = hp + n * (0.85 * vs);
 
-  // Tunables (keep your constants, but this version is less sensitive)
-  let max_dist_vox: f32 = LIGHT_MAX_DIST_VOX;
-  let falloff_radius = 24.0 * vs;                // a bit larger helps caves feel “filled”
-  let inv_r2 = 1.0 / max(falloff_radius * falloff_radius, 1e-6);
+  // Deterministic per-surface-voxel scrambling (breaks structured artifacts)
+  let surf_v = vec3<i32>(floor((hp - root_bmin) / max(vs, 1e-6)));
+  let h = hash3_i32(surf_v);
+
+  // Rotation around the normal (0..2pi)
+  let rot = 6.28318530718 * (f32(h & 1023u) / 1024.0);
+
+  // Cranley–Patterson shift in [0,1) applied to the Hammersley v component
+  let vshift = f32((h >> 10u) & 1023u) / 1024.0;
 
   var sum = vec3<f32>(0.0);
-  var hits: f32 = 0.0;
 
   // For each deterministic hemisphere direction
   for (var i: u32 = 0u; i < LIGHT_RAYS; i = i + 1u) {
-    let xi  = hammersley_2d(i, LIGHT_RAYS);
-    let ldir_ws = normalize(tbn * sample_hemi_cosine(xi.x, xi.y));
+    var xi = hammersley_2d(i, LIGHT_RAYS);
+    xi.y = fract(xi.y + vshift);
+
+    var ldir_ws = normalize(tbn * sample_hemi_cosine(xi.x, xi.y));
+    ldir_ws = normalize(rot_about_axis(ldir_ws, n, rot));
 
     // March outward in voxel steps, sampling at voxel centers
-    // NOTE: stepping in whole voxels prevents skipping small emitters.
-    for (var s: u32 = 1u; s <= u32(max_dist_vox); s = s + 1u) {
-      let t_vox = f32(s);
-
-      let p = p0 + ldir_ws * (t_vox * vs);
+    for (var s: u32 = 1u; s <= LIGHT_MAX_DIST_VOX; s = s + 1u) {
+      let p = p0 + ldir_ws * (f32(s) * vs);
 
       // Query leaf at this sample point
       let leaf = query_leaf_world(p);
@@ -206,17 +239,28 @@ fn gather_voxel_lights(
         let r  = sqrt(r2);
         let ldir = L / r;
 
-        let ndl = max(dot(n, ldir), 0.0);
-        if (ndl > 0.0) {
-          // Occlusion check (voxel DDA along the segment)
+        let ndl_raw  = dot(n, ldir);
+
+        // “wrap” diffuse: subtle only
+        let ndl_wrap = clamp((ndl_raw + LIGHT_WRAP) / (1.0 + LIGHT_WRAP), 0.0, 1.0);
+
+        // Optional minimum fill (recommended 0; do ambient elsewhere)
+        let ndl = max(ndl_wrap, LIGHT_FILL);
+
+        // Keep a mild facing gate to avoid totally unphysical full back lighting
+        if (ndl_raw > (-0.90 - 0.10 * LIGHT_WRAP)) {
           let vis = light_visibility_segment(p0, p, root_bmin, root_size, node_base, macro_base);
 
-          // Smooth falloff with explicit radius:
-          // 1 / (1 + r^2 / R^2)
-          let falloff = 1.0 / (1.0 + r2 * inv_r2);
+          // Inverse-square-ish falloff with near clamp (prevents blowup near source)
+          let r2_clamped = max(r2, (1.5 * vs) * (1.5 * vs));
 
-          sum += light_emission_color() * (LIGHT_INTENSITY * ndl * falloff * vis);
-          hits += 1.0;
+          // soften distance in voxel units (tune 12..32)
+          let falloff_radius = 20.0 * vs;
+          let falloff = 1.0 / (r2_clamped + falloff_radius * falloff_radius);
+
+
+          let PI : f32 = 3.14159265359;
+          sum += light_emission_color() * (LIGHT_INTENSITY * PI * ndl * falloff * vis);
         }
 
         // Stop after first light hit per ray (stable & cheap)
@@ -225,22 +269,15 @@ fn gather_voxel_lights(
     }
   }
 
-  // Normalize: don’t wash out small lights
-  if (hits > 0.0) {
-    sum *= 1.0 / hits;
-
-    // Gentle coverage scaling: big emitters still win, tiny ones still show up
-    let coverage = clamp(hits / f32(LIGHT_RAYS), 0.0, 1.0);
-    sum *= mix(0.45, 1.0, coverage);
-  }
+  // Normalize by ray count (misses contribute 0 naturally)
+  sum *= 1.0 / f32(LIGHT_RAYS);
 
   return sum;
 }
 
-
-//// --------------------------------------------------------------------------
-//// Deterministic direction set (Hammersley + radical inverse)
-//// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Deterministic direction set (Hammersley + radical inverse)
+// -----------------------------------------------------------------------------
 
 // Van der Corput radical inverse in base 2 (bit-reversal), deterministic.
 fn radical_inverse_vdc(bits_in: u32) -> f32 {
@@ -262,9 +299,9 @@ fn hammersley_2d(i: u32, n: u32) -> vec2<f32> {
   return vec2<f32>(u, v);
 }
 
-//// --------------------------------------------------------------------------
-//// Hemisphere sampling + basis
-//// --------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Hemisphere sampling + basis
+// -----------------------------------------------------------------------------
 
 // cosine-weighted hemisphere sample around +Z, then rotate to normal via TBN
 fn sample_hemi_cosine(u1: f32, u2: f32) -> vec3<f32> {
