@@ -164,7 +164,8 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
       hg.root_bmin,
       hg.root_size,
       hg.node_base,
-      hg.macro_base
+      hg.macro_base,
+      seed
     );
   }
 
