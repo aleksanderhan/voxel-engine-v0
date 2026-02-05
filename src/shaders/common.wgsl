@@ -25,10 +25,10 @@ const EPS_INV : f32 = 1e-8;
 
 const ENABLE_GRASS   : bool = false;
 const ENABLE_CLIPMAP : bool = false;
-const ENABLE_GODRAYS : bool = true;
-const ENABLE_CLOUDS  : bool = true;
-const ENABLE_FOG     : bool = true;
-const ENABLE_BLOOM   : bool = true;
+const ENABLE_GODRAYS : bool = false;
+const ENABLE_CLOUDS  : bool = false;
+const ENABLE_FOG     : bool = false;
+const ENABLE_BLOOM   : bool = false;
 
 //// --------------------------------------------------------------------------
 //// Materials
