@@ -14,7 +14,7 @@
 
 @group(1) @binding(0) var local_in_tex   : texture_2d<f32>;
 @group(1) @binding(1) var local_hist_tex : texture_2d<f32>;
-@group(1) @binding(2) var local_hist_out : texture_storage_2d<rgba16float, write>;
+@group(1) @binding(2) var local_hist_out : texture_storage_2d<rgba32float, write>;
 @group(1) @binding(3) var local_samp     : sampler;
 
 // Tune this: lower = steadier but slower response

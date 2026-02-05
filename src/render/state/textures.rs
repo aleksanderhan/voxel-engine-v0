@@ -127,7 +127,7 @@ pub fn create_textures(
         "color_tex",
         internal_w,
         internal_h,
-        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureFormat::Rgba32Float,
         rw_tex_usage,
     );
 
@@ -146,7 +146,7 @@ pub fn create_textures(
             "godray_a",
             internal_w,
             internal_h,
-            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Rgba32Float,
             rw_tex_usage,
         ),
         make_tex2d(
@@ -154,12 +154,12 @@ pub fn create_textures(
             "godray_b",
             internal_w,
             internal_h,
-            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Rgba32Float,
             rw_tex_usage,
         ),
     ];
 
-    // FP16 clipmap height: R16Float (half bandwidth vs R32Float)
+    // Clipmap height: R32Float
     let clip_height = make_tex2d_array(
         device,
         "clip_height",
@@ -175,7 +175,7 @@ pub fn create_textures(
         "local_tex",
         internal_w,
         internal_h,
-        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureFormat::Rgba32Float,
         rw_tex_usage,
     );
 

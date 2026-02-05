@@ -20,7 +20,7 @@ pub struct OutputTex {
 /// Create the final output texture (full resolution).
 ///
 /// Properties:
-/// - Format: RGBA16F (high dynamic range, good for post-processing)
+/// - Format: RGBA32F (high dynamic range, good for post-processing)
 /// - Usage:
 ///   - STORAGE_BINDING: composite pass writes into it as a storage texture
 ///   - TEXTURE_BINDING: blit pass samples it in the fragment shader
@@ -43,7 +43,7 @@ pub fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> OutputTex
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba16Float,
+        format: wgpu::TextureFormat::Rgba32Float,
         // Must support both compute writes and render sampling.
         usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
