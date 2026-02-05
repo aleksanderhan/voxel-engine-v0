@@ -38,17 +38,14 @@ fn hemi_ambient(n: vec3<f32>, sky_up: vec3<f32>) -> vec3<f32> {
   return mix(grd, sky_up, upw);
 }
 
-fn material_variation(world_p: vec3<f32>, cell_size_m: f32, dist_m: f32) -> f32 {
+fn material_variation(world_p: vec3<f32>, cell_size_m: f32) -> f32 {
   let cell = floor(world_p / cell_size_m);
-  let raw = (hash31(cell) - 0.5) * 2.0;
-  let fade = exp(-dist_m / 75.0);
-  return raw * fade;
+  return (hash31(cell) - 0.5) * 2.0;
 }
 
-fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>, dist_m: f32) -> vec3<f32> {
+fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f32> {
   var c = base;
-  let cell_size = max(0.08, cam.voxel_params.x * 0.75);
-  let v = ALBEDO_VAR_GAIN * material_variation(hp, cell_size, dist_m);
+  let v = ALBEDO_VAR_GAIN * material_variation(hp, 0.05);
 
   if (mat == MAT_GRASS) {
     c += vec3<f32>(0.02 * v, 0.05 * v, 0.01 * v);
@@ -78,17 +75,8 @@ fn occ_at_material_aware(
   node_base: u32,
   macro_base: u32
 ) -> f32 {
-  // Query actual leaf material (use world lookup if we stepped outside this chunk).
-  let eps = 1e-4 * root_size;
-  let bmin = root_bmin - vec3<f32>(eps);
-  let bmax = root_bmin + vec3<f32>(root_size + eps);
-  let inside = all(p >= bmin) && all(p < bmax);
-  var q: LeafQuery;
-  if (inside) {
-    q = query_leaf_at(p, root_bmin, root_size, node_base, macro_base);
-  } else {
-    q = query_leaf_world(p);
-  }
+  // Query actual leaf material (macro_base still needed by query traversal)
+  let q = query_leaf_at(p, root_bmin, root_size, node_base, macro_base);
 
   // Ignore air and lights completely (so placing a lamp never darkens AO)
   if (q.mat == MAT_AIR || q.mat == MAT_LIGHT) {
@@ -202,7 +190,7 @@ fn shade_hit_split(
   }
 
   var base = color_for_material(hg.mat);
-  base = apply_material_variation(base, hg.mat, hp, hg.t);
+  base = apply_material_variation(base, hg.mat, hp);
 
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
@@ -228,8 +216,8 @@ fn shade_hit_split(
   // AO (macro) — smooth distance fade to avoid “sphere” contour
   var ao = 1.0;
   if (hg.hit != 0u) {
-    let ao_fade = exp(-hg.t / 55.0);
-    if (ao_fade > 0.01) {
+    let ao_fade = 1.0 - smoothstep(35.0, 55.0, hg.t); // tune range
+    if (ao_fade > 0.001) {
       let ao_raw = voxel_ao_material4(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
       ao = mix(1.0, ao_raw, ao_fade);
     }
@@ -284,8 +272,8 @@ fn shade_hit_split(
   var local_light = vec3<f32>(0.0);
   var local_w: f32 = 0.0;
 
-  let ll_fade = exp(-hg.t / 45.0);
-  if (ll_fade > 0.01) {
+  let ll_fade = 1.0 - smoothstep(28.0, 42.0, hg.t); // tune range
+  if (ll_fade > 0.001) {
     let cave = (sv_raw < 0.20);
 
     // Keep perf: sample less often as distance increases
@@ -382,8 +370,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
 }
 
 fn sky_visibility(p: vec3<f32>) -> f32 {
-  // Up ray: if blocked, returns ~0. If open, returns ~1.
-  let vs = cam.voxel_params.x;
-  let pu = p + vec3<f32>(0.0, 1.0, 0.0) * (0.75 * vs);
-  return sun_transmittance_geom_only(pu, vec3<f32>(0.0, 1.0, 0.0));
+  // Soft cone-averaged visibility (fixes hard cave ambient cutoffs)
+  return sky_visibility_soft_geom(p);
 }
+

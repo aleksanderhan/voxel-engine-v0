@@ -13,9 +13,7 @@
 //   When local_w == 0, do NOT decay/overwrite history. Keep history as-is.
 
 @group(1) @binding(0) var local_in_tex   : texture_2d<f32>;
-@group(1) @binding(1) var local_hist_tex : texture_2d<f32>;
 @group(1) @binding(2) var local_hist_out : texture_storage_2d<rgba32float, write>;
-@group(1) @binding(3) var local_samp     : sampler;
 
 // Tune this: lower = steadier but slower response
 const LOCAL_TAA_ALPHA : f32 = 0.12;
@@ -32,16 +30,28 @@ fn main_local_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
   let hist4 = textureSampleLevel(local_hist_tex, local_samp, uv, 0.0);
 
   let cur   = cur4.xyz;
-  let w     = cur4.w;          // local_w in [0,1]
+  let w_in  = cur4.w;          // local_w in [0,1] meaning “valid this frame”
   let hist  = hist4.xyz;
+  let conf0 = hist4.w;         // history confidence in [0,1] (we’ll maintain it)
 
-  // Gate history updates: if w == 0 => keep history (k = 0)
-  // If w == 1 => normal blend (k = alpha)
-  let has_sample = (w > 0.0);
-  let k = select(0.0, LOCAL_TAA_ALPHA, has_sample);
+  // 1) Strong validity gate: reject bogus inputs even if w_in > 0
+  //    (NaNs/Infs propagate horribly through TAA).
+  let cur_ok = !(is_bad_vec3(cur));
+  let has_sample = (w_in > 0.0) && cur_ok;
 
+  // 2) Adaptive blend amount scaled by sample strength.
+  //    If w_in is small (distance fade), integrate less.
+  let k = select(0.0, LOCAL_TAA_ALPHA * clamp(w_in, 0.0, 1.0), has_sample);
+
+  // 3) Only update color if we have a valid sample.
   let out_local = mix(hist, cur, k);
 
-  // Store alpha=1 just so history tex stays "valid" for sampling
-  textureStore(local_hist_out, ip, vec4<f32>(out_local, 1.0));
+  // 4) Maintain confidence:
+  //    - If we had a valid sample: confidence rises toward 1.
+  //    - If not: confidence stays EXACTLY the same (critical correctness).
+  //
+  // The “rise” is matched to k so it behaves intuitively.
+  let conf1 = select(conf0, min(1.0, conf0 + k), has_sample);
+
+  textureStore(local_hist_out, ip, vec4<f32>(out_local, conf1));
 }

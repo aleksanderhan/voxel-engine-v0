@@ -207,3 +207,82 @@ fn sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let Tc = cloud_sun_transmittance(p, sun_dir);
   return Tc * sun_transmittance_geom_only(p, sun_dir);
 }
+
+// -----------------------------------------------------------------------------
+// Soft sky visibility (fixes hard cave ambient cutoffs)
+// -----------------------------------------------------------------------------
+
+// Keep low to avoid perf spikes. 3–5 is usually enough.
+const SKYVIS_SAMPLES : u32 = 4u;
+
+// Cone angle around +Y in radians (0.12..0.30 typical)
+const SKYVIS_CONE_ANGLE : f32 = 0.22;
+
+// Optional shaping to reduce “binary” feel
+const SKYVIS_CURVE_POW : f32 = 0.70;
+
+// Build a stable TBN around a given "up" direction.
+fn tbn_from_dir(n: vec3<f32>) -> mat3x3<f32> {
+  let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
+  let t = normalize(cross(up_ref, n));
+  let b = normalize(cross(n, t));
+  return mat3x3<f32>(t, b, n);
+}
+
+// Uniform cone sampling around +Z in local space, then rotate into world via TBN.
+// u in [0,1), v in [0,1)
+fn sample_cone_dir_local(u: f32, v: f32, cone_angle: f32) -> vec3<f32> {
+  // cos(theta) in [cos(cone), 1]
+  let cos_min = cos(cone_angle);
+  let cos_t   = mix(cos_min, 1.0, u);
+  let sin_t   = sqrt(max(0.0, 1.0 - cos_t * cos_t));
+  let phi     = 6.28318530718 * v;
+
+  // cone points along +Z in local
+  return vec3<f32>(cos(phi) * sin_t, sin(phi) * sin_t, cos_t);
+}
+
+// Stable per-point random (don’t use frame_index; avoid shimmer).
+fn skyvis_seed01(p: vec3<f32>) -> vec2<f32> {
+  // Quantize in voxel space for stability
+  let vs = cam.voxel_params.x;
+  let q  = floor(p / max(vs, 1e-6));
+  let a  = hash31(q + vec3<f32>(11.3, 7.1, 3.7));
+  let b  = hash31(q + vec3<f32>(5.9,  2.2, 9.4));
+  return vec2<f32>(a, b);
+}
+
+// Soft sky visibility: average a few geometry-only transmittance rays in a cone around +Y.
+fn sky_visibility_soft_geom(p: vec3<f32>) -> f32 {
+  // Bias up a hair (same intent as your old sky_visibility())
+  let vs = cam.voxel_params.x;
+  let pu = p + vec3<f32>(0.0, 1.0, 0.0) * (0.75 * vs);
+
+  let up = vec3<f32>(0.0, 1.0, 0.0);
+  let tbn = tbn_from_dir(up);
+
+  let s = skyvis_seed01(pu);
+
+  var sum: f32 = 0.0;
+
+  // Simple stratified pattern (stable)
+  for (var i: u32 = 0u; i < SKYVIS_SAMPLES; i = i + 1u) {
+    let fi = f32(i);
+
+    // Two stable pseudo-randoms per sample
+    let u = fract(s.x + (fi + 1.0) * 0.381966); // golden-ish
+    let v = fract(s.y + (fi + 1.0) * 0.618034);
+
+    // Sample cone around local +Z, map local +Z -> world +Y using TBN columns:
+    // Our tbn_from_dir makes n be the 3rd column, so local +Z maps to world "up".
+    let dl = sample_cone_dir_local(u, v, SKYVIS_CONE_ANGLE);
+    let dir = normalize(tbn * dl);
+
+    sum += sun_transmittance_geom_only(pu, dir);
+  }
+
+  let avg = sum / max(1.0, f32(SKYVIS_SAMPLES));
+
+  // Gentle curve: makes mid-values more common (reduces “either 0 or 1” feel).
+  return pow(clamp(avg, 0.0, 1.0), SKYVIS_CURVE_POW);
+}

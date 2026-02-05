@@ -43,6 +43,8 @@ pub const RAY_CS_WGSL: &str = concat!(
     "\n",
     include_str!("../shaders/ray_main.wgsl"),
     "\n",
+    include_str!("../shaders/local_taa.wgsl"),
+    "\n",
 );
 
 pub const BLIT_WGSL: &str = include_str!("../shaders/blit.wgsl");
