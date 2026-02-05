@@ -38,14 +38,17 @@ fn hemi_ambient(n: vec3<f32>, sky_up: vec3<f32>) -> vec3<f32> {
   return mix(grd, sky_up, upw);
 }
 
-fn material_variation(world_p: vec3<f32>, cell_size_m: f32) -> f32 {
+fn material_variation(world_p: vec3<f32>, cell_size_m: f32, dist_m: f32) -> f32 {
   let cell = floor(world_p / cell_size_m);
-  return (hash31(cell) - 0.5) * 2.0;
+  let raw = (hash31(cell) - 0.5) * 2.0;
+  let fade = 1.0 - smoothstep(35.0, 80.0, dist_m);
+  return raw * fade;
 }
 
-fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f32> {
+fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>, dist_m: f32) -> vec3<f32> {
   var c = base;
-  let v = ALBEDO_VAR_GAIN * material_variation(hp, 0.05);
+  let cell_size = max(0.08, cam.voxel_params.x * 0.75);
+  let v = ALBEDO_VAR_GAIN * material_variation(hp, cell_size, dist_m);
 
   if (mat == MAT_GRASS) {
     c += vec3<f32>(0.02 * v, 0.05 * v, 0.01 * v);
@@ -190,7 +193,7 @@ fn shade_hit_split(
   }
 
   var base = color_for_material(hg.mat);
-  base = apply_material_variation(base, hg.mat, hp);
+  base = apply_material_variation(base, hg.mat, hp, hg.t);
 
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
