@@ -9,6 +9,7 @@ fn color_for_material(m: u32) -> vec3<f32> {
   if (m == MAT_STONE) { return vec3<f32>(0.50, 0.50, 0.55); }
   if (m == MAT_WOOD)  { return vec3<f32>(0.38, 0.26, 0.14); }
   if (m == MAT_LEAF)  { return vec3<f32>(0.10, 0.55, 0.12); }
+  if (m == MAT_LIGHT) { return vec3<f32>(1.0, 0.95, 0.75); }
   return vec3<f32>(1.0, 0.0, 1.0);
 }
 
@@ -96,6 +97,7 @@ fn material_roughness(mat: u32) -> f32 {
   if (mat == MAT_LEAF)  { return 0.80; }
   if (mat == MAT_GRASS) { return 0.85; }
   if (mat == MAT_DIRT)  { return 0.90; }
+  if (mat == MAT_LIGHT) { return 0.25; }
   return 0.90;
 }
 
@@ -105,7 +107,15 @@ fn material_f0(mat: u32) -> f32 {
   if (mat == MAT_LEAF)  { return 0.05; }
   if (mat == MAT_GRASS) { return 0.04; }
   if (mat == MAT_DIRT)  { return 0.02; }
+  if (mat == MAT_LIGHT) { return 0.08; }
   return 0.02;
+}
+
+fn material_emission(mat: u32) -> vec3<f32> {
+  if (mat == MAT_LIGHT) {
+    return 18.0 * vec3<f32>(1.0, 0.95, 0.75);
+  }
+  return vec3<f32>(0.0);
 }
 
 fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
