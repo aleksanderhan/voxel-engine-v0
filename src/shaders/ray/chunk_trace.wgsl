@@ -53,6 +53,12 @@ fn point_in_cube(p: vec3<f32>, bmin: vec3<f32>, size: f32) -> bool {
          (p.z >= bmin.z && p.z < bmax.z);
 }
 
+fn step_eps(vs: f32, t: f32) -> f32 {
+  let eps_vs = 1e-4 * vs;
+  let eps_t  = 1e-5 * max(t, 1.0);
+  return max(eps_vs, eps_t);
+}
+
 // --------------------------------------------------------------------------
 // Macro occupancy early-out (returns a MAT_AIR cube if empty, else size==0)
 // --------------------------------------------------------------------------
@@ -400,8 +406,8 @@ fn trace_chunk_rope_interval(
   let root_bmin     = root_bmin_vox * vs;
   let root_size     = f32(cam.chunk_size) * vs;
 
-  let eps_step = 1e-4 * vs;
-  var tcur     = max(t_enter, 0.0) + eps_step;
+  var tcur = max(t_enter, 0.0);
+  tcur = tcur + step_eps(vs, tcur);
 
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
 
@@ -438,7 +444,8 @@ fn trace_chunk_rope_interval(
 
       if (macro_empty) {
         // Jump across empty macro cell
-        tcur = max(t_macro_exit, tcur) + eps_step;
+        let tnext = max(t_macro_exit, tcur);
+        tcur = tnext + step_eps(vs, tnext);
         have_leaf = false;
 
         if (tcur > t_exit) { break; }
@@ -466,7 +473,8 @@ fn trace_chunk_rope_interval(
     // Macro boundary event happens before leaf exit => advance to macro boundary
     // IMPORTANT: do not treat as leaf exit; do not do ropes.
     if (m.valid && (t_macro_exit < t_leave)) {
-      tcur = max(t_macro_exit, tcur) + eps_step;
+      let tnext = max(t_macro_exit, tcur);
+      tcur = tnext + step_eps(vs, tnext);
 
       if (tcur > t_exit) { break; }
 
@@ -491,7 +499,7 @@ fn trace_chunk_rope_interval(
       }
 
       if (lod_probe != 2u && leaf.size <= grass_leaf_limit) {
-        let t0_probe = max(t_enter, tcur - eps_step);
+        let t0_probe = max(t_enter, tcur - step_eps(vs, tcur));
         let t1_probe = min(t_leave, t_exit);
 
         if (t1_probe >= t0_probe) {
@@ -525,7 +533,8 @@ fn trace_chunk_rope_interval(
       // True leaf exit => rope traversal
       let face = exit_face_from_slab(rd, slab);
 
-      tcur = max(t_leave, tcur) + eps_step;
+      let tnext = max(t_leave, tcur);
+      tcur = tnext + step_eps(vs, tnext);
       if (tcur > t_exit) { break; }
 
       let p_next  = ro + tcur * rd;
@@ -600,7 +609,8 @@ fn trace_chunk_rope_interval(
       }
 
       // Miss: step out of this leaf
-      tcur = max(t_leave, tcur) + eps_step;
+      let tnext = max(t_leave, tcur);
+      tcur = tnext + step_eps(vs, tnext);
       have_leaf = false;
       continue;
     }
@@ -656,7 +666,8 @@ fn trace_chunk_rope_interval(
     }
 
     // Miss solid: step out of leaf
-    tcur = max(t_leave, tcur) + eps_step;
+    let tnext = max(t_leave, tcur);
+    tcur = tnext + step_eps(vs, tnext);
     have_leaf = false;
   }
 
@@ -701,7 +712,7 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
 
 
   // Nudge inside
-  let nudge_p = PRIMARY_NUDGE_VOXEL_FRAC * voxel_size;
+  let nudge_p = step_eps(voxel_size, t_enter);
   let start_t = t_enter + nudge_p;
   let p0      = ro + start_t * rd;
 
@@ -982,5 +993,3 @@ fn probe_grass_columns_xz_dda(
 
   return GrassHit(false, BIG_F32, vec3<f32>(0.0));
 }
-
-
