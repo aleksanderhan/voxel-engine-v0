@@ -442,10 +442,15 @@ fn grid_lookup_slot(cx: i32, cy: i32, cz: i32) -> u32 {
 }
 
 fn chunk_coord_from_pos(p: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
+  // Bias inward to avoid precision-induced chunk flips at exact boundaries.
+  let eps = 1e-4 * chunk_size_m;
+  let px = p.x - eps;
+  let py = p.y - eps;
+  let pz = p.z - eps;
   return vec3<i32>(
-    i32(floor(p.x / chunk_size_m)),
-    i32(floor(p.y / chunk_size_m)),
-    i32(floor(p.z / chunk_size_m))
+    i32(floor(px / chunk_size_m)),
+    i32(floor(py / chunk_size_m)),
+    i32(floor(pz / chunk_size_m))
   );
 }
 
