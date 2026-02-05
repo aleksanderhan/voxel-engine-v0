@@ -78,8 +78,17 @@ fn occ_at_material_aware(
   node_base: u32,
   macro_base: u32
 ) -> f32 {
-  // Query actual leaf material (macro_base still needed by query traversal)
-  let q = query_leaf_at(p, root_bmin, root_size, node_base, macro_base);
+  // Query actual leaf material (use world lookup if we stepped outside this chunk).
+  let eps = 1e-4 * root_size;
+  let bmin = root_bmin - vec3<f32>(eps);
+  let bmax = root_bmin + vec3<f32>(root_size + eps);
+  let inside = all(p >= bmin) && all(p < bmax);
+  var q: LeafQuery;
+  if (inside) {
+    q = query_leaf_at(p, root_bmin, root_size, node_base, macro_base);
+  } else {
+    q = query_leaf_world(p);
+  }
 
   // Ignore air and lights completely (so placing a lamp never darkens AO)
   if (q.mat == MAT_AIR || q.mat == MAT_LIGHT) {

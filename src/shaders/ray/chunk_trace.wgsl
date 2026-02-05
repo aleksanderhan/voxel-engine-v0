@@ -624,7 +624,6 @@ fn trace_chunk_rope_interval(
 
         let cell = pick_grass_cell_in_chunk(
           hp, rd,
-          root_bmin,
           origin_vox_i,
           vs,
           i32(cam.chunk_size)
