@@ -2,9 +2,26 @@
 //
 // Compute entrypoints + pass bindings only.
 // Depends on: common.wgsl + ray_core.wgsl + clipmap.wgsl
+//
+// Changes:
+// - Added local light output target (local_img) for shade_hit_split().local_hdr
+// - main_primary now:
+//     * computes ShadeOut for voxel hits
+//     * fogs ONLY base_hdr (and emissive voxels are already in base_hdr)
+//     * writes local_hdr UNFOGGED into local_img (for later temporal accumulation)
+// - For non-voxel cases (heightfield/sky), local_img is written as 0.
+//
+// NOTE: This file assumes you have:
+// - shade_hit_split() in shading.wgsl (and ShadeOut struct)
+// - shade_clip_hit() unchanged
+// - apply_fog() unchanged
+// - Your temporal accumulation pass is separate (not shown here).
 
 @group(0) @binding(4) var color_img : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var depth_img : texture_storage_2d<r32float, write>;
+
+// NEW: local (noisy) voxel-light term output (HDR, NOT fogged)
+@group(0) @binding(6) var local_img : texture_storage_2d<rgba16float, write>;
 
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
 @group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
@@ -45,8 +62,11 @@ fn main_primary(
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
 
-  let frame = cam.frame_index; // or whatever you already have
+  let frame = cam.frame_index;
   let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
+
+  // Default local output: none
+  var local_out = vec3<f32>(0.0);
 
   // ------------------------------------------------------------
   // Case 1: no voxel chunks => heightfield or sky
@@ -61,6 +81,7 @@ fn main_primary(
 
       textureStore(color_img, ip, vec4<f32>(col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+      textureStore(local_img, ip, vec4<f32>(local_out, 1.0));
       return;
     }
 
@@ -68,6 +89,7 @@ fn main_primary(
     let sky = sky_color(rd);
     textureStore(color_img, ip, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
+    textureStore(local_img, ip, vec4<f32>(local_out, 1.0));
     return;
   }
 
@@ -87,23 +109,36 @@ fn main_primary(
 
       textureStore(color_img, ip, vec4<f32>(col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+      textureStore(local_img, ip, vec4<f32>(local_out, 1.0));
       return;
     }
 
     let sky = sky_color(rd);
     textureStore(color_img, ip, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
+    textureStore(local_img, ip, vec4<f32>(local_out, 1.0));
     return;
   }
 
   // In grid: voxel hit?
   if (vt.best.hit != 0u) {
-    let surface = shade_hit(ro, rd, vt.best, sky_up, seed);
-    let t_scene = min(vt.best.t, FOG_MAX_DIST);
-    let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
+    // --- NEW: split shading
+    let sh = shade_hit_split(ro, rd, vt.best, sky_up, seed);
 
-    textureStore(color_img, ip, vec4<f32>(col, 1.0));
+    let t_scene = min(vt.best.t, FOG_MAX_DIST);
+
+    // Fog is a *view-space medium*, so apply it to the base surface term only.
+    // Local voxel lights will be accumulated separately and then added in composite
+    // (you can optionally fog it later in the accumulate/composite stage).
+    let col_base = apply_fog(sh.base_hdr, ro, rd, t_scene, sky_bg_rd);
+
+    // Local is stored un-fogged for TAA.
+    // (If you want local to be fogged too, do it after TAA, not here.)
+    local_out = sh.local_hdr;
+
+    textureStore(color_img, ip, vec4<f32>(col_base, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+    textureStore(local_img, ip, vec4<f32>(local_out, 1.0));
     return;
   }
 
@@ -117,6 +152,7 @@ fn main_primary(
 
     textureStore(color_img, ip, vec4<f32>(col, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+    textureStore(local_img, ip, vec4<f32>(local_out, 1.0));
     return;
   }
 
@@ -124,8 +160,8 @@ fn main_primary(
   let sky = sky_color(rd);
   textureStore(color_img, ip, vec4<f32>(sky, 1.0));
   textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
+  textureStore(local_img, ip, vec4<f32>(local_out, 1.0));
 }
-
 
 @compute @workgroup_size(8, 8, 1)
 fn main_godray(@builtin(global_invocation_id) gid3: vec3<u32>) {
@@ -138,7 +174,6 @@ fn main_godray(@builtin(global_invocation_id) gid3: vec3<u32>) {
   let out_rgba = compute_godray_pixel(gid, depth_tex, godray_hist_tex, godray_hist_samp);
   textureStore(godray_out, hip, out_rgba);
 }
-
 
 @compute @workgroup_size(8, 8, 1)
 fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {

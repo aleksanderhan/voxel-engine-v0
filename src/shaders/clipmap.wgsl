@@ -22,8 +22,8 @@ struct ClipmapParams {
   offset      : array<vec4<u32>, CLIP_LEVELS_MAX>,
 };
 
-@group(0) @binding(6) var<uniform> clip : ClipmapParams;
-@group(0) @binding(7) var clip_height : texture_2d_array<f32>;
+@group(0) @binding(7) var<uniform> clip : ClipmapParams;
+@group(0) @binding(8) var clip_height : texture_2d_array<f32>;;
 
 fn imod(a: i32, m: i32) -> i32 {
   var r = a % m;

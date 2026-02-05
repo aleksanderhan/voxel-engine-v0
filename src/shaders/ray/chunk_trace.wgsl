@@ -460,7 +460,7 @@ fn trace_chunk_rope_interval(
       have_leaf = true;
     }
 
-    let slab    = cube_slab_inv(ro, inv, leaf.bmin, leaf.size);
+    let slab    = cube_slab_inv(ro, rd, inv, leaf.bmin, leaf.size);
     let t_leave = slab.t_exit;
 
     // Macro boundary event happens before leaf exit => advance to macro boundary

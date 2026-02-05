@@ -1,7 +1,17 @@
 // src/shaders/ray/shadows.wgsl
+// ----------------------------
+// Sun transmittance (geometry-only + full with clouds)
+//
+// FIX: MAT_LIGHT voxels must NOT act like “black occluders” for sun/sky visibility.
+// If they do, placing a lamp can *reduce* sky_visibility() (used to gate ambient),
+// making nearby cave surfaces darker even though the lamp adds local light.
+//
+// So: treat MAT_LIGHT as transparent (like MAT_AIR) in shadow rays.
+
 //// --------------------------------------------------------------------------
 //// Sun transmittance (geometry-only + full with clouds)
 //// --------------------------------------------------------------------------
+
 fn trace_chunk_shadow_trans_interval(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -31,14 +41,20 @@ fn trace_chunk_shadow_trans_interval(
     let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base, ch.macro_base);
 
     // slab once (for stepping)
-    let slab    = cube_slab_inv(ro, inv, q.bmin, q.size);
+    let slab    = cube_slab_inv(ro, rd, inv, q.bmin, q.size);
     let t_leave = slab.t_exit;
 
     if (q.mat != MAT_AIR) {
+      // --- IMPORTANT FIX: lights do not occlude the sun/sky for visibility ---
+      if (q.mat == MAT_LIGHT) {
+        tcur = max(t_leave, tcur) + nudge_s;
+        continue;
+      }
+      // ----------------------------------------------------------------------
+
       if (q.mat == MAT_LEAF) {
         if (VOLUME_DISPLACED_LEAVES) {
-          // --- NEW: distance gate for displaced-leaf shadow test ---
-          // If far, skip expensive displaced intersection and just apply transmit.
+          // distance gate for displaced-leaf shadow test
           let center = q.bmin + vec3<f32>(0.5 * q.size);
           let d = length(center - cam.cam_pos.xyz);
 
@@ -56,7 +72,6 @@ fn trace_chunk_shadow_trans_interval(
           } else {
             trans *= LEAF_LIGHT_TRANSMIT;
           }
-          // --------------------------------------------------------
 
           tcur = max(t_leave, tcur) + nudge_s;
           continue;
@@ -73,6 +88,7 @@ fn trace_chunk_shadow_trans_interval(
         continue;
       }
 
+      // Any other solid fully blocks
       return 0.0;
     }
 
@@ -81,7 +97,6 @@ fn trace_chunk_shadow_trans_interval(
 
   return trans;
 }
-
 
 fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let voxel_size   = cam.voxel_params.x;
@@ -139,7 +154,7 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   var trans = 1.0;
   let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 512u);
 
-  // ---- HOISTED: grid bounds for the DDA loop (was recomputed each step)
+  // hoisted grid bounds for loop bounds check
   let ox: i32 = go.x;
   let oy: i32 = go.y;
   let oz: i32 = go.z;
@@ -152,7 +167,6 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let gx1: i32 = ox + nx;
   let gy1: i32 = oy + ny;
   let gz1: i32 = oz + nz;
-  // ---------------------------------------------------------------
 
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }
@@ -167,10 +181,12 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
       let cell_enter = start_t + t_local;
       let cell_exit2 = start_t + min(tNextLocal, t_exit_local);
 
+      // This function now treats MAT_LIGHT as transparent too.
       trans *= trace_chunk_shadow_trans_interval(ro, rd, ch2, cell_enter, cell_exit2);
       if (trans < MIN_TRANS) { break; }
     }
 
+    // advance DDA
     if (tMaxX < tMaxY) {
       if (tMaxX < tMaxZ) { cx += step_x; t_local = tMaxX; tMaxX += tDeltaX; }
       else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
@@ -179,7 +195,7 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
       else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
     }
 
-    // bounds check (now uses hoisted constants)
+    // bounds check
     if (cx < gx0 || cy < gy0 || cz < gz0 || cx >= gx1 || cy >= gy1 || cz >= gz1) { break; }
   }
 

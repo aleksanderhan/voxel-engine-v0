@@ -19,10 +19,14 @@ pub struct TextureSet {
     pub output: OutputTex,
     pub color: Tex2D,
     pub depth: Tex2D,
-    pub godray: [Tex2D; 2],
 
+    // per-pixel local lighting term (unfogged), written by primary
+    pub local: Tex2D,
+    
+    pub godray: [Tex2D; 2],
     pub clip_height: Tex2DArray,
 }
+
 
 pub fn quarter_dim(x: u32) -> u32 {
     (x + 3) / 4
@@ -166,10 +170,21 @@ pub fn create_textures(
         wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
     );
 
+    let local = make_tex2d(
+        device,
+        "local_tex",
+        internal_w,
+        internal_h,
+        wgpu::TextureFormat::Rgba16Float,
+        rw_tex_usage,
+    );
+
+
     TextureSet {
         output,
         color,
         depth,
+        local,
         godray,
         clip_height,
     }

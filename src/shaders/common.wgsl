@@ -308,9 +308,10 @@ struct ChunkMeta {
 @group(0) @binding(1) var<storage, read> chunks     : array<ChunkMeta>;
 @group(0) @binding(2) var<storage, read> nodes      : array<Node>;
 @group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
-@group(0) @binding(8) var<storage, read> macro_occ : array<u32>;
-@group(0) @binding(9) var<storage, read> node_ropes: array<NodeRopes>;
-@group(0) @binding(10) var<storage, read> chunk_colinfo : array<u32>;
+@group(0) @binding(9)  var<storage, read> macro_occ : array<u32>;
+@group(0) @binding(10) var<storage, read> node_ropes: array<NodeRopes>;
+@group(0) @binding(11) var<storage, read> chunk_colinfo : array<u32>;
+
 
 //// --------------------------------------------------------------------------
 //// Shared helpers
@@ -338,6 +339,16 @@ fn macro_test(macro_base: u32, bit: u32) -> bool {
 fn safe_inv(x: f32) -> f32 {
   return select(1.0 / x, BIG_F32, abs(x) < EPS_INV);
 }
+
+fn safe_normalize(v: vec3<f32>) -> vec3<f32> {
+  let l2 = dot(v, v);
+  // 1e-12 is conservative for f32; tweak if you want.
+  if (l2 <= 1e-12) {
+    return vec3<f32>(0.0, 1.0, 0.0); // arbitrary stable fallback
+  }
+  return v * inverseSqrt(l2);
+}
+
 
 fn ray_dir_from_pixel(px: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
   let ndc = vec4<f32>(
@@ -552,4 +563,20 @@ fn ip_render_from_present_px(px_present: vec2<f32>) -> vec2<i32> {
   let ix = clamp(i32(floor(pr.x)), 0, i32(rd.x) - 1);
   let iy = clamp(i32(floor(pr.y)), 0, i32(rd.y) - 1);
   return vec2<i32>(ix, iy);
+}
+
+fn is_nan_f32(x: f32) -> bool {
+  // NaN is the only float where x != x
+  return x != x;
+}
+
+fn is_inf_f32(x: f32) -> bool {
+  // Treat very large magnitude as inf/overflow.
+  // f32 max is ~3.4e38; choose a slightly smaller guard.
+  return abs(x) > 1.0e30;
+}
+
+fn is_bad_vec3(v: vec3<f32>) -> bool {
+  return is_nan_f32(v.x) || is_nan_f32(v.y) || is_nan_f32(v.z) ||
+         is_inf_f32(v.x) || is_inf_f32(v.y) || is_inf_f32(v.z);
 }

@@ -171,6 +171,7 @@ fn composite_pixel_mapped(
   // contrast around mid-gray
   let mid = vec3<f32>(0.18);
   hdr = (hdr - mid) * contrast + mid;
+  hdr = select(hdr, vec3<f32>(0.0), is_bad_vec3(hdr));
   hdr = max(hdr, vec3<f32>(0.0));
 
 

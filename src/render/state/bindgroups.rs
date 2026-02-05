@@ -47,28 +47,35 @@ fn make_primary_bg(
                 binding: 5,
                 resource: wgpu::BindingResource::TextureView(&textures.depth.view),
             },
-            // Clipmap params uniform
+            // NEW: local lighting output
             wgpu::BindGroupEntry {
                 binding: 6,
-                resource: buffers.clipmap.as_entire_binding(),
+                resource: wgpu::BindingResource::TextureView(&textures.local.view),
             },
-            // Clipmap height texture array
+            // shifted clipmap params uniform
             wgpu::BindGroupEntry {
                 binding: 7,
-                resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
+                resource: buffers.clipmap.as_entire_binding(),
             },
+            // shifted clipmap height texture array
             wgpu::BindGroupEntry {
                 binding: 8,
+                resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
+            },
+            // shifted storage buffers
+            wgpu::BindGroupEntry {
+                binding: 9,
                 resource: buffers.macro_occ.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 9,
+                binding: 10,
                 resource: buffers.node_ropes.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 10,
+                binding: 11,
                 resource: buffers.colinfo.as_entire_binding(),
             },
+
 
         ],
     })
