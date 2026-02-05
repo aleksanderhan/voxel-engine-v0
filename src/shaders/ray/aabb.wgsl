@@ -23,6 +23,20 @@ fn cube_slab_inv(
 ) -> CubeSlab {
   let bmax = bmin + vec3<f32>(size);
 
+  // Fast path: fully non-parallel ray (no per-axis branching needed).
+  if (all(abs(rd) >= vec3<f32>(EPS_INV))) {
+    let t0 = (bmin - ro) * inv;
+    let t1 = (bmax - ro) * inv;
+
+    let tminv = min(t0, t1);
+    let tmaxv = max(t0, t1);
+
+    let t_enter = max3(tminv);
+    let t_exit  = min3(tmaxv);
+
+    return CubeSlab(tminv, tmaxv, t_enter, t_exit);
+  }
+
   // Start with a valid “wide open” interval; we’ll fill per-axis.
   var t0 = vec3<f32>(0.0);
   var t1 = vec3<f32>(0.0);
