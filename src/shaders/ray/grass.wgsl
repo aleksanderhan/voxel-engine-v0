@@ -1,4 +1,3 @@
-// src/shaders/ray/grass.wgsl
 //// --------------------------------------------------------------------------
 //// Grass: SDF blades + tracing
 //// --------------------------------------------------------------------------
@@ -258,10 +257,6 @@ fn try_grass_slab_hit(
   time_s: f32,
   strength: f32
 ) -> GrassHit {
-  if (!ENABLE_GRASS) {
-    return GrassHit(false, BIG_F32, vec3<f32>(0.0));
-  }
-
   let layer_h = GRASS_LAYER_HEIGHT_VOX * vs;
   let over    = GRASS_OVERHANG_VOX * vs;
 
@@ -305,7 +300,6 @@ fn grass_lod_from_t(t: f32) -> u32 {
 }
 
 fn grass_allowed_primary(t: f32, n: vec3<f32>, seed: u32) -> bool {
-  if (!ENABLE_GRASS) { return false; }
   if (t > GRASS_PRIMARY_MAX_DIST) { return false; }
   if (n.y < GRASS_PRIMARY_MIN_NY) { return false; }
 

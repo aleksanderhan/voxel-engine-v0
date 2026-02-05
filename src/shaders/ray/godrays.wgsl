@@ -1,4 +1,3 @@
-// src/shaders/ray/godrays.wgsl
 // -----------------------------------------------------------------------------
 // Godrays (full-res):
 // - Single-pass raymarch integration
@@ -240,10 +239,7 @@ fn godray_compress(lin: vec3<f32>) -> vec3<f32> {
 // -----------------------------------------------------------------------------
 fn prev_uv_from_world(p_ws: vec3<f32>) -> vec2<f32> {
   let clip = cam.prev_view_proj * vec4<f32>(p_ws, 1.0);
-  if (clip.w <= 1e-6) {
-    return vec2<f32>(-1.0);
-  }
-  let invw = 1.0 / clip.w;
+  let invw = 1.0 / max(clip.w, 1e-6);
   let ndc  = clip.xy * invw;          // -1..+1
   return ndc * 0.5 + vec2<f32>(0.5);  // 0..1
 }
@@ -295,13 +291,13 @@ fn compute_godray_pixel(
 
   let t_hist = dmin;
 
-  if (!ENABLE_GODRAYS) {
-    return vec4<f32>(0.0, 0.0, 0.0, t_hist);
-  }
-
   // Jitters (frame-varying)
   let j4      = 0.20 * (hash12(qpx * J0_SCALE + fj) - 0.5);
   let j_phase =        (hash12(qpx * 0.91 + fj * 0.73 + vec2<f32>(31.7, 12.3)) - 0.5);
+
+  // Quantized end distance (frame-varying)
+  let qstep = 0.03;
+  let dq = (hash12(qpx * 1.37 + fj * 1.19 + vec2<f32>(9.2, 1.1)) - 0.5) * qstep;
 
   // Ray dir jitter (frame-varying)
   let j_rd = vec2<f32>(
@@ -310,7 +306,7 @@ fn compute_godray_pixel(
   );
 
   // Quantized end distance
-  let t_end = min(t_c, GODRAY_MAX_DIST);
+  let t_end = min(floor((t_c + dq) / qstep) * qstep, GODRAY_MAX_DIST);
 
   let fog_ok = fog_density_godray() > 0.0;
 
@@ -377,7 +373,6 @@ fn godray_sample_linear(
   godray_tex: texture_2d<f32>,
   godray_samp: sampler
 ) -> vec3<f32> {
-  if (!ENABLE_GODRAYS) { return vec3<f32>(0.0); }
   // history/current godray textures store *compressed* RGB in [0..1]
   let c = textureSampleLevel(godray_tex, godray_samp, uv, 0.0).xyz;
   return godray_decompress(c);

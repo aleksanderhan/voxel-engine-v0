@@ -30,7 +30,6 @@ fn cloud_coverage_at_xz(xz: vec2<f32>, time_s: f32) -> f32 {
 
 // Pseudo-3D density: xz noise + y-warped detail (still cheap)
 fn cloud_density(p: vec3<f32>, time_s: f32) -> f32 {
-  if (!ENABLE_CLOUDS) { return 0.0; }
   // outside slab => no density
   if (p.y <= CLOUD_BASE_H || p.y >= CLOUD_TOP_H) { return 0.0; }
 
@@ -64,7 +63,6 @@ fn cloud_density(p: vec3<f32>, time_s: f32) -> f32 {
 
 // March along sun dir to get self-shadowing (0..1 transmittance)
 fn cloud_light_transmittance(p: vec3<f32>, time_s: f32) -> f32 {
-  if (!ENABLE_CLOUDS) { return 1.0; }
   // If sun is below horizon, don’t self-shadow
   if (SUN_DIR.y <= 0.01) { return 1.0; }
 
@@ -88,7 +86,6 @@ fn cloud_light_transmittance(p: vec3<f32>, time_s: f32) -> f32 {
 }
 
 fn cloud_sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
-  if (!ENABLE_CLOUDS) { return 1.0; }
   if (sun_dir.y <= 0.01) { return 1.0; }
 
   // Intersect the sun ray with slab [BASE..TOP]
@@ -130,7 +127,6 @@ fn cloud_sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
 
 // A faster version used by godrays (2 steps)
 fn cloud_sun_transmittance_fast(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
-  if (!ENABLE_CLOUDS) { return 1.0; }
   if (sun_dir.y <= 0.01) { return 1.0; }
 
   let y0 = CLOUD_BASE_H;
@@ -163,7 +159,6 @@ fn cloud_sun_transmittance_fast(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
 }
 
 fn cloud_density_godray(p: vec3<f32>, time_s: f32) -> f32 {
-  if (!ENABLE_CLOUDS) { return 0.0; }
   if (p.y <= CLOUD_BASE_H || p.y >= CLOUD_TOP_H) { return 0.0; }
 
   let h = cloud_height01(p.y);
@@ -180,7 +175,6 @@ fn cloud_density_godray(p: vec3<f32>, time_s: f32) -> f32 {
 }
 
 fn cloud_sun_transmittance_godray(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
-  if (!ENABLE_CLOUDS) { return 1.0; }
   if (sun_dir.y <= 0.01) { return 1.0; }
 
   let y0 = CLOUD_BASE_H;
