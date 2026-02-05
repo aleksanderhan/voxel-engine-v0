@@ -201,7 +201,9 @@ fn composite_pixel_mapped(
 
   // Scale: tune this. Larger denom = weaker dither (less visible noise).
   // Start here:
-  c += vec3<f32>(tri / 2048.0);
+  let l_c = max(dot(c, lum_w), 0.0);
+  let dither_strength = mix(0.35, 1.0, smoothstep(0.02, 0.2, l_c));
+  c += vec3<f32>(tri / 4096.0) * dither_strength;
 
 
   // Gamma encode to LDR output
