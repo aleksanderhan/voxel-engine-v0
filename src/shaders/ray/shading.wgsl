@@ -1,25 +1,6 @@
-// src/shaders/ray/shading.wgsl
-// ----------------------------
-// Shading (split outputs for temporal accumulation of local voxel lights)
-//
-// What changed:
-// - Added ShadeOut + shade_hit_split(): returns (base_hdr, local_hdr)
-// - Added shade_hit(): wrapper that preserves old behavior (base+local) so
-//   existing callsites don’t break while you wire up the new buffers.
-// - Everything else kept compatible with your current symbols.
-//
-// Notes:
-// - This file does NOT implement the temporal accumulation pass. It only
-//   splits the shading so you can accumulate local_hdr elsewhere.
-// - Assumes these exist in other includes:
-//   - HitGeom, ClipHit, cam, clip, chunk_size, etc.
-//   - hash31(), hash12(), safe_normalize(), is_bad_vec3(), etc.
-//   - grass_* helpers, sun_transmittance_* and cloud_* helpers
-//   - macro_* helpers (macro_cell_size, macro_bit_index, macro_test, etc.)
-
-// --- Ambient floor so caves are never pitch black (HDR-linear space) ---
-const AMBIENT_FLOOR_STRENGTH : f32 = 0.020;                 // try 0.01..0.05
-const AMBIENT_FLOOR_COLOR    : vec3<f32> = vec3<f32>(0.9, 0.95, 1.0); // slight cool tint
+//// --------------------------------------------------------------------------
+//// Shading
+//// --------------------------------------------------------------------------
 
 fn color_for_material(m: u32) -> vec3<f32> {
   if (m == MAT_AIR)   { return vec3<f32>(0.0); }
@@ -66,32 +47,7 @@ fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f3
   return clamp(c, vec3<f32>(0.0), vec3<f32>(1.5));
 }
 
-// --- AO that ignores MAT_LIGHT (and treats leaves/grass as partial occluders) ---
-
-fn occ_at_material_aware(
-  p: vec3<f32>,
-  root_bmin: vec3<f32>,
-  root_size: f32,
-  node_base: u32,
-  macro_base: u32
-) -> f32 {
-  // Query actual leaf material (macro_base still needed by query traversal)
-  let q = query_leaf_at(p, root_bmin, root_size, node_base, macro_base);
-
-  // Ignore air and lights completely (so placing a lamp never darkens AO)
-  if (q.mat == MAT_AIR || q.mat == MAT_LIGHT) {
-    return 0.0;
-  }
-
-  // Treat foliage as partial occlusion (optional but looks nicer)
-  if (q.mat == MAT_LEAF)  { return 0.35; }
-  if (q.mat == MAT_GRASS) { return 0.25; }
-
-  // Everything else is solid occluder
-  return 1.0;
-}
-
-fn voxel_ao_material4(
+fn voxel_ao_local(
   hp: vec3<f32>,
   n: vec3<f32>,
   root_bmin: vec3<f32>,
@@ -99,32 +55,37 @@ fn voxel_ao_material4(
   node_base: u32,
   macro_base: u32
 ) -> f32 {
-  let vs = cam.voxel_params.x;
+  let r = 0.75 * cam.voxel_params.x;
 
-  // AO radius: keep your old intent (low-freq), but stable
-  let cell = macro_cell_size(root_size);
-  let r = max(0.75 * cell, 1.25 * vs);
-
-  // Stable TBN
   let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
   let t = normalize(cross(up_ref, n));
   let b = normalize(cross(n, t));
 
-  // Nudge off surface
-  let p0 = hp + n * (0.75 * vs);
+  var occ = 0.0;
 
-  var occ: f32 = 0.0;
-  occ += occ_at_material_aware(p0 + t * r, root_bmin, root_size, node_base, macro_base);
-  occ += occ_at_material_aware(p0 - t * r, root_bmin, root_size, node_base, macro_base);
-  occ += occ_at_material_aware(p0 + b * r, root_bmin, root_size, node_base, macro_base);
-  occ += occ_at_material_aware(p0 - b * r, root_bmin, root_size, node_base, macro_base);
+  let q0 = query_leaf_at(hp + t * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q0.mat != MAT_AIR);
 
-  let occ_n = occ * 0.25;
+  let q1 = query_leaf_at(hp - t * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q1.mat != MAT_AIR);
 
-  // Same shaping as before
+  let q2 = query_leaf_at(hp + b * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q2.mat != MAT_AIR);
+
+  let q3 = query_leaf_at(hp - b * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q3.mat != MAT_AIR);
+
+  let h0 = normalize(n + 0.65 * t + 0.35 * b);
+  let q4 = query_leaf_at(hp + h0 * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q4.mat != MAT_AIR);
+
+  let h1 = normalize(n - 0.65 * t + 0.35 * b);
+  let q5 = query_leaf_at(hp + h1 * r, root_bmin, root_size, node_base, macro_base);
+  occ += select(0.0, 1.0, q5.mat != MAT_AIR);
+
+  let occ_n = occ * (1.0 / 6.0);
   return clamp(1.0 - 0.70 * occ_n, 0.35, 1.0);
 }
-
 
 fn fresnel_schlick(ndv: f32, f0: f32) -> f32 {
   return f0 + (1.0 - f0) * pow(1.0 - clamp(ndv, 0.0, 1.0), 5.0);
@@ -152,23 +113,17 @@ fn material_f0(mat: u32) -> f32 {
 
 fn material_emission(mat: u32) -> vec3<f32> {
   if (mat == MAT_LIGHT) {
-    // HDR emission. Tune this to taste.
     return 18.0 * vec3<f32>(1.0, 0.95, 0.75);
   }
   return vec3<f32>(0.0);
 }
 
-// -----------------------------------------------------------------------------
-// Split shading output
-// -----------------------------------------------------------------------------
 struct ShadeOut {
   base_hdr   : vec3<f32>,
   local_hdr  : vec3<f32>,
-  local_w    : f32,       // 1 when local_hdr is a valid sample this frame, else 0
+  local_w    : f32,
 };
 
-
-// NEW: split shading (base + local voxel lights)
 fn shade_hit_split(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -176,18 +131,12 @@ fn shade_hit_split(
   sky_up: vec3<f32>,
   seed: u32
 ) -> ShadeOut {
+  let base_hdr = shade_hit(ro, rd, hg, sky_up, seed);
+  return ShadeOut(base_hdr, vec3<f32>(0.0), 0.0);
+}
+
+fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
   let hp = ro + hg.t * rd;
-
-  // Emissive lamp voxel itself: keep fully in base_hdr (do NOT TAA as "local")
-  if (hg.mat == MAT_LIGHT) {
-    let v = normalize(-rd);
-    let ndv = max(dot(hg.n, v), 0.0);
-
-    let core = 22.0 * vec3<f32>(1.0, 0.95, 0.75);
-    let rim  = 10.0 * pow(1.0 - ndv, 3.0) * vec3<f32>(1.0, 0.85, 0.55);
-
-    return ShadeOut(core + rim, vec3<f32>(0.0), 0.0);
-  }
 
   var base = color_for_material(hg.mat);
   base = apply_material_variation(base, hg.mat, hp);
@@ -213,36 +162,18 @@ fn shade_hit_split(
 
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
-  // AO (macro) — smooth distance fade to avoid “sphere” contour
-  var ao = 1.0;
-  if (hg.hit != 0u) {
-    let ao_fade = 1.0 - smoothstep(35.0, 55.0, hg.t); // tune range
-    if (ao_fade > 0.001) {
-      let ao_raw = voxel_ao_material4(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
-      ao = mix(1.0, ao_raw, ao_fade);
-    }
-  }
+  // AO for voxels: only when the hit is a real voxel hit (not sky / miss)
+  let ao = select(1.0, voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base), hg.hit != 0u);
 
-
-  // Ambient
   let amb_col      = hemi_ambient(hg.n, sky_up);
   let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
-
-  let sv_raw = sky_visibility(hp_shadow);
-  let sv     = max(sv_raw, 0.08);
-
-  var ambient = amb_col * amb_strength * ao * sv;
-
-  // Constant floor (fades outdoors)
-  let outdoor_fade = smoothstep(0.35, 0.90, sv_raw);
-  let floor_k = AMBIENT_FLOOR_STRENGTH * (1.0 - 0.65 * outdoor_fade);
-  ambient += floor_k * ao * AMBIENT_FLOOR_COLOR;
+  var ambient      = amb_col * amb_strength * ao;
 
   if (hg.mat == MAT_STONE) {
     ambient *= vec3<f32>(0.92, 0.95, 1.05);
   }
 
-  // Leaf dapple
+  // Leaf dapple (cheap) - keep as-is
   var dapple = 1.0;
   if (hg.mat == MAT_LEAF) {
     let time_s = cam.voxel_params.y;
@@ -251,9 +182,8 @@ fn shade_hit_split(
     dapple = 0.90 + 0.10 * (0.6 * d0 + 0.4 * d1);
   }
 
-  // Specular
-  let v = safe_normalize(-rd);
-  let h = safe_normalize(v + SUN_DIR);
+  let v = normalize(-rd);
+  let h = normalize(v + SUN_DIR);
 
   let ndv = max(dot(hg.n, v), 0.0);
   let ndh = max(dot(hg.n, h), 0.0);
@@ -268,45 +198,11 @@ fn shade_hit_split(
   let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis_geom * Tc * dapple;
   let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis_geom * Tc;
 
-  // Local voxel lights — smooth distance fade to avoid “sphere” contour
-  var local_light = vec3<f32>(0.0);
-  var local_w: f32 = 0.0;
-
-  let ll_fade = 1.0 - smoothstep(28.0, 42.0, hg.t); // tune range
-  if (ll_fade > 0.001) {
-    let cave = (sv_raw < 0.20);
-
-    // Keep perf: sample less often as distance increases
-    // (near: full rate; mid: half; far: quarter; outside fade: none)
-    let rate_mask = select(3u, 0u, cave); // original cave/outdoor behavior
-    let extra_mask = select(0u, 1u, hg.t > 20.0); // optional: half-rate after 20m
-    let m = rate_mask | extra_mask;
-
-    if ((seed & m) == 0u) {
-      local_light = gather_voxel_lights(
-        hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base, seed
-      ) * ll_fade;
-
-      // Tell the TAA pass this sample is “weaker” (optional but helps blending)
-      local_w = ll_fade;
-    }
-  }
-
-
-  let base_hdr  = base * (ambient + direct) + 0.20 * spec_col;
-  let local_hdr = base * local_light;
-
-  return ShadeOut(base_hdr, local_hdr, local_w);
+  return base * (ambient + direct) + 0.20 * spec_col;
 }
 
-// Your clip shading stays single-output (you can split later if desired)
 fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
   let hp = ro + ch.t * rd;
-
-  if (ch.mat == MAT_LIGHT) {
-    let facing = 0.65 + 0.35 * max(dot(ch.n, normalize(-rd)), 0.0);
-    return material_emission(ch.mat) * facing;
-  }
 
   var base = color_for_material(ch.mat);
   base = apply_material_variation_clip(base, ch.mat, hp);
@@ -340,15 +236,12 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
 
   let amb_col      = hemi_ambient(ch.n, sky_up);
   let amb_strength = 0.10;
-  var ambient      = amb_col * amb_strength * ao;
-
-  // tiny constant floor for terrain too (optional)
-  ambient += (0.015 * ao) * vec3<f32>(0.9, 0.95, 1.0);
+  let ambient      = amb_col * amb_strength * ao;
 
   let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis;
 
-  let vdir = safe_normalize(-rd);
-  let hdir = safe_normalize(vdir + SUN_DIR);
+  let vdir = normalize(-rd);
+  let hdir = normalize(vdir + SUN_DIR);
   let ndv  = max(dot(ch.n, vdir), 0.0);
   let ndh  = max(dot(ch.n, hdir), 0.0);
 
@@ -368,9 +261,3 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
 
   return base * (ambient + direct) + 0.18 * spec_col;
 }
-
-fn sky_visibility(p: vec3<f32>) -> f32 {
-  // Soft cone-averaged visibility (fixes hard cave ambient cutoffs)
-  return sky_visibility_soft_geom(p);
-}
-

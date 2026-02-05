@@ -1,4 +1,3 @@
-// src/shaders/ray/svo_query.wgsl
 //// --------------------------------------------------------------------------
 //// SVO query (leaf query + convenience predicates)
 //// --------------------------------------------------------------------------
@@ -29,15 +28,10 @@ fn query_leaf_at(
     // local position in chunk (meters)
     let lp = p_in - root_bmin;
 
-    // macro coords 0..7 (clamp in signed space before casting to avoid wrap)
-    let md = i32(MACRO_DIM) - 1;
-    let mx_i = clamp(i32(floor(lp.x / cell)), 0, md);
-    let my_i = clamp(i32(floor(lp.y / cell)), 0, md);
-    let mz_i = clamp(i32(floor(lp.z / cell)), 0, md);
-
-    let mx = u32(mx_i);
-    let my = u32(my_i);
-    let mz = u32(mz_i);
+    // macro coords 0..7
+    let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
+    let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
+    let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
 
     let bit = macro_bit_index(mx, my, mz);
 
@@ -102,16 +96,12 @@ fn query_leaf_at(
   return LeafQuery(bmin, size, MAT_AIR);
 }
 
-
 fn make_air_leaf(bmin: vec3<f32>, size: f32) -> LeafQuery {
   return LeafQuery(bmin, size, MAT_AIR);
 }
 
 // Returns leaf material at world position by first locating the chunk.
 fn query_leaf_world(p: vec3<f32>) -> LeafQuery {
-  // You need a leaf return type here that at least includes .mat.
-  // If your existing query_leaf_at returns a struct with .mat/.bmin/.size, reuse that type.
-
   let vs = cam.voxel_params.x;
   let chunk_size_m = f32(cam.chunk_size) * vs;
 
@@ -122,7 +112,7 @@ fn query_leaf_world(p: vec3<f32>) -> LeafQuery {
   let slot = grid_lookup_slot(c.x, c.y, c.z);
   if (slot == INVALID_U32 || slot >= cam.chunk_count) {
     // Outside loaded grid => air
-    return make_air_leaf(p, vs); // implement as your leaf struct with mat=MAT_AIR
+    return make_air_leaf(p, vs);
   }
 
   let ch = chunks[slot];

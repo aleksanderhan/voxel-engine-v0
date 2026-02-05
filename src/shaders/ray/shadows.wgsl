@@ -1,17 +1,6 @@
-// src/shaders/ray/shadows.wgsl
-// ----------------------------
-// Sun transmittance (geometry-only + full with clouds)
-//
-// FIX: MAT_LIGHT voxels must NOT act like “black occluders” for sun/sky visibility.
-// If they do, placing a lamp can *reduce* sky_visibility() (used to gate ambient),
-// making nearby cave surfaces darker even though the lamp adds local light.
-//
-// So: treat MAT_LIGHT as transparent (like MAT_AIR) in shadow rays.
-
 //// --------------------------------------------------------------------------
 //// Sun transmittance (geometry-only + full with clouds)
 //// --------------------------------------------------------------------------
-
 fn trace_chunk_shadow_trans_interval(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -36,26 +25,19 @@ fn trace_chunk_shadow_trans_interval(
     if (trans < MIN_TRANS) { break; }
 
     let p  = ro + tcur * rd;
-    let pq = p + rd * (0.1 * voxel_size); // try 0.01..0.05
-
+    let pq = p + rd * (1e-4 * cam.voxel_params.x);
 
     let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base, ch.macro_base);
 
     // slab once (for stepping)
-    let slab    = cube_slab_inv(ro, rd, inv, q.bmin, q.size);
+    let slab    = cube_slab_inv(ro, inv, q.bmin, q.size);
     let t_leave = slab.t_exit;
 
     if (q.mat != MAT_AIR) {
-      // --- IMPORTANT FIX: lights do not occlude the sun/sky for visibility ---
-      if (q.mat == MAT_LIGHT) {
-        tcur = max(t_leave, tcur) + nudge_s;
-        continue;
-      }
-      // ----------------------------------------------------------------------
-
       if (q.mat == MAT_LEAF) {
         if (VOLUME_DISPLACED_LEAVES) {
-          // distance gate for displaced-leaf shadow test
+          // --- NEW: distance gate for displaced-leaf shadow test ---
+          // If far, skip expensive displaced intersection and just apply transmit.
           let center = q.bmin + vec3<f32>(0.5 * q.size);
           let d = length(center - cam.cam_pos.xyz);
 
@@ -73,6 +55,7 @@ fn trace_chunk_shadow_trans_interval(
           } else {
             trans *= LEAF_LIGHT_TRANSMIT;
           }
+          // --------------------------------------------------------
 
           tcur = max(t_leave, tcur) + nudge_s;
           continue;
@@ -89,7 +72,6 @@ fn trace_chunk_shadow_trans_interval(
         continue;
       }
 
-      // Any other solid fully blocks
       return 0.0;
     }
 
@@ -98,6 +80,7 @@ fn trace_chunk_shadow_trans_interval(
 
   return trans;
 }
+
 
 fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let voxel_size   = cam.voxel_params.x;
@@ -125,7 +108,7 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   var t_local: f32 = 0.0;
   let t_exit_local = max(t_exit - start_t, 0.0);
 
-  var c = chunk_coord_from_pos_dir(p0, rd, chunk_size_m);
+  var c = chunk_coord_from_pos(p0, chunk_size_m);
   var cx: i32 = c.x;
   var cy: i32 = c.y;
   var cz: i32 = c.z;
@@ -155,7 +138,7 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   var trans = 1.0;
   let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 512u);
 
-  // hoisted grid bounds for loop bounds check
+  // ---- HOISTED: grid bounds for the DDA loop (was recomputed each step)
   let ox: i32 = go.x;
   let oy: i32 = go.y;
   let oz: i32 = go.z;
@@ -168,6 +151,7 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let gx1: i32 = ox + nx;
   let gy1: i32 = oy + ny;
   let gz1: i32 = oz + nz;
+  // ---------------------------------------------------------------
 
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }
@@ -182,12 +166,10 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
       let cell_enter = start_t + t_local;
       let cell_exit2 = start_t + min(tNextLocal, t_exit_local);
 
-      // This function now treats MAT_LIGHT as transparent too.
       trans *= trace_chunk_shadow_trans_interval(ro, rd, ch2, cell_enter, cell_exit2);
       if (trans < MIN_TRANS) { break; }
     }
 
-    // advance DDA
     if (tMaxX < tMaxY) {
       if (tMaxX < tMaxZ) { cx += step_x; t_local = tMaxX; tMaxX += tDeltaX; }
       else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
@@ -196,7 +178,7 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
       else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
     }
 
-    // bounds check
+    // bounds check (now uses hoisted constants)
     if (cx < gx0 || cy < gy0 || cz < gz0 || cx >= gx1 || cy >= gy1 || cz >= gz1) { break; }
   }
 
@@ -206,83 +188,4 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
 fn sun_transmittance(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let Tc = cloud_sun_transmittance(p, sun_dir);
   return Tc * sun_transmittance_geom_only(p, sun_dir);
-}
-
-// -----------------------------------------------------------------------------
-// Soft sky visibility (fixes hard cave ambient cutoffs)
-// -----------------------------------------------------------------------------
-
-// Keep low to avoid perf spikes. 3–5 is usually enough.
-const SKYVIS_SAMPLES : u32 = 4u;
-
-// Cone angle around +Y in radians (0.12..0.30 typical)
-const SKYVIS_CONE_ANGLE : f32 = 0.22;
-
-// Optional shaping to reduce “binary” feel
-const SKYVIS_CURVE_POW : f32 = 0.70;
-
-// Build a stable TBN around a given "up" direction.
-fn tbn_from_dir(n: vec3<f32>) -> mat3x3<f32> {
-  let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
-  let t = normalize(cross(up_ref, n));
-  let b = normalize(cross(n, t));
-  return mat3x3<f32>(t, b, n);
-}
-
-// Uniform cone sampling around +Z in local space, then rotate into world via TBN.
-// u in [0,1), v in [0,1)
-fn sample_cone_dir_local(u: f32, v: f32, cone_angle: f32) -> vec3<f32> {
-  // cos(theta) in [cos(cone), 1]
-  let cos_min = cos(cone_angle);
-  let cos_t   = mix(cos_min, 1.0, u);
-  let sin_t   = sqrt(max(0.0, 1.0 - cos_t * cos_t));
-  let phi     = 6.28318530718 * v;
-
-  // cone points along +Z in local
-  return vec3<f32>(cos(phi) * sin_t, sin(phi) * sin_t, cos_t);
-}
-
-// Stable per-point random (don’t use frame_index; avoid shimmer).
-fn skyvis_seed01(p: vec3<f32>) -> vec2<f32> {
-  // Quantize in voxel space for stability
-  let vs = cam.voxel_params.x;
-  let q  = floor(p / max(vs, 1e-6));
-  let a  = hash31(q + vec3<f32>(11.3, 7.1, 3.7));
-  let b  = hash31(q + vec3<f32>(5.9,  2.2, 9.4));
-  return vec2<f32>(a, b);
-}
-
-// Soft sky visibility: average a few geometry-only transmittance rays in a cone around +Y.
-fn sky_visibility_soft_geom(p: vec3<f32>) -> f32 {
-  // Bias up a hair (same intent as your old sky_visibility())
-  let vs = cam.voxel_params.x;
-  let pu = p + vec3<f32>(0.0, 1.0, 0.0) * (0.75 * vs);
-
-  let up = vec3<f32>(0.0, 1.0, 0.0);
-  let tbn = tbn_from_dir(up);
-
-  let s = skyvis_seed01(pu);
-
-  var sum: f32 = 0.0;
-
-  // Simple stratified pattern (stable)
-  for (var i: u32 = 0u; i < SKYVIS_SAMPLES; i = i + 1u) {
-    let fi = f32(i);
-
-    // Two stable pseudo-randoms per sample
-    let u = fract(s.x + (fi + 1.0) * 0.381966); // golden-ish
-    let v = fract(s.y + (fi + 1.0) * 0.618034);
-
-    // Sample cone around local +Z, map local +Z -> world +Y using TBN columns:
-    // Our tbn_from_dir makes n be the 3rd column, so local +Z maps to world "up".
-    let dl = sample_cone_dir_local(u, v, SKYVIS_CONE_ANGLE);
-    let dir = normalize(tbn * dl);
-
-    sum += sun_transmittance_geom_only(pu, dir);
-  }
-
-  let avg = sum / max(1.0, f32(SKYVIS_SAMPLES));
-
-  // Gentle curve: makes mid-values more common (reduces “either 0 or 1” feel).
-  return pow(clamp(avg, 0.0, 1.0), SKYVIS_CURVE_POW);
 }
