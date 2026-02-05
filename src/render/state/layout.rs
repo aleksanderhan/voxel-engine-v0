@@ -199,6 +199,16 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
 
             // NEW: sampler for godray_tex (used by textureSampleLevel)
             bgl_sampler(4, cs_vis),
+
+            // binding 5: local_hist_tex (sampled)
+            bgl_tex_sample_2d(
+                5,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: true },
+            ),
+            // binding 6: sampler (can reuse same sampler type)
+            bgl_sampler(6, cs_vis),
+
         ],
     });
 

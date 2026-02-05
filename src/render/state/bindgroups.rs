@@ -165,6 +165,8 @@ fn make_composite_bg(
     output_view: &wgpu::TextureView,
     depth_view: &wgpu::TextureView,
     godray_sampler: &wgpu::Sampler,
+    local_hist_view: &wgpu::TextureView,
+    local_sampler: &wgpu::Sampler,
     label: &str,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -176,6 +178,8 @@ fn make_composite_bg(
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(output_view) },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(godray_sampler) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(local_hist_view) },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(local_sampler) },
         ],
     })
 }
@@ -255,6 +259,8 @@ pub fn create_bind_groups(
             &textures.output.view,
             &textures.depth.view,
             sampler,
+            &textures.local.view,
+            sampler,
             "composite_bg_read_a",
         ),
         make_composite_bg(
@@ -265,9 +271,12 @@ pub fn create_bind_groups(
             &textures.output.view,
             &textures.depth.view,
             sampler,
+            &textures.local.view,
+            sampler,
             "composite_bg_read_b",
         ),
     ];
+
 
     let blit = make_blit_bg(
         device,

@@ -66,56 +66,65 @@ fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f3
   return clamp(c, vec3<f32>(0.0), vec3<f32>(1.5));
 }
 
-// Small helper: macro bit test at position p
-// returns 1.0 if occupied, 0.0 if empty
-fn occ_at(p: vec3<f32>, root_bmin: vec3<f32>, root_size: f32, macro_base: u32) -> f32 {
-  let cell = macro_cell_size(root_size);
-  let lp   = p - root_bmin;
+// --- AO that ignores MAT_LIGHT (and treats leaves/grass as partial occluders) ---
 
-  // macro coords 0..7
-  let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
-  let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
-  let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
+fn occ_at_material_aware(
+  p: vec3<f32>,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  node_base: u32,
+  macro_base: u32
+) -> f32 {
+  // Query actual leaf material (macro_base still needed by query traversal)
+  let q = query_leaf_at(p, root_bmin, root_size, node_base, macro_base);
 
-  let bit = macro_bit_index(mx, my, mz);
-  return select(0.0, 1.0, macro_test(macro_base, bit));
+  // Ignore air and lights completely (so placing a lamp never darkens AO)
+  if (q.mat == MAT_AIR || q.mat == MAT_LIGHT) {
+    return 0.0;
+  }
+
+  // Treat foliage as partial occlusion (optional but looks nicer)
+  if (q.mat == MAT_LEAF)  { return 0.35; }
+  if (q.mat == MAT_GRASS) { return 0.25; }
+
+  // Everything else is solid occluder
+  return 1.0;
 }
 
-// Ultra-cheap AO using only macro occupancy bits.
-// If macro_base is INVALID => returns 1 (no occlusion info available).
-fn voxel_ao_macro4(
+fn voxel_ao_material4(
   hp: vec3<f32>,
   n: vec3<f32>,
   root_bmin: vec3<f32>,
   root_size: f32,
+  node_base: u32,
   macro_base: u32
 ) -> f32 {
-  if (macro_base == INVALID_U32) { return 1.0; }
-
   let vs = cam.voxel_params.x;
 
-  // AO radius: tie it to macro cell size (AO is low-frequency anyway)
+  // AO radius: keep your old intent (low-freq), but stable
   let cell = macro_cell_size(root_size);
   let r = max(0.75 * cell, 1.25 * vs);
 
-  // Build a stable TBN
+  // Stable TBN
   let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
   let t = normalize(cross(up_ref, n));
   let b = normalize(cross(n, t));
 
-  var occ: f32 = 0.0;
-
   // Nudge off surface
   let p0 = hp + n * (0.75 * vs);
 
-  occ += occ_at(p0 + t * r, root_bmin, root_size, macro_base);
-  occ += occ_at(p0 - t * r, root_bmin, root_size, macro_base);
-  occ += occ_at(p0 + b * r, root_bmin, root_size, macro_base);
-  occ += occ_at(p0 - b * r, root_bmin, root_size, macro_base);
+  var occ: f32 = 0.0;
+  occ += occ_at_material_aware(p0 + t * r, root_bmin, root_size, node_base, macro_base);
+  occ += occ_at_material_aware(p0 - t * r, root_bmin, root_size, node_base, macro_base);
+  occ += occ_at_material_aware(p0 + b * r, root_bmin, root_size, node_base, macro_base);
+  occ += occ_at_material_aware(p0 - b * r, root_bmin, root_size, node_base, macro_base);
 
   let occ_n = occ * 0.25;
+
+  // Same shaping as before
   return clamp(1.0 - 0.70 * occ_n, 0.35, 1.0);
 }
+
 
 fn fresnel_schlick(ndv: f32, f0: f32) -> f32 {
   return f0 + (1.0 - f0) * pow(1.0 - clamp(ndv, 0.0, 1.0), 5.0);
@@ -153,9 +162,11 @@ fn material_emission(mat: u32) -> vec3<f32> {
 // Split shading output
 // -----------------------------------------------------------------------------
 struct ShadeOut {
-  base_hdr  : vec3<f32>,
-  local_hdr : vec3<f32>,
+  base_hdr   : vec3<f32>,
+  local_hdr  : vec3<f32>,
+  local_w    : f32,       // 1 when local_hdr is a valid sample this frame, else 0
 };
+
 
 // NEW: split shading (base + local voxel lights)
 fn shade_hit_split(
@@ -175,7 +186,7 @@ fn shade_hit_split(
     let core = 22.0 * vec3<f32>(1.0, 0.95, 0.75);
     let rim  = 10.0 * pow(1.0 - ndv, 3.0) * vec3<f32>(1.0, 0.85, 0.55);
 
-    return ShadeOut(core + rim, vec3<f32>(0.0));
+    return ShadeOut(core + rim, vec3<f32>(0.0), 0.0);
   }
 
   var base = color_for_material(hg.mat);
@@ -206,7 +217,7 @@ fn shade_hit_split(
   var ao = 1.0;
   if (hg.hit != 0u) {
     if (hg.t < 45.0) {
-      ao = voxel_ao_macro4(hp, hg.n, hg.root_bmin, hg.root_size, hg.macro_base);
+      ao = voxel_ao_material4(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
     }
   }
 
@@ -256,11 +267,11 @@ fn shade_hit_split(
 
   // Local voxel lights (noisy term)
   var local_light = vec3<f32>(0.0);
+  var local_w: f32 = 0.0;
+
   if (hg.t < 35.0) {
-    // “Cave detector”: low sky visibility => don’t subsample
     let cave = (sv_raw < 0.20);
 
-    // Keep your old scheme by default:
     // outdoors: quarter-rate, caves: full-rate
     let m = select(3u, 0u, cave);
 
@@ -268,25 +279,14 @@ fn shade_hit_split(
       local_light = gather_voxel_lights(
         hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base, seed
       );
+      local_w = 1.0;
     }
   }
 
   let base_hdr  = base * (ambient + direct) + 0.20 * spec_col;
   let local_hdr = base * local_light;
 
-  return ShadeOut(base_hdr, local_hdr);
-}
-
-// Back-compat wrapper: old behavior returns base+local in one vec3
-fn shade_hit(
-  ro: vec3<f32>,
-  rd: vec3<f32>,
-  hg: HitGeom,
-  sky_up: vec3<f32>,
-  seed: u32
-) -> vec3<f32> {
-  let sh = shade_hit_split(ro, rd, hg, sky_up, seed);
-  return sh.base_hdr + sh.local_hdr;
+  return ShadeOut(base_hdr, local_hdr, local_w);
 }
 
 // Your clip shading stays single-output (you can split later if desired)
