@@ -17,20 +17,20 @@
 // - apply_fog() unchanged
 // - Your temporal accumulation pass is separate (not shown here).
 
-@group(0) @binding(4) var color_img : texture_storage_2d<rgba16float, write>;
+@group(0) @binding(4) var color_img : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(5) var depth_img : texture_storage_2d<r32float, write>;
 
 // local (noisy) voxel-light term output (HDR, NOT fogged)
-@group(0) @binding(6) var local_img : texture_storage_2d<rgba16float, write>;
+@group(0) @binding(6) var local_img : texture_storage_2d<rgba32float, write>;
 
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
 @group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
-@group(1) @binding(2) var godray_out      : texture_storage_2d<rgba16float, write>;
+@group(1) @binding(2) var godray_out      : texture_storage_2d<rgba32float, write>;
 @group(1) @binding(3) var godray_hist_samp: sampler;
 
 @group(2) @binding(0) var color_tex  : texture_2d<f32>;
 @group(2) @binding(1) var godray_tex : texture_2d<f32>;
-@group(2) @binding(2) var out_img    : texture_storage_2d<rgba16float, write>;
+@group(2) @binding(2) var out_img    : texture_storage_2d<rgba32float, write>;
 @group(2) @binding(3) var depth_full : texture_2d<f32>;
 @group(2) @binding(4) var godray_samp: sampler;
 
