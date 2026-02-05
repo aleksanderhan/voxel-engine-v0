@@ -403,11 +403,10 @@ fn macro_chunk_is_empty(macro_base: u32) -> bool {
   if (macro_base == INVALID_U32) { return false; }
 
   // 16 u32 words = 512 bits (8*8*8)
-  var any: u32 = 0u;
   for (var i: u32 = 0u; i < MACRO_WORDS_PER_CHUNK; i = i + 1u) {
-    any |= macro_occ[macro_base + i];
+    if (macro_occ[macro_base + i] != 0u) { return false; }
   }
-  return any == 0u;
+  return true;
 }
 
 // --------------------------------------------------------------------------
@@ -643,6 +642,7 @@ fn trace_chunk_rope_interval(
 
         let cell = pick_grass_cell_in_chunk(
           hp, rd,
+          root_bmin,
           origin_vox_i,
           vs,
           i32(cam.chunk_size)

@@ -29,10 +29,15 @@ fn query_leaf_at(
     // local position in chunk (meters)
     let lp = p_in - root_bmin;
 
-    // macro coords 0..7
-    let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
-    let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
-    let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
+    // macro coords 0..7 (clamp in signed space before casting to avoid wrap)
+    let md = i32(MACRO_DIM) - 1;
+    let mx_i = clamp(i32(floor(lp.x / cell)), 0, md);
+    let my_i = clamp(i32(floor(lp.y / cell)), 0, md);
+    let mz_i = clamp(i32(floor(lp.z / cell)), 0, md);
+
+    let mx = u32(mx_i);
+    let my = u32(my_i);
+    let mz = u32(mz_i);
 
     let bit = macro_bit_index(mx, my, mz);
 

@@ -29,9 +29,18 @@ fn exp_neg_fast(x_in: f32) -> f32 {
 }
 
 fn godray_steps_for_tend(t_end: f32) -> u32 {
-  let raw_f = t_end * GODRAY_STEPS_PER_METER;
-  let clamped = clamp(raw_f, f32(GODRAY_MIN_STEPS), f32(GODRAY_STEPS_FAST));
-  return u32(ceil(clamped));
+  // raw desired steps
+  let raw_f = ceil(t_end * GODRAY_STEPS_PER_METER);
+
+  // clamp to [min..max]
+  var s: u32 = u32(clamp(raw_f, f32(GODRAY_MIN_STEPS), f32(GODRAY_STEPS_FAST)));
+
+  // quantize to multiples of GODRAY_STEP_Q to reduce shimmer
+  // round up so we don't lose quality
+  s = ((s + (GODRAY_STEP_Q - 1u)) / GODRAY_STEP_Q) * GODRAY_STEP_Q;
+
+  // final clamp in case rounding pushed above max
+  return min(s, GODRAY_STEPS_FAST);
 }
 
 fn godray_integrate_1(
