@@ -11,35 +11,25 @@ struct GrassCell {
 fn pick_grass_cell_in_chunk(
   hp_m: vec3<f32>,
   rd: vec3<f32>,
-  root_bmin_m: vec3<f32>,
   ch_origin_vox: vec3<i32>,
   voxel_size_m: f32,
   chunk_size_vox: i32
 ) -> GrassCell {
-  let root_size_m = f32(chunk_size_vox) * voxel_size_m;
-
   let bias = 0.05 * voxel_size_m;
-  var local_xz = (hp_m - root_bmin_m) - rd * bias;
-  local_xz.x = clamp(local_xz.x, 0.0, root_size_m - 1e-6);
-  local_xz.z = clamp(local_xz.z, 0.0, root_size_m - 1e-6);
+  let p = hp_m - rd * bias;
 
-  let y_in = hp_m.y - 1e-4 * voxel_size_m;
-  var local_y = clamp(y_in - root_bmin_m.y, 0.0, root_size_m - 1e-6);
+  var wx = i32(floor(p.x / voxel_size_m));
+  var wy = i32(floor(p.y / voxel_size_m));
+  var wz = i32(floor(p.z / voxel_size_m));
 
-  var ix = i32(floor(local_xz.x / voxel_size_m));
-  var iy = i32(floor(local_y    / voxel_size_m));
-  var iz = i32(floor(local_xz.z / voxel_size_m));
+  let max_vox = ch_origin_vox + vec3<i32>(chunk_size_vox - 1);
 
-  ix = clamp(ix, 0, chunk_size_vox - 1);
-  iy = clamp(iy, 0, chunk_size_vox - 1);
-  iz = clamp(iz, 0, chunk_size_vox - 1);
+  wx = clamp(wx, ch_origin_vox.x, max_vox.x);
+  wy = clamp(wy, ch_origin_vox.y, max_vox.y);
+  wz = clamp(wz, ch_origin_vox.z, max_vox.z);
 
-  let bmin_m = root_bmin_m + vec3<f32>(f32(ix), f32(iy), f32(iz)) * voxel_size_m;
-  let id_vox = vec3<f32>(
-    f32(ch_origin_vox.x + ix),
-    f32(ch_origin_vox.y + iy),
-    f32(ch_origin_vox.z + iz)
-  );
+  let bmin_m = vec3<f32>(f32(wx), f32(wy), f32(wz)) * voxel_size_m;
+  let id_vox = vec3<f32>(f32(wx), f32(wy), f32(wz));
 
   return GrassCell(bmin_m, id_vox);
 }
