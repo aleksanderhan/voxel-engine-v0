@@ -124,7 +124,8 @@ fn cube_hit_normal_from_slab(
     if (axis == 1u) { n = vec3<f32>(0.0, select(-1.0,  1.0, rd.y > 0.0), 0.0); }
     if (axis == 2u) { n = vec3<f32>(0.0, 0.0, select(-1.0,  1.0, rd.z > 0.0)); }
 
-    return BoxHit(true, t0, slab.t_exit, n);
+    // Ray starts inside the box; return the exit intersection.
+    return BoxHit(true, slab.t_exit, slab.t_exit, n);
   }
 }
 
