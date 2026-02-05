@@ -92,9 +92,9 @@ fn occ_at_material_aware(
   let inside = all(p >= bmin) && all(p < bmax);
   var q: LeafQuery;
   if (inside) {
-    q = query_leaf_at(p, root_bmin, root_size, node_base, macro_base);
+    q = query_leaf_at(p, root_bmin, root_size, node_base, INVALID_U32);
   } else {
-    q = query_leaf_world(p);
+    q = query_leaf_world_no_macro(p);
   }
 
   // Ignore air and lights completely (so placing a lamp never darkens AO)

@@ -128,3 +128,21 @@ fn query_leaf_world(p: vec3<f32>) -> LeafQuery {
 
   return query_leaf_at(p, root_bmin, root_size, ch.node_base, ch.macro_base);
 }
+
+// Variant for shading/AO: skip macro occupancy to avoid coarse seams.
+fn query_leaf_world_no_macro(p: vec3<f32>) -> LeafQuery {
+  let vs = cam.voxel_params.x;
+  let chunk_size_m = f32(cam.chunk_size) * vs;
+
+  let c = chunk_coord_from_pos(p, chunk_size_m);
+  let slot = grid_lookup_slot(c.x, c.y, c.z);
+  if (slot == INVALID_U32 || slot >= cam.chunk_count) {
+    return make_air_leaf(p, vs);
+  }
+
+  let ch = chunks[slot];
+  let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * vs;
+  let root_size = f32(cam.chunk_size) * vs;
+
+  return query_leaf_at(p, root_bmin, root_size, ch.node_base, INVALID_U32);
+}
