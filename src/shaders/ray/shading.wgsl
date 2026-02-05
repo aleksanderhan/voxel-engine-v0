@@ -39,16 +39,23 @@ fn hemi_ambient(n: vec3<f32>, sky_up: vec3<f32>) -> vec3<f32> {
 }
 
 fn material_variation(world_p: vec3<f32>, cell_size_m: f32, dist_m: f32) -> f32 {
-  let cell = floor(world_p / cell_size_m);
-  let raw = (hash31(cell) - 0.5) * 2.0;
+  let scale = max(cell_size_m * 2.5, 1e-3);
+  let uv = world_p.xz / scale;
+  let raw = (value_noise(uv) - 0.5) * 2.0;
   let fade = exp(-dist_m / 75.0);
   return raw * fade;
 }
 
-fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>, dist_m: f32) -> vec3<f32> {
+fn apply_material_variation(
+  base: vec3<f32>,
+  mat: u32,
+  hp: vec3<f32>,
+  dist_m: f32,
+  strength: f32
+) -> vec3<f32> {
   var c = base;
   let cell_size = max(0.08, cam.voxel_params.x * 0.75);
-  let v = ALBEDO_VAR_GAIN * material_variation(hp, cell_size, dist_m);
+  let v = ALBEDO_VAR_GAIN * material_variation(hp, cell_size, dist_m) * strength;
 
   if (mat == MAT_GRASS) {
     c += vec3<f32>(0.02 * v, 0.05 * v, 0.01 * v);
@@ -201,13 +208,21 @@ fn shade_hit_split(
     return ShadeOut(core + rim, vec3<f32>(0.0), 0.0);
   }
 
+  let vs        = cam.voxel_params.x;
+  let hp_shadow = hp + hg.n * (0.75 * vs);
+
+  let Tc       = cloud_sun_transmittance(hp_shadow, SUN_DIR);
+  let vis_geom = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
+
+  let sv_raw = sky_visibility(hp_shadow);
+  let var_strength = mix(0.35, 1.0, smoothstep(0.15, 0.45, sv_raw));
+
   var base = color_for_material(hg.mat);
-  base = apply_material_variation(base, hg.mat, hp, hg.t);
+  base = apply_material_variation(base, hg.mat, hp, hg.t, var_strength);
 
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
     if (grass_allowed_primary(hg.t, hg.n, seed)) {
-      let vs  = cam.voxel_params.x;
       let tip = clamp(fract(hp.y / max(vs, 1e-6)), 0.0, 1.0);
 
       base = mix(base, base + vec3<f32>(0.10, 0.10, 0.02), 0.35 * tip);
@@ -216,12 +231,6 @@ fn shade_hit_split(
       base += 0.22 * back * vec3<f32>(0.18, 0.35, 0.10);
     }
   }
-
-  let vs        = cam.voxel_params.x;
-  let hp_shadow = hp + hg.n * (0.75 * vs);
-
-  let Tc       = cloud_sun_transmittance(hp_shadow, SUN_DIR);
-  let vis_geom = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
 
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
@@ -240,7 +249,6 @@ fn shade_hit_split(
   let amb_col      = hemi_ambient(hg.n, sky_up);
   let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
 
-  let sv_raw = sky_visibility(hp_shadow);
   let sv     = max(sv_raw, 0.08);
 
   var ambient = amb_col * amb_strength * ao * sv;
