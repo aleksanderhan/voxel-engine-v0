@@ -139,6 +139,10 @@ struct ClipHit {
 };
 
 fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> ClipHit {
+  if (!ENABLE_CLIPMAP) {
+    return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+  }
+
   // Same behavior: only trace when ray points downward.
   if (rd.y >= -1e-4) {
     return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
