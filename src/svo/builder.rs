@@ -386,126 +386,23 @@ fn build_height_cache<'g>(
         tim.cache_w = cache_w as u32;
         tim.cache_h = cache_h as u32;
 
-        // If vpm == 1, meter-grid == voxel-grid: just do the old direct fill (exact + simple).
-        if ctx.vpm <= 1 {
-            scratch.height_cache
-                .par_chunks_mut(cache_w)
-                .enumerate()
-                .for_each(|(z, row)| {
-                    if (z & 15) == 0 && should_cancel(cancel) {
-                        return;
-                    }
-                    let wz = cache_z0 + z as i32;
-                    for x in 0..cache_w {
-                        let wx = cache_x0 + x as i32;
-                        row[x] = gen.ground_height(wx, wz);
-                    }
-                });
-
-            scratch.height_cache_x0 = cache_x0;
-            scratch.height_cache_z0 = cache_z0;
-            scratch.height_cache_valid = true;
-        } else {
-            // Meter-grid bounds (inclusive), with +1 halo for bilinear.
-            // We sample integer meter coordinates, then upsample to voxels.
-            let xm0 = cache_x0.div_euclid(ctx.vpm);
-            let zm0 = cache_z0.div_euclid(ctx.vpm);
-            let xm1 = cache_x1.div_euclid(ctx.vpm) + 1;
-            let zm1 = cache_z1.div_euclid(ctx.vpm) + 1;
-
-            let hm_w = (xm1 - xm0 + 1) as usize;
-            let hm_h = (zm1 - zm0 + 1) as usize;
-
-            let hm_same =
-                scratch.hm_valid &&
-                scratch.hm_xm0 == xm0 &&
-                scratch.hm_zm0 == zm0 &&
-                scratch.hm_w == hm_w &&
-                scratch.hm_h == hm_h;
-
-            if !hm_same {
-                scratch.ensure_hm(hm_w, hm_h);
-
-                for j in 0..hm_h {
-                    if (j & 15) == 0 && should_cancel(cancel) {
-                        break;
-                    }
-                    let zm = zm0 + j as i32;
-                    let row0 = j * hm_w;
-                    for i in 0..hm_w {
-                        let xm = xm0 + i as i32;
-                        scratch.hm[row0 + i] = gen.ground_height_m(xm as f64, zm as f64);
-                    }
+        scratch.height_cache
+            .par_chunks_mut(cache_w)
+            .enumerate()
+            .for_each(|(z, row)| {
+                if (z & 15) == 0 && should_cancel(cancel) {
+                    return;
                 }
-
-                scratch.hm_xm0 = xm0;
-                scratch.hm_zm0 = zm0;
-                scratch.hm_valid = true;
-            }
-
-            // Bilinear upsample into per-voxel height_cache
-            let hm = &scratch.hm;
-            let hm_wu = scratch.hm_w;
-            let hm_hu = scratch.hm_h;
-
-            let vpm = ctx.vpm as usize;
-            let inv_vpm = 1.0f32 / (ctx.vpm as f32);
-
-            for z in 0..cache_h {
-                if (z & 31) == 0 && should_cancel(cancel) {
-                    break;
-                }
-
                 let wz = cache_z0 + z as i32;
-
-                // meter row + fractional within the meter cell (incremental would be possible too,
-                // but z is only 64, so one div+rem per row is fine).
-                let mz = (wz.div_euclid(ctx.vpm) - scratch.hm_zm0) as i32;
-                let rz = wz.rem_euclid(ctx.vpm) as usize;
-
-                let mz0 = (mz.max(0) as usize).min(hm_hu - 1);
-                let mz1 = (mz0 + 1).min(hm_hu - 1);
-                let fz = (rz as f32) * inv_vpm;
-
-                let row_off = z * cache_w;
-
-                // Incremental x mapping: avoid div/rem per voxel.
-                let mut wx = cache_x0;
-                let mut mx = (wx.div_euclid(ctx.vpm) - scratch.hm_xm0) as i32;
-                let mut rx = wx.rem_euclid(ctx.vpm) as i32;
-                if rx < 0 { rx += ctx.vpm; mx -= 1; } // just in case cache_x0 can be negative
-
                 for x in 0..cache_w {
-                    let mx0 = (mx.max(0) as usize).min(hm_wu - 1);
-                    let mx1 = (mx0 + 1).min(hm_wu - 1);
-                    let fx = (rx as f32) * inv_vpm;
-
-                    let a = hm[mz0 * hm_wu + mx0] as f32;
-                    let b = hm[mz0 * hm_wu + mx1] as f32;
-                    let c = hm[mz1 * hm_wu + mx0] as f32;
-                    let d = hm[mz1 * hm_wu + mx1] as f32;
-
-                    let ab = a + (b - a) * fx;
-                    let cd = c + (d - c) * fx;
-                    let h = ab + (cd - ab) * fz;
-
-                    scratch.height_cache[row_off + x] = h.round() as i32;
-
-                    // advance x
-                    wx += 1;
-                    rx += 1;
-                    if rx == ctx.vpm {
-                        rx = 0;
-                        mx += 1;
-                    }
+                    let wx = cache_x0 + x as i32;
+                    row[x] = gen.ground_height(wx, wz);
                 }
-            }
+            });
 
-
-            scratch.height_cache_x0 = cache_x0;
-            scratch.height_cache_z0 = cache_z0;
-            scratch.height_cache_valid = true;
-        }
+        scratch.height_cache_x0 = cache_x0;
+        scratch.height_cache_z0 = cache_z0;
+        scratch.height_cache_valid = true;
     }
 
     HeightSampler {
