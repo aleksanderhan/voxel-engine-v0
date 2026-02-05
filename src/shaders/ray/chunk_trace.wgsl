@@ -716,7 +716,7 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
   let p0      = ro + start_t * rd;
 
   // World chunk coords at start
-  let c = chunk_coord_from_pos(p0, chunk_size_m);
+  let c = chunk_coord_from_pos_dir(p0, rd, chunk_size_m);
 
   // Local grid coords (0..dims-1) and running linear index
   let nx: i32 = i32(gd.x);

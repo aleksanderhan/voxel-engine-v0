@@ -454,6 +454,19 @@ fn chunk_coord_from_pos(p: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
   );
 }
 
+fn chunk_coord_from_pos_dir(p: vec3<f32>, rd: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
+  // Bias along ray direction to stay on the same side of boundaries during DDA.
+  let eps = 1e-4 * chunk_size_m;
+  let px = p.x + sign(rd.x) * eps;
+  let py = p.y + sign(rd.y) * eps;
+  let pz = p.z + sign(rd.z) * eps;
+  return vec3<i32>(
+    i32(floor(px / chunk_size_m)),
+    i32(floor(py / chunk_size_m)),
+    i32(floor(pz / chunk_size_m))
+  );
+}
+
 fn chunk_max_depth() -> u32 {
   // chunk_size is power-of-two; log2 = 31 - clz
   return 31u - countLeadingZeros(cam.chunk_size);

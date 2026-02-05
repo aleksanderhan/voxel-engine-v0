@@ -125,7 +125,7 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   var t_local: f32 = 0.0;
   let t_exit_local = max(t_exit - start_t, 0.0);
 
-  var c = chunk_coord_from_pos(p0, chunk_size_m);
+  var c = chunk_coord_from_pos_dir(p0, rd, chunk_size_m);
   var cx: i32 = c.x;
   var cy: i32 = c.y;
   var cz: i32 = c.z;
