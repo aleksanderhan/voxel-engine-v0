@@ -443,7 +443,7 @@ fn grid_lookup_slot(cx: i32, cy: i32, cz: i32) -> u32 {
 
 fn chunk_coord_from_pos(p: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
   // Bias inward to avoid precision-induced chunk flips at exact boundaries.
-  let eps = 1e-4 * chunk_size_m;
+  let eps = 1e-6 * chunk_size_m;
   let px = p.x - sign(p.x) * eps;
   let py = p.y - sign(p.y) * eps;
   let pz = p.z - sign(p.z) * eps;
@@ -456,7 +456,7 @@ fn chunk_coord_from_pos(p: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
 
 fn chunk_coord_from_pos_dir(p: vec3<f32>, rd: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
   // Bias along ray direction to stay on the same side of boundaries during DDA.
-  let eps = 1e-4 * chunk_size_m;
+  let eps = 1e-6 * chunk_size_m;
   let px = p.x + sign(rd.x) * eps;
   let py = p.y + sign(rd.y) * eps;
   let pz = p.z + sign(rd.z) * eps;
