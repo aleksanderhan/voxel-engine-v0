@@ -480,7 +480,7 @@ impl Renderer {
             let h = u.h as usize;
             if w == 0 || h == 0 { continue; }
 
-            let row_bytes = w * 2;                 // R16Float => 2 bytes/texel
+            let row_bytes = w * 4;                 // R32Float => 4 bytes/texel
             let padded = align_up(row_bytes, 256); // required
             let needed = padded * h;
 
@@ -488,12 +488,13 @@ impl Renderer {
             scratch.resize(needed, 0);
 
             // copy row-by-row into padded scratch
-            let src: &[u8] = bytemuck::cast_slice(&u.data_f16);
+            let src: &[u8] = bytemuck::cast_slice(&u.data_f32);
             for row in 0..h {
                 let s0 = row * row_bytes;
                 let d0 = row * padded;
                 scratch[d0..d0 + row_bytes].copy_from_slice(&src[s0..s0 + row_bytes]);
             }
+
 
             self.queue.write_texture(
                 wgpu::ImageCopyTexture {

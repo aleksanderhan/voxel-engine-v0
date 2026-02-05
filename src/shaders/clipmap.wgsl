@@ -23,7 +23,7 @@ struct ClipmapParams {
 };
 
 @group(0) @binding(7) var<uniform> clip : ClipmapParams;
-@group(0) @binding(8) var clip_height : texture_2d_array<f32>;;
+@group(0) @binding(8) var clip_height : texture_2d_array<f32>;
 
 fn imod(a: i32, m: i32) -> i32 {
   var r = a % m;
@@ -40,13 +40,11 @@ struct HSample { h: f32, ok: bool };
 
 fn clip_height_at_level_ok(world_xz: vec2<f32>, level: u32) -> HSample {
   let res_i = max(i32(clip.res), 1);
-  let p = clip.level[level];
-  let origin = vec2<f32>(p.x, p.y);
-  let cell   = max(p.z, 1e-6);
 
-  let uv = (world_xz - origin) / cell;
-  let ix = i32(floor(uv.x));
-  let iz = i32(floor(uv.y));
+  let st = clip_st(world_xz, level);
+
+  let ix = i32(floor(st.x));
+  let iz = i32(floor(st.y));
 
   if (ix < 0 || iz < 0 || ix >= res_i || iz >= res_i) {
     return HSample(0.0, false);
@@ -59,6 +57,7 @@ fn clip_height_at_level_ok(world_xz: vec2<f32>, level: u32) -> HSample {
   let h = textureLoad(clip_height, vec2<i32>(sx, sz), i32(level), 0).x;
   return HSample(h, true);
 }
+
 
 fn clip_height_texel(level: u32, ix: i32, iz: i32) -> f32 {
   let res_i = max(i32(clip.res), 1);
@@ -246,15 +245,19 @@ fn apply_material_variation_clip(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> ve
 
 fn clip_level_contains(xz: vec2<f32>, level: u32, guard: i32) -> bool {
   let res_i = max(i32(clip.res), 1);
-  let p = clip.level[level];
-  let origin = vec2<f32>(p.x, p.y);
-  let cell   = max(p.z, 1e-6);
 
-  let uv = (xz - origin) / cell;
-  let ix = i32(floor(uv.x));
-  let iz = i32(floor(uv.y));
+  let st = clip_st(xz, level);
 
-  return (ix >= guard) && (iz >= guard) && (ix < (res_i - guard)) && (iz < (res_i - guard));
+  let ix0 = i32(floor(st.x));
+  let iz0 = i32(floor(st.y));
+  let ix1 = ix0 + 1;
+  let iz1 = iz0 + 1;
+
+  // Need full bilerp footprint inside [0..res-1]
+  return (ix0 >= guard) &&
+         (iz0 >= guard) &&
+         (ix1 < (res_i - guard)) &&
+         (iz1 < (res_i - guard));
 }
 
 // Finest available level that contains xz (coverage-based).
@@ -276,3 +279,16 @@ fn clip_ensure_contains(xz: vec2<f32>, lvl_in: u32, guard: i32) -> u32 {
   }
   return lvl;
 }
+
+fn clip_st(world_xz: vec2<f32>, level: u32) -> vec2<f32> {
+  let p = clip.level[level];
+  let origin = vec2<f32>(p.x, p.y);
+  let cell   = max(p.z, 1e-6);
+
+  // uv in texel units, texel centers are at N+0.5
+  let uv = (world_xz - origin) / cell;
+
+  // st is aligned so integer ix/iz index texel centers (matches clip_height_at_level)
+  return uv - vec2<f32>(0.5, 0.5);
+}
+  

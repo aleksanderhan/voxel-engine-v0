@@ -185,12 +185,18 @@ fn composite_pixel_mapped(
   // Optional tiny "print" bias (keep subtle)
   c = pow(c, vec3<f32>(0.98));
 
-  // Dither/grain before gamma
-  let fi = f32(cam.frame_index & 255u);
-  let n0 = hash12(px_render + vec2<f32>(fi, 0.0)) - 0.5;
-  let n1 = hash12(px_render * 0.73 + vec2<f32>(0.0, fi)) - 0.5;
-  let n  = 0.6 * n0 + 0.4 * n1;
-  c += vec3<f32>(n / 1536.0);
+  // Dither (triangular PDF) before gamma: less “sparkle” for similar banding reduction
+  // tri = U - U  => triangular distribution in [-1, +1], mean 0
+  let fi  = f32(cam.frame_index & 255u);
+
+  let u0  = hash12(px_render + vec2<f32>(fi, 13.37));
+  let u1  = hash12(px_render + vec2<f32>(7.11, fi));
+  let tri = u0 - u1;                  // [-1, +1], triangular PDF
+
+  // Scale: tune this. Larger denom = weaker dither (less visible noise).
+  // Start here:
+  c += vec3<f32>(tri / 2048.0);
+
 
   // Gamma encode to LDR output
   let ldr = gamma_encode(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));

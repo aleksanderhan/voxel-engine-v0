@@ -296,10 +296,6 @@ fn compute_godray_pixel(
   let j4      = 0.20 * (hash12(qpx * J0_SCALE + fj) - 0.5);
   let j_phase =        (hash12(qpx * 0.91 + fj * 0.73 + vec2<f32>(31.7, 12.3)) - 0.5);
 
-  // Quantized end distance (frame-varying)
-  let qstep = 0.03;
-  let dq = (hash12(qpx * 1.37 + fj * 1.19 + vec2<f32>(9.2, 1.1)) - 0.5) * qstep;
-
   // Ray dir jitter (frame-varying)
   let j_rd = vec2<f32>(
     hash12(qpx + fj + vec2<f32>(1.7, 9.2)) - 0.5,
@@ -307,7 +303,7 @@ fn compute_godray_pixel(
   );
 
   // Quantized end distance
-  let t_end = min(floor((t_c + dq) / qstep) * qstep, GODRAY_MAX_DIST);
+  let t_end = min(t_c, GODRAY_MAX_DIST);
 
   let fog_ok = fog_density_godray() > 0.0;
 

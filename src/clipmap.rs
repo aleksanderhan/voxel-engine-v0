@@ -38,8 +38,7 @@ pub struct ClipmapUpload {
     pub y: u32,
     pub w: u32,
     pub h: u32,
-    /// w*h heights, FP16 bits (IEEE-754 half), row-major for the patch.
-    pub data_f16: Vec<u16>,
+    pub data_f32: Vec<f32>,
 }
 
 pub struct Clipmap {
@@ -93,96 +92,21 @@ impl Clipmap {
         r as u16
     }
 
-    // -------------------------------------------------------------------------
-    // f32 -> f16 (bits) conversion, IEEE-754 half precision
-    // -------------------------------------------------------------------------
     #[inline]
-    fn f32_to_f16_bits(v: f32) -> u16 {
-        let x = v.to_bits();
-
-        let sign = ((x >> 16) & 0x8000) as u16;
-        let exp = ((x >> 23) & 0xFF) as i32;
-        let mant = x & 0x007F_FFFF;
-
-        // NaN/Inf
-        if exp == 255 {
-            if mant == 0 {
-                return sign | 0x7C00; // Inf
-            } else {
-                let payload = (mant >> 13) as u16;
-                return sign | 0x7C00 | (payload.max(1));
-            }
-        }
-
-        // Unbias exponent from f32, then bias to f16
-        let e = exp - 127;
-        let e16 = e + 15;
-
-        // Too large => Inf
-        if e16 >= 31 {
-            return sign | 0x7C00;
-        }
-
-        // Too small => subnormal or zero
-        if e16 <= 0 {
-            if e16 < -10 {
-                return sign;
-            }
-
-            let m = mant | 0x0080_0000;
-
-            let shift = 14 - e16;
-            let mut mant16 = (m >> shift) as u16;
-
-            // Round to nearest-even
-            let rem_mask = (1u32 << shift) - 1;
-            let rem = m & rem_mask;
-            let half = 1u32 << (shift - 1);
-
-            if rem > half || (rem == half && (mant16 & 1) != 0) {
-                mant16 = mant16.wrapping_add(1);
-            }
-
-            return sign | mant16;
-        }
-
-        // Normal f16
-        let mut mant16 = (mant >> 13) as u16;
-
-        let round_bits = mant & 0x0000_1FFF;
-        if round_bits > 0x1000 || (round_bits == 0x1000 && (mant16 & 1) != 0) {
-            mant16 = mant16.wrapping_add(1);
-
-            // Mantissa overflow => bump exponent
-            if mant16 & 0x0400 != 0 {
-                mant16 = 0;
-                let e_out = (e16 + 1) as u16;
-                if e_out >= 31 {
-                    return sign | 0x7C00;
-                }
-                return sign | (e_out << 10) | mant16;
-            }
-        }
-
-        sign | ((e16 as u16) << 10) | (mant16 & 0x03FF)
-    }
-
-    #[inline]
-    fn sample_height_f16(world: &WorldGen, wx_m: f32, wz_m: f32) -> u16 {
+    fn sample_height_f32(world: &WorldGen, wx_m: f32, wz_m: f32) -> f32 {
         let vs = config::VOXEL_SIZE_M_F32;
 
         let wx_vx = (wx_m / vs).floor() as i32;
         let wz_vx = (wz_m / vs).floor() as i32;
 
         let h_vx = world.ground_height(wx_vx, wz_vx);
-        let h_m = (h_vx as f32) * vs;
-
-        Self::f32_to_f16_bits(h_m)
+        (h_vx as f32) * vs
     }
 
-    fn build_full_level(world: &WorldGen, ox_m: f32, oz_m: f32, cell_m: f32) -> Vec<u16> {
+
+    fn build_full_level(world: &WorldGen, ox_m: f32, oz_m: f32, cell_m: f32) -> Vec<f32> {
         let res = config::CLIPMAP_RES as usize;
-        let mut data = vec![0u16; res * res];
+        let mut data = vec![0.0f32; res * res];
 
         for tz in 0..res {
             let wz_m = oz_m + (tz as f32 + 0.5) * cell_m;
@@ -190,12 +114,13 @@ impl Clipmap {
 
             for tx in 0..res {
                 let wx_m = ox_m + (tx as f32 + 0.5) * cell_m;
-                data[row + tx] = Self::sample_height_f16(world, wx_m, wz_m);
+                data[row + tx] = Self::sample_height_f32(world, wx_m, wz_m);
             }
         }
 
         data
     }
+
 
     fn build_row_patch(
         world: &WorldGen,
@@ -204,12 +129,12 @@ impl Clipmap {
         cell_m: f32,
         logical_z0: u32,
         rows: u32,
-    ) -> Vec<u16> {
+    ) -> Vec<f32> {
         let res = config::CLIPMAP_RES as usize;
         let w = res as u32;
 
         let h = rows as usize;
-        let mut data = vec![0u16; (w as usize) * h];
+        let mut data = vec![0.0f32; (w as usize) * h];
 
         for rz in 0..rows {
             let lz = logical_z0 + rz;
@@ -218,7 +143,7 @@ impl Clipmap {
             let row = (rz as usize) * res;
             for tx in 0..res {
                 let wx_m = ox_m + (tx as f32 + 0.5) * cell_m;
-                data[row + tx] = Self::sample_height_f16(world, wx_m, wz_m);
+                data[row + tx] = Self::sample_height_f32(world, wx_m, wz_m);
             }
         }
 
@@ -232,12 +157,12 @@ impl Clipmap {
         cell_m: f32,
         logical_x0: u32,
         cols: u32,
-    ) -> Vec<u16> {
+    ) -> Vec<f32> {
         let res = config::CLIPMAP_RES as usize;
         let w = cols as usize;
         let h = res;
 
-        let mut data = vec![0u16; w * h];
+        let mut data = vec![0.0f32; w * h];
 
         for tz in 0..res {
             let wz_m = oz_m + (tz as f32 + 0.5) * cell_m;
@@ -246,12 +171,13 @@ impl Clipmap {
             for cx in 0..cols {
                 let lx = logical_x0 + cx;
                 let wx_m = ox_m + (lx as f32 + 0.5) * cell_m;
-                data[row + (cx as usize)] = Self::sample_height_f16(world, wx_m, wz_m);
+                data[row + (cx as usize)] = Self::sample_height_f32(world, wx_m, wz_m);
             }
         }
 
         data
     }
+
 
     pub fn update(
         &mut self,
@@ -395,7 +321,7 @@ impl Clipmap {
                         y: 0,
                         w: res_u,
                         h: res_u,
-                        data_f16: full,
+                        data_f32: full,
                     });
                 } else {
                     let adx = dx.unsigned_abs() as u32;
@@ -416,7 +342,7 @@ impl Clipmap {
                             y: 0,
                             w: res_u,
                             h: res_u,
-                            data_f16: full,
+                            data_f32: full,
                         });
                     } else {
                         // Scroll torus offsets (commit mapping + origin together with the uploads)
@@ -449,7 +375,7 @@ impl Clipmap {
                                         y: 0,
                                         w: cols,
                                         h: res_u,
-                                        data_f16: data,
+                                        data_f32: data,
                                     });
                                 } else {
                                     let a = res_u - sx0;
@@ -464,7 +390,7 @@ impl Clipmap {
                                         y: 0,
                                         w: a,
                                         h: res_u,
-                                        data_f16: data_a,
+                                        data_f32: data_a,
                                     });
 
                                     let data_b = Self::build_col_patch(
@@ -476,7 +402,7 @@ impl Clipmap {
                                         y: 0,
                                         w: b,
                                         h: res_u,
-                                        data_f16: data_b,
+                                        data_f32: data_b,
                                     });
                                 }
                             } else {
@@ -495,7 +421,7 @@ impl Clipmap {
                                         y: 0,
                                         w: cols,
                                         h: res_u,
-                                        data_f16: data,
+                                        data_f32: data,
                                     });
                                 } else {
                                     let a = res_u - sx0;
@@ -510,7 +436,7 @@ impl Clipmap {
                                         y: 0,
                                         w: a,
                                         h: res_u,
-                                        data_f16: data_a,
+                                        data_f32: data_a,
                                     });
 
                                     let data_b = Self::build_col_patch(
@@ -522,7 +448,7 @@ impl Clipmap {
                                         y: 0,
                                         w: b,
                                         h: res_u,
-                                        data_f16: data_b,
+                                        data_f32: data_b,
                                     });
                                 }
                             }
@@ -548,7 +474,7 @@ impl Clipmap {
                                         y: sy0,
                                         w: res_u,
                                         h: rows,
-                                        data_f16: data,
+                                        data_f32: data,
                                     });
                                 } else {
                                     let a = res_u - sy0;
@@ -563,7 +489,7 @@ impl Clipmap {
                                         y: sy0,
                                         w: res_u,
                                         h: a,
-                                        data_f16: data_a,
+                                        data_f32: data_a,
                                     });
 
                                     let data_b = Self::build_row_patch(
@@ -575,7 +501,7 @@ impl Clipmap {
                                         y: 0,
                                         w: res_u,
                                         h: b,
-                                        data_f16: data_b,
+                                        data_f32: data_b,
                                     });
                                 }
                             } else {
@@ -594,7 +520,7 @@ impl Clipmap {
                                         y: sy0,
                                         w: res_u,
                                         h: rows,
-                                        data_f16: data,
+                                        data_f32: data,
                                     });
                                 } else {
                                     let a = res_u - sy0;
@@ -609,7 +535,7 @@ impl Clipmap {
                                         y: sy0,
                                         w: res_u,
                                         h: a,
-                                        data_f16: data_a,
+                                        data_f32: data_a,
                                     });
 
                                     let data_b = Self::build_row_patch(
@@ -621,7 +547,7 @@ impl Clipmap {
                                         y: 0,
                                         w: res_u,
                                         h: b,
-                                        data_f16: data_b,
+                                        data_f32: data_b,
                                     });
                                 }
                             }
@@ -658,3 +584,4 @@ impl Clipmap {
     }
 
 }
+

@@ -186,8 +186,9 @@ fn fs_main(
   @location(0) uv: vec2<f32>
 ) -> @location(0) vec4<f32> {
 
-  // Sample the renderer's final output texture.
-  let c = textureSample(img, samp, uv);
+  let uv_c = clamp(uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
+  let c = textureSample(img, samp, uv_c);
+
   var rgb = c.rgb; // no tonemap here
 
   // ---- FPS overlay ----

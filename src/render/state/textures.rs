@@ -166,7 +166,7 @@ pub fn create_textures(
         config::CLIPMAP_RES,
         config::CLIPMAP_RES,
         config::CLIPMAP_LEVELS,
-        wgpu::TextureFormat::R16Float,
+        wgpu::TextureFormat::R32Float,
         wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
     );
 
