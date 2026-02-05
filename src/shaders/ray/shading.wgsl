@@ -213,13 +213,16 @@ fn shade_hit_split(
 
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
-  // AO (macro, distance gated)
+  // AO (macro) — smooth distance fade to avoid “sphere” contour
   var ao = 1.0;
   if (hg.hit != 0u) {
-    if (hg.t < 45.0) {
-      ao = voxel_ao_material4(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
+    let ao_fade = 1.0 - smoothstep(35.0, 55.0, hg.t); // tune range
+    if (ao_fade > 0.001) {
+      let ao_raw = voxel_ao_material4(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
+      ao = mix(1.0, ao_raw, ao_fade);
     }
   }
+
 
   // Ambient
   let amb_col      = hemi_ambient(hg.n, sky_up);
@@ -265,23 +268,30 @@ fn shade_hit_split(
   let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis_geom * Tc * dapple;
   let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis_geom * Tc;
 
-  // Local voxel lights (noisy term)
+  // Local voxel lights — smooth distance fade to avoid “sphere” contour
   var local_light = vec3<f32>(0.0);
   var local_w: f32 = 0.0;
 
-  if (hg.t < 35.0) {
+  let ll_fade = 1.0 - smoothstep(28.0, 42.0, hg.t); // tune range
+  if (ll_fade > 0.001) {
     let cave = (sv_raw < 0.20);
 
-    // outdoors: quarter-rate, caves: full-rate
-    let m = select(3u, 0u, cave);
+    // Keep perf: sample less often as distance increases
+    // (near: full rate; mid: half; far: quarter; outside fade: none)
+    let rate_mask = select(3u, 0u, cave); // original cave/outdoor behavior
+    let extra_mask = select(0u, 1u, hg.t > 20.0); // optional: half-rate after 20m
+    let m = rate_mask | extra_mask;
 
     if ((seed & m) == 0u) {
       local_light = gather_voxel_lights(
         hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base, seed
-      );
-      local_w = 1.0;
+      ) * ll_fade;
+
+      // Tell the TAA pass this sample is “weaker” (optional but helps blending)
+      local_w = ll_fade;
     }
   }
+
 
   let base_hdr  = base * (ambient + direct) + 0.20 * spec_col;
   let local_hdr = base * local_light;

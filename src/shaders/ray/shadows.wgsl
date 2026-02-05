@@ -36,7 +36,8 @@ fn trace_chunk_shadow_trans_interval(
     if (trans < MIN_TRANS) { break; }
 
     let p  = ro + tcur * rd;
-    let pq = p + rd * (1e-4 * cam.voxel_params.x);
+    let pq = p + rd * (0.1 * voxel_size); // try 0.01..0.05
+
 
     let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base, ch.macro_base);
 
