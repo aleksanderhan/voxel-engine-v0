@@ -142,6 +142,9 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
   if (!ENABLE_CLIPMAP) {
     return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
   }
+  if (clip.levels == 0u) {
+    return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+  }
 
   // Same behavior: only trace when ray points downward.
   if (rd.y >= -1e-4) {
@@ -159,6 +162,9 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
 
   // Initial signed height
   var h0: f32   = clip_height_at_level(p.xz, lvl);
+  if (h0 <= -0.5 * BIG_F32) {
+    return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+  }
   var s_prev: f32 = p.y - h0;
   var t_prev: f32 = t;
 
@@ -171,6 +177,9 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
     lvl = clip_ensure_contains(p.xz, lvl, guard);
 
     let h: f32 = clip_height_at_level(p.xz, lvl);
+    if (h <= -0.5 * BIG_F32) {
+      return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+    }
     let s: f32 = p.y - h;
 
     // Crossing from above -> below: refine with bisection at SAME lvl.
@@ -183,6 +192,9 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
         let pm = ro + rd * m;
 
         let hm = clip_height_at_level(pm.xz, lvl);
+        if (hm <= -0.5 * BIG_F32) {
+          return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+        }
         let sm = pm.y - hm;
 
         if (sm > 0.0) { a = m; } else { b = m; }
@@ -276,6 +288,9 @@ fn clip_best_level(xz: vec2<f32>, guard: i32) -> u32 {
 // Ensure containment by moving only to coarser levels.
 fn clip_ensure_contains(xz: vec2<f32>, lvl_in: u32, guard: i32) -> u32 {
   let n = min(clip.levels, CLIP_LEVELS_MAX);
+  if (n == 0u) {
+    return 0u;
+  }
   var lvl = min(lvl_in, n - 1u);
   loop {
     if (clip_level_contains(xz, lvl, guard) || lvl >= (n - 1u)) { break; }
