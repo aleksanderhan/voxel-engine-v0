@@ -41,7 +41,7 @@ fn hemi_ambient(n: vec3<f32>, sky_up: vec3<f32>) -> vec3<f32> {
 fn material_variation(world_p: vec3<f32>, cell_size_m: f32, dist_m: f32) -> f32 {
   let cell = floor(world_p / cell_size_m);
   let raw = (hash31(cell) - 0.5) * 2.0;
-  let fade = 1.0 - smoothstep(35.0, 80.0, dist_m);
+  let fade = exp(-dist_m / 75.0);
   return raw * fade;
 }
 
@@ -228,8 +228,8 @@ fn shade_hit_split(
   // AO (macro) — smooth distance fade to avoid “sphere” contour
   var ao = 1.0;
   if (hg.hit != 0u) {
-    let ao_fade = 1.0 - smoothstep(35.0, 55.0, hg.t); // tune range
-    if (ao_fade > 0.001) {
+    let ao_fade = exp(-hg.t / 55.0);
+    if (ao_fade > 0.01) {
       let ao_raw = voxel_ao_material4(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
       ao = mix(1.0, ao_raw, ao_fade);
     }
@@ -284,8 +284,8 @@ fn shade_hit_split(
   var local_light = vec3<f32>(0.0);
   var local_w: f32 = 0.0;
 
-  let ll_fade = 1.0 - smoothstep(28.0, 42.0, hg.t); // tune range
-  if (ll_fade > 0.001) {
+  let ll_fade = exp(-hg.t / 45.0);
+  if (ll_fade > 0.01) {
     let cave = (sv_raw < 0.20);
 
     // Keep perf: sample less often as distance increases
