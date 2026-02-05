@@ -54,7 +54,7 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
   // ------------------------------------------------------------------------
   // Volumetric slab clouds (cheap front-to-back)
   // ------------------------------------------------------------------------
-  if (rd.y > 0.01) {
+  if (ENABLE_CLOUDS && rd.y > 0.01) {
     let ro = cam.cam_pos.xyz;
     let time_s = cam.voxel_params.y;
 
@@ -127,7 +127,7 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
   // ------------------------------------------------------------------------
   var T_sun: f32 = 1.0;
 
-  if (CLOUD_DIM_SUN_DISC && rd.y > 0.01) {
+  if (ENABLE_CLOUDS && CLOUD_DIM_SUN_DISC && rd.y > 0.01) {
     // If a cloud makes the sky behind it dim (T_view < 1),
     // the disc should dim *much more*.
     T_sun = pow(clamp(T_view, 0.0, 1.0), CLOUD_SUN_DISC_DIM_POW);

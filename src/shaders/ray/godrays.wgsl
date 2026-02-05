@@ -283,6 +283,10 @@ fn compute_godray_pixel(
 
   let t_hist = dmin;
 
+  if (!ENABLE_GODRAYS) {
+    return vec4<f32>(0.0, 0.0, 0.0, t_hist);
+  }
+
   // Jitters (frame-varying)
   let j4      = 0.20 * (hash12(qpx * J0_SCALE + fj) - 0.5);
   let j_phase =        (hash12(qpx * 0.91 + fj * 0.73 + vec2<f32>(31.7, 12.3)) - 0.5);
@@ -361,6 +365,7 @@ fn godray_sample_linear(
   godray_tex: texture_2d<f32>,
   godray_samp: sampler
 ) -> vec3<f32> {
+  if (!ENABLE_GODRAYS) { return vec3<f32>(0.0); }
   // history/current godray textures store *compressed* RGB in [0..1]
   let c = textureSampleLevel(godray_tex, godray_samp, uv, 0.0).xyz;
   return godray_decompress(c);
