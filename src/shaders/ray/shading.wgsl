@@ -118,6 +118,23 @@ fn material_emission(mat: u32) -> vec3<f32> {
   return vec3<f32>(0.0);
 }
 
+struct ShadeOut {
+  base_hdr   : vec3<f32>,
+  local_hdr  : vec3<f32>,
+  local_w    : f32,
+};
+
+fn shade_hit_split(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  hg: HitGeom,
+  sky_up: vec3<f32>,
+  seed: u32
+) -> ShadeOut {
+  let base_hdr = shade_hit(ro, rd, hg, sky_up, seed);
+  return ShadeOut(base_hdr, vec3<f32>(0.0), 0.0);
+}
+
 fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
   let hp = ro + hg.t * rd;
 
