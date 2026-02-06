@@ -613,13 +613,13 @@ fn trace_chunk_interval_stream_macro(
   var anchor_valid = use_anchor;
 
   if (ch.macro_base == INVALID_U32) {
-    let h = trace_chunk_rope_interval(ro, rd, ch, tcur, t_end, anchor_valid, anchor_key);
+    let h = trace_chunk_rope_interval(ro, rd, inv, ch, tcur, t_end, anchor_valid, anchor_key);
     return h;
   }
 
   var ms = macro_dda_init(ro, rd, inv, tcur, root_bmin, root_size, ch.macro_base);
   if (!ms.enabled) {
-    let h = trace_chunk_rope_interval(ro, rd, ch, tcur, t_end, anchor_valid, anchor_key);
+    let h = trace_chunk_rope_interval(ro, rd, inv, ch, tcur, t_end, anchor_valid, anchor_key);
     return h;
   }
 
@@ -639,7 +639,7 @@ fn trace_chunk_interval_stream_macro(
       continue;
     }
 
-    let h = trace_chunk_rope_interval(ro, rd, ch, tcur, t_cell_exit, anchor_valid, anchor_key);
+    let h = trace_chunk_rope_interval_nomacro(ro, rd, inv, ch, tcur, t_cell_exit, anchor_valid, anchor_key);
 
     if (h.hit.hit != 0u) {
       return h;
@@ -655,9 +655,10 @@ fn trace_chunk_interval_stream_macro(
   return ChunkTraceResult(miss_hitgeom(), anchor_valid, anchor_key);
 }
 
-fn trace_chunk_rope_interval(
+fn trace_chunk_rope_interval_nomacro(
   ro: vec3<f32>,
   rd: vec3<f32>,
+  inv: vec3<f32>,
   ch: ChunkMeta,
   t_enter: f32,
   t_exit: f32,
@@ -672,13 +673,6 @@ fn trace_chunk_rope_interval(
 
   let eps_step = 1e-4 * vs;
   var tcur     = max(t_enter, 0.0) + eps_step;
-
-  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
-  var macro_state = macro_dda_init(
-    ro, rd, inv, tcur,
-    root_bmin, root_size,
-    ch.macro_base
-  );
 
   var anchor_node = AnchorNode(false, 0u, vec3<f32>(0.0), 0.0, INVALID_U32);
   if (use_anchor) {
@@ -699,26 +693,6 @@ fn trace_chunk_rope_interval(
 
   for (var it: u32 = 0u; it < MAX_ITERS; it = it + 1u) {
     if (tcur > t_exit) { break; }
-
-    // ------------------------------------------------------------
-    // COARSE: macro empty jump using per-step macro occupancy
-    // ------------------------------------------------------------
-    if (macro_state.enabled) {
-      macro_dda_sync(&macro_state, tcur);
-    }
-
-    let macro_step = macro_dda_current(macro_state, ch.macro_base);
-
-    if (macro_step.valid && macro_step.empty) {
-      // Jump across empty macro cell
-      let t_macro_exit = min(t_exit, macro_step.t_exit);
-      tcur = max(t_macro_exit, tcur) + eps_step;
-      have_leaf = false;
-      if (macro_state.enabled && tcur >= macro_step.t_exit) {
-        macro_dda_step(&macro_state);
-      }
-      continue;
-    }
 
     // ------------------------------------------------------------
     // FINE: leaf traversal (rope traversal only on true leaf exit)
@@ -947,6 +921,28 @@ fn trace_chunk_rope_interval(
   }
 
   return ChunkTraceResult(miss_hitgeom(), anchor_node.valid, anchor_node.key);
+}
+
+fn trace_chunk_rope_interval(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  inv: vec3<f32>,
+  ch: ChunkMeta,
+  t_enter: f32,
+  t_exit: f32,
+  use_anchor: bool,
+  anchor_key: u32
+) -> ChunkTraceResult {
+  return trace_chunk_rope_interval_nomacro(
+    ro,
+    rd,
+    inv,
+    ch,
+    t_enter,
+    t_exit,
+    use_anchor,
+    anchor_key
+  );
 }
 
 // --------------------------------------------------------------------------
