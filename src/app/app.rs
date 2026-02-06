@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use glam::Vec3;
+use glam::{Vec2, Vec3, Vec4};
 
 use winit::{
     event::*,
@@ -425,6 +425,30 @@ impl App {
 
         let max_steps = (config::CHUNK_SIZE * 2).clamp(64, 256);
         let (internal_width, internal_height) = self.renderer.internal_dims();
+        let render_res = Vec2::new(internal_width as f32, internal_height as f32);
+
+        let ray_dir_at = |px: Vec2| -> Vec3 {
+            let ndc = Vec4::new(
+                2.0 * px.x / render_res.x - 1.0,
+                1.0 - 2.0 * px.y / render_res.y,
+                1.0,
+                1.0,
+            );
+            let view_pos = camera_frame.proj_inv * ndc;
+            let vdir = Vec4::new(
+                view_pos.x / view_pos.w,
+                view_pos.y / view_pos.w,
+                view_pos.z / view_pos.w,
+                0.0,
+            );
+            (camera_frame.view_inv * vdir).truncate()
+        };
+
+        let ray00 = ray_dir_at(Vec2::new(0.5, 0.5));
+        let ray10 = ray_dir_at(Vec2::new(1.5, 0.5));
+        let ray01 = ray_dir_at(Vec2::new(0.5, 1.5));
+        let ray_dx = ray10 - ray00;
+        let ray_dy = ray01 - ray00;
 
         let camera_gpu = CameraGpu {
             view_inv: camera_frame.view_inv.to_cols_array_2d(),
@@ -434,6 +458,9 @@ impl App {
             prev_view_proj: previous_view_proj.to_cols_array_2d(),
 
             cam_pos: [camera_frame.pos.x, camera_frame.pos.y, camera_frame.pos.z, 1.0],
+            ray00: [ray00.x, ray00.y, ray00.z, 0.0],
+            ray_dx: [ray_dx.x, ray_dx.y, ray_dx.z, 0.0],
+            ray_dy: [ray_dy.x, ray_dy.y, ray_dy.z, 0.0],
 
             chunk_size: config::CHUNK_SIZE,
             chunk_count: self.chunks.chunk_count(),

@@ -55,6 +55,9 @@ pub struct CameraGpu {
     pub prev_view_proj: [[f32; 4]; 4],
     
     pub cam_pos: [f32; 4],
+    pub ray00: [f32; 4],
+    pub ray_dx: [f32; 4],
+    pub ray_dy: [f32; 4],
 
     pub chunk_size: u32,
     pub chunk_count: u32,

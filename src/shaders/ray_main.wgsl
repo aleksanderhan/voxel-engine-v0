@@ -81,7 +81,6 @@ fn main_primary(
   if (lid == 0u) {
     atomicStore(&WG_TILE_COUNT, 0u);
     if (cam.chunk_count != 0u) {
-      let res_tile = vec2<f32>(f32(dims.x), f32(dims.y));
       let tile_origin = vec2<f32>(
         f32(wg_id.x * TILE_SIZE),
         f32(wg_id.y * TILE_SIZE)
@@ -93,10 +92,10 @@ fn main_primary(
       let px01 = tile_origin + vec2<f32>(0.0, f32(TILE_SIZE));
       let px11 = tile_origin + vec2<f32>(f32(TILE_SIZE), f32(TILE_SIZE));
 
-      let rd00 = ray_dir_from_pixel(px00, res_tile);
-      let rd10 = ray_dir_from_pixel(px10, res_tile);
-      let rd01 = ray_dir_from_pixel(px01, res_tile);
-      let rd11 = ray_dir_from_pixel(px11, res_tile);
+      let rd00 = ray_dir_from_pixel(px00);
+      let rd10 = ray_dir_from_pixel(px10);
+      let rd01 = ray_dir_from_pixel(px01);
+      let rd11 = ray_dir_from_pixel(px11);
 
       tile_append_candidates_for_ray(ro_tile, rd00, 0.0, FOG_MAX_DIST);
       tile_append_candidates_for_ray(ro_tile, rd10, 0.0, FOG_MAX_DIST);
@@ -110,7 +109,7 @@ fn main_primary(
   let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
 
   let ro  = cam.cam_pos.xyz;
-  let rd  = ray_dir_from_pixel(px, res);
+  let rd  = ray_dir_from_pixel(px);
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
 
