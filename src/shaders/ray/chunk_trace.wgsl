@@ -281,31 +281,16 @@ fn descend_leaf_sparse(
 // => descend starting from that neighbor node (NOT from root).
 // --------------------------------------------------------------------------
 // --------------------------------------------------------------------------
-// Macro 3D DDA (digital differential analyzer) for macro occupancy stepping
+// Macro occupancy query (robust per-step query; no persistent DDA state)
 // --------------------------------------------------------------------------
 
-struct MacroDDA {
-  valid  : bool,
-  cell   : f32,
-
-  mx     : i32,
-  my     : i32,
-  mz     : i32,
-
-  stepX  : i32,
-  stepY  : i32,
-  stepZ  : i32,
-
-  tMaxX  : f32,
-  tMaxY  : f32,
-  tMaxZ  : f32,
-
-  tDeltaX: f32,
-  tDeltaY: f32,
-  tDeltaZ: f32,
+struct MacroCell {
+  valid : bool,
+  empty : bool,
+  t_exit: f32,
 };
 
-fn macro_dda_init(
+fn macro_cell_query_at_t(
   ro: vec3<f32>,
   rd: vec3<f32>,
   inv: vec3<f32>,
@@ -313,111 +298,60 @@ fn macro_dda_init(
   root_bmin: vec3<f32>,
   root_size: f32,
   macro_base: u32
-) -> MacroDDA {
-  var m: MacroDDA;
-  m.valid = (macro_base != INVALID_U32);
-  if (!m.valid) {
-    m.cell = 0.0;
-    return m;
+) -> MacroCell {
+  var out: MacroCell;
+  out.valid = false;
+  out.empty = false;
+  out.t_exit = tcur;
+
+  if (macro_base == INVALID_U32) {
+    return out;
   }
 
-  m.cell = macro_cell_size(root_size);
-
-  let p  = ro + rd * tcur;
+  let cell = macro_cell_size(root_size);
+  let p = ro + rd * tcur;
   let lp = p - root_bmin;
 
-  // NEW: strict bounds. If outside chunk, disable macro DDA for this ray segment.
   if (lp.x < 0.0 || lp.y < 0.0 || lp.z < 0.0 ||
       lp.x >= root_size || lp.y >= root_size || lp.z >= root_size) {
-    m.valid = false;
-    m.cell = 0.0;
-    return m;
+    return out;
   }
 
-  // current macro cell indices (NOW safe to floor without clamping-to-edge artifacts)
-  let mx0 = i32(floor(lp.x / m.cell));
-  let my0 = i32(floor(lp.y / m.cell));
-  let mz0 = i32(floor(lp.z / m.cell));
+  let mx_i = i32(floor(lp.x / cell));
+  let my_i = i32(floor(lp.y / cell));
+  let mz_i = i32(floor(lp.z / cell));
 
-  // If you still want safety, clamp only after the bounds check:
-  let md = i32(MACRO_DIM) - 1;
-  m.mx = clamp(mx0, 0, md);
-  m.my = clamp(my0, 0, md);
-  m.mz = clamp(mz0, 0, md);
-
-
-  m.stepX = select(-1, 1, rd.x > 0.0);
-  m.stepY = select(-1, 1, rd.y > 0.0);
-  m.stepZ = select(-1, 1, rd.z > 0.0);
-
-  // next boundary plane index in macro grid space
-  let nx = m.mx + select(0, 1, m.stepX > 0);
-  let ny = m.my + select(0, 1, m.stepY > 0);
-  let nz = m.mz + select(0, 1, m.stepZ > 0);
-
-  // boundary positions in world space
-  let bx = root_bmin.x + f32(nx) * m.cell;
-  let by = root_bmin.y + f32(ny) * m.cell;
-  let bz = root_bmin.z + f32(nz) * m.cell;
-
-  // tMax values in ray-t space
-  m.tMaxX = select(BIG_F32, tcur + (bx - p.x) * inv.x, abs(rd.x) >= EPS_INV);
-  m.tMaxY = select(BIG_F32, tcur + (by - p.y) * inv.y, abs(rd.y) >= EPS_INV);
-  m.tMaxZ = select(BIG_F32, tcur + (bz - p.z) * inv.z, abs(rd.z) >= EPS_INV);
-
-  // tDelta: distance (in t) to cross one macro cell along each axis
-  m.tDeltaX = select(BIG_F32, m.cell * abs(inv.x), abs(rd.x) >= EPS_INV);
-  m.tDeltaY = select(BIG_F32, m.cell * abs(inv.y), abs(rd.y) >= EPS_INV);
-  m.tDeltaZ = select(BIG_F32, m.cell * abs(inv.z), abs(rd.z) >= EPS_INV);
-
-  return m;
-}
-
-fn macro_dda_exit_t(m: MacroDDA, t_exit: f32) -> f32 {
-  return min(t_exit, min(m.tMaxX, min(m.tMaxY, m.tMaxZ)));
-}
-
-fn macro_dda_step_and_refresh(
-  m: ptr<function, MacroDDA>,
-  macro_base: u32,
-  macro_empty: ptr<function, bool>
-) {
-  // --- step to next macro cell along smallest tMax axis
-  let tNext = min((*m).tMaxX, min((*m).tMaxY, (*m).tMaxZ));
-  let epsTie = 1e-6 * max(1.0, abs(tNext));
-
-  if (abs((*m).tMaxX - tNext) <= epsTie) {
-    (*m).mx += (*m).stepX;
-    (*m).tMaxX += (*m).tDeltaX;
-  }
-  if (abs((*m).tMaxY - tNext) <= epsTie) {
-    (*m).my += (*m).stepY;
-    (*m).tMaxY += (*m).tDeltaY;
-  }
-  if (abs((*m).tMaxZ - tNext) <= epsTie) {
-    (*m).mz += (*m).stepZ;
-    (*m).tMaxZ += (*m).tDeltaZ;
+  if (mx_i < 0 || my_i < 0 || mz_i < 0 ||
+      mx_i >= i32(MACRO_DIM) || my_i >= i32(MACRO_DIM) || mz_i >= i32(MACRO_DIM)) {
+    return out;
   }
 
-  // --- bounds check
-  let md = i32(MACRO_DIM) - 1;
-  if ((*m).mx < 0 || (*m).my < 0 || (*m).mz < 0 ||
-      (*m).mx > md || (*m).my > md || (*m).mz > md) {
-    (*m).valid = false;
-    (*macro_empty) = false;
-    return;
-  }
+  let mx = u32(mx_i);
+  let my = u32(my_i);
+  let mz = u32(mz_i);
+  let bit = macro_bit_index(mx, my, mz);
 
-  // --- refresh cached emptiness for the new cell
-  let mxu = u32((*m).mx);
-  let myu = u32((*m).my);
-  let mzu = u32((*m).mz);
-  let bit = macro_bit_index(mxu, myu, mzu);
-  (*macro_empty) = !macro_test(macro_base, bit);
+  out.valid = true;
+  out.empty = !macro_test(macro_base, bit);
+
+  let nx = mx_i + select(0, 1, rd.x > 0.0);
+  let ny = my_i + select(0, 1, rd.y > 0.0);
+  let nz = mz_i + select(0, 1, rd.z > 0.0);
+
+  let bx = root_bmin.x + f32(nx) * cell;
+  let by = root_bmin.y + f32(ny) * cell;
+  let bz = root_bmin.z + f32(nz) * cell;
+
+  let tMaxX = select(BIG_F32, tcur + (bx - p.x) * inv.x, abs(rd.x) >= EPS_INV);
+  let tMaxY = select(BIG_F32, tcur + (by - p.y) * inv.y, abs(rd.y) >= EPS_INV);
+  let tMaxZ = select(BIG_F32, tcur + (bz - p.z) * inv.z, abs(rd.z) >= EPS_INV);
+
+  out.t_exit = min(tMaxX, min(tMaxY, tMaxZ));
+  return out;
 }
 
 // --------------------------------------------------------------------------
-// Rewritten traversal (macro DDA + leaf/rope traversal)
+// Rewritten traversal (macro occupancy + leaf/rope traversal)
 // --------------------------------------------------------------------------
 fn trace_chunk_rope_interval(
   ro: vec3<f32>,
@@ -447,40 +381,26 @@ fn trace_chunk_rope_interval(
   var have_leaf: bool = false;
   var leaf: LeafState;
 
-  // Macro DDA setup (valid==false if no macro data)
-  var m = macro_dda_init(ro, rd, inv, tcur, root_bmin, root_size, ch.macro_base);
-  var macro_empty: bool = false;
-  //m.valid = false; // <- THIS FIXES EVERYTHING!
-
-  if (m.valid) {
-    let bit = macro_bit_index(u32(m.mx), u32(m.my), u32(m.mz));
-    macro_empty = !macro_test(ch.macro_base, bit);
-  }
-
   let MAX_ITERS: u32 = 192u + cam.chunk_size * 4u;
 
   for (var it: u32 = 0u; it < MAX_ITERS; it = it + 1u) {
     if (tcur > t_exit) { break; }
 
     // ------------------------------------------------------------
-    // COARSE: macro empty jump using macro 3D DDA
+    // COARSE: macro empty jump using per-step macro occupancy
     // ------------------------------------------------------------
-    var t_macro_exit: f32 = t_exit;
+    let macro = macro_cell_query_at_t(
+      ro, rd, inv, tcur,
+      root_bmin, root_size,
+      ch.macro_base
+    );
 
-    if (m.valid) {
-      t_macro_exit = macro_dda_exit_t(m, t_exit);
-
-      if (macro_empty) {
-        // Jump across empty macro cell
-        tcur = max(t_macro_exit, tcur) + eps_step;
-        have_leaf = false;
-
-        if (tcur > t_exit) { break; }
-
-        // Enter next macro cell
-        macro_dda_step_and_refresh(&m, ch.macro_base, &macro_empty);
-        continue;
-      }
+    if (macro.valid && macro.empty) {
+      // Jump across empty macro cell
+      let t_macro_exit = min(t_exit, macro.t_exit);
+      tcur = max(t_macro_exit, tcur) + eps_step;
+      have_leaf = false;
+      continue;
     }
 
     // ------------------------------------------------------------
@@ -496,18 +416,6 @@ fn trace_chunk_rope_interval(
 
     let slab    = cube_slab_inv(ro, inv, leaf.bmin, leaf.size);
     let t_leave = slab.t_exit;
-
-    // Macro boundary event happens before leaf exit => advance to macro boundary
-    // IMPORTANT: do not treat as leaf exit; do not do ropes.
-    if (m.valid && (t_macro_exit < t_leave)) {
-      tcur = max(t_macro_exit, tcur) + eps_step;
-
-      if (tcur > t_exit) { break; }
-
-      macro_dda_step_and_refresh(&m, ch.macro_base, &macro_empty);
-      // leaf can straddle macro boundaries; keep cache
-      continue;
-    }
 
     // ------------------------------------------------------------
     // AIR leaf path
@@ -565,14 +473,6 @@ fn trace_chunk_rope_interval(
         // Edge/corner exit: ropes are unstable here; re-descend next iter.
         have_leaf = false;
 
-        // (optional but recommended) re-sync macro DDA to the new tcur
-        if (m.valid) {
-          m = macro_dda_init(ro, rd, inv, tcur, root_bmin, root_size, ch.macro_base);
-          if (m.valid) {
-            let bit = macro_bit_index(u32(m.mx), u32(m.my), u32(m.mz));
-            macro_empty = !macro_test(ch.macro_base, bit);
-          }
-        }
         continue;
       }
 
