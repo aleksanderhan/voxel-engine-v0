@@ -7,6 +7,24 @@ struct GrassCell {
   id_vox : vec3<f32>,
 };
 
+fn pick_grass_cell_world(
+  hp_m: vec3<f32>,
+  rd: vec3<f32>,
+  voxel_size_m: f32
+) -> GrassCell {
+  let bias = 0.05 * voxel_size_m;
+  let p = hp_m - rd * bias;
+
+  let ix = i32(floor(p.x / voxel_size_m));
+  let iy = i32(floor(p.y / voxel_size_m));
+  let iz = i32(floor(p.z / voxel_size_m));
+
+  let bmin_m = vec3<f32>(f32(ix), f32(iy), f32(iz)) * voxel_size_m;
+  let id_vox = vec3<f32>(f32(ix), f32(iy), f32(iz));
+
+  return GrassCell(bmin_m, id_vox);
+}
+
 fn pick_grass_cell_in_chunk(
   hp_m: vec3<f32>,
   rd: vec3<f32>,

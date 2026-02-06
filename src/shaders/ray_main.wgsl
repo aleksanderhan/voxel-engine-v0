@@ -404,8 +404,23 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
     let hp_in = hp - rd * (1e-4 * cam.voxel_params.x);
     let leaf = query_leaf_world(hp_in);
 
+    var grass_ok = false;
+    var n = vec3<f32>(0.0, 1.0, 0.0);
+
     if (leaf.mat == MAT_GRASS) {
-      let n = leaf_face_normal(hp_in, leaf);
+      grass_ok = true;
+      n = leaf_face_normal(hp_in, leaf);
+    } else if (ENABLE_CLIPMAP && clip.levels > 0u) {
+      let lvl = clip_best_level(hp_in.xz, 2);
+      let h = clip_height_at_level(hp_in.xz, lvl);
+      let vs = cam.voxel_params.x;
+      if (abs(hp_in.y - h) <= 0.75 * vs) {
+        grass_ok = true;
+        n = clip_normal_at_level_2tap(hp_in.xz, lvl);
+      }
+    }
+
+    if (grass_ok) {
       let frame = cam.frame_index;
       let seed = (u32(ip_f.x) * 1973u) ^ (u32(ip_f.y) * 9277u) ^ (frame * 26699u);
 
@@ -415,12 +430,13 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
         let c = chunk_coord_from_pos(hp_in, chunk_size_m);
         let slot = grid_lookup_slot(c.x, c.y, c.z);
 
+        var cell: GrassCell;
         if (slot != INVALID_U32 && slot < cam.chunk_count) {
           let ch = chunks[slot];
           let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * vs;
           let origin_vox = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
 
-          let cell = pick_grass_cell_in_chunk(
+          cell = pick_grass_cell_in_chunk(
             hp_in,
             rd,
             root_bmin,
@@ -428,24 +444,26 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
             vs,
             i32(cam.chunk_size)
           );
+        } else {
+          cell = pick_grass_cell_world(hp_in, rd, vs);
+        }
 
-          let t_min = max(t_depth - (GRASS_LAYER_HEIGHT_VOX + 1.0) * vs, 0.0);
+        let t_min = max(t_depth - (GRASS_LAYER_HEIGHT_VOX + 1.0) * vs, 0.0);
 
-          let gh = try_grass_slab_hit(
-            ro, rd,
-            t_min, t_depth,
-            cell.bmin_m, cell.id_vox,
-            vs,
-            cam.voxel_params.y,
-            cam.voxel_params.z
-          );
+        let gh = try_grass_slab_hit(
+          ro, rd,
+          t_min, t_depth,
+          cell.bmin_m, cell.id_vox,
+          vs,
+          cam.voxel_params.y,
+          cam.voxel_params.z
+        );
 
-          if (gh.hit) {
-            let sky_up = sky_bg(vec3<f32>(0.0, 1.0, 0.0));
-            let grass_raw = shade_grass_decor(ro, rd, gh.t, gh.n, sky_up);
-            let sky_bg_rd = sky_bg(rd);
-            grass_hdr = apply_fog(grass_raw, ro, rd, gh.t, sky_bg_rd);
-          }
+        if (gh.hit) {
+          let sky_up = sky_bg(vec3<f32>(0.0, 1.0, 0.0));
+          let grass_raw = shade_grass_decor(ro, rd, gh.t, gh.n, sky_up);
+          let sky_bg_rd = sky_bg(rd);
+          grass_hdr = apply_fog(grass_raw, ro, rd, gh.t, sky_bg_rd);
         }
       }
     }
