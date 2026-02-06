@@ -198,8 +198,8 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   }
 
   let amb_col      = hemi_ambient(hg.n, sky_up);
-  let amb_strength = select(0.06, 0.09, hg.mat == MAT_LEAF);
-  let ao_term      = ao * ao;
+  let amb_strength = select(0.03, 0.05, hg.mat == MAT_LEAF);
+  let ao_term      = ao * ao * ao;
   var ambient      = amb_col * amb_strength * ao_term;
 
   if (hg.mat == MAT_STONE) {
