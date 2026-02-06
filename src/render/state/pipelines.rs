@@ -79,15 +79,15 @@ pub fn create_pipelines(
     // -------------------------------------------------------------------------
 
     // Primary pass:
-    // Uses group(0) = layouts.primary, which includes:
-    // - camera + scene buffers
-    // - storage outputs for color/depth
+    // Uses:
+    //   group(0) = layouts.primary (camera + scene buffers + storage outputs)
+    //   group(1) = layouts.godray  (history sampler inputs reused for t_max hint)
     let primary = make_compute_pipeline(
         device,
         "primary_pipeline",
         cs_module,
         "main_primary",
-        &[&layouts.primary],
+        &[&layouts.primary, &layouts.godray],
     );
 
     // Godray pass:
