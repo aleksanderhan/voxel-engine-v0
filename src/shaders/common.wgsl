@@ -510,17 +510,25 @@ fn intersect_aabb_inv(ro: vec3<f32>, inv: vec3<f32>, bmin: vec3<f32>, bmax: vec3
 
   let INV_PARALLEL: f32 = 1e20;
 
-  if (abs(inv.x) > INV_PARALLEL) {
-    if (ro.x < bmin.x || ro.x >= bmax.x) { return vec2<f32>(1.0, 0.0); }
-    t0.x = -BIG_F32; t1.x = BIG_F32;
-  }
-  if (abs(inv.y) > INV_PARALLEL) {
-    if (ro.y < bmin.y || ro.y >= bmax.y) { return vec2<f32>(1.0, 0.0); }
-    t0.y = -BIG_F32; t1.y = BIG_F32;
-  }
-  if (abs(inv.z) > INV_PARALLEL) {
-    if (ro.z < bmin.z || ro.z >= bmax.z) { return vec2<f32>(1.0, 0.0); }
-    t0.z = -BIG_F32; t1.z = BIG_F32;
+  let par_x = abs(inv.x) > INV_PARALLEL;
+  let par_y = abs(inv.y) > INV_PARALLEL;
+  let par_z = abs(inv.z) > INV_PARALLEL;
+
+  if (par_x || par_y || par_z) {
+    var miss = false;
+    if (par_x) {
+      miss = miss || (ro.x < bmin.x || ro.x >= bmax.x);
+      t0.x = -BIG_F32; t1.x = BIG_F32;
+    }
+    if (par_y) {
+      miss = miss || (ro.y < bmin.y || ro.y >= bmax.y);
+      t0.y = -BIG_F32; t1.y = BIG_F32;
+    }
+    if (par_z) {
+      miss = miss || (ro.z < bmin.z || ro.z >= bmax.z);
+      t0.z = -BIG_F32; t1.z = BIG_F32;
+    }
+    if (miss) { return vec2<f32>(1.0, 0.0); }
   }
 
   let tminv = min(t0, t1);
