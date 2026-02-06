@@ -23,6 +23,11 @@
 // local (noisy) voxel-light term output (HDR, NOT fogged)
 @group(0) @binding(6) var local_img : texture_storage_2d<rgba32float, write>;
 
+// primary hit history (temporal reprojection)
+@group(0) @binding(12) var primary_hist_tex  : texture_2d<f32>;
+@group(0) @binding(13) var primary_hist_out  : texture_storage_2d<r32float, write>;
+@group(0) @binding(14) var primary_hist_samp : sampler;
+
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
 @group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
 @group(1) @binding(2) var godray_out      : texture_storage_2d<rgba32float, write>;
@@ -57,6 +62,7 @@ fn main_primary(
 
   let res = vec2<f32>(f32(dims.x), f32(dims.y));
   let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+  let uv  = px / res;
 
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px, res);
@@ -72,6 +78,28 @@ fn main_primary(
   // Local output defaults: invalid (alpha=0) so TAA keeps history instead of blending black.
   var local_out = vec3<f32>(0.0);
   var local_w   : f32 = 0.0;
+  var t_store   : f32 = 0.0;
+
+  var t_hist     : f32 = 0.0;
+  var hist_valid : bool = false;
+
+  let t_hist_guess = textureLoad(primary_hist_tex, ip, 0).x;
+  if (t_hist_guess > 1e-3) {
+    let p_ws = ro + rd * t_hist_guess;
+    let uv_prev = prev_uv_from_world(p_ws);
+
+    if (in_unit_square(uv_prev)) {
+      let t_prev = textureSampleLevel(primary_hist_tex, primary_hist_samp, uv_prev, 0.0).x;
+      let rel = abs(t_prev - t_hist_guess) / max(t_hist_guess, 1e-3);
+      let depth_ok = 1.0 - smoothstep(PRIMARY_HIT_DEPTH_REL0, PRIMARY_HIT_DEPTH_REL1, rel);
+      let vel_px = length((uv_prev - uv) * res);
+      let motion_ok = 1.0 - smoothstep(PRIMARY_HIT_MOTION_PX0, PRIMARY_HIT_MOTION_PX1, vel_px);
+      if (t_prev > 1e-3 && depth_ok > 0.5 && motion_ok > 0.5) {
+        t_hist = t_prev;
+        hist_valid = true;
+      }
+    }
+  }
 
   // ------------------------------------------------------------
   // Case 1: no voxel chunks => heightfield or sky
@@ -84,9 +112,11 @@ fn main_primary(
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
+      t_store = t_scene;
       textureStore(color_img, ip, vec4<f32>(col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+      textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
       return;
     }
 
@@ -95,13 +125,27 @@ fn main_primary(
     textureStore(color_img, ip, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
     return;
   }
 
   // ------------------------------------------------------------
   // Case 2: voxel grid present => voxels, then heightfield fallback, then sky
   // ------------------------------------------------------------
-  let vt = trace_scene_voxels(ro, rd);
+  var vt = VoxTraceResult(false, miss_hitgeom(), 0.0);
+  var used_hint = false;
+  if (hist_valid) {
+    let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
+    let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
+    let vt_hint = trace_scene_voxels_interval(ro, rd, t_start, t_end);
+    if (vt_hint.best.hit != 0u) {
+      vt = vt_hint;
+      used_hint = true;
+    }
+  }
+  if (!used_hint) {
+    vt = trace_scene_voxels_interval(ro, rd, 0.0, FOG_MAX_DIST);
+  }
 
   // Outside streamed grid => heightfield or sky
   if (!vt.in_grid) {
@@ -112,9 +156,11 @@ fn main_primary(
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
+      t_store = t_scene;
       textureStore(color_img, ip, vec4<f32>(col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+      textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
       return;
     }
 
@@ -122,6 +168,7 @@ fn main_primary(
     textureStore(color_img, ip, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
     return;
   }
 
@@ -138,10 +185,12 @@ fn main_primary(
     // Local is stored UNFOGGED for temporal accumulation
     local_out = sh.local_hdr;
     local_w   = sh.local_w;
+    t_store   = t_scene;
 
     textureStore(color_img, ip, vec4<f32>(col_base, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha = validity
+    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
     return;
   }
 
@@ -153,9 +202,11 @@ fn main_primary(
     let t_scene = min(hf.t, FOG_MAX_DIST);
     let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
+    t_store = t_scene;
     textureStore(color_img, ip, vec4<f32>(col, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
     return;
   }
 
@@ -164,6 +215,7 @@ fn main_primary(
   textureStore(color_img, ip, vec4<f32>(sky, 1.0));
   textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
   textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+  textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
 }
 
 

@@ -315,6 +315,9 @@ impl Renderer {
     }
 
     pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
+        let ping = self.ping;
+        let pong = 1 - ping;
+
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("primary_pass"),
@@ -322,16 +325,13 @@ impl Renderer {
             });
 
             cpass.set_pipeline(&self.pipelines.primary);
-            cpass.set_bind_group(0, &self.bind_groups.primary, &[]);
+            cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
 
             let gx = (self.internal_w + 7) / 8;
             let gy = (self.internal_h + 7) / 8;
             cpass.dispatch_workgroups(gx, gy, 1);
 
         }
-
-        let ping = self.ping;
-        let pong = 1 - ping;
 
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

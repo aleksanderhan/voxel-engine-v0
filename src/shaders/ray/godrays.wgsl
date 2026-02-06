@@ -235,20 +235,6 @@ fn godray_compress(lin: vec3<f32>) -> vec3<f32> {
 
 
 // -----------------------------------------------------------------------------
-// History reprojection utilities.
-// -----------------------------------------------------------------------------
-fn prev_uv_from_world(p_ws: vec3<f32>) -> vec2<f32> {
-  let clip = cam.prev_view_proj * vec4<f32>(p_ws, 1.0);
-  let invw = 1.0 / max(clip.w, 1e-6);
-  let ndc  = clip.xy * invw;          // -1..+1
-  return ndc * 0.5 + vec2<f32>(0.5);  // 0..1
-}
-
-fn in_unit_square(uv: vec2<f32>) -> bool {
-  return all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
-}
-
-// -----------------------------------------------------------------------------
 // Full-res godray pixel: integrate + temporal accumulate.
 // Returns RGBA: rgb = compressed, a = depth proxy.
 // -----------------------------------------------------------------------------

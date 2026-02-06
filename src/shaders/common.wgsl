@@ -213,6 +213,14 @@ const TAU             : f32        = 6.28318530718;
 
 const PRIMARY_NUDGE_VOXEL_FRAC : f32 = 1e-4;
 
+// Primary hit cache (temporal reprojection) tuning.
+const PRIMARY_HIT_MARGIN        : f32 = 0.15;
+const PRIMARY_HIT_WINDOW        : f32 = 1.20;
+const PRIMARY_HIT_DEPTH_REL0    : f32 = 0.05;
+const PRIMARY_HIT_DEPTH_REL1    : f32 = 0.20;
+const PRIMARY_HIT_MOTION_PX0    : f32 = 0.75;
+const PRIMARY_HIT_MOTION_PX1    : f32 = 2.50;
+
 const J0_SCALE : f32 = 1.31;
 const J1_SCALE : f32 = 2.11;
 const J2_SCALE : f32 = 3.01;
@@ -435,6 +443,17 @@ fn ray_dir_from_pixel(px: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
   let vdir = vec4<f32>(view.xyz / view.w, 0.0);
   let wdir = (cam.view_inv * vdir).xyz;
   return normalize(wdir);
+}
+
+fn prev_uv_from_world(p_ws: vec3<f32>) -> vec2<f32> {
+  let clip = cam.prev_view_proj * vec4<f32>(p_ws, 1.0);
+  let invw = 1.0 / max(clip.w, 1e-6);
+  let ndc  = clip.xy * invw;          // -1..+1
+  return ndc * 0.5 + vec2<f32>(0.5);  // 0..1
+}
+
+fn in_unit_square(uv: vec2<f32>) -> bool {
+  return all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
 }
 
 fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
