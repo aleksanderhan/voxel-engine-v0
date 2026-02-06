@@ -594,7 +594,7 @@ fn trace_chunk_rope_interval(
     let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
     if (bh.hit) {
       // Optional grass-on-solid-face probe when solid voxel is grass
-      if (leaf.mat == MAT_GRASS) {
+      if (leaf.mat == MAT_GRASS && bh.t <= GRASS_PRIMARY_MAX_DIST && bh.n.y >= GRASS_PRIMARY_MIN_NY) {
         let hp = ro + bh.t * rd;
 
         let cell = pick_grass_cell_in_chunk(
