@@ -252,10 +252,10 @@ const HF_DT_MAX : f32 = 48.0;
 //// --------------------------------------------------------------------------
 
 // How far rays march in voxels (controls “search radius” for lights)
-const LIGHT_MAX_DIST_VOX : u32 = 32u;   // try 16..64
+const LIGHT_MAX_DIST_VOX : u32 = 16u;   // try 16..64
 
 // Number of rays
-const LIGHT_RAYS : u32 = 24u;          // try 16..32
+const LIGHT_RAYS : u32 = 8u;           // try 8..16
 
 // Softens inverse-square near the light (in voxels)
 const LIGHT_SOFT_RADIUS_VOX : f32 = 3.0;
@@ -274,7 +274,7 @@ const LIGHT_DIRECT_GAIN   : f32 = 1.00;
 const LIGHT_INDIRECT_GAIN : f32 = 0.65; // cheap “bounce fill”
 
 // Stop after N light hits (perf only; output is normalized with LIGHT_RAYS)
-const LIGHT_EARLY_HITS : u32 = 24u;
+const LIGHT_EARLY_HITS : u32 = 4u;
 
 //// --------------------------------------------------------------------------
 //// Shading gates (world-space distance)
@@ -317,12 +317,12 @@ const GRASS_SEGS_MID : u32 = 2u;
 const GRASS_SEGS_FAR : u32 = 1u;
 
 const GRASS_TRACE_STEPS_MID : u32 = 6u;
-const GRASS_TRACE_STEPS_FAR : u32 = 4u;
+const GRASS_TRACE_STEPS_FAR : u32 = 2u;
 
 // Primary-pass grass gating (tune these)
-const GRASS_PRIMARY_MAX_DIST : f32 = 14.0; // meters-ish
+const GRASS_PRIMARY_MAX_DIST : f32 = 8.0; // meters-ish
 const GRASS_PRIMARY_MIN_NY   : f32 = 0.60; // only fairly upward normals
-const GRASS_PRIMARY_RATE_MASK: u32 = 7u;   // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
+const GRASS_PRIMARY_RATE_MASK: u32 = 15u;  // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
 
 
 // Misc
