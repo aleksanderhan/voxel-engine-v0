@@ -597,7 +597,8 @@ fn trace_chunk_interval_stream_macro(
   t0_in: f32,
   t1_in: f32,
   use_anchor: bool,
-  anchor_key_in: u32
+  anchor_key_in: u32,
+  grass_seed: u32
 ) -> ChunkTraceResult {
   let vs = cam.voxel_params.x;
 
@@ -613,13 +614,13 @@ fn trace_chunk_interval_stream_macro(
   var anchor_valid = use_anchor;
 
   if (ch.macro_base == INVALID_U32) {
-    let h = trace_chunk_rope_interval(ro, rd, inv, ch, tcur, t_end, anchor_valid, anchor_key);
+    let h = trace_chunk_rope_interval(ro, rd, inv, ch, tcur, t_end, anchor_valid, anchor_key, grass_seed);
     return h;
   }
 
   var ms = macro_dda_init(ro, rd, inv, tcur, root_bmin, root_size, ch.macro_base);
   if (!ms.enabled) {
-    let h = trace_chunk_rope_interval(ro, rd, inv, ch, tcur, t_end, anchor_valid, anchor_key);
+    let h = trace_chunk_rope_interval(ro, rd, inv, ch, tcur, t_end, anchor_valid, anchor_key, grass_seed);
     return h;
   }
 
@@ -639,7 +640,17 @@ fn trace_chunk_interval_stream_macro(
       continue;
     }
 
-    let h = trace_chunk_rope_interval_nomacro(ro, rd, inv, ch, tcur, t_cell_exit, anchor_valid, anchor_key);
+    let h = trace_chunk_rope_interval_nomacro(
+      ro,
+      rd,
+      inv,
+      ch,
+      tcur,
+      t_cell_exit,
+      anchor_valid,
+      anchor_key,
+      grass_seed
+    );
 
     if (h.hit.hit != 0u) {
       return h;
@@ -663,7 +674,8 @@ fn trace_chunk_rope_interval_nomacro(
   t_enter: f32,
   t_exit: f32,
   use_anchor: bool,
-  anchor_key: u32
+  anchor_key: u32,
+  grass_seed: u32
 ) -> ChunkTraceResult {
   let vs = cam.voxel_params.x;
 
@@ -732,32 +744,37 @@ fn trace_chunk_rope_interval_nomacro(
       }
 
       if (ENABLE_GRASS && lod_probe != 2u && leaf.size <= grass_leaf_limit) {
-        let t0_probe = max(t_enter, tcur - eps_step);
-        let t1_probe = min(t_leave, t_exit);
+        let grass_ok = grass_allowed_primary(tcur, vec3<f32>(0.0, 1.0, 0.0), grass_seed);
+        if (!grass_ok) {
+          // Skip grass entirely in primary pass (subsampled)
+        } else {
+          let t0_probe = max(t_enter, tcur - eps_step);
+          let t1_probe = min(t_leave, t_exit);
 
-        if (t1_probe >= t0_probe) {
-          let gh = probe_grass_columns_xz_dda(
-            ro, rd, inv,
-            t0_probe, t1_probe,
-            root_bmin,
-            origin_vox_i,
-            vs,
-            ch.colinfo_base,
-            time_s,
-            strength
-          );
+          if (t1_probe >= t0_probe) {
+            let gh = probe_grass_columns_xz_dda(
+              ro, rd, inv,
+              t0_probe, t1_probe,
+              root_bmin,
+              origin_vox_i,
+              vs,
+              ch.colinfo_base,
+              time_s,
+              strength
+            );
 
-          if (gh.hit) {
-            var outg = miss_hitgeom();
-            outg.hit = 1u;
-            outg.t   = gh.t;
-            outg.mat = MAT_GRASS;
-            outg.n   = gh.n;
-            outg.root_bmin  = root_bmin;
-            outg.root_size  = root_size;
-            outg.node_base  = ch.node_base;
-            outg.macro_base = ch.macro_base;
-            return ChunkTraceResult(outg, anchor_node.valid, anchor_node.key);
+            if (gh.hit) {
+              var outg = miss_hitgeom();
+              outg.hit = 1u;
+              outg.t   = gh.t;
+              outg.mat = MAT_GRASS;
+              outg.n   = gh.n;
+              outg.root_bmin  = root_bmin;
+              outg.root_size  = root_size;
+              outg.node_base  = ch.node_base;
+              outg.macro_base = ch.macro_base;
+              return ChunkTraceResult(outg, anchor_node.valid, anchor_node.key);
+            }
           }
         }
       }
@@ -931,7 +948,8 @@ fn trace_chunk_rope_interval(
   t_enter: f32,
   t_exit: f32,
   use_anchor: bool,
-  anchor_key: u32
+  anchor_key: u32,
+  grass_seed: u32
 ) -> ChunkTraceResult {
   return trace_chunk_rope_interval_nomacro(
     ro,
@@ -941,7 +959,8 @@ fn trace_chunk_rope_interval(
     t_enter,
     t_exit,
     use_anchor,
-    anchor_key
+    anchor_key,
+    grass_seed
   );
 }
 
@@ -1143,7 +1162,8 @@ fn trace_scene_voxels_candidates(
   anchor_valid_in: bool,
   anchor_chunk_in: vec3<i32>,
   anchor_key_in: u32,
-  candidate_count: u32
+  candidate_count: u32,
+  grass_seed: u32
 ) -> VoxTraceResult {
   if (cam.chunk_count == 0u) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
@@ -1202,16 +1222,17 @@ fn trace_scene_voxels_candidates(
     let use_anchor = anchor_valid_in && chunk_coords_neighbor(chunk_coord, anchor_chunk_in);
     let anchor_key_use = select(INVALID_U32, anchor_key_in, use_anchor);
 
-    let h = trace_chunk_interval_stream_macro(
-      ro,
-      rd,
-      inv,
-      ch,
-      cell_enter,
-      cell_exit,
-      use_anchor,
-      anchor_key_use
-    );
+          let h = trace_chunk_interval_stream_macro(
+            ro,
+            rd,
+            inv,
+            ch,
+            cell_enter,
+            cell_exit,
+            use_anchor,
+            anchor_key_use,
+            grass_seed
+          );
     if (h.hit.hit != 0u && h.hit.t < best.t) {
       best = h.hit;
       best_anchor_valid = h.anchor_valid;
@@ -1230,7 +1251,8 @@ fn trace_scene_voxels_interval(
   t_max: f32,
   anchor_valid_in: bool,
   anchor_chunk_in: vec3<i32>,
-  anchor_key_in: u32
+  anchor_key_in: u32,
+  grass_seed: u32
 ) -> VoxTraceResult {
   if (cam.chunk_count == 0u) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
@@ -1366,16 +1388,17 @@ fn trace_scene_voxels_interval(
             (slot == anchor_slot || chunk_coords_neighbor(cur_coord, anchor_coord));
           let anchor_key_use = select(INVALID_U32, anchor_key, use_anchor);
 
-          let h = trace_chunk_interval_stream_macro(
-            ro,
-            rd,
-            inv,
-            ch,
-            cell_enter,
-            cell_exit,
-            use_anchor,
-            anchor_key_use
-          );
+    let h = trace_chunk_interval_stream_macro(
+      ro,
+      rd,
+      inv,
+      ch,
+      cell_enter,
+      cell_exit,
+      use_anchor,
+      anchor_key_use,
+      grass_seed
+    );
           if (h.hit.hit != 0u && h.hit.t < best.t) {
             best = h.hit;
             best_anchor_valid = h.anchor_valid;
@@ -1432,7 +1455,7 @@ fn hitgeom_from_clipmap(ch: ClipHit, ro: vec3<f32>, rd: vec3<f32>) -> HitGeom {
   return h;
 }
 
-fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
+fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>, grass_seed: u32) -> VoxTraceResult {
   // 1) Fast terrain estimate (downward rays only inside clipmap code)
   let ch = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
@@ -1444,7 +1467,7 @@ fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
     // - far_skip_dist: beyond this, clipmap shading is "good enough" for primary
     // - band: how much extra distance we allow for voxel detail around the clip hit
     // accept clipmap terrain earlier
-    let far_skip_dist = 18.0;                      // try 16..24
+    let far_skip_dist = 24.0;                      // try 16..32
     let band          = 0.75 * cam.voxel_params.x; // slightly wider band
 
     if (ch.t >= far_skip_dist) {
@@ -1457,7 +1480,16 @@ fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
     let tmax_vox = min(FOG_MAX_DIST, ch.t + band);
 
     // Reuse your existing voxel trace, but with a much smaller t_max
-    let v = trace_scene_voxels_interval(ro, rd, 0.0, tmax_vox, false, vec3<i32>(0), INVALID_U32);
+    let v = trace_scene_voxels_interval(
+      ro,
+      rd,
+      0.0,
+      tmax_vox,
+      false,
+      vec3<i32>(0),
+      INVALID_U32,
+      grass_seed
+    );
 
     // If voxels found something, keep it; otherwise fall back to clipmap hit
     if (v.best.hit != 0u) {
@@ -1469,11 +1501,20 @@ fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
   }
 
   // No clip terrain: keep current behavior (sky etc.)
-  return trace_scene_voxels_interval(ro, rd, 0.0, FOG_MAX_DIST, false, vec3<i32>(0), INVALID_U32);
+  return trace_scene_voxels_interval(
+    ro,
+    rd,
+    0.0,
+    FOG_MAX_DIST,
+    false,
+    vec3<i32>(0),
+    INVALID_U32,
+    grass_seed
+  );
 }
 
-fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
-  return trace_scene_primary_fast(ro, rd);
+fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>, grass_seed: u32) -> VoxTraceResult {
+  return trace_scene_primary_fast(ro, rd, grass_seed);
 }
 
 // --------------------------------------------------------------------------
