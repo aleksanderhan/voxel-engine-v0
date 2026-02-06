@@ -187,7 +187,7 @@ fn fs_main(
 ) -> @location(0) vec4<f32> {
 
   let uv_c = clamp(uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
-  let c = textureSample(img, samp, uv_c);
+  let c = textureSampleLevel(img, samp, uv_c, 0.0);
 
   var rgb = c.rgb; // no tonemap here
 

@@ -226,8 +226,8 @@ impl Renderer {
         let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
 
         let render_scale = config::RENDER_SCALE;
-        let internal_w = ((width as f32) * render_scale).round() as u32;
-        let internal_h = ((height as f32) * render_scale).round() as u32;
+        let internal_w = ((width as f32) * render_scale).round().max(1.0) as u32;
+        let internal_h = ((height as f32) * render_scale).round().max(1.0) as u32;
         
         let textures = create_textures(&device, width, height, internal_w, internal_h);
         let bind_groups = create_bind_groups(&device, &layouts, &buffers, &textures, &sampler);
@@ -283,8 +283,8 @@ impl Renderer {
     }
 
     pub fn resize_output(&mut self, width: u32, height: u32) {
-        self.internal_w = ((width as f32) * self.render_scale).round() as u32;
-        self.internal_h = ((height as f32) * self.render_scale).round() as u32;
+        self.internal_w = ((width as f32) * self.render_scale).round().max(1.0) as u32;
+        self.internal_h = ((height as f32) * self.render_scale).round().max(1.0) as u32;
 
         self.textures = create_textures(&self.device, width, height, self.internal_w, self.internal_h);
 
