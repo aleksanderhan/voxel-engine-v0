@@ -534,6 +534,7 @@ fn trace_chunk_rope_interval(
   ch: ChunkMeta,
   t_enter: f32,
   t_exit: f32,
+  use_anchor: bool,
   anchor_key: u32
 ) -> ChunkTraceResult {
   let vs = cam.voxel_params.x;
@@ -552,7 +553,10 @@ fn trace_chunk_rope_interval(
     ch.macro_base
   );
 
-  var anchor_node = anchor_from_key(ch.node_base, root_bmin, root_size, anchor_key);
+  var anchor_node = AnchorNode(false, 0u, vec3<f32>(0.0), 0.0, INVALID_U32);
+  if (use_anchor) {
+    anchor_node = anchor_from_key(ch.node_base, root_bmin, root_size, anchor_key);
+  }
 
   // Only probe grass when we are in small-enough air leaves
   let grass_probe_max_leaf = vs;
@@ -602,7 +606,7 @@ fn trace_chunk_rope_interval(
         leaf = descend_leaf_sparse(pq, ch.node_base, 0u, root_bmin, root_size);
       }
       let next_anchor = anchor_from_leaf(leaf, ch.node_base);
-      if (next_anchor.valid) {
+      if (next_anchor.valid && (!anchor_node.valid || next_anchor.key != anchor_node.key)) {
         anchor_node = next_anchor;
       }
       have_leaf = true;
@@ -684,7 +688,7 @@ fn trace_chunk_rope_interval(
         let c  = node_cube_from_key(root_bmin, root_size, nk);
         leaf = descend_leaf_sparse(pq_next, ch.node_base, nidx, c.xyz, c.w);
         let next_anchor = anchor_from_leaf(leaf, ch.node_base);
-        if (next_anchor.valid) {
+        if (next_anchor.valid && (!anchor_node.valid || next_anchor.key != anchor_node.key)) {
           anchor_node = next_anchor;
         }
         have_leaf = true;
@@ -713,7 +717,7 @@ fn trace_chunk_rope_interval(
 
         leaf = descend_leaf_sparse(pq_next, ch.node_base, nidx2, c2.xyz, c2.w);
         let next_anchor = anchor_from_leaf(leaf, ch.node_base);
-        if (next_anchor.valid) {
+        if (next_anchor.valid && (!anchor_node.valid || next_anchor.key != anchor_node.key)) {
           anchor_node = next_anchor;
         }
         have_leaf = true;
@@ -978,7 +982,15 @@ fn trace_scene_voxels_interval(
           (slot == anchor_slot || chunk_coords_neighbor(cur_coord, anchor_coord));
         let anchor_key_use = select(INVALID_U32, anchor_key, use_anchor);
 
-        let h = trace_chunk_rope_interval(ro, rd, ch, cell_enter, cell_exit, anchor_key_use);
+        let h = trace_chunk_rope_interval(
+          ro,
+          rd,
+          ch,
+          cell_enter,
+          cell_exit,
+          use_anchor,
+          anchor_key_use
+        );
         if (h.hit.hit != 0u && h.hit.t < best.t) {
           best = h.hit;
           best_anchor_valid = h.anchor_valid;
