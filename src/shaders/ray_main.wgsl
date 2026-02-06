@@ -108,7 +108,6 @@ fn main_primary(
 
   let res = vec2<f32>(f32(dims.x), f32(dims.y));
   let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
-  let uv  = px / res;
 
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px, res);
@@ -127,8 +126,7 @@ fn main_primary(
   // ------------------------------------------------------------
   // Case 1: no voxel chunks => heightfield or sky
   // ------------------------------------------------------------
-  let dims_u = textureDimensions(color_img);
-  let shadow_idx = u32(ip.y) * dims_u.x + u32(ip.x);
+  let shadow_idx = u32(ip.y) * dims.x + u32(ip.x);
 
   if (cam.chunk_count == 0u) {
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
@@ -166,6 +164,7 @@ fn main_primary(
   var hist_anchor_key  : u32 = INVALID_U32;
   var hist_anchor_coord: vec3<i32> = vec3<i32>(0);
   let tile_candidate_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
+  let uv  = px / res;
 
   let hist_guess = textureLoad(primary_hist_tex, ip, 0);
   let t_hist_guess = hist_guess.x;
