@@ -53,6 +53,14 @@ fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f3
   return clamp(c, vec3<f32>(0.0), vec3<f32>(1.5));
 }
 
+fn base_albedo(mat: u32, hp: vec3<f32>, t: f32) -> vec3<f32> {
+  var base = color_for_material(mat);
+  if (t <= FAR_SHADING_DIST) {
+    base = apply_material_variation(base, mat, hp);
+  }
+  return base;
+}
+
 fn voxel_ao_local(
   hp: vec3<f32>,
   n: vec3<f32>,
@@ -138,15 +146,16 @@ fn shade_hit_split(
 
   if (hg.hit != 0u && hg.mat != MAT_LIGHT && hg.t <= LOCAL_LIGHT_MAX_DIST) {
     let hp = ro + hg.t * rd;
+    let albedo = base_albedo(hg.mat, hp, hg.t);
     local_hdr = gather_voxel_lights(
       hp,
       hg.n,
       hg.root_bmin,
       hg.root_size,
       hg.node_base,
-      hg.macro_base,
-      seed
+      hg.macro_base
     );
+    local_hdr *= albedo;
     local_w = 1.0;
   }
 
@@ -156,10 +165,7 @@ fn shade_hit_split(
 fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
   let hp = ro + hg.t * rd;
 
-  var base = color_for_material(hg.mat);
-  if (hg.t <= FAR_SHADING_DIST) {
-    base = apply_material_variation(base, hg.mat, hp);
-  }
+  var base = base_albedo(hg.mat, hp, hg.t);
 
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
@@ -192,8 +198,9 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   }
 
   let amb_col      = hemi_ambient(hg.n, sky_up);
-  let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
-  var ambient      = amb_col * amb_strength * ao;
+  let amb_strength = select(0.03, 0.05, hg.mat == MAT_LEAF);
+  let ao_term      = ao * ao * ao;
+  var ambient      = amb_col * amb_strength * ao_term;
 
   if (hg.mat == MAT_STONE) {
     ambient *= vec3<f32>(0.92, 0.95, 1.05);
