@@ -130,7 +130,7 @@ fn node_y(key: u32) -> u32 { return (key >>  6u) & 63u; }
 fn node_z(key: u32) -> u32 { return (key >> 12u) & 63u; }
 
 fn node_cube_from_key(root_bmin: vec3<f32>, root_size: f32, key: u32) -> vec4<f32> {
-  let lvl = node_level(key);
+  let lvl = min(node_level(key), chunk_max_depth());
   let s = root_size / f32(1u << lvl);
   let bmin = root_bmin + vec3<f32>(f32(node_x(key)), f32(node_y(key)), f32(node_z(key))) * s;
   return vec4<f32>(bmin, s);
