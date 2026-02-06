@@ -326,16 +326,25 @@ fn macro_dda_init(
   let p  = ro + rd * tcur;
   let lp = p - root_bmin;
 
-  // current macro cell indices
+  // NEW: strict bounds. If outside chunk, disable macro DDA for this ray segment.
+  if (lp.x < 0.0 || lp.y < 0.0 || lp.z < 0.0 ||
+      lp.x >= root_size || lp.y >= root_size || lp.z >= root_size) {
+    m.valid = false;
+    m.cell = 0.0;
+    return m;
+  }
+
+  // current macro cell indices (NOW safe to floor without clamping-to-edge artifacts)
   let mx0 = i32(floor(lp.x / m.cell));
   let my0 = i32(floor(lp.y / m.cell));
   let mz0 = i32(floor(lp.z / m.cell));
 
-  // clamp into [0 .. MACRO_DIM-1]
+  // If you still want safety, clamp only after the bounds check:
   let md = i32(MACRO_DIM) - 1;
   m.mx = clamp(mx0, 0, md);
   m.my = clamp(my0, 0, md);
   m.mz = clamp(mz0, 0, md);
+
 
   m.stepX = select(-1, 1, rd.x > 0.0);
   m.stepY = select(-1, 1, rd.y > 0.0);
