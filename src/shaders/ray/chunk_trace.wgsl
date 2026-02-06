@@ -31,6 +31,12 @@ struct HitGeom {
   _pad4      : vec2<u32>,
 };
 
+struct ChunkTraceResult {
+  hit : HitGeom,
+  anchor_valid: bool,
+  anchor_key  : u32,
+};
+
 fn miss_hitgeom() -> HitGeom {
   var h : HitGeom;
   h.hit = 0u;
@@ -119,6 +125,81 @@ fn node_cube_from_key(root_bmin: vec3<f32>, root_size: f32, key: u32) -> vec4<f3
   let s = root_size / f32(1u << lvl);
   let bmin = root_bmin + vec3<f32>(f32(node_x(key)), f32(node_y(key)), f32(node_z(key))) * s;
   return vec4<f32>(bmin, s);
+}
+
+struct AnchorNode {
+  valid : bool,
+  idx   : u32,
+  bmin  : vec3<f32>,
+  size  : f32,
+  key   : u32,
+};
+
+fn anchor_from_key(
+  node_base: u32,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  key: u32
+) -> AnchorNode {
+  if (key == INVALID_U32) {
+    return AnchorNode(false, 0u, vec3<f32>(0.0), 0.0, INVALID_U32);
+  }
+
+  let lvl = min(node_level(key), chunk_max_depth());
+  let tx  = node_x(key);
+  let ty  = node_y(key);
+  let tz  = node_z(key);
+
+  var idx  : u32 = 0u;
+  var bmin : vec3<f32> = root_bmin;
+  var size : f32 = root_size;
+
+  for (var d: u32 = 0u; d < 32u; d = d + 1u) {
+    if (d >= lvl) {
+      let nk = node_at(node_base, idx).key;
+      return AnchorNode(true, idx, bmin, size, nk);
+    }
+
+    let n = node_at(node_base, idx);
+    if (n.child_base == LEAF_U32) {
+      return AnchorNode(true, idx, bmin, size, n.key);
+    }
+
+    let shift = (lvl - 1u) - d;
+    let hx = (tx >> shift) & 1u;
+    let hy = (ty >> shift) & 1u;
+    let hz = (tz >> shift) & 1u;
+    let ci = hx | (hy << 1u) | (hz << 2u);
+
+    let bit = 1u << ci;
+    if ((n.child_mask & bit) == 0u) {
+      return AnchorNode(true, idx, bmin, size, n.key);
+    }
+
+    let half = size * 0.5;
+    bmin = bmin + vec3<f32>(
+      select(0.0, half, hx != 0u),
+      select(0.0, half, hy != 0u),
+      select(0.0, half, hz != 0u)
+    );
+    size = half;
+    let r = child_rank(n.child_mask, ci);
+    idx = n.child_base + r;
+  }
+
+  return AnchorNode(true, idx, bmin, size, node_at(node_base, idx).key);
+}
+
+fn anchor_from_leaf(leaf: LeafState, node_base: u32) -> AnchorNode {
+  if (leaf.has_node) {
+    let k = node_at(node_base, leaf.idx_local).key;
+    return AnchorNode(true, leaf.idx_local, leaf.bmin, leaf.size, k);
+  }
+  if (leaf.has_anchor) {
+    let k = node_at(node_base, leaf.anchor_idx).key;
+    return AnchorNode(true, leaf.anchor_idx, leaf.anchor_bmin, leaf.anchor_size, k);
+  }
+  return AnchorNode(false, 0u, vec3<f32>(0.0), 0.0, INVALID_U32);
 }
 
 // --------------------------------------------------------------------------
@@ -452,8 +533,10 @@ fn trace_chunk_rope_interval(
   rd: vec3<f32>,
   ch: ChunkMeta,
   t_enter: f32,
-  t_exit: f32
-) -> HitGeom {
+  t_exit: f32,
+  use_anchor: bool,
+  anchor_key: u32
+) -> ChunkTraceResult {
   let vs = cam.voxel_params.x;
 
   let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
@@ -469,6 +552,11 @@ fn trace_chunk_rope_interval(
     root_bmin, root_size,
     ch.macro_base
   );
+
+  var anchor_node = AnchorNode(false, 0u, vec3<f32>(0.0), 0.0, INVALID_U32);
+  if (use_anchor) {
+    anchor_node = anchor_from_key(ch.node_base, root_bmin, root_size, anchor_key);
+  }
 
   // Only probe grass when we are in small-enough air leaves
   let grass_probe_max_leaf = vs;
@@ -512,7 +600,15 @@ fn trace_chunk_rope_interval(
     let pq = p + ray_eps_vec(rd, 1e-4 * vs);
 
     if (!have_leaf || !point_in_cube(pq, leaf.bmin, leaf.size)) {
-      leaf = descend_leaf_sparse(pq, ch.node_base, 0u, root_bmin, root_size);
+      if (anchor_node.valid && point_in_cube(pq, anchor_node.bmin, anchor_node.size)) {
+        leaf = descend_leaf_sparse(pq, ch.node_base, anchor_node.idx, anchor_node.bmin, anchor_node.size);
+      } else {
+        leaf = descend_leaf_sparse(pq, ch.node_base, 0u, root_bmin, root_size);
+      }
+      let next_anchor = anchor_from_leaf(leaf, ch.node_base);
+      if (next_anchor.valid && (!anchor_node.valid || next_anchor.key != anchor_node.key)) {
+        anchor_node = next_anchor;
+      }
       have_leaf = true;
     }
 
@@ -560,7 +656,7 @@ fn trace_chunk_rope_interval(
             outg.root_size  = root_size;
             outg.node_base  = ch.node_base;
             outg.macro_base = ch.macro_base;
-            return outg;
+            return ChunkTraceResult(outg, anchor_node.valid, anchor_node.key);
           }
         }
       }
@@ -591,6 +687,10 @@ fn trace_chunk_rope_interval(
         let nk = node_at(ch.node_base, nidx).key;
         let c  = node_cube_from_key(root_bmin, root_size, nk);
         leaf = descend_leaf_sparse(pq_next, ch.node_base, nidx, c.xyz, c.w);
+        let next_anchor = anchor_from_leaf(leaf, ch.node_base);
+        if (next_anchor.valid && (!anchor_node.valid || next_anchor.key != anchor_node.key)) {
+          anchor_node = next_anchor;
+        }
         have_leaf = true;
         continue;
       }
@@ -616,6 +716,10 @@ fn trace_chunk_rope_interval(
         let c2  = node_cube_from_key(root_bmin, root_size, nk2);
 
         leaf = descend_leaf_sparse(pq_next, ch.node_base, nidx2, c2.xyz, c2.w);
+        let next_anchor = anchor_from_leaf(leaf, ch.node_base);
+        if (next_anchor.valid && (!anchor_node.valid || next_anchor.key != anchor_node.key)) {
+          anchor_node = next_anchor;
+        }
         have_leaf = true;
         continue;
       }
@@ -650,7 +754,7 @@ fn trace_chunk_rope_interval(
         out.root_size  = root_size;
         out.node_base  = ch.node_base;
         out.macro_base = ch.macro_base;
-        return out;
+        return ChunkTraceResult(out, anchor_node.valid, anchor_node.key);
       }
 
       // Miss: step out of this leaf
@@ -694,7 +798,7 @@ fn trace_chunk_rope_interval(
           outg.root_size  = root_size;
           outg.node_base  = ch.node_base;
           outg.macro_base = ch.macro_base;
-          return outg;
+          return ChunkTraceResult(outg, anchor_node.valid, anchor_node.key);
         }
       }
 
@@ -707,7 +811,7 @@ fn trace_chunk_rope_interval(
       out.root_size  = root_size;
       out.node_base  = ch.node_base;
       out.macro_base = ch.macro_base;
-      return out;
+      return ChunkTraceResult(out, anchor_node.valid, anchor_node.key);
     }
 
     // Miss solid: step out of leaf
@@ -715,7 +819,7 @@ fn trace_chunk_rope_interval(
     have_leaf = false;
   }
 
-  return miss_hitgeom();
+  return ChunkTraceResult(miss_hitgeom(), anchor_node.valid, anchor_node.key);
 }
 
 // --------------------------------------------------------------------------
@@ -726,11 +830,29 @@ struct VoxTraceResult {
   in_grid : bool,
   best    : HitGeom,
   t_exit  : f32,
+  anchor_valid: bool,
+  anchor_key  : u32,
+  anchor_chunk: vec3<i32>,
 };
 
-fn trace_scene_voxels_interval(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> VoxTraceResult {
+fn chunk_coords_neighbor(a: vec3<i32>, b: vec3<i32>) -> bool {
+  let dx = abs(a.x - b.x);
+  let dy = abs(a.y - b.y);
+  let dz = abs(a.z - b.z);
+  return (dx <= 1 && dy <= 1 && dz <= 1);
+}
+
+fn trace_scene_voxels_interval(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_min: f32,
+  t_max: f32,
+  anchor_valid_in: bool,
+  anchor_chunk_in: vec3<i32>,
+  anchor_key_in: u32
+) -> VoxTraceResult {
   if (cam.chunk_count == 0u) {
-    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+    return VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
   }
 
   let voxel_size   = cam.voxel_params.x;
@@ -751,7 +873,7 @@ fn trace_scene_voxels_interval(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: 
   let t_exit  = min(min(rtg.y, FOG_MAX_DIST), t_max);
 
   if (t_exit < t_enter) {
-    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+    return VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
   }
 
 
@@ -773,7 +895,7 @@ fn trace_scene_voxels_interval(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: 
   var lcz: i32 = c.z - go.z;
 
   if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) {
-    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+    return VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
   }
 
   let stride_y: i32 = nx;
@@ -813,6 +935,13 @@ fn trace_scene_voxels_interval(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: 
   let didx_z: i32 = select(-stride_z, stride_z, rd.z > 0.0);
 
   var best = miss_hitgeom();
+  var best_anchor_valid = false;
+  var best_anchor_key = INVALID_U32;
+  var best_anchor_chunk = vec3<i32>(0);
+  var anchor_valid = anchor_valid_in;
+  var anchor_coord = anchor_chunk_in;
+  var anchor_key = anchor_key_in;
+  var anchor_slot: u32 = INVALID_U32;
 
   // Tight cap: how many chunk boundaries can this ray possibly cross?
   // (visited cells <= boundary_crossings + 1)
@@ -848,8 +977,30 @@ fn trace_scene_voxels_interval(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: 
         let cell_enter = start_t + t_local;
         let cell_exit  = start_t + min(tNextLocal, t_exit_local);
 
-        let h = trace_chunk_rope_interval(ro, rd, ch, cell_enter, cell_exit);
-        if (h.hit != 0u && h.t < best.t) { best = h; }
+        let cur_coord = vec3<i32>(go.x + lcx, go.y + lcy, go.z + lcz);
+        let use_anchor = anchor_valid &&
+          (slot == anchor_slot || chunk_coords_neighbor(cur_coord, anchor_coord));
+        let anchor_key_use = select(INVALID_U32, anchor_key, use_anchor);
+
+        let h = trace_chunk_rope_interval(
+          ro,
+          rd,
+          ch,
+          cell_enter,
+          cell_exit,
+          use_anchor,
+          anchor_key_use
+        );
+        if (h.hit.hit != 0u && h.hit.t < best.t) {
+          best = h.hit;
+          best_anchor_valid = h.anchor_valid;
+          best_anchor_key = h.anchor_key;
+          best_anchor_chunk = cur_coord;
+        }
+        anchor_valid = h.anchor_valid;
+        anchor_key = h.anchor_key;
+        anchor_coord = cur_coord;
+        anchor_slot = slot;
       }
     }
 
@@ -878,11 +1029,11 @@ fn trace_scene_voxels_interval(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: 
     if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) { break; }
   }
 
-  return VoxTraceResult(true, best, t_exit);
+  return VoxTraceResult(true, best, t_exit, best_anchor_valid, best_anchor_key, best_anchor_chunk);
 }
 
 fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
-  return trace_scene_voxels_interval(ro, rd, 0.0, FOG_MAX_DIST);
+  return trace_scene_voxels_interval(ro, rd, 0.0, FOG_MAX_DIST, false, vec3<i32>(0), INVALID_U32);
 }
 
 // --------------------------------------------------------------------------

@@ -148,7 +148,7 @@ pub fn create_textures(
             "primary_hit_hist_a",
             internal_w,
             internal_h,
-            wgpu::TextureFormat::R32Float,
+            wgpu::TextureFormat::Rgba32Float,
             rw_tex_usage,
         ),
         make_tex2d(
@@ -156,7 +156,7 @@ pub fn create_textures(
             "primary_hit_hist_b",
             internal_w,
             internal_h,
-            wgpu::TextureFormat::R32Float,
+            wgpu::TextureFormat::Rgba32Float,
             rw_tex_usage,
         ),
     ];

@@ -160,7 +160,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             cs_vis,
             wgpu::TextureSampleType::Float { filterable: false },
         ),
-        bgl_storage_tex_wo(13, cs_vis, wgpu::TextureFormat::R32Float),
+        bgl_storage_tex_wo(13, cs_vis, wgpu::TextureFormat::Rgba32Float),
         bgl_sampler_non_filtering(14, cs_vis),
     ];
 
