@@ -147,10 +147,10 @@ impl ChunkManager {
         let ny = GRID_Y_COUNT;
 
         let grid_len = (nx * ny * nz) as usize;
-        let super = config::SUPERGRID_CHUNK_DIM;
-        let super_nx = (nx + super - 1) / super;
-        let super_ny = (ny + super - 1) / super;
-        let super_nz = (nz + super - 1) / super;
+        let super_dim = config::SUPERGRID_CHUNK_DIM;
+        let super_nx = (nx + super_dim - 1) / super_dim;
+        let super_ny = (ny + super_dim - 1) / super_dim;
+        let super_nz = (nz + super_dim - 1) / super_dim;
         let super_len = (super_nx * super_ny * super_nz) as usize;
 
         let active_offsets = keep::build_offsets(config::ACTIVE_RADIUS);

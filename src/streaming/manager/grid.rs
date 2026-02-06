@@ -16,7 +16,7 @@ pub fn rebuild_grid(mgr: &mut ChunkManager, center: ChunkKey) {
     let nx = (2 * config::KEEP_RADIUS + 1) as u32;
     let nz = nx;
     let ny = GRID_Y_COUNT;
-    let super = config::SUPERGRID_CHUNK_DIM;
+    let super_dim = config::SUPERGRID_CHUNK_DIM;
 
     mgr.grid.grid_dims = [nx, ny, nz];
     mgr.grid.grid_origin_chunk = super::keep::keep_origin_for(center);
@@ -27,9 +27,9 @@ pub fn rebuild_grid(mgr: &mut ChunkManager, center: ChunkKey) {
     }
     mgr.grid.chunk_grid.fill(INVALID_U32);
 
-    let super_nx = (nx + super - 1) / super;
-    let super_ny = (ny + super - 1) / super;
-    let super_nz = (nz + super - 1) / super;
+    let super_nx = (nx + super_dim - 1) / super_dim;
+    let super_ny = (ny + super_dim - 1) / super_dim;
+    let super_nz = (nz + super_dim - 1) / super_dim;
     let super_needed = (super_nx * super_ny * super_nz) as usize;
     mgr.grid.supergrid_dims = [super_nx, super_ny, super_nz];
     if mgr.grid.supergrid_occ.len() != super_needed {
@@ -64,9 +64,9 @@ pub fn rebuild_grid(mgr: &mut ChunkManager, center: ChunkKey) {
                 if mgr.grid.chunk_grid[idx as usize] == INVALID_U32 {
                     continue;
                 }
-                let scx = sx / super;
-                let scy = sy / super;
-                let scz = sz / super;
+                let scx = sx / super_dim;
+                let scy = sy / super_dim;
+                let scz = sz / super_dim;
                 let sidx = (scz * super_ny * super_nx) + (scy * super_nx) + scx;
                 mgr.grid.supergrid_occ[sidx as usize] = 1;
             }

@@ -80,13 +80,13 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
     );
 
     let grid_capacity = chunk_capacity;
-    let super = config::SUPERGRID_CHUNK_DIM;
+    let super_dim = config::SUPERGRID_CHUNK_DIM;
     let nx = (2 * config::KEEP_RADIUS + 1) as u32;
     let nz = nx;
     let ny = crate::streaming::types::GRID_Y_COUNT;
-    let super_nx = (nx + super - 1) / super;
-    let super_ny = (ny + super - 1) / super;
-    let super_nz = (nz + super - 1) / super;
+    let super_nx = (nx + super_dim - 1) / super_dim;
+    let super_ny = (ny + super_dim - 1) / super_dim;
+    let super_nz = (nz + super_dim - 1) / super_dim;
     let supergrid_capacity = super_nx * super_ny * super_nz;
 
     let chunk_grid = make_storage_buffer(
