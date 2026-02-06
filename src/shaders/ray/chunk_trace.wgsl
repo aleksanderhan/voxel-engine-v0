@@ -712,11 +712,14 @@ fn trace_chunk_rope_interval_nomacro(
     let p  = ro + tcur * rd;
     let pq = p + ray_eps_vec(rd, 1e-4 * vs);
 
-    var leaf_bmin = leaf.bmin;
+    var leaf_bmin = vec3<f32>(0.0);
     // If we already have a leaf and it's a LEAF material, use displaced bounds for containment
-    if (have_leaf && leaf.mat == MAT_LEAF) {
-      let off = leaf_cube_offset(leaf.bmin, leaf.size, time_s, strength);
-      leaf_bmin = leaf.bmin + off;
+    if (have_leaf) {
+      leaf_bmin = leaf.bmin;
+      if (leaf.mat == MAT_LEAF) {
+        let off = leaf_cube_offset(leaf.bmin, leaf.size, time_s, strength);
+        leaf_bmin = leaf.bmin + off;
+      }
     }
 
     if (!have_leaf || !point_in_cube(pq, leaf_bmin, leaf.size)) {
