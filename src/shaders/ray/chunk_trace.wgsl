@@ -405,7 +405,7 @@ fn trace_chunk_rope_interval(
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
 
   // Only probe grass when we are in small-enough air leaves
-  let grass_probe_max_leaf = 2.0 * vs;
+  let grass_probe_max_leaf = vs;
 
   let origin_vox_i = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
   let time_s       = cam.voxel_params.y;
@@ -422,7 +422,7 @@ fn trace_chunk_rope_interval(
     macro_empty = !macro_test(ch.macro_base, bit);
   }
 
-  let MAX_ITERS: u32 = 256u + cam.chunk_size * 8u;
+  let MAX_ITERS: u32 = 192u + cam.chunk_size * 4u;
 
   for (var it: u32 = 0u; it < MAX_ITERS; it = it + 1u) {
     if (tcur > t_exit) { break; }
@@ -924,7 +924,7 @@ fn probe_grass_columns_xz_dda(
 
   // Safety cap: max columns crossed within a tiny leaf is small.
   // Still cap to be safe in edge cases / long segments.
-  let MAX_COLS: u32 = 128u;
+  let MAX_COLS: u32 = 64u;
 
   for (var iter: u32 = 0u; iter < MAX_COLS; iter = iter + 1u) {
     if (t > t1) { break; }
