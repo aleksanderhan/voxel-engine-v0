@@ -50,9 +50,6 @@ pub struct Clipmap {
 }
 
 impl Clipmap {
-    const TREE_CANOPY_CELL_M_MAX: f32 = 4.0;
-    const TREE_CANOPY_MAX_EXTRA_M: f32 = 16.0;
-
     pub fn new() -> Self {
         Self {
             last_origin_cell: [(i32::MIN, i32::MIN); config::CLIPMAP_LEVELS_USIZE],
@@ -96,56 +93,14 @@ impl Clipmap {
     }
 
     #[inline]
-    fn sample_tree_top_height_f32(world: &WorldGen, wx_m: f32, wz_m: f32, cell_m: f32) -> f32 {
-        let vs = config::VOXEL_SIZE_M_F32;
-        let vpm = config::VOXELS_PER_METER;
-
-        let half = 0.5 * cell_m;
-        let offsets = [
-            (0.0, 0.0),
-            (-half, -half),
-            (-half, half),
-            (half, -half),
-            (half, half),
-        ];
-
-        let mut best = f32::NEG_INFINITY;
-        for (dx, dz) in offsets {
-            let mx = (wx_m + dx).floor() as i32;
-            let mz = (wz_m + dz).floor() as i32;
-            let Some((trunk_h_vox, crown_r_vox)) = world.tree_instance_at_meter(mx, mz) else {
-                continue;
-            };
-
-            let wx_vx = mx * vpm;
-            let wz_vx = mz * vpm;
-            let ground_vx = world.ground_height(wx_vx, wz_vx);
-            let top_vx = ground_vx + trunk_h_vox + crown_r_vox;
-            best = best.max((top_vx as f32) * vs);
-        }
-
-        best
-    }
-
-    #[inline]
-    fn sample_height_f32(world: &WorldGen, wx_m: f32, wz_m: f32, cell_m: f32) -> f32 {
+    fn sample_height_f32(world: &WorldGen, wx_m: f32, wz_m: f32) -> f32 {
         let vs = config::VOXEL_SIZE_M_F32;
 
         let wx_vx = (wx_m / vs).floor() as i32;
         let wz_vx = (wz_m / vs).floor() as i32;
 
         let h_vx = world.ground_height(wx_vx, wz_vx);
-        let mut h_m = (h_vx as f32) * vs;
-
-        if cell_m <= Self::TREE_CANOPY_CELL_M_MAX {
-            let tree_top_m = Self::sample_tree_top_height_f32(world, wx_m, wz_m, cell_m);
-            if tree_top_m.is_finite() {
-                let max_canopy = h_m + Self::TREE_CANOPY_MAX_EXTRA_M;
-                h_m = h_m.max(tree_top_m.min(max_canopy));
-            }
-        }
-
-        h_m
+        (h_vx as f32) * vs
     }
 
 
@@ -159,7 +114,7 @@ impl Clipmap {
 
             for tx in 0..res {
                 let wx_m = ox_m + (tx as f32 + 0.5) * cell_m;
-                data[row + tx] = Self::sample_height_f32(world, wx_m, wz_m, cell_m);
+                data[row + tx] = Self::sample_height_f32(world, wx_m, wz_m);
             }
         }
 
@@ -188,7 +143,7 @@ impl Clipmap {
             let row = (rz as usize) * res;
             for tx in 0..res {
                 let wx_m = ox_m + (tx as f32 + 0.5) * cell_m;
-                data[row + tx] = Self::sample_height_f32(world, wx_m, wz_m, cell_m);
+                data[row + tx] = Self::sample_height_f32(world, wx_m, wz_m);
             }
         }
 
@@ -216,7 +171,7 @@ impl Clipmap {
             for cx in 0..cols {
                 let lx = logical_x0 + cx;
                 let wx_m = ox_m + (lx as f32 + 0.5) * cell_m;
-                data[row + (cx as usize)] = Self::sample_height_f32(world, wx_m, wz_m, cell_m);
+                data[row + (cx as usize)] = Self::sample_height_f32(world, wx_m, wz_m);
             }
         }
 

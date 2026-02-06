@@ -482,8 +482,8 @@ fn build_tree_top(
 ) {
     BuildScratch::ensure_2d_i32(&mut scratch.tree_top, ctx.side, -1);
 
-    // pad region in meters
-    let pad_m = 4;
+    // pad region in meters (match tree cache slack)
+    let pad_m = 10;
     let xm0 = (ctx.ox.div_euclid(ctx.vpm)) - pad_m;
     let xm1 = ((ctx.ox + ctx.size_i).div_euclid(ctx.vpm)) + pad_m;
     let zm0 = (ctx.oz.div_euclid(ctx.vpm)) - pad_m;
