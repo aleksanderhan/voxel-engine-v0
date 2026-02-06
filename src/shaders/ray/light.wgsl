@@ -14,10 +14,10 @@
 // -----------------------------------------------------------------------------
 
 // How far rays march in voxels (controls “search radius” for lights)
-const LIGHT_MAX_DIST_VOX : u32 = 32u;   // try 24..80
+const LIGHT_MAX_DIST_VOX : u32 = 20u;   // try 16..64
 
 // Number of rays
-const LIGHT_RAYS : u32 = 12u;           // try 8..16
+const LIGHT_RAYS : u32 = 8u;           // try 6..12
 
 // Softens inverse-square near the light (in voxels)
 const LIGHT_SOFT_RADIUS_VOX : f32 = 3.0;
@@ -36,7 +36,7 @@ const LIGHT_DIRECT_GAIN   : f32 = 1.00;
 const LIGHT_INDIRECT_GAIN : f32 = 0.65; // cheap “bounce fill”
 
 // Stop after N light hits (perf only; output is normalized with LIGHT_RAYS)
-const LIGHT_EARLY_HITS : u32 = 3u;
+const LIGHT_EARLY_HITS : u32 = 2u;
 
 // -----------------------------------------------------------------------------
 // Helpers
