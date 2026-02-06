@@ -81,26 +81,23 @@ fn main_primary(
   if (lid == 0u) {
     atomicStore(&WG_TILE_COUNT, 0u);
     if (cam.chunk_count != 0u) {
-      let tile_origin = vec2<f32>(
+      let tile_base = vec2<f32>(
         f32(wg_id.x * TILE_SIZE),
         f32(wg_id.y * TILE_SIZE)
       );
       let ro_tile = cam.cam_pos.xyz;
 
-      let px00 = tile_origin;
-      let px10 = tile_origin + vec2<f32>(f32(TILE_SIZE), 0.0);
-      let px01 = tile_origin + vec2<f32>(0.0, f32(TILE_SIZE));
-      let px11 = tile_origin + vec2<f32>(f32(TILE_SIZE), f32(TILE_SIZE));
+      var px = tile_base + vec2<f32>(4.5, 4.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
 
-      let rd00 = ray_dir_from_pixel(px00);
-      let rd10 = ray_dir_from_pixel(px10);
-      let rd01 = ray_dir_from_pixel(px01);
-      let rd11 = ray_dir_from_pixel(px11);
-
-      tile_append_candidates_for_ray(ro_tile, rd00, 0.0, FOG_MAX_DIST);
-      tile_append_candidates_for_ray(ro_tile, rd10, 0.0, FOG_MAX_DIST);
-      tile_append_candidates_for_ray(ro_tile, rd01, 0.0, FOG_MAX_DIST);
-      tile_append_candidates_for_ray(ro_tile, rd11, 0.0, FOG_MAX_DIST);
+      px = tile_base + vec2<f32>(0.5, 0.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      px = tile_base + vec2<f32>(7.5, 0.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      px = tile_base + vec2<f32>(0.5, 7.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      px = tile_base + vec2<f32>(7.5, 7.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
     }
   }
   workgroupBarrier();
