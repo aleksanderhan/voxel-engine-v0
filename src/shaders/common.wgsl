@@ -241,8 +241,8 @@ const POST_EXPOSURE : f32 = 0.15;
 const CLIP_LEVELS_MAX : u32 = 16u;
 
 // March tuning
-const HF_MAX_STEPS : u32 = 96u;
-const HF_BISECT    : u32 = 5u;
+const HF_MAX_STEPS : u32 = 48u;  // 32..64 usually fine
+const HF_BISECT    : u32 = 3u;   // 2..3 is enough once stepping is stable
 
 // dt clamp (meters along ray)
 const HF_DT_MAX : f32 = 48.0;

@@ -231,10 +231,10 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
 
     let dt_y  = abs(s) / vy;
     let cell  = clip.level[lvl].z;
-    let dt_xz = (2.0 * cell) / vh; // ~2 texels per step in xz
+    let dt_xz = (6.0 * cell) / vh; // ~6 texels per step in xz
 
     var dt = min(dt_y, dt_xz);
-    dt = clamp(dt, 0.25, HF_DT_MAX);
+    dt = clamp(dt, 0.6, HF_DT_MAX);
 
     t = t + dt;
   }

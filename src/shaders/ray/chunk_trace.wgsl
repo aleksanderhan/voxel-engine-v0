@@ -1442,8 +1442,9 @@ fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
     // Tune these two knobs:
     // - far_skip_dist: beyond this, clipmap shading is "good enough" for primary
     // - band: how much extra distance we allow for voxel detail around the clip hit
-    let far_skip_dist = FAR_SHADING_DIST;          // you already have this constant
-    let band          = 2.0 * cam.voxel_params.x;  // ~2 voxels in meters
+    // accept clipmap terrain earlier
+    let far_skip_dist = 24.0;                      // try 16..32
+    let band          = 1.0 * cam.voxel_params.x;  // ~1 voxel
 
     if (ch.t >= far_skip_dist) {
       // Skip the expensive voxel trace for far terrain
