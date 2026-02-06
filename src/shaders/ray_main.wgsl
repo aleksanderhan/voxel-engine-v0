@@ -410,14 +410,6 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (leaf.mat == MAT_GRASS) {
       grass_ok = true;
       n = leaf_face_normal(hp_in, leaf);
-    } else if (ENABLE_CLIPMAP && clip.levels > 0u) {
-      let lvl = clip_best_level(hp_in.xz, 2);
-      let h = clip_height_at_level(hp_in.xz, lvl);
-      let vs = cam.voxel_params.x;
-      if (abs(hp_in.y - h) <= 0.75 * vs) {
-        grass_ok = true;
-        n = clip_normal_at_level_2tap(hp_in.xz, lvl);
-      }
     }
 
     if (grass_ok) {
