@@ -13,7 +13,7 @@
 //
 // NOTE: This file assumes you have:
 // - shade_hit_split() in shading.wgsl (and ShadeOut struct)
-// - shade_clip_hit() unchanged
+// - shade_clip_hit() now takes sun shadow visibility
 // - apply_fog() unchanged
 // - Your temporal accumulation pass is separate (not shown here).
 
@@ -27,6 +27,8 @@
 @group(0) @binding(12) var primary_hist_tex  : texture_2d<f32>;
 @group(0) @binding(13) var primary_hist_out  : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(14) var primary_hist_samp : sampler;
+@group(0) @binding(15) var shadow_hist_tex   : texture_2d<f32>;
+@group(0) @binding(16) var shadow_hist_out   : texture_storage_2d<rgba32float, write>;
 
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
 @group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
@@ -58,6 +60,40 @@ fn unpack_i16x2(v: u32) -> vec2<i32> {
   return vec2<i32>(unpack_i16(v), unpack_i16(v >> 16u));
 }
 
+fn shadow_history_sample(uv: vec2<f32>, hp_shadow: vec3<f32>) -> vec4<f32> {
+  var hist4 = textureSampleLevel(shadow_hist_tex, primary_hist_samp, uv, 0.0);
+  let uv_prev = prev_uv_from_world(hp_shadow);
+  if (in_unit_square(uv_prev)) {
+    hist4 = textureSampleLevel(shadow_hist_tex, primary_hist_samp, uv_prev, 0.0);
+  }
+  return hist4;
+}
+
+fn shadow_temporal_update(
+  uv: vec2<f32>,
+  hp_shadow: vec3<f32>,
+  take_sample: bool
+) -> vec2<f32> {
+  let hist4 = shadow_history_sample(uv, hp_shadow);
+  let hist  = clamp(hist4.x, 0.0, 1.0);
+  let conf0 = hist4.w;
+
+  var cur = hist;
+  if (take_sample) {
+    cur = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
+  }
+
+  let k = select(0.0, SHADOW_TAA_ALPHA, take_sample);
+  var out_shadow = mix(hist, cur, k);
+  if (!take_sample && conf0 < 0.01) {
+    out_shadow = 1.0;
+  }
+  out_shadow = clamp(out_shadow, 0.0, 1.0);
+
+  let conf1 = select(conf0, min(1.0, conf0 + k), take_sample);
+  return vec2<f32>(out_shadow, conf1);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main_primary(
   @builtin(global_invocation_id) gid: vec3<u32>,
@@ -87,11 +123,15 @@ fn main_primary(
 
   let frame = cam.frame_index;
   let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
+  let shadow_sample =
+    PRIMARY_SUN_SHADOWS && (((gid.x + gid.y + frame) & SHADOW_SUBSAMPLE_MASK) == 0u);
 
   // Local output defaults: invalid (alpha=0) so TAA keeps history instead of blending black.
   var local_out = vec3<f32>(0.0);
   var local_w   : f32 = 0.0;
   var t_store   : f32 = 0.0;
+  var shadow_vis: f32 = 1.0;
+  var shadow_conf: f32 = 0.0;
 
   var t_hist     : f32 = 0.0;
   var hist_valid : bool = false;
@@ -133,7 +173,14 @@ fn main_primary(
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+      let voxel_size = cam.voxel_params.x;
+      let hp_shadow  = (ro + hf.t * rd) + hf.n * (0.75 * voxel_size);
+      if (PRIMARY_SUN_SHADOWS) {
+        let shadow_pack = shadow_temporal_update(uv, hp_shadow, shadow_sample);
+        shadow_vis = shadow_pack.x;
+        shadow_conf = shadow_pack.y;
+      }
+      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed, shadow_vis);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
@@ -142,6 +189,7 @@ fn main_primary(
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+      textureStore(shadow_hist_out, ip, vec4<f32>(shadow_vis, 0.0, 0.0, shadow_conf));
       return;
     }
 
@@ -151,6 +199,7 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+    textureStore(shadow_hist_out, ip, textureSampleLevel(shadow_hist_tex, primary_hist_samp, uv, 0.0));
     return;
   }
 
@@ -193,7 +242,14 @@ fn main_primary(
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+      let voxel_size = cam.voxel_params.x;
+      let hp_shadow  = (ro + hf.t * rd) + hf.n * (0.75 * voxel_size);
+      if (PRIMARY_SUN_SHADOWS) {
+        let shadow_pack = shadow_temporal_update(uv, hp_shadow, shadow_sample);
+        shadow_vis = shadow_pack.x;
+        shadow_conf = shadow_pack.y;
+      }
+      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed, shadow_vis);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
@@ -202,6 +258,7 @@ fn main_primary(
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+      textureStore(shadow_hist_out, ip, vec4<f32>(shadow_vis, 0.0, 0.0, shadow_conf));
       return;
     }
 
@@ -210,13 +267,21 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+    textureStore(shadow_hist_out, ip, textureSampleLevel(shadow_hist_tex, primary_hist_samp, uv, 0.0));
     return;
   }
 
   // In grid: voxel hit?
   if (vt.best.hit != 0u) {
+    let vs = cam.voxel_params.x;
+    let hp_shadow = (ro + vt.best.t * rd) + vt.best.n * (0.75 * vs);
+    if (PRIMARY_SUN_SHADOWS) {
+      let shadow_pack = shadow_temporal_update(uv, hp_shadow, shadow_sample);
+      shadow_vis = shadow_pack.x;
+      shadow_conf = shadow_pack.y;
+    }
     // Split shading (base + local)
-    let sh = shade_hit_split(ro, rd, vt.best, sky_up, seed);
+    let sh = shade_hit_split(ro, rd, vt.best, sky_up, seed, shadow_vis);
 
     let t_scene = min(vt.best.t, FOG_MAX_DIST);
 
@@ -245,6 +310,7 @@ fn main_primary(
       ip,
       vec4<f32>(t_store, bitcast<f32>(anchor_key), bitcast<f32>(packed_xy), bitcast<f32>(packed_z))
     );
+    textureStore(shadow_hist_out, ip, vec4<f32>(shadow_vis, 0.0, 0.0, shadow_conf));
     return;
   }
 
@@ -252,7 +318,14 @@ fn main_primary(
   let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
   if (hf.hit) {
-    let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+    let voxel_size = cam.voxel_params.x;
+    let hp_shadow  = (ro + hf.t * rd) + hf.n * (0.75 * voxel_size);
+    if (PRIMARY_SUN_SHADOWS) {
+      let shadow_pack = shadow_temporal_update(uv, hp_shadow, shadow_sample);
+      shadow_vis = shadow_pack.x;
+      shadow_conf = shadow_pack.y;
+    }
+    let surface = shade_clip_hit(ro, rd, hf, sky_up, seed, shadow_vis);
     let t_scene = min(hf.t, FOG_MAX_DIST);
     let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
@@ -261,6 +334,7 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+    textureStore(shadow_hist_out, ip, vec4<f32>(shadow_vis, 0.0, 0.0, shadow_conf));
     return;
   }
 
@@ -270,6 +344,7 @@ fn main_primary(
   textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
   textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
   textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+  textureStore(shadow_hist_out, ip, textureSampleLevel(shadow_hist_tex, primary_hist_samp, uv, 0.0));
 }
 
 

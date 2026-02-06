@@ -24,6 +24,8 @@ pub struct TextureSet {
     pub local: Tex2D,
 
     pub primary_hit_hist: [Tex2D; 2],
+
+    pub shadow_hist: [Tex2D; 2],
     
     pub godray: [Tex2D; 2],
     pub clip_height: Tex2DArray,
@@ -161,6 +163,25 @@ pub fn create_textures(
         ),
     ];
 
+    let shadow_hist = [
+        make_tex2d(
+            device,
+            "shadow_hist_a",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::Rgba32Float,
+            rw_tex_usage,
+        ),
+        make_tex2d(
+            device,
+            "shadow_hist_b",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::Rgba32Float,
+            rw_tex_usage,
+        ),
+    ];
+
     let godray = [
         make_tex2d(
             device,
@@ -207,6 +228,7 @@ pub fn create_textures(
         depth,
         local,
         primary_hit_hist,
+        shadow_hist,
         godray,
         clip_height,
     }

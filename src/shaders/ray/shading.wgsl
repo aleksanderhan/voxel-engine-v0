@@ -154,9 +154,10 @@ fn shade_hit_split(
   rd: vec3<f32>,
   hg: HitGeom,
   sky_up: vec3<f32>,
-  seed: u32
+  seed: u32,
+  sun_vis: f32
 ) -> ShadeOut {
-  let base_hdr = shade_hit(ro, rd, hg, sky_up, seed);
+  let base_hdr = shade_hit(ro, rd, hg, sky_up, seed, sun_vis);
 
   // Local voxel lighting from MAT_LIGHT blocks.
   // Keep it separate so it can be temporally accumulated without fog.
@@ -181,7 +182,14 @@ fn shade_hit_split(
   return ShadeOut(base_hdr, local_hdr, local_w);
 }
 
-fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
+fn shade_hit(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  hg: HitGeom,
+  sky_up: vec3<f32>,
+  seed: u32,
+  sun_vis: f32
+) -> vec3<f32> {
   let hp = ro + hg.t * rd;
 
   var base = base_albedo(hg.mat, hp, hg.t);
@@ -206,6 +214,7 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   if (PRIMARY_CLOUD_SHADOWS) {
     Tc = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
   }
+  let vis = Tc * sun_vis;
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
   // AO for voxels: only when the hit is a real voxel hit (not sky / miss)
@@ -246,15 +255,22 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
 
     let f0   = material_f0(hg.mat);
     let fres = fresnel_schlick(ndv, f0);
-    spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * Tc;
+    spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis;
   }
 
-  let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * Tc * dapple;
+  let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis * dapple;
   let emissive = material_emission(hg.mat);
   return base * (ambient + direct) + 0.20 * spec_col + emissive;
 }
 
-fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
+fn shade_clip_hit(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  ch: ClipHit,
+  sky_up: vec3<f32>,
+  seed: u32,
+  sun_vis: f32
+) -> vec3<f32> {
   let hp = ro + ch.t * rd;
 
   var base = color_for_material(ch.mat);
@@ -269,6 +285,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
   if (PRIMARY_CLOUD_SHADOWS) {
     vis = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
   }
+  vis *= sun_vis;
   let diff = max(dot(ch.n, SUN_DIR), 0.0);
 
   // AO-lite for terrain: gate hard for grass in primary
