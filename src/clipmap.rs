@@ -50,6 +50,9 @@ pub struct Clipmap {
 }
 
 impl Clipmap {
+    const TREE_CANOPY_CELL_M_MAX: f32 = 4.0;
+    const TREE_CANOPY_MAX_EXTRA_M: f32 = 16.0;
+
     pub fn new() -> Self {
         Self {
             last_origin_cell: [(i32::MIN, i32::MIN); config::CLIPMAP_LEVELS_USIZE],
@@ -134,9 +137,12 @@ impl Clipmap {
         let h_vx = world.ground_height(wx_vx, wz_vx);
         let mut h_m = (h_vx as f32) * vs;
 
-        let tree_top_m = Self::sample_tree_top_height_f32(world, wx_m, wz_m, cell_m);
-        if tree_top_m.is_finite() {
-            h_m = h_m.max(tree_top_m);
+        if cell_m <= Self::TREE_CANOPY_CELL_M_MAX {
+            let tree_top_m = Self::sample_tree_top_height_f32(world, wx_m, wz_m, cell_m);
+            if tree_top_m.is_finite() {
+                let max_canopy = h_m + Self::TREE_CANOPY_MAX_EXTRA_M;
+                h_m = h_m.max(tree_top_m.min(max_canopy));
+            }
         }
 
         h_m
