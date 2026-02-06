@@ -389,15 +389,15 @@ fn trace_chunk_rope_interval(
     // ------------------------------------------------------------
     // COARSE: macro empty jump using per-step macro occupancy
     // ------------------------------------------------------------
-    let macro = macro_cell_query_at_t(
+    let macro_cell = macro_cell_query_at_t(
       ro, rd, inv, tcur,
       root_bmin, root_size,
       ch.macro_base
     );
 
-    if (macro.valid && macro.empty) {
+    if (macro_cell.valid && macro_cell.empty) {
       // Jump across empty macro cell
-      let t_macro_exit = min(t_exit, macro.t_exit);
+      let t_macro_exit = min(t_exit, macro_cell.t_exit);
       tcur = max(t_macro_exit, tcur) + eps_step;
       have_leaf = false;
       continue;
