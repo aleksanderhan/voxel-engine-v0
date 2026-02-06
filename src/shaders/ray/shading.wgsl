@@ -32,22 +32,22 @@ fn material_variation(world_p: vec3<f32>, cell_size_m: f32) -> f32 {
 
 fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f32> {
   var c = base;
-  let v = ALBEDO_VAR_GAIN * material_variation(hp, 0.05);
+  let v = ALBEDO_VAR_GAIN * material_variation(hp, 0.20);
 
   if (mat == MAT_GRASS) {
-    c += vec3<f32>(0.02 * v, 0.05 * v, 0.01 * v);
-    c *= (1.0 + 0.06 * v);
-  } else if (mat == MAT_DIRT) {
-    c += vec3<f32>(0.04 * v, 0.02 * v, 0.01 * v);
-    c *= (1.0 + 0.08 * v);
-  } else if (mat == MAT_STONE) {
-    c *= (1.0 + 0.10 * v);
-  } else if (mat == MAT_WOOD) {
-    c += vec3<f32>(0.05 * v, 0.02 * v, 0.00 * v);
-    c *= (1.0 + 0.07 * v);
-  } else if (mat == MAT_LEAF) {
-    c += vec3<f32>(0.00 * v, 0.03 * v, 0.00 * v);
+    c += vec3<f32>(0.01 * v, 0.03 * v, 0.01 * v);
     c *= (1.0 + 0.04 * v);
+  } else if (mat == MAT_DIRT) {
+    c += vec3<f32>(0.03 * v, 0.015 * v, 0.01 * v);
+    c *= (1.0 + 0.05 * v);
+  } else if (mat == MAT_STONE) {
+    c *= (1.0 + 0.06 * v);
+  } else if (mat == MAT_WOOD) {
+    c += vec3<f32>(0.03 * v, 0.015 * v, 0.00 * v);
+    c *= (1.0 + 0.05 * v);
+  } else if (mat == MAT_LEAF) {
+    c += vec3<f32>(0.00 * v, 0.02 * v, 0.00 * v);
+    c *= (1.0 + 0.03 * v);
   }
 
   return clamp(c, vec3<f32>(0.0), vec3<f32>(1.5));
