@@ -26,6 +26,16 @@ fn fog_density_godray() -> f32 {
   return max(cam.voxel_params.w * FOG_GODRAY_SCALE, 0.0);
 }
 
+fn fog_primary_trace_max_dist() -> f32 {
+  let base = fog_density_primary();
+  if (base <= 0.0) { return FOG_MAX_DIST; }
+
+  // Stop tracing once fog becomes near-opaque to save primary pass time.
+  let cutoff = clamp(FOG_PRIMARY_TRACE_CUTOFF, 1e-4, 0.999);
+  let t = -log(cutoff) / base;
+  return min(t, FOG_MAX_DIST);
+}
+
 fn fog_optical_depth_with_base(base: f32, ro: vec3<f32>, rd: vec3<f32>, t: f32) -> f32 {
   if (base <= 0.0) { return 0.0; }
 

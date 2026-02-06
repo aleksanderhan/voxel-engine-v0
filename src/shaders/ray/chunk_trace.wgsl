@@ -678,7 +678,7 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
 
   // Only trace as far as fog can contribute (huge perf win on big loaded grids)
   var t_enter = max(rtg.x, 0.0);
-  let t_exit  = min(rtg.y, FOG_MAX_DIST);
+  let t_exit  = min(rtg.y, fog_primary_trace_max_dist());
 
   if (t_exit < t_enter) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0);

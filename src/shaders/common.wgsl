@@ -85,6 +85,8 @@ const FOG_MAX_DIST       : f32 = 120.0;
 
 const FOG_PRIMARY_SCALE : f32 = 0.02;
 const FOG_GODRAY_SCALE  : f32 = 1.0;
+const FOG_PRIMARY_TRACE_CUTOFF : f32 = 0.02;
+const FOG_PRIMARY_EARLY_OUT_DIST : f32 = 2.0;
 
 const FOG_COLOR_GROUND    : vec3<f32> = vec3<f32>(0.40, 0.42, 0.45);
 const FOG_COLOR_SKY_BLEND : f32       = 0.10;

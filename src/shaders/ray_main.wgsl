@@ -40,6 +40,18 @@
 
 var<workgroup> WG_SKY_UP : vec3<f32>;
 
+fn store_primary_outputs(
+  ip: vec2<i32>,
+  col: vec3<f32>,
+  t_scene: f32,
+  local_out: vec3<f32>,
+  local_w: f32
+) {
+  textureStore(color_img, ip, vec4<f32>(col, 1.0));
+  textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+  textureStore(local_img, ip, vec4<f32>(local_out, local_w));
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main_primary(
   @builtin(global_invocation_id) gid: vec3<u32>,
@@ -73,28 +85,37 @@ fn main_primary(
   var local_out = vec3<f32>(0.0);
   var local_w   : f32 = 0.0;
 
+  let fog_max = fog_primary_trace_max_dist();
+  if (fog_max <= FOG_PRIMARY_EARLY_OUT_DIST) {
+    let fog_only = apply_fog(vec3<f32>(0.0), ro, rd, fog_max, sky_bg_rd);
+    store_primary_outputs(ip, fog_only, fog_max, local_out, local_w);
+    return;
+  }
+
   // ------------------------------------------------------------
   // Case 1: no voxel chunks => heightfield or sky
   // ------------------------------------------------------------
   if (cam.chunk_count == 0u) {
-    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+    let hf = clip_trace_heightfield(ro, rd, 0.0, fog_max);
 
     if (hf.hit) {
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
-      let t_scene = min(hf.t, FOG_MAX_DIST);
+      let t_scene = min(hf.t, fog_max);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
-      textureStore(color_img, ip, vec4<f32>(col, 1.0));
-      textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
-      textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+      store_primary_outputs(ip, col, t_scene, local_out, local_w); // alpha=0
       return;
     }
 
-    // True sky pixel: now pay for full sky (clouds + sun)
+    // True sky pixel: use cheap sky when fog is active, full sky only when clear.
+    if (fog_max < FOG_MAX_DIST) {
+      let sky = apply_fog(sky_bg_rd, ro, rd, fog_max, sky_bg_rd);
+      store_primary_outputs(ip, sky, fog_max, local_out, local_w); // alpha=0
+      return;
+    }
+
     let sky = sky_color(rd);
-    textureStore(color_img, ip, vec4<f32>(sky, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    store_primary_outputs(ip, sky, FOG_MAX_DIST, local_out, local_w); // alpha=0
     return;
   }
 
@@ -105,23 +126,25 @@ fn main_primary(
 
   // Outside streamed grid => heightfield or sky
   if (!vt.in_grid) {
-    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+    let hf = clip_trace_heightfield(ro, rd, 0.0, fog_max);
 
     if (hf.hit) {
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
-      let t_scene = min(hf.t, FOG_MAX_DIST);
+      let t_scene = min(hf.t, fog_max);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
-      textureStore(color_img, ip, vec4<f32>(col, 1.0));
-      textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
-      textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+      store_primary_outputs(ip, col, t_scene, local_out, local_w); // alpha=0
+      return;
+    }
+
+    if (fog_max < FOG_MAX_DIST) {
+      let sky = apply_fog(sky_bg_rd, ro, rd, fog_max, sky_bg_rd);
+      store_primary_outputs(ip, sky, fog_max, local_out, local_w); // alpha=0
       return;
     }
 
     let sky = sky_color(rd);
-    textureStore(color_img, ip, vec4<f32>(sky, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    store_primary_outputs(ip, sky, FOG_MAX_DIST, local_out, local_w); // alpha=0
     return;
   }
 
@@ -130,7 +153,7 @@ fn main_primary(
     // Split shading (base + local)
     let sh = shade_hit_split(ro, rd, vt.best, sky_up, seed);
 
-    let t_scene = min(vt.best.t, FOG_MAX_DIST);
+    let t_scene = min(vt.best.t, fog_max);
 
     // Fog only the base surface term (view-space medium)
     let col_base = apply_fog(sh.base_hdr, ro, rd, t_scene, sky_bg_rd);
@@ -139,31 +162,31 @@ fn main_primary(
     local_out = sh.local_hdr;
     local_w   = sh.local_w;
 
-    textureStore(color_img, ip, vec4<f32>(col_base, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha = validity
+    store_primary_outputs(ip, col_base, t_scene, local_out, local_w); // alpha = validity
     return;
   }
 
   // Voxel miss: try heightfield
-  let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+  let hf = clip_trace_heightfield(ro, rd, 0.0, fog_max);
 
   if (hf.hit) {
     let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
-    let t_scene = min(hf.t, FOG_MAX_DIST);
+    let t_scene = min(hf.t, fog_max);
     let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
-    textureStore(color_img, ip, vec4<f32>(col, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    store_primary_outputs(ip, col, t_scene, local_out, local_w); // alpha=0
     return;
   }
 
   // True sky pixel: now compute full sky (clouds + sun)
+  if (fog_max < FOG_MAX_DIST) {
+    let sky = apply_fog(sky_bg_rd, ro, rd, fog_max, sky_bg_rd);
+    store_primary_outputs(ip, sky, fog_max, local_out, local_w); // alpha=0
+    return;
+  }
+
   let sky = sky_color(rd);
-  textureStore(color_img, ip, vec4<f32>(sky, 1.0));
-  textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
-  textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+  store_primary_outputs(ip, sky, FOG_MAX_DIST, local_out, local_w); // alpha=0
 }
 
 
