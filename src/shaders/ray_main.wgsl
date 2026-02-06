@@ -394,12 +394,12 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
     clamp(i32(floor(px_full.y)), 0, fd_i.y - 1)
   );
 
-  let t_depth = textureLoad(depth_full, ip_f, 0).x;
+  let t_depth = textureLoad(depth_full, ip_render, 0).x;
 
   var grass_hdr = vec3<f32>(0.0);
   if (t_depth > 1e-3 && t_depth < GRASS_DECORATE_MAX_DIST) {
     let ro = cam.cam_pos.xyz;
-    let rd = ray_dir_from_pixel(px_present, pd_f);
+    let rd = ray_dir_from_pixel(px_render, rd_f);
     let hp = ro + rd * t_depth;
     let hp_in = hp - rd * (1e-4 * cam.voxel_params.x);
     let leaf = query_leaf_world(hp_in);
@@ -414,7 +414,7 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (grass_ok) {
       let frame = cam.frame_index;
-      let seed = (u32(ip_f.x) * 1973u) ^ (u32(ip_f.y) * 9277u) ^ (frame * 26699u);
+      let seed = (u32(ip_render.x) * 1973u) ^ (u32(ip_render.y) * 9277u) ^ (frame * 26699u);
 
       if (grass_allowed_decorate(t_depth, n, seed)) {
         let vs = cam.voxel_params.x;
