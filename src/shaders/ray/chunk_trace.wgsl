@@ -1466,7 +1466,7 @@ fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>, grass_seed: u32) -> Vo
     // Tune these two knobs:
     // - far_skip_dist: beyond this, clipmap shading is "good enough" for primary
     // - band: how much extra distance we allow for voxel detail around the clip hit
-    let far_skip_dist = 48.0;                      // try 16..32
+    let far_skip_dist = 64.0;                      // try 16..32
     let band          = 0.75 * cam.voxel_params.x; // slightly wider band
 
     if (ch.t >= far_skip_dist) {
@@ -1475,8 +1475,8 @@ fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>, grass_seed: u32) -> Vo
       let vs = cam.voxel_params.x;
 
       // How far we search for voxel occluders before giving up and using clipmap terrain.
-      // Tune: 16..64 voxels is usually enough to eliminate "tree holes" without going full-cost.
-      let occluder_band = 96.0 * vs;
+      // Use a minimum band, but extend it far enough to reach the clipmap hit when it's distant.
+      let occluder_band = max(256.0 * vs, ch.t - far_skip_dist);
 
       // Trace voxels up to (far_skip_dist + band), but never past the clipmap terrain hit.
       let tmax_vox = min(ch.t, far_skip_dist + occluder_band);
