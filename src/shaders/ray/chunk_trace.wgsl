@@ -5,7 +5,7 @@
 // - Removed cached-path SVO query (unused now).
 // - Removed dead helpers (node_* key decode, global rope_next, etc).
 // - Kept only what trace_scene_voxels -> trace_chunk_rope_interval needs.
-// - Kept macro early-out + slab stepping + grass-on-solid-face probing.
+// - Kept macro early-out + slab stepping (no grass hits in primary).
 // --------------------------------------------------------------------------
 
 // --------------------------------------------------------------------------
@@ -619,10 +619,6 @@ fn trace_chunk_rope_interval(
     anchor_node = anchor_from_key(ch.node_base, root_bmin, root_size, anchor_key);
   }
 
-  // Only probe grass when we are in small-enough air leaves
-  let grass_probe_max_leaf = vs;
-
-  let origin_vox_i = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
   let time_s       = cam.voxel_params.y;
   let strength     = cam.voxel_params.z;
 
@@ -680,48 +676,6 @@ fn trace_chunk_rope_interval(
     // AIR leaf path
     // ------------------------------------------------------------
     if (leaf.mat == MAT_AIR) {
-      // Grass probing scales with distance (LOD = level of detail):
-      // - near: probe normally
-      // - mid: probe only for smaller leaves
-      // - far: skip probing entirely
-      let lod_probe = grass_lod_from_t(tcur);
-
-      var grass_leaf_limit = grass_probe_max_leaf; // default near
-      if (lod_probe == 1u) {
-        grass_leaf_limit = cam.voxel_params.x;     // mid: only probe 1-voxel leaves
-      }
-
-      if (ENABLE_GRASS && lod_probe != 2u && leaf.size <= grass_leaf_limit) {
-        let t0_probe = max(t_enter, tcur - eps_step);
-        let t1_probe = min(t_leave, t_exit);
-
-        if (t1_probe >= t0_probe) {
-          let gh = probe_grass_columns_xz_dda(
-            ro, rd, inv,
-            t0_probe, t1_probe,
-            root_bmin,
-            origin_vox_i,
-            vs,
-            ch.colinfo_base,
-            time_s,
-            strength
-          );
-
-          if (gh.hit) {
-            var outg = miss_hitgeom();
-            outg.hit = 1u;
-            outg.t   = gh.t;
-            outg.mat = MAT_GRASS;
-            outg.n   = gh.n;
-            outg.root_bmin  = root_bmin;
-            outg.root_size  = root_size;
-            outg.node_base  = ch.node_base;
-            outg.macro_base = ch.macro_base;
-            return ChunkTraceResult(outg, anchor_node.valid, anchor_node.key);
-          }
-        }
-      }
-
       // True leaf exit => rope traversal (but bail out on edge/corner exits)
       let ex = exit_face_from_slab_safe(rd, slab);
 
@@ -828,41 +782,6 @@ fn trace_chunk_rope_interval(
     let tmin_iter = max(t_enter, tcur - eps_step); // keep it inside the current chunk interval
     let bh = cube_hit_normal_from_slab(rd, slab, tmin_iter, t_exit);
     if (bh.hit) {
-      // Optional grass-on-solid-face probe when solid voxel is grass
-      if (ENABLE_GRASS && leaf.mat == MAT_GRASS) {
-        let hp = ro + bh.t * rd;
-
-        let cell = pick_grass_cell_in_chunk(
-          hp, rd,
-          root_bmin,
-          origin_vox_i,
-          vs,
-          i32(cam.chunk_size)
-        );
-
-        let tmax_probe = min(bh.t, t_exit);
-
-        let gh = try_grass_slab_hit(
-          ro, rd,
-          t_enter, tmax_probe,
-          cell.bmin_m, cell.id_vox,
-          vs, time_s, strength
-        );
-
-        if (gh.hit) {
-          var outg = miss_hitgeom();
-          outg.hit = 1u;
-          outg.t   = gh.t;
-          outg.mat = MAT_GRASS;
-          outg.n   = gh.n;
-          outg.root_bmin  = root_bmin;
-          outg.root_size  = root_size;
-          outg.node_base  = ch.node_base;
-          outg.macro_base = ch.macro_base;
-          return ChunkTraceResult(outg, anchor_node.valid, anchor_node.key);
-        }
-      }
-
       var out = miss_hitgeom();
       out.hit = 1u;
       out.t   = bh.t;

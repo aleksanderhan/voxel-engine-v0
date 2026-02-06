@@ -309,3 +309,11 @@ fn grass_allowed_primary(t: f32, n: vec3<f32>, seed: u32) -> bool {
 
   return true;
 }
+
+fn grass_allowed_decorate(t: f32, n: vec3<f32>, seed: u32) -> bool {
+  if (!ENABLE_GRASS) { return false; }
+  if (t > GRASS_DECORATE_MAX_DIST) { return false; }
+  if (n.y < GRASS_DECORATE_MIN_NY) { return false; }
+  if ((seed & GRASS_DECORATE_RATE_MASK) != 0u) { return false; }
+  return true;
+}

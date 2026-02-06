@@ -263,6 +263,34 @@ fn shade_hit(
   return base * (ambient + direct) + 0.20 * spec_col + emissive;
 }
 
+fn shade_grass_decor(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t: f32,
+  n: vec3<f32>,
+  sky_up: vec3<f32>
+) -> vec3<f32> {
+  let hp = ro + t * rd;
+  var base = base_albedo(MAT_GRASS, hp, t);
+
+  let vs  = cam.voxel_params.x;
+  let tip = clamp(fract(hp.y / max(vs, 1e-6)), 0.0, 1.0);
+
+  base = mix(base, base + vec3<f32>(0.10, 0.10, 0.02), 0.35 * tip);
+
+  let back = pow(clamp(dot(-SUN_DIR, n), 0.0, 1.0), 2.0);
+  base += 0.22 * back * vec3<f32>(0.18, 0.35, 0.10);
+
+  let diff = max(dot(n, SUN_DIR), 0.0);
+
+  let amb_col = hemi_ambient(n, sky_up);
+  let ambient = amb_col * 0.06;
+
+  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff);
+
+  return base * (ambient + direct);
+}
+
 fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
   let hp = ro + ch.t * rd;
 

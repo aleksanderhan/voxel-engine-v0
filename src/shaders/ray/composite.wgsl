@@ -21,7 +21,8 @@ fn composite_pixel_mapped(
   color_tex: texture_2d<f32>,
   godray_tex: texture_2d<f32>,
   godray_samp: sampler,
-  depth_full: texture_2d<f32>
+  depth_full: texture_2d<f32>,
+  grass_hdr: vec3<f32>
 ) -> vec4<f32> {
   // --- render dims (color buffer) ---
   let rd_u = textureDimensions(color_tex);
@@ -121,7 +122,7 @@ fn composite_pixel_mapped(
   let warm = mix(vec3<f32>(1.0), vec3<f32>(1.08, 1.03, 0.92), god_far); // tweak to taste
   god_lin *= warm;
 
-  var hdr = max(base + god_scale * god_lin, vec3<f32>(0.0));
+  var hdr = max(base + god_scale * god_lin + grass_hdr, vec3<f32>(0.0));
 
   // Bloom (hue-preserving + distance-faded)
   if (ENABLE_BLOOM) {

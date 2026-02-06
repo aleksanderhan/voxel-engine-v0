@@ -324,6 +324,11 @@ const GRASS_PRIMARY_MAX_DIST : f32 = 14.0; // meters-ish
 const GRASS_PRIMARY_MIN_NY   : f32 = 0.60; // only fairly upward normals
 const GRASS_PRIMARY_RATE_MASK: u32 = 7u;   // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
 
+// Secondary/pass grass decoration (post pass)
+const GRASS_DECORATE_MAX_DIST : f32 = 18.0;
+const GRASS_DECORATE_MIN_NY   : f32 = 0.55;
+const GRASS_DECORATE_RATE_MASK: u32 = 3u;
+
 
 // Misc
 const ALBEDO_VAR_GAIN = 3.5;

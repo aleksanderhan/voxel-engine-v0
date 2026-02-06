@@ -111,6 +111,29 @@ fn make_air_leaf(bmin: vec3<f32>, size: f32) -> LeafQuery {
   return LeafQuery(bmin, size, MAT_AIR);
 }
 
+fn leaf_face_normal(p: vec3<f32>, leaf: LeafQuery) -> vec3<f32> {
+  let size = leaf.size;
+  let local = clamp(p - leaf.bmin, vec3<f32>(0.0), vec3<f32>(size));
+
+  let dnx = local.x;
+  let dpx = size - local.x;
+  let dny = local.y;
+  let dpy = size - local.y;
+  let dnz = local.z;
+  let dpz = size - local.z;
+
+  var dmin = dpx;
+  var n = vec3<f32>(1.0, 0.0, 0.0);
+
+  if (dnx < dmin) { dmin = dnx; n = vec3<f32>(-1.0, 0.0, 0.0); }
+  if (dny < dmin) { dmin = dny; n = vec3<f32>(0.0, -1.0, 0.0); }
+  if (dpy < dmin) { dmin = dpy; n = vec3<f32>(0.0, 1.0, 0.0); }
+  if (dnz < dmin) { dmin = dnz; n = vec3<f32>(0.0, 0.0, -1.0); }
+  if (dpz < dmin) { n = vec3<f32>(0.0, 0.0, 1.0); }
+
+  return n;
+}
+
 // Returns leaf material at world position by first locating the chunk.
 fn query_leaf_world(p: vec3<f32>) -> LeafQuery {
   let vs = cam.voxel_params.x;

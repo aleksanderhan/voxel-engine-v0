@@ -380,16 +380,87 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
   // mapped render pixel center (float, in internal render space)
   let px_render = px_render_from_present_px(px_present);
 
+  let rd_u = textureDimensions(color_tex);
+  let rd_f = vec2<f32>(f32(rd_u.x), f32(rd_u.y));
+
+  let fd_u = textureDimensions(depth_full);
+  let fd_i = vec2<i32>(i32(fd_u.x), i32(fd_u.y));
+  let fd_f = vec2<f32>(f32(fd_u.x), f32(fd_u.y));
+
+  let px_full = px_render * (fd_f / rd_f);
+  let ip_f = vec2<i32>(
+    clamp(i32(floor(px_full.x)), 0, fd_i.x - 1),
+    clamp(i32(floor(px_full.y)), 0, fd_i.y - 1)
+  );
+
+  let t_depth = textureLoad(depth_full, ip_f, 0).x;
+
+  var grass_hdr = vec3<f32>(0.0);
+  if (t_depth > 1e-3 && t_depth < GRASS_DECORATE_MAX_DIST) {
+    let ro = cam.cam_pos.xyz;
+    let rd = ray_dir_from_pixel(px_render, rd_f);
+    let hp = ro + rd * t_depth;
+    let hp_in = hp - rd * (1e-4 * cam.voxel_params.x);
+    let leaf = query_leaf_world(hp_in);
+
+    if (leaf.mat == MAT_GRASS) {
+      let n = leaf_face_normal(hp_in, leaf);
+      let frame = cam.frame_index;
+      let seed = (u32(ip_render.x) * 1973u) ^ (u32(ip_render.y) * 9277u) ^ (frame * 26699u);
+
+      if (grass_allowed_decorate(t_depth, n, seed)) {
+        let vs = cam.voxel_params.x;
+        let chunk_size_m = f32(cam.chunk_size) * vs;
+        let c = chunk_coord_from_pos(hp_in, chunk_size_m);
+        let slot = grid_lookup_slot(c.x, c.y, c.z);
+
+        if (slot != INVALID_U32 && slot < cam.chunk_count) {
+          let ch = chunks[slot];
+          let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * vs;
+          let origin_vox = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
+
+          let cell = pick_grass_cell_in_chunk(
+            hp_in,
+            rd,
+            root_bmin,
+            origin_vox,
+            vs,
+            i32(cam.chunk_size)
+          );
+
+          let t_min = max(t_depth - (GRASS_LAYER_HEIGHT_VOX + 1.0) * vs, 0.0);
+
+          let gh = try_grass_slab_hit(
+            ro, rd,
+            t_min, t_depth,
+            cell.bmin_m, cell.id_vox,
+            vs,
+            cam.voxel_params.y,
+            cam.voxel_params.z
+          );
+
+          if (gh.hit) {
+            let sky_up = sky_bg(vec3<f32>(0.0, 1.0, 0.0));
+            let grass_raw = shade_grass_decor(ro, rd, gh.t, gh.n, sky_up);
+            let sky_bg_rd = sky_bg(rd);
+            grass_hdr = apply_fog(grass_raw, ro, rd, gh.t, sky_bg_rd);
+          }
+        }
+      }
+    }
+  }
+
   // Base composite (already fogged inside composite_pixel_mapped / via color_tex content)
   let outc = composite_pixel_mapped(
     ip_render, px_render,
     color_tex, godray_tex, godray_samp,
-    depth_full
+    depth_full,
+    grass_hdr
   );
 
   // Sample accumulated local lighting in the SAME internal render UV space.
   // local_hist_tex is expected to be internal render resolution (same as color_tex/depth_full).
-  let dims_r = textureDimensions(color_tex);
+  let dims_r = rd_u;
   let inv_r  = vec2<f32>(1.0 / f32(dims_r.x), 1.0 / f32(dims_r.y));
   let uv_r   = px_render * inv_r;
 
