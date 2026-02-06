@@ -742,7 +742,19 @@ fn trace_chunk_rope_interval_nomacro(
     }
 
     let slab    = cube_slab_inv(ro, inv, slab_bmin, leaf.size);
-    let t_leave = slab.t_exit;
+    var t_leave = slab.t_exit;
+
+    // sanitize
+    if (!(t_leave == t_leave)) { // NaN check
+      // bail out of this leaf/node; step forward a bit
+      tcur = tcur + 1e-3;
+      continue;
+    }
+
+    // enforce progress
+    if (t_leave <= tcur) {
+      t_leave = tcur + 1e-4 * max(1.0, leaf.size); // scale epsilon by cell size
+    }
 
     // ------------------------------------------------------------
     // AIR leaf path
