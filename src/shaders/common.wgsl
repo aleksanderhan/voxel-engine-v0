@@ -211,7 +211,7 @@ const TAU             : f32        = 6.28318530718;
 //// Ray / post
 //// --------------------------------------------------------------------------
 
-const PRIMARY_NUDGE_VOXEL_FRAC : f32 = 1e-4;
+const PRIMARY_NUDGE_VOXEL_FRAC : f32 = 1e-3;
 
 // Primary hit cache (temporal reprojection) tuning.
 const PRIMARY_HIT_MARGIN        : f32 = 0.08;

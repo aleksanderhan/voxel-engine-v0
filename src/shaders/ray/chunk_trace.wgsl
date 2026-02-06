@@ -1466,38 +1466,37 @@ fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>, grass_seed: u32) -> Vo
     // Tune these two knobs:
     // - far_skip_dist: beyond this, clipmap shading is "good enough" for primary
     // - band: how much extra distance we allow for voxel detail around the clip hit
-    // accept clipmap terrain earlier
-    let far_skip_dist = 24.0;                      // try 16..32
+    let far_skip_dist = 48.0;                      // try 16..32
     let band          = 0.75 * cam.voxel_params.x; // slightly wider band
 
     if (ch.t >= far_skip_dist) {
-      // Skip the expensive voxel trace for far terrain
+      // Still allow voxel occluders (trees, leaves, etc.) in front of the far clipmap terrain.
+      // Keep it bounded for perf.
+      let vs = cam.voxel_params.x;
+
+      // How far we search for voxel occluders before giving up and using clipmap terrain.
+      // Tune: 16..64 voxels is usually enough to eliminate "tree holes" without going full-cost.
+      let occluder_band = 96.0 * vs;
+
+      // Trace voxels up to (far_skip_dist + band), but never past the clipmap terrain hit.
+      let tmax_vox = min(ch.t, far_skip_dist + occluder_band);
+
+      let v = trace_scene_voxels_interval(
+        ro, rd,
+        0.0, tmax_vox,
+        false, vec3<i32>(0), INVALID_U32, grass_seed
+      );
+
+      if (v.best.hit != 0u) {
+        return v; // voxel tree/leaf/wood hit
+      }
+
+      // No voxel occluder found: accept far clipmap terrain
       let best = hitgeom_from_clipmap(ch, ro, rd);
       return VoxTraceResult(true, best, min(ch.t, FOG_MAX_DIST), false, INVALID_U32, vec3<i32>(0));
     }
 
-    // Near: clamp voxel trace max distance to just around the terrain hit
-    let tmax_vox = min(FOG_MAX_DIST, ch.t + band);
-
-    // Reuse your existing voxel trace, but with a much smaller t_max
-    let v = trace_scene_voxels_interval(
-      ro,
-      rd,
-      0.0,
-      tmax_vox,
-      false,
-      vec3<i32>(0),
-      INVALID_U32,
-      grass_seed
-    );
-
-    // If voxels found something, keep it; otherwise fall back to clipmap hit
-    if (v.best.hit != 0u) {
-      return v;
-    } else {
-      let best = hitgeom_from_clipmap(ch, ro, rd);
-      return VoxTraceResult(true, best, min(ch.t, FOG_MAX_DIST), false, INVALID_U32, vec3<i32>(0));
-    }
+    // (Optional) You can add the "near band" voxel-trace path here later.
   }
 
   // No clip terrain: keep current behavior (sky etc.)
@@ -1512,6 +1511,7 @@ fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>, grass_seed: u32) -> Vo
     grass_seed
   );
 }
+
 
 fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>, grass_seed: u32) -> VoxTraceResult {
   return trace_scene_primary_fast(ro, rd, grass_seed);
