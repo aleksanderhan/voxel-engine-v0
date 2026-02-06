@@ -1,4 +1,4 @@
-// src/streaming/types.rs
+
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Instant;
 
@@ -8,17 +8,17 @@ use crate::svo::builder::BuildTimingsMs;
 
 pub const INVALID_U32: u32 = 0xFFFF_FFFF;
 
-// Vertical band dy in [-1..=2]
+
 pub const GRID_Y_MIN_DY: i32 = -2;
 pub const GRID_Y_COUNT: u32 = 5;
 
 pub const EVICT_ATTEMPTS: usize = 8;
 
-// 8^3 bits = 512 bits = 16 u32
+
 pub const MACRO_WORDS_PER_CHUNK: u32 = 16;
 pub const MACRO_WORDS_PER_CHUNK_USIZE: usize = 16;
 
-// 64x64 columns, packed 2x u16 per u32 => 2048 u32 per chunk
+
 pub const COLINFO_WORDS_PER_CHUNK: u32 = 2048;
 pub const COLINFO_WORDS_PER_CHUNK_USIZE: usize = 2048;
 
@@ -74,14 +74,14 @@ pub struct BuildDone {
     pub ropes: Vec<NodeRopesGpu>,
     pub colinfo_words: Vec<u32>,
     pub tim: BuildTimingsMs,
-    pub queue_ms: f64, // enqueue -> worker start
-    pub build_ms: f64, // worker start -> build done
+    pub queue_ms: f64, 
+    pub build_ms: f64, 
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum UploadKind {
-    PromoteToResident, // new chunk becoming resident
-    RewriteResident,   // resident chunk being refreshed
+    PromoteToResident, 
+    RewriteResident,   
 }
 
 pub struct ChunkUpload {
@@ -142,25 +142,25 @@ pub struct StreamStats {
 
     pub orphan_queued: u32,
 
-    // ---------------------------------------------------------------------
-    // Aggregated timing window (drained/reset on profiler print cadence)
-    // ---------------------------------------------------------------------
+    
+    
+    
     pub builds_done: u32,
     pub builds_canceled: u32,
 
-    // enqueue -> worker-start
+    
     pub queue_ms_avg: f64,
     pub queue_ms_max: f64,
 
-    // worker-start -> build-done (worldgen + SVO (Sparse Voxel Octree) build)
+    
     pub build_ms_avg: f64,
     pub build_ms_max: f64,
 
-    // optional: size signal for cost correlation
+    
     pub nodes_avg: f64,
     pub nodes_max: u32,
 
-    // per-stage build timings (averaged over the window) + maxima
+    
     pub bt_avg: BuildTimingsMs,
     pub bt_max: BuildTimingsMs,
 }

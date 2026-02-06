@@ -5,7 +5,7 @@ use crate::streaming::types::*;
 
 use super::ChunkManager;
 
-// src/streaming/manager/keep.rs
+
 
 #[inline]
 pub fn build_offsets(radius: i32) -> Vec<(i32, i32, i32)> {
@@ -22,7 +22,7 @@ pub fn build_offsets(radius: i32) -> Vec<(i32, i32, i32)> {
         }
     }
 
-    // Optional but helps uniform “rings”: sort by xz distance (then dy).
+    
     v.sort_by_key(|(dx, dy, dz)| (dx*dx + dz*dz, *dy, *dz, *dx));
     v
 }
@@ -63,7 +63,7 @@ pub fn compute_center(world: &WorldGen, cam_pos_m: Vec3) -> ChunkKey {
     ChunkKey { x: ccx, y: ground_cy, z: ccz }
 }
 
-/// publish new center; if changed, rebucket uploads.
+
 pub fn publish_center_and_rebucket(mgr: &mut ChunkManager, center: ChunkKey) -> bool {
     let changed = mgr.build.last_center.map_or(true, |c| c != center);
     if changed {

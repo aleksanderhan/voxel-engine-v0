@@ -9,7 +9,7 @@ use crate::Arc;
 pub fn mark_slot_rewrite(mgr: &mut ChunkManager, slot: usize) {
     let s = slot as u32;
     if mgr.uploads.slot_rewrite_set.insert(s) {
-        // push_front so newest churn is fixed first
+        
         mgr.uploads.slot_rewrite_q.push_front(s);
     }
 }
@@ -22,7 +22,7 @@ fn make_slot_rewrite_upload(mgr: &mut ChunkManager, slot: u32) -> Option<ChunkUp
 
     let key = mgr.slots.slot_to_key[s];
 
-    // If this is resident, track rewrite-in-flight.
+    
     if let Some(ChunkState::Resident(r)) = mgr.build.chunks.get_mut(&key) {
         r.rewrite_in_flight = true;
     }
@@ -150,13 +150,13 @@ pub fn take_all(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
 }
 
 
-// src/streaming/manager/uploads.rs
+
 
 pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
-    // GPU = graphics processing unit.
+    
     let backlog = uploads_len_total(mgr);
 
-    // Scale budgets with backlog a bit, but clamp to sane limits.
+    
     let max_uploads =
         (MAX_UPLOADS_PER_FRAME + backlog / 4).clamp(MAX_UPLOADS_PER_FRAME, 128);
     let max_bytes =
@@ -165,8 +165,8 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
     let mut out = Vec::new();
     let mut bytes = 0usize;
 
-    // 0) SLOT REWRITES FIRST
-    let slot_rewrite_cap = (256 + backlog).min(2048); // cheap uploads; keep GPU view consistent
+    
+    let slot_rewrite_cap = (256 + backlog).min(2048); 
 
     let mut slot_rewrites_taken = 0usize;
     while slot_rewrites_taken < slot_rewrite_cap {
@@ -179,7 +179,7 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
 
         let ub = upload_bytes(&u);
 
-        // still obey byte budget, but always allow at least one upload per frame
+        
         if bytes + ub > max_bytes && !out.is_empty() {
             mgr.uploads.slot_rewrite_set.insert(slot);
             mgr.uploads.slot_rewrite_q.push_front(slot);
@@ -192,12 +192,12 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
     }
 
 
-    // ---------------------------------------------------------------------
-    // 1) EXISTING BUDGETED UPLOADS (chunk-content rewrites, promotes, etc.)
-    // ---------------------------------------------------------------------
+    
+    
+    
 
-    // Rewrites are what makes edits “show up”.
-    // Let rewrites take a big slice of the frame, scaling with backlog.
+    
+    
     let rewrite_cap = ((max_uploads / 2).max(8)).min(64);
     let mut rewrites_taken = 0usize;
 
@@ -213,7 +213,7 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
         None
     };
 
-    // NOTE: push *back* so we don't immediately re-pop the same blocked item.
+    
     let push_back_same = |mgr: &mut ChunkManager, which: u8, u: ChunkUpload| {
         match which {
             0 => mgr.uploads.uploads_rewrite.push_back(u),
@@ -222,7 +222,7 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
         }
     };
 
-    // Prevent infinite scan when gate is closed and almost everything is non-priority.
+    
     let mut deferred = 0usize;
     let defer_cap = uploads_len_total(mgr).max(1);
 
@@ -232,7 +232,7 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
             break;
         }
 
-        // Validate slot + update bases.
+        
         let slot = match mgr.build.chunks.get(&u.key) {
             Some(ChunkState::Resident(r)) => r.slot,
             Some(ChunkState::Uploading(up)) => up.slot,
@@ -245,7 +245,7 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
 
         let ub = upload_bytes(&u);
 
-        // Always allow at least ONE upload per frame even if it exceeds the byte budget.
+        
         if bytes + ub > max_bytes && !out.is_empty() {
             push_back_same(mgr, which, u);
             break;

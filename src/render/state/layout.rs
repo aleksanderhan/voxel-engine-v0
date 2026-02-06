@@ -1,6 +1,6 @@
-// src/render/state/layout.rs
-//
-// Bind group layouts and small helpers.
+
+
+
 
 pub struct Layouts {
     pub primary: wgpu::BindGroupLayout,
@@ -118,19 +118,19 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         entries: &scene_entries,
     });
 
-    // PRIMARY bindings:
-    // 0 camera (uniform)
-    // 1 chunks (storage_ro)
-    // 2 nodes (storage_ro)
-    // 3 chunk_grid (storage_ro)
-    // 4 color (storage write)
-    // 5 depth (storage write)
-    // 6 local lighting (storage write)
-    // 7 clipmap params (uniform)
-    // 8 clipmap height texture array (sampled)
-    // 9 macro_occ (storage_ro)
-    // 10 node_ropes (storage_ro)
-    // 11 colinfo (storage_ro)
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
     let primary_entries: [wgpu::BindGroupLayoutEntry; 12] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
@@ -139,7 +139,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
 
         bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba32Float),
         bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float),
-        bgl_storage_tex_wo(6, cs_vis, wgpu::TextureFormat::Rgba32Float), // local
+        bgl_storage_tex_wo(6, cs_vis, wgpu::TextureFormat::Rgba32Float), 
 
         bgl_uniform(7, cs_vis),
         bgl_tex_sample_2d_array(
@@ -173,7 +173,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
                 wgpu::TextureSampleType::Float { filterable: false },
             ),
             bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba32Float),
-            bgl_sampler_non_filtering(3, cs_vis), // sampler for history
+            bgl_sampler_non_filtering(3, cs_vis), 
         ],
     });
 
@@ -192,23 +192,23 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             ),
             bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba32Float),
 
-            // full-res depth for depth-aware upsample
+            
             bgl_tex_sample_2d(
                 3,
                 cs_vis,
                 wgpu::TextureSampleType::Float { filterable: false },
             ),
 
-            // NEW: sampler for godray_tex (used by textureSampleLevel)
+            
             bgl_sampler_non_filtering(4, cs_vis),
 
-            // binding 5: local_hist_tex (sampled)
+            
             bgl_tex_sample_2d(
                 5,
                 cs_vis,
                 wgpu::TextureSampleType::Float { filterable: false },
             ),
-            // binding 6: sampler (can reuse same sampler type)
+            
             bgl_sampler_non_filtering(6, cs_vis),
 
         ],

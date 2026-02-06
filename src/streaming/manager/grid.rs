@@ -26,13 +26,13 @@ pub fn rebuild_grid(mgr: &mut ChunkManager, center: ChunkKey) {
     }
     mgr.grid.chunk_grid.fill(INVALID_U32);
 
-    // Include any slot that is actually usable by the GPU.
+    
     for slot in 0..mgr.slots.slot_to_key.len() {
         let k = mgr.slots.slot_to_key[slot];
 
         let ready = match mgr.build.chunks.get(&k) {
             Some(ChunkState::Resident(_)) => true,
-            Some(ChunkState::Uploading(up)) => up.uploaded, // uploaded => meta+macro/colinfo+nodes are on GPU
+            Some(ChunkState::Uploading(up)) => up.uploaded, 
             _ => false,
         };
 

@@ -1,4 +1,4 @@
-// src/main.rs
+
 mod app;
 mod clipmap;
 mod render;

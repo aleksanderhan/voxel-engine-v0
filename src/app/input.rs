@@ -1,4 +1,4 @@
-// src/input.rs
+
 use winit::{
     event::{DeviceEvent, ElementState, KeyEvent, WindowEvent, MouseScrollDelta, MouseButton},
     keyboard::{KeyCode, PhysicalKey},
@@ -56,7 +56,7 @@ impl InputState {
         }
     }
 
-    /// Returns true if event is fully handled/consumed.
+    
     pub fn on_window_event(&mut self, event: &WindowEvent, window: &Window) -> bool {
         match event {
             WindowEvent::Focused(f) => {
@@ -102,7 +102,7 @@ impl InputState {
                 if *button == MouseButton::Left {
                     let down = *state == ElementState::Pressed;
                     if down && !self.lmb_down {
-                        self.lmb_pressed = true; // rising edge
+                        self.lmb_pressed = true; 
                     }
                     self.lmb_down = down;
                     return true;
@@ -111,10 +111,10 @@ impl InputState {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                // convert to "notches"
+                
                 let steps = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (*y).round() as i32,
-                    MouseScrollDelta::PixelDelta(p) => (p.y / 120.0).round() as i32, // common Windows scale
+                    MouseScrollDelta::PixelDelta(p) => (p.y / 120.0).round() as i32, 
                 };
                 self.wheel_steps += steps;
                 true

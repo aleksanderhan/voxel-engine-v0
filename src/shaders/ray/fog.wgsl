@@ -1,11 +1,11 @@
-//// --------------------------------------------------------------------------
-//// Fog
-//// --------------------------------------------------------------------------
+
+
+
 
 fn fog_color_from_sky(rd: vec3<f32>, sky: vec3<f32>) -> vec3<f32> {
   let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
 
-  // Keep your clamp behavior identical
+  
   let sky_clamped = min(sky, vec3<f32>(0.45));
 
   return mix(FOG_COLOR_GROUND, sky_clamped, FOG_COLOR_SKY_BLEND * up);

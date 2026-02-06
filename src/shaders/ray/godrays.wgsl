@@ -1,44 +1,44 @@
-// -----------------------------------------------------------------------------
-// Godrays (full-res):
-// - Single-pass raymarch integration
-// - Full-res temporal accumulation (history is full-res ping-pong texture)
-// - Stores: RGB = compressed godray, A = depth proxy (nearest depth)
-// -----------------------------------------------------------------------------
+
+
+
+
+
+
 
 fn approx_pow_0p75(x: f32) -> f32 {
   let y = clamp(x, 0.0, 1.0);
-  // x^0.75 is between x^1 and x^0.5; blend is a decent cheap approximation
+  
   return mix(y, sqrt(y), 0.5);
 }
 
 fn approx_pow_0p55(x: f32) -> f32 {
   let y = clamp(x, 0.0, 1.0);
-  let s = sqrt(y);          // y^0.5
-  // 0.55 is close to 0.5; bias slightly toward linear to mimic 0.55
+  let s = sqrt(y);          
+  
   return mix(s, y, 0.20);
 }
 
-// Cheap exp(-x) for x >= 0.
-// Fast monotone rational approximation (no native exp needed in the raymarch loop).
+
+
 fn exp_neg_fast(x_in: f32) -> f32 {
   let x = max(x_in, 0.0);
   let x2 = x * x;
-  // Tuned-ish coefficient; adjust ~0.45..0.55 if you want slightly different bias.
+  
   return 1.0 / (1.0 + x + 0.48 * x2);
 }
 
 fn godray_steps_for_tend(t_end: f32) -> u32 {
-  // raw desired steps
+  
   let raw_f = ceil(t_end * GODRAY_STEPS_PER_METER);
 
-  // clamp to [min..max]
+  
   var s: u32 = u32(clamp(raw_f, f32(GODRAY_MIN_STEPS), f32(GODRAY_STEPS_FAST)));
 
-  // quantize to multiples of GODRAY_STEP_Q to reduce shimmer
-  // round up so we don't lose quality
+  
+  
   s = ((s + (GODRAY_STEP_Q - 1u)) / GODRAY_STEP_Q) * GODRAY_STEP_Q;
 
-  // final clamp in case rounding pushed above max
+  
   return min(s, GODRAY_STEPS_FAST);
 }
 
@@ -66,28 +66,28 @@ fn godray_integrate_1(
   var sh: f32 = 0.0;
   var sum = vec3<f32>(0.0);
 
-  // ---------------------------------------------------------------------------
-  // Incremental view-fog transmittance (kills per-step fog_transmittance_godray)
-  //
-  // We maintain Tv_acc = transmittance from ro to the *current march position*.
-  // The original analytic call computed Tv(ro,rd,ti) each step; here we update
-  // it with a recurrence, using only cheap ops per step + a few exp() per pixel.
-  //
-  // Assumes the view-fog model used in fog_transmittance_godray is height fog:
-  //   density(y) ~ exp(-k*y)   (k = FOG_HEIGHT_FALLOFF)
-  // Optical depth between t0..t1:
-  //   OD = base * ∫ exp(-k*(y0 + dy*t)) dt
-  //
-  // We evaluate OD over two subsegments per dt:
-  //   (step start -> sample point) and (sample point -> step end),
-  // so Tv at the jittered sample matches your original (0.5 + j_phase) offset.
-  // ---------------------------------------------------------------------------
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
   let k  = FOG_HEIGHT_FALLOFF;
   let y0 = ro.y;
   let dy = rd.y;
 
-  // Sample location within the step: (i + (0.5 + j_phase)) * dt
-  // Clamp for safety; j_phase is in ~[-0.5,0.5] so f is usually ~[0,1].
+  
+  
   let f = clamp(0.5 + j_phase, 0.0, 1.0);
   let one_m_f = 1.0 - f;
 
@@ -95,75 +95,75 @@ fn godray_integrate_1(
 
   let horiz = abs(dy) < 1e-4;
 
-  // Horizontal case constants
+  
   var dens_const: f32 = 0.0;
   var trans_to_sample_h: f32 = 1.0;
   var trans_to_end_h: f32 = 1.0;
 
-  // General case constants (height fog)
+  
   var inv_kdy: f32 = 0.0;
   var B: f32 = 0.0;
   var r_f: f32 = 1.0;
   var r_rem: f32 = 1.0;
 
   if (horiz) {
-    // density along ray is constant (in this height-fog model)
-    let a = exp(-k * y0);             // one exp OUTSIDE the loop
+    
+    let a = exp(-k * y0);             
     dens_const = base * a;
 
-    // OD = dens_const * segment_length
+    
     trans_to_sample_h = exp_neg_fast(dens_const * dt * f);
     trans_to_end_h    = exp_neg_fast(dens_const * dt * one_m_f);
   } else {
     inv_kdy = 1.0 / (k * dy);
 
-    // B(t) = exp(-k*(y0 + dy*t))
-    B = exp(-k * y0);                 // B at t = 0, one exp OUTSIDE loop
+    
+    B = exp(-k * y0);                 
 
-    // Per-pixel constants for the jittered split within dt
-    r_f   = exp(-k * dy * dt * f);        // exp once per pixel
-    r_rem = exp(-k * dy * dt * one_m_f);  // exp once per pixel
+    
+    r_f   = exp(-k * dy * dt * f);        
+    r_rem = exp(-k * dy * dt * one_m_f);  
   }
-  // ---------------------------------------------------------------------------
+  
 
   var Ts_geom: f32 = 1.0;
   for (var i: u32 = 0u; i < steps; i = i + 1u) {
     let ti = (f32(i) + 0.5 + j_phase) * dt;
 
-    // keep the original "tcut" idea
+    
     if (ti + j * dt > t_end) { break; }
 
     let p  = ro + rd * ti;
 
-    // ---- Incremental Tv at the sample point (replaces fog_transmittance_godray) ----
+    
     if (horiz) {
-      // step start -> sample point
+      
       Tv_acc *= trans_to_sample_h;
     } else {
-      // step start B -> sample point B_s
+      
       let B_s = B * r_f;
-      let d_od = base * (B - B_s) * inv_kdy;          // should be >= 0
+      let d_od = base * (B - B_s) * inv_kdy;          
       Tv_acc *= exp_neg_fast(max(d_od, 0.0));
     }
 
     let Tv = Tv_acc;
     if (Tv < GODRAY_TV_CUTOFF) { break; }
-    // ---------------------------------------------------------------------------
+    
 
-    if ((i & 3u) == 0u) {           // every 4 steps
+    if ((i & 3u) == 0u) {           
       Ts_geom = sun_transmittance_geom_only(p, SUN_DIR);
     }
     let Tc      = cloud_sun_transmittance_godray(p, SUN_DIR);
 
     let Tc_vol  = mix(1.0, Tc, CLOUD_GODRAY_W);
 
-    // Replace pow(x, 0.75) with cheaper ops (section 4)
+    
     let Ts_clamped = clamp(Ts_geom, 0.0, 1.0);
     let Ts_soft = approx_pow_0p75(Ts_clamped);
 
-    // haze_ramp: either keep exp(), or use recurrence (section 5)
+    
     let haze_ramp = 1.0 - exp(-ti / GODRAY_HAZE_NEAR_FADE);
-    // let haze_ramp = 1.0 - exp_haze; exp_haze *= haze_decay;
+    
 
     let height_term = max(exp(-GODRAY_SCATTER_HEIGHT_FALLOFF * p.y), GODRAY_SCATTER_MIN_FRAC);
     let dens = base * height_term;
@@ -173,7 +173,7 @@ fn godray_integrate_1(
       * Tc_vol
       * 0.70;
 
-    // Tap body (your tap4 logic)
+    
     let ts_prev = ts;
     ts = mix(ts, Ts_soft, a_ts);
 
@@ -189,24 +189,24 @@ fn godray_integrate_1(
     let edge_boost = 1.0 + GODRAY_EDGE_ENERGY_BOOST * shaft;
 
     let shaft_sun_gate = smoothstep(0.35, 0.80, ts);
-    let haze = GODRAY_BASE_HAZE * haze_ramp * (ts * ts); // was pow(ts,2)
+    let haze = GODRAY_BASE_HAZE * haze_ramp * (ts * ts); 
 
     let w = clamp(haze + (1.0 - haze) * (shaft * shaft_sun_gate), 0.0, 1.0);
     sum += common_factor * view_gate * edge_boost * (ts * w);
 
-    // ---- Finish advancing Tv_acc to end of this dt, and advance B ----
+    
     if (horiz) {
-      // sample point -> step end
+      
       Tv_acc *= trans_to_end_h;
     } else {
-      // sample point B_s -> step end B_e
+      
       let B_s  = B * r_f;
       let B_e  = B_s * r_rem;
-      let d_od2 = base * (B_s - B_e) * inv_kdy;        // should be >= 0
+      let d_od2 = base * (B_s - B_e) * inv_kdy;        
       Tv_acc *= exp_neg_fast(max(d_od2, 0.0));
       B = B_e;
     }
-    // ---------------------------------------------------------------------------
+    
   }
 
   var g = sum * GODRAY_ENERGY_BOOST;
@@ -217,41 +217,41 @@ fn godray_integrate_1(
 
 
 
-// -----------------------------------------------------------------------------
-// Compression helpers (history stores compressed RGB in [0..1]).
-// -----------------------------------------------------------------------------
+
+
+
 fn godray_decompress(c: vec3<f32>) -> vec3<f32> {
-  // lin = (k*c)/(1-c)
+  
   let k = 0.25;
   let denom = max(vec3<f32>(1.0) - c, vec3<f32>(1e-4));
   return (k * c) / denom;
 }
 
 fn godray_compress(lin: vec3<f32>) -> vec3<f32> {
-  // c = lin / (lin + k)
+  
   let k = 0.25;
   return lin / (lin + vec3<f32>(k));
 }
 
 
-// -----------------------------------------------------------------------------
-// History reprojection utilities.
-// -----------------------------------------------------------------------------
+
+
+
 fn prev_uv_from_world(p_ws: vec3<f32>) -> vec2<f32> {
   let clip = cam.prev_view_proj * vec4<f32>(p_ws, 1.0);
   let invw = 1.0 / max(clip.w, 1e-6);
-  let ndc  = clip.xy * invw;          // -1..+1
-  return ndc * 0.5 + vec2<f32>(0.5);  // 0..1
+  let ndc  = clip.xy * invw;          
+  return ndc * 0.5 + vec2<f32>(0.5);  
 }
 
 fn in_unit_square(uv: vec2<f32>) -> bool {
   return all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
 }
 
-// -----------------------------------------------------------------------------
-// Full-res godray pixel: integrate + temporal accumulate.
-// Returns RGBA: rgb = compressed, a = depth proxy.
-// -----------------------------------------------------------------------------
+
+
+
+
 fn compute_godray_pixel(
   gid: vec2<u32>,
   depth_tex: texture_2d<f32>,
@@ -267,11 +267,11 @@ fn compute_godray_pixel(
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
   let qpx = vec2<f32>(f32(gid.x), f32(gid.y));
 
-  // Frame-varying jitter seed (so temporal accumulation converges)
+  
   let fi = f32(cam.frame_index & 1023u);
   let fj = vec2<f32>(fi, fi * 1.371);
 
-  // Depth neighborhood (for stability + depth proxy)
+  
   let ip_l = vec2<i32>(clamp(ip.x - 1, 0, fdims_i.x - 1), ip.y);
   let ip_r = vec2<i32>(clamp(ip.x + 1, 0, fdims_i.x - 1), ip.y);
   let ip_u = vec2<i32>(ip.x, clamp(ip.y - 1, 0, fdims_i.y - 1));
@@ -291,36 +291,36 @@ fn compute_godray_pixel(
 
   let t_hist = dmin;
 
-  // Jitters (frame-varying)
+  
   let j4      = 0.20 * (hash12(qpx * J0_SCALE + fj) - 0.5);
   let j_phase =        (hash12(qpx * 0.91 + fj * 0.73 + vec2<f32>(31.7, 12.3)) - 0.5);
 
-  // Quantized end distance (frame-varying)
+  
   let qstep = 0.03;
   let dq = (hash12(qpx * 1.37 + fj * 1.19 + vec2<f32>(9.2, 1.1)) - 0.5) * qstep;
 
-  // Ray dir jitter (frame-varying)
+  
   let j_rd = vec2<f32>(
     hash12(qpx + fj + vec2<f32>(1.7, 9.2)) - 0.5,
     hash12(qpx + fj * 1.13 + vec2<f32>(8.3, 2.1)) - 0.5
   );
 
-  // Quantized end distance
+  
   let t_end = min(floor((t_c + dq) / qstep) * qstep, GODRAY_MAX_DIST);
 
   let fog_ok = fog_density_godray() > 0.0;
 
-  // Ray dir for this pixel (with small sub-texel jitter)
+  
   let px_center = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5) + 0.35 * j_rd;
   let rd = ray_dir_from_pixel(px_center, res_full);
 
-  // Current (linear)
+  
   var cur_lin = vec3<f32>(0.0);
   if (fog_ok && t_end > 0.0) {
     cur_lin = godray_integrate_1(ro, rd, t_end, j4, j_phase);
   }
 
-  // Reproject history
+  
   let p_ws    = ro + rd * t_hist;
   let uv_prev = prev_uv_from_world(p_ws);
 
@@ -347,18 +347,18 @@ fn compute_godray_pixel(
     hist_valid = depth_ok * depth_sane * motion_ok;
   }
 
-  // Reactive mask
+  
   let delta_lin = length(cur_lin - hist_lin);
   let energy    = max(length(cur_lin), 1e-3);
   let delta_rel = delta_lin / (0.05 + energy);
   let react     = smoothstep(0.10, 0.45, delta_rel);
 
-  // Clamp history around current
+  
   let clamp_scale = mix(0.55, 0.18, stable);
   let clamp_w     = max(cur_lin * clamp_scale, vec3<f32>(0.015));
   let hist_clamped = clamp(hist_lin, cur_lin - clamp_w, cur_lin + clamp_w);
 
-  // History weight
+  
   let hist_w_base = mix(0.25, 0.92, stable);
   let hist_w      = mix(hist_w_base, 0.03, react) * hist_valid;
 
@@ -373,7 +373,7 @@ fn godray_sample_linear(
   godray_tex: texture_2d<f32>,
   godray_samp: sampler
 ) -> vec3<f32> {
-  // history/current godray textures store *compressed* RGB in [0..1]
+  
   let c = textureSampleLevel(godray_tex, godray_samp, uv, 0.0).xyz;
   return godray_decompress(c);
 }

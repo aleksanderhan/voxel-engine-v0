@@ -1,5 +1,5 @@
 
-// src/streaming/manager/mod.rs
+
 pub mod build;
 mod grid;
 mod slots;
@@ -38,13 +38,13 @@ use crate::streaming::{
     workers::spawn_workers,
 };
 
-/// Column visibility (PVS) bucket.
+
 pub(crate) struct VisibilityState {
     pub col_visible: Vec<u8>,
 }
 
 
-/// Build-related state bucket.
+
 pub(crate) struct BuildState {
     pub chunks: HashMap<ChunkKey, ChunkState>,
 
@@ -62,16 +62,16 @@ pub(crate) struct BuildState {
 
     pub rebuild_queue: VecDeque<ChunkKey>,
     pub rebuild_set: HashSet<ChunkKey>,
-    // needed to score heap inserts when center doesn't change
+    
     pub last_cam_fwd: Vec3,
-    // monotonically increasing tie-breaker so newer bumps win
+    
     pub heap_tie: u32,
 
-    // if true, allow negative dy (we are in caves / below terrain surface)
+    
     pub cam_below_ground: bool,
 }
 
-/// Slot-residency bucket.
+
 pub(crate) struct SlotState {
     pub slot_to_key: Vec<ChunkKey>,
     pub chunk_meta: Vec<ChunkMetaGpu>,
@@ -80,7 +80,7 @@ pub(crate) struct SlotState {
     pub resident_slots: usize,
 }
 
-/// Upload bucket.
+
 pub(crate) struct UploadState {
     pub uploads_rewrite: VecDeque<ChunkUpload>,
     pub uploads_active:  VecDeque<ChunkUpload>,
@@ -90,7 +90,7 @@ pub(crate) struct UploadState {
     pub slot_rewrite_set: HashSet<u32>,
 }
 
-/// Grid bucket.
+
 pub(crate) struct GridState {
     pub grid_dirty: bool,
     pub grid_origin_chunk: [i32; 3],
@@ -98,12 +98,12 @@ pub(crate) struct GridState {
     pub chunk_grid: Vec<u32>,
 }
 
-/// Column ground cache bucket.
+
 pub(crate) struct GroundState {
     pub col_ground_y_vox: Vec<i32>,
 }
 
-/// Offset precomputes bucket.
+
 pub(crate) struct Offsets {
     pub active_offsets: Vec<(i32, i32, i32)>,
 }
@@ -124,7 +124,7 @@ pub struct ChunkManager {
 
     pub(crate) vis: VisibilityState,
 
-    // Build timing window (drained on stats() print cadence)
+    
     pub timing: StreamTimingWindow,
 }
 
@@ -162,7 +162,7 @@ impl ChunkManager {
                 to_unload: Vec::new(),
                 rebuild_queue: VecDeque::new(),
                 rebuild_set: HashSet::default(),
-                last_cam_fwd: Vec3::Z, // or Vec3::ZERO
+                last_cam_fwd: Vec3::Z, 
                 heap_tie: 0,
                 cam_below_ground: false,
             },
@@ -201,9 +201,9 @@ impl ChunkManager {
         }
     }
 
-    /// Main frame update (same logic as before; now calls into submodules).
+    
     pub fn update(&mut self, world: &Arc<WorldGen>, cam_pos_m: Vec3, cam_fwd: Vec3) -> bool {
-        // 1) compute center
+        
         let center = {
             let cam_vx = (cam_pos_m.x / config::VOXEL_SIZE_M_F32).floor() as i32;
             let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
@@ -214,11 +214,11 @@ impl ChunkManager {
             let ccx = cam_vx.div_euclid(cs);
             let ccz = cam_vz.div_euclid(cs);
 
-            // Fast path: use cached column ground if available
+            
             if let Some(ground_cy) = ground::ground_cy_for_column(self, ccx, ccz) {
                 ChunkKey { x: ccx, y: ground_cy, z: ccz }
             } else {
-                // Slow fallback (only when outside cache / first frame)
+                
                 keep::compute_center( world.as_ref(), cam_pos_m)
             }
         };
@@ -228,14 +228,14 @@ impl ChunkManager {
         let prev_cam_below_ground = self.build.cam_below_ground;
         let prev_cam_fwd = self.build.last_cam_fwd;
         
-        // 2) ensure ground cache (only does real work when origin changes)
+        
         ground::ensure_column_cache(self, world.as_ref(), center);
 
-        // determine if camera is below ground at the current center column
+        
         let cam_y_vox = cam_pos_m.y / config::VOXEL_SIZE_M_F32;
         let ground_y_vox = ground::ground_y_vox_for_column(self, center.x, center.z)
             .unwrap_or_else(|| {
-                // fallback (should be rare): compute at center column
+                
                 let cs = config::CHUNK_SIZE as i32;
                 let half = cs / 2;
                 let wx = center.x * cs + half;
@@ -243,12 +243,12 @@ impl ChunkManager {
                 world.ground_height(wx, wz)
             }) as f32;
 
-        // small margin to avoid flicker when standing exactly on the surface
+        
         self.build.cam_below_ground = cam_y_vox < (ground_y_vox - 1.0);
 
         let cam_below_ground_changed = self.build.cam_below_ground != prev_cam_below_ground;
 
-        // rebuild heap when turning a lot (avoids “I turned to look at it” starvation)
+        
         let cam_fwd_changed = {
             let a = glam::Vec2::new(prev_cam_fwd.x, prev_cam_fwd.z);
             let b = glam::Vec2::new(cam_fwd.x, cam_fwd.z);
@@ -257,13 +257,13 @@ impl ChunkManager {
             } else {
                 let da = a.normalize();
                 let db = b.normalize();
-                da.dot(db) < 0.90 // ~25° turn threshold; tune
+                da.dot(db) < 0.90 
             }
         };
 
 
 
-        // 3) publish center (rebuckets uploads only if changed)
+        
         let center_changed = keep::publish_center_and_rebucket(self, center);
 
         let planning_changed = center_changed || cam_below_ground_changed || cam_fwd_changed;
@@ -272,16 +272,16 @@ impl ChunkManager {
             visibility::ensure_visible_columns(self, center, cam_pos_m);
         }
 
-        // Always do cheap “keep things moving”
+        
         build::harvest_done_builds(self, center);
         build::dispatch_builds(self, center);
 
-        // Do planning when needed (not only on center change)
+        
         if planning_changed {
             build::enqueue_active_ring(self, center);
             build::unload_outside_keep(self, center);
 
-            // heap rebuild is the expensive part; only when we detect a meaningful change
+            
             build::rebuild_build_heap(self, center, cam_fwd);
         }
 
@@ -295,7 +295,7 @@ impl ChunkManager {
     }
 
 
-    // --- Public API (same signatures; implemented in submodules via impl blocks) ---
+    
 
     pub fn chunk_count(&self) -> u32 { self.slots.resident_slots as u32 }
     pub fn grid_origin(&self) -> [i32; 3] { self.grid.grid_origin_chunk }
@@ -319,25 +319,25 @@ impl ChunkManager {
     }
 
 
-    /// Cheap per-frame maintenance. MUST NOT do expensive planning.
-    /// - harvest worker completions
-    /// - keep workers fed using the existing build_heap
-    /// - rebuild grid if dirty
+    
+    
+    
+    
     pub fn pump_completed(&mut self) -> bool {
         let Some(center) = self.build.last_center else {
-            // No center published yet => nothing meaningful to pump.
+            
             return false;
         };
 
-        // 1) Drain completed builds (non-blocking)
+        
         build::harvest_done_builds(self, center);
         #[cfg(debug_assertions)]
         slots::assert_slot_invariants(self);
 
-        // 2) Keep workers busy (uses existing heap; no heap rebuild here)
+        
         build::dispatch_builds(self, center);
 
-        // 3) Rebuild grid if something changed (dirty flag set by slot ops)
+        
         let changed = grid::rebuild_if_dirty(self, center);
 
         #[cfg(debug_assertions)]
@@ -362,8 +362,8 @@ pub struct StreamTimingWindow {
     pub nodes_sum: u64,
     pub nodes_max: u32,
 
-    pub bt_sum: BuildTimingsMs, // sums (times)
-    pub bt_max: BuildTimingsMs, // max  (times + counters as max signal)
+    pub bt_sum: BuildTimingsMs, 
+    pub bt_max: BuildTimingsMs, 
 }
 
 
@@ -375,7 +375,7 @@ impl StreamTimingWindow {
         build_ms: f64,
         nodes: u32,
         canceled: bool,
-        tim: &BuildTimingsMs, // NEW
+        tim: &BuildTimingsMs, 
     ) {
         if canceled {
             self.builds_canceled += 1;
@@ -393,7 +393,7 @@ impl StreamTimingWindow {
         self.nodes_sum += nodes as u64;
         self.nodes_max = self.nodes_max.max(nodes);
 
-        // ---- per-stage sums ----
+        
         self.bt_sum.total         += tim.total;
         self.bt_sum.height_cache  += tim.height_cache;
         self.bt_sum.tree_mask     += tim.tree_mask;
@@ -412,7 +412,7 @@ impl StreamTimingWindow {
         self.bt_sum.svo_build     += tim.svo_build;
         self.bt_sum.ropes         += tim.ropes;
 
-        // ---- per-stage maxima ----
+        
         self.bt_max.total         = self.bt_max.total.max(tim.total);
         self.bt_max.height_cache  = self.bt_max.height_cache.max(tim.height_cache);
         self.bt_max.tree_mask     = self.bt_max.tree_mask.max(tim.tree_mask);
@@ -431,7 +431,7 @@ impl StreamTimingWindow {
         self.bt_max.svo_build     = self.bt_max.svo_build.max(tim.svo_build);
         self.bt_max.ropes         = self.bt_max.ropes.max(tim.ropes);
 
-        // counters as maxima signal (optional but useful)
+        
         self.bt_max.cache_w           = self.bt_max.cache_w.max(tim.cache_w);
         self.bt_max.cache_h           = self.bt_max.cache_h.max(tim.cache_h);
         self.bt_max.tree_cells_tested = self.bt_max.tree_cells_tested.max(tim.tree_cells_tested);

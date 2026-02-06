@@ -1,9 +1,9 @@
-// src/streaming/node_arena.rs
-//
-// Very simple free-list arena for node ranges (in units of NodeGpu elements).
-// Improvements:
-// - free() now fully coalesces adjacent ranges (fixes long-run fragmentation).
-// - alloc() uses best-fit (smallest range that fits) to reduce fragmentation further.
+
+
+
+
+
+
 
 #[derive(Clone, Copy, Debug)]
 struct Range {
@@ -12,7 +12,7 @@ struct Range {
 }
 
 pub struct NodeArena {
-    free: Vec<Range>, // kept sorted by start
+    free: Vec<Range>, 
 }
 
 impl NodeArena {
@@ -25,14 +25,14 @@ impl NodeArena {
         }
     }
 
-    /// Allocate a contiguous range of `len` elements.
-    /// Returns the start index in the arena, or None if no free range fits.
+    
+    
     pub fn alloc(&mut self, len: u32) -> Option<u32> {
         if len == 0 {
             return Some(0);
         }
 
-        // Best-fit: choose the smallest free range that still fits.
+        
         let mut best_i: Option<usize> = None;
         let mut best_len: u32 = u32::MAX;
 
@@ -41,7 +41,7 @@ impl NodeArena {
                 best_len = r.len;
                 best_i = Some(i);
                 if r.len == len {
-                    break; // perfect fit
+                    break; 
                 }
             }
         }
@@ -62,13 +62,13 @@ impl NodeArena {
         Some(start)
     }
 
-    /// Free a previously allocated range.
+    
     pub fn free(&mut self, start: u32, len: u32) {
         if len == 0 {
             return;
         }
 
-        // Insert sorted by start (log n search).
+        
         let idx = self
             .free
             .binary_search_by_key(&start, |r| r.start)
@@ -76,12 +76,12 @@ impl NodeArena {
 
         self.free.insert(idx, Range { start, len });
 
-        // Fully coalesce with neighbors (both directions).
+        
         self.coalesce_at(idx);
     }
 
     fn coalesce_at(&mut self, mut i: usize) {
-        // Merge backward as long as possible.
+        
         while i > 0 {
             let a = self.free[i - 1];
             let b = self.free[i];
@@ -97,7 +97,7 @@ impl NodeArena {
             }
         }
 
-        // Merge forward as long as possible.
+        
         while i + 1 < self.free.len() {
             let a = self.free[i];
             let b = self.free[i + 1];

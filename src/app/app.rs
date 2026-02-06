@@ -1,12 +1,12 @@
-// src/app/app.rs
-// --------------
-//
-// Application loop + per-frame orchestration.
-//
-// Key rule for correctness:
-// - Clipmap texture patch uploads and the clipmap uniform update must be encoded
-//   in the same command encoder, before the compute pass. This prevents the
-//   uniform (origin/offset) from getting ahead of the texture data on the GPU.
+
+
+
+
+
+
+
+
+
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,19 +36,19 @@ pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
 
     event_loop
         .run(move |event, elwt| {
-            // Poll yields the lowest latency and best profiling determinism.
+            
             elwt.set_control_flow(ControlFlow::Poll);
 
             match &event {
                 Event::AboutToWait => {
-                    // Schedule the next frame; the redraw will arrive as WindowEvent::RedrawRequested.
+                    
                     app.window.request_redraw();
                 }
                 Event::WindowEvent {
                     event: WindowEvent::RedrawRequested,
                     ..
                 } => {
-                    // Render only on RedrawRequested (keeps event handling lightweight).
+                    
                     app.render_frame(elwt);
                 }
                 _ => {
@@ -71,7 +71,7 @@ pub struct App {
     window: Arc<Window>,
     start_time: Instant,
 
-    // Keep handles alive for the app lifetime.
+    
     _instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     _adapter: wgpu::Adapter,
@@ -87,7 +87,7 @@ pub struct App {
     input: InputState,
     camera: Camera,
 
-    // FPS display (smoothed in a coarse window).
+    
     fps_value: u32,
     fps_frames: u32,
     fps_last_update: Instant,
@@ -97,11 +97,11 @@ pub struct App {
     profiler: profiler::FrameProf,
     last_frame_time: Instant,
 
-    // Motion vectors / temporal reprojection needs last frame's VP.
+    
     prev_view_proj: glam::Mat4,
     has_prev_view_proj: bool,
 
-    // Streaming update throttle.
+    
     last_stream_update: Instant,
     stream_period: Duration,
 
@@ -114,8 +114,8 @@ pub struct App {
 
 #[derive(Clone, Copy)]
 enum EditMode {
-    Dig,        // set hit voxel to AIR
-    Place(u32), // place material into prev-voxel
+    Dig,        
+    Place(u32), 
 }
 
 impl App {
@@ -123,7 +123,7 @@ impl App {
         let start_time = Instant::now();
         let initial_size = window.inner_size();
 
-        // --- GPU/Surface bootstrap -----------------------------------------------------------
+        
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window.clone()).unwrap();
 
@@ -158,7 +158,7 @@ impl App {
 
         surface.configure(renderer.device(), &surface_config);
 
-        // --- World / streaming / camera ------------------------------------------------------
+        
         let world = Arc::new(WorldGen::new(12345));
         let chunks = ChunkManager::new(world.clone());
 
@@ -182,7 +182,7 @@ impl App {
             EditMode::Place(LIGHT),
         ];
 
-        // --- Profiling (default off) ---------------------------------------------------------
+        
         let (prof_enabled, prof_every) = profiler::settings_from_args();
         let profiler = profiler::FrameProf::new(prof_enabled, prof_every);
 
@@ -209,7 +209,7 @@ impl App {
             prev_view_proj: glam::Mat4::IDENTITY,
             has_prev_view_proj: false,
             last_stream_update: Instant::now(),
-            stream_period: Duration::from_millis(33), // 30 Hz
+            stream_period: Duration::from_millis(33), 
             physics,
             free_cam: false,
             edit_mode: 0,
@@ -223,7 +223,7 @@ impl App {
                 self.input.on_device_event(&event);
             }
             Event::WindowEvent { event, .. } => {
-                // Input gets first look; it can capture mouse/keyboard state.
+                
                 let _ = self.input.on_window_event(&event, &self.window);
 
                 match event {
@@ -241,7 +241,7 @@ impl App {
     }
 
     fn handle_resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        // WGPU requires non-zero surface size.
+        
         self.surface_config.width = new_size.width.max(1);
         self.surface_config.height = new_size.height.max(1);
 
@@ -250,10 +250,10 @@ impl App {
         self.renderer
             .resize_output(self.surface_config.width, self.surface_config.height);
 
-        // Resize recreates internal clip-height resources, so force a full reupload next frame.
+        
         self.clipmap.invalidate_all();
 
-        // Temporal history is invalid after resize due to projection mismatch.
+        
         self.has_prev_view_proj = false;
     }
 
@@ -271,14 +271,14 @@ impl App {
 
         self.apply_chunk_uploads_and_refresh_grid();
 
-        // Encode all GPU work (compute + blit) in one submission.
+        
         let mut encoder = self.create_frame_encoder();
 
-        // IMPORTANT ORDER:
-        // 1) clipmap texture uploads and clipmap uniform updates
-        // 2) compute pass
-        // 3) acquire swapchain
-        // 4) blit to swapchain
+        
+        
+        
+        
+        
         self.encode_clipmap_updates(&clipmap_update, &mut encoder);
         self.encode_compute_pass(&mut encoder);
 
@@ -293,11 +293,11 @@ impl App {
 
         self.submit_and_present(encoder, swapchain_frame);
 
-        // Record temporal history for next frame.
+        
         self.prev_view_proj = glam::Mat4::from_cols_array_2d(&camera_gpu.view_proj);
         self.has_prev_view_proj = true;
 
-        // IMPORTANT: "render_ms" should exclude finish_frame_profiling overhead
+        
         let render_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
         self.finish_frame_profiling(render_ms);
     }
@@ -307,7 +307,7 @@ impl App {
         let raw_dt = (now - self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
 
-        // Clamp prevents giant dt spikes from causing unstable camera integration.
+        
         raw_dt.clamp(0.0, 0.05)
     }
 
@@ -334,12 +334,12 @@ impl App {
         };
 
         let (_eye, _forward) = if self.free_cam {
-            // free cam: camera owns mouse + movement
+            
             self.physics.step_frame_player_only(delta_seconds, &q);
             self.camera.integrate_input(&mut self.input, delta_seconds);
             (self.camera.position(), self.camera.forward())
         } else {
-            // player cam: physics owns mouse + movement; camera just mirrors
+            
             let eye = self.physics.step_frame(&mut self.input, delta_seconds, &q);
             self.camera.set_position(eye);
             self.camera
@@ -354,10 +354,10 @@ impl App {
     fn update_streaming(&mut self) {
         let t0 = self.profiler.start();
 
-        // Always do cheap housekeeping each frame.
+        
         let grid_changed_by_pump = self.chunks.pump_completed();
 
-        // Do expensive planning at a fixed cadence.
+        
         let mut grid_changed = grid_changed_by_pump;
         if self.last_stream_update.elapsed() >= self.stream_period {
             let camera_position = self.camera.position();
@@ -387,7 +387,7 @@ impl App {
             self.clipmap.update(self.world.as_ref(), camera_position, time_seconds);
         let clip_gpu = ClipmapGpu::from_cpu(&clip_params_cpu);
 
-        // R16 = 2 bytes per texel.
+        
         let upload_bytes = clip_uploads
             .iter()
             .map(|upload| (upload.w as usize) * (upload.h as usize) * 2)
@@ -440,8 +440,8 @@ impl App {
             max_steps,
             frame_index: self.frame_index,
 
-            // [voxel_size_m, time_seconds, ???, ???]
-            // NOTE: Keep exact layout/values stable; shader expects this packing.
+            
+            
             voxel_params: [config::VOXEL_SIZE_M_F32, time_seconds, 2.0, 0.002],
 
             grid_origin_chunk: [
@@ -485,7 +485,7 @@ impl App {
         }
 
         let edit_value = match self.edit_modes[self.edit_mode] {
-            EditMode::Dig => crate::world::materials::AIR,   // or keep a dedicated “DIG” path if you prefer
+            EditMode::Dig => crate::world::materials::AIR,   
             EditMode::Place(m) => m,
         };
 
@@ -510,7 +510,7 @@ impl App {
 
         self.renderer.apply_chunk_uploads(&chunk_uploads);
 
-        // After applying uploads, the chunk grid may change again (e.g. new resident chunks).
+        
         let grid_changed = self.chunks.commit_uploads_applied(&chunk_uploads);
         if grid_changed {
             self.renderer.write_chunk_grid(self.chunks.chunk_grid());
@@ -534,10 +534,10 @@ impl App {
     ) {
         let t0 = self.profiler.start();
 
-        // This call should encode both:
-        // - texture uploads (staging -> clipmap textures)
-        // - clipmap uniform updates
-        // so the compute pass always sees matching data and parameters.
+        
+        
+        
+        
         self.renderer
             .write_clipmap_updates(&clipmap_update.clip_gpu, &clipmap_update.clip_uploads);
 
@@ -565,17 +565,17 @@ impl App {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
 
-            // Recoverable errors: reconfigure and try next frame.
+            
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.surface
                     .configure(self.renderer.device(), &self.surface_config);
                 return None;
             }
 
-            // Transient: skip this frame.
+            
             Err(wgpu::SurfaceError::Timeout) => return None,
 
-            // Fatal: exit the app.
+            
             Err(wgpu::SurfaceError::OutOfMemory) => {
                 elwt.exit();
                 return None;
@@ -601,17 +601,17 @@ impl App {
     }
 
     fn submit_and_present(&mut self, encoder: wgpu::CommandEncoder, frame: wgpu::SurfaceTexture) {
-        // Submit
+        
         let t0 = self.profiler.start();
         self.renderer.queue().submit(Some(encoder.finish()));
         self.profiler.submit(profiler::FrameProf::end_ms(t0));
 
-        // Poll (keeps mapping/timestamp queries flowing)
+        
         let t0 = self.profiler.start();
         self.renderer.device().poll(wgpu::Maintain::Poll);
         self.profiler.poll_wait(profiler::FrameProf::end_ms(t0));
 
-        // Present
+        
         let t0 = self.profiler.start();
         frame.present();
         self.profiler.present(profiler::FrameProf::end_ms(t0));
@@ -642,7 +642,7 @@ impl App {
 
 
     fn update_editor(&mut self) {
-        // scroll wheel selects mode
+        
         let steps = self.input.take_wheel_steps();
         if steps != 0 {
             let n = self.edit_modes.len() as i32;
@@ -651,7 +651,7 @@ impl App {
             self.edit_mode = i as usize;
         }
 
-        // click applies operation (one-shot per click)
+        
         if self.input.take_lmb_pressed() {
             self.apply_edit_click();
         }
@@ -679,20 +679,20 @@ impl App {
         println!("PLACE= {:?} mat={}", place_w, self.sample_voxel_material(place_w.0, place_w.1, place_w.2));
         println!("enter_n = {:?}", enter_n);
 
-        // Decide edit operation.
-        // Rule:
-        // - Dig replaces the HIT voxel with AIR.
-        // - Place writes ONLY into the PREV voxel (adjacent empty). Never overwrite solids.
+        
+        
+        
+        
         let (tx, ty, tz, mat) = match self.edit_modes[self.edit_mode] {
             EditMode::Dig => (hit_w.0, hit_w.1, hit_w.2, crate::world::materials::AIR),
 
             EditMode::Place(m) => {
-                // Absolute guarantee: we never write into hit voxel when placing.
+                
                 if place_w == hit_w {
                     panic!("BUG: place_w == hit_w  hit={:?} place={:?} enter_n={:?}", hit_w, place_w, enter_n);
                 }
 
-                // Only place into empty.
+                
                 let place_mat = self.sample_voxel_material(place_w.0, place_w.1, place_w.2);
                 if place_mat != AIR {
                     println!("blocked: place_w {:?} is not AIR (mat={})", place_w, place_mat);
@@ -704,15 +704,15 @@ impl App {
 
         };
 
-        // chunk key + local coords
+        
         let (key, lx, ly, lz) = crate::world::edits::voxel_to_chunk_local(&self.world, tx, ty, tz);
 
         println!("edit key={:?} state={:?}", key, self.chunks.build.chunks.get(&key));
 
-        // pin so it will never unload
+        
         self.chunks.pinned.insert(key);
 
-        // write edit override
+        
         self.chunks.edits.apply_voxel(key, lx, ly, lz, mat);
 
         let (hit_key, hit_lx, hit_ly, hit_lz) =
@@ -733,7 +733,7 @@ impl App {
             key, lx, ly, lz, mat, verify
         );
 
-        // force a rebuild soon
+        
         self.enqueue_chunk_rebuild_now(key);
     }
 
@@ -746,10 +746,10 @@ impl App {
     ) -> Option<((i32, i32, i32), (i32, i32, i32), (i32, i32, i32))> {
         let dir = dir_m.normalize();
 
-        // Nudge origin slightly along the ray to avoid starting exactly on voxel boundaries.
+        
         let origin_m = origin_m + dir * (voxel_m * 1e-4);
 
-        // Start voxel (cell containing origin)
+        
         let mut vx = (origin_m.x / voxel_m).floor() as i32;
         let mut vy = (origin_m.y / voxel_m).floor() as i32;
         let mut vz = (origin_m.z / voxel_m).floor() as i32;
@@ -801,13 +801,13 @@ impl App {
         let max_t = max_dist_m;
         let mut t = 0.0f32;
 
-        // Deterministic single-axis stepping:
-        // - We step EXACTLY ONE axis per iteration.
-        // - On ties we use a stable priority (X then Y then Z).
-        // This removes edge/corner ambiguity that causes placement to "flip".
+        
+        
+        
+        
         for _ in 0..512 {
-            // Choose next crossing axis (stable tie-break)
-            let mut axis = 0; // 0=x, 1=y, 2=z
+            
+            let mut axis = 0; 
             let mut t_next = t_max_x;
 
             if t_max_y < t_next || (t_max_y == t_next && axis > 1) {
@@ -823,7 +823,7 @@ impl App {
                 break;
             }
 
-            // Step exactly one axis, and set enter_n to the face we crossed.
+            
             let enter_n = match axis {
                 0 => {
                     vx += step_x;
@@ -844,10 +844,10 @@ impl App {
 
             t = t_next;
 
-            // Now inside the newly-entered voxel.
+            
             if self.sample_voxel_material(vx, vy, vz) != AIR {
                 let hit_w = (vx, vy, vz);
-                // Place in the adjacent voxel on the entered face (outside the solid).
+                
                 let place_w = (vx + enter_n.0, vy + enter_n.1, vz + enter_n.2);
                 return Some((hit_w, place_w, enter_n));
             }
@@ -873,7 +873,7 @@ impl App {
             return m;
         }
 
-        // Procedural fallback (with edits context available, if WorldGen uses it)
+        
         self.world
             .material_at_voxel_with_edits(&self.chunks.edits, wx, wy, wz)
     }
@@ -881,8 +881,8 @@ impl App {
 }
 
 fn choose_present_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
-    // For profiling: avoid vsync blocking.
-    // Use --profile as the switch (or add a dedicated flag).
+    
+    
     let profiling = std::env::args().any(|a| a == "--profile");
 
     if profiling && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {

@@ -1,5 +1,5 @@
-// src/render/state/textures.rs
-// ----------------------------
+
+
 
 use crate::app::config;
 use crate::{
@@ -20,7 +20,7 @@ pub struct TextureSet {
     pub color: Tex2D,
     pub depth: Tex2D,
 
-    // per-pixel local lighting term (unfogged), written by primary
+    
     pub local: Tex2D,
     
     pub godray: [Tex2D; 2],
@@ -159,7 +159,7 @@ pub fn create_textures(
         ),
     ];
 
-    // Clipmap height: R32Float
+    
     let clip_height = make_tex2d_array(
         device,
         "clip_height",

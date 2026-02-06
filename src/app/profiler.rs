@@ -1,8 +1,8 @@
-// src/app/profiler.rs
-// -------------------
+
+
 use std::time::{Duration, Instant};
 
-use crate::render::state::GpuTimingsMs; // GPU = Graphics Processing Unit
+use crate::render::state::GpuTimingsMs; 
 use crate::streaming::types::StreamStats;
 
 pub struct FrameProf {
@@ -12,7 +12,7 @@ pub struct FrameProf {
     pub last_print: Instant,
     pub print_every: Duration,
 
-    // window accumulators
+    
     pub n_frames: u64,
     pub t_cam: f64,
     pub t_stream: f64,
@@ -39,7 +39,7 @@ pub struct FrameProf {
     pub t_prof_overhead: f64,
     pub max_prof_overhead_ms: f64,
 
-    // per-slot maxima in the window
+    
     pub max_present_ms: f64,
     pub max_acq_swapchain_ms: f64,
     pub max_submit_ms: f64,
@@ -93,7 +93,7 @@ impl FrameProf {
         self.enabled
     }
 
-    /// Returns `Some(Instant::now())` only when profiling is enabled.
+    
     #[inline]
     pub fn start(&self) -> Option<Instant> {
         if self.enabled {
@@ -111,7 +111,7 @@ impl FrameProf {
         }
     }
 
-    // --- per-slot adders (no-op when disabled) ---
+    
     #[inline]
     pub fn cam(&mut self, ms: f64) {
         if self.enabled {
@@ -239,15 +239,15 @@ impl FrameProf {
         self.frame += 1;
         self.n_frames += 1;
 
-        // Track worst render frame in this print window.
+        
         self.max_frame_ms = self.max_frame_ms.max(render_ms);
 
-        // Track profiling/printing overhead separately (so it doesn't pollute render max/avg).
+        
         self.t_prof_overhead += prof_overhead_ms;
         self.max_prof_overhead_ms = self.max_prof_overhead_ms.max(prof_overhead_ms);
 
-        // IMPORTANT: compute once so all printing is consistently gated,
-        // and so it stays true even after we reset last_print inside the block.
+        
+        
         let do_print = self.last_print.elapsed() >= self.print_every;
         if !do_print {
             return;
@@ -256,7 +256,7 @@ impl FrameProf {
         let nf = self.n_frames.max(1) as f64;
         let avg = |x: f64| x / nf;
 
-        // "Render time" average: only the per-slot timings (not profiling overhead).
+        
         let avg_frame = avg(
             self.t_cam
                 + self.t_stream
@@ -398,7 +398,7 @@ impl FrameProf {
             );
         }
 
-        // Reset window counters (keep frame + print_every).
+        
         self.last_print = Instant::now();
         self.n_frames = 0;
 
@@ -433,9 +433,9 @@ impl FrameProf {
     }
 }
 
-/// Parse command-line flags:
-/// - `--profile` or `--profiling` enables profiling
-/// - optional: `--profile-every-ms=500` or `--profile-every-ms 500`
+
+
+
 pub fn settings_from_args() -> (bool, Duration) {
     #[cfg(target_arch = "wasm32")]
     {

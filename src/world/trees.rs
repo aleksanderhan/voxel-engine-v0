@@ -1,4 +1,4 @@
-// src/world/trees.rs
+
 use crate::app::config;
 
 use super::{
@@ -7,46 +7,46 @@ use super::{
     materials::{AIR, LEAF, WOOD},
 };
 
-// ================================================================================================
-// TREE TUNING KNOBS
-// ================================================================================================
-// Conventions
-// - vpm = voxels per meter (VOXELS_PER_METER)
-// - Fast probability via bitmask:
-//      (hash & mask) == 0  => true with probability 1/(mask+1)
-//
-// Notes:
-// - AABB = axis-aligned bounding box
-// - BFS = breadth-first search
-// - SVO = Sparse Voxel Octree
-// ================================================================================================
 
-// Tree density: 1 tree per N meter-cells (lower => more trees)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 const TREE_CELL_MOD: u32 = 256;
 
-// ----------------------------------------
-// Primary branches (depth=0)
-// ----------------------------------------
 
-// Fewer primaries, but less “spike crown”
+
+
+
+
 const PRIMARY_MIN: usize = 6;
 const PRIMARY_MAX: usize = 14;
 const PRIMARY_MAX_CLAMP: usize = 18;
 
-// Start height along trunk (% of trunk height)
-// IMPORTANT: allow starts right near the top so the trunk doesn't look “pruned”
+
+
 const PRIMARY_START_Y_LO_FRAC: i32 = 28;
-const PRIMARY_START_Y_HI_FRAC: i32 = 99; // was 92
+const PRIMARY_START_Y_HI_FRAC: i32 = 99; 
 const PRIMARY_START_JITTER_FRAC: f32 = 0.10;
 
-// Shape
-const PRIMARY_ANG_JITTER: f32 = 1.05; // more irregular azimuth (less radial symmetry)
 
-// SHORTER primaries (big lever for “branches too long”)
+const PRIMARY_ANG_JITTER: f32 = 1.05; 
+
+
 const PRIMARY_LEN_M_MIN: f32 = 1.40;
 const PRIMARY_LEN_M_RAND: f32 = 2.20;
 
-// More vertical variation + less spear-like
+
 const PRIMARY_PITCH_BASE: f32 = 0.10;
 const PRIMARY_PITCH_H_SCALE: f32 = 0.18;
 const PRIMARY_PITCH_QUAD_BASE: f32 = 0.44;
@@ -57,7 +57,7 @@ const PRIMARY_R0_M_RAND: f32 = 0.22;
 const PRIMARY_R1_SCALE_MIN: f32 = 0.28;
 const PRIMARY_R1_SCALE_RAND: f32 = 0.22;
 
-// More curvature so branches feel “grown”, not extruded
+
 const PRIMARY_BEND_M_MIN: f32 = 1.05;
 const PRIMARY_BEND_M_RAND: f32 = 1.85;
 const PRIMARY_C1_T: f32 = 0.28;
@@ -67,41 +67,41 @@ const PRIMARY_C2_BEND_SCALE: f32 = 0.85;
 const PRIMARY_C1_Y_BEND_SCALE: f32 = 0.44;
 const PRIMARY_C2_Y_BEND_SCALE: f32 = 0.34;
 
-// ----------------------------------------
-// Recursion / complexity
-// ----------------------------------------
+
+
+
 
 const MAX_BRANCH_DEPTH: u8 = 4;
 const BRANCH_CAP: usize = 520;
 
-// How many child candidates per parent depth: min + uniform(0..rand)
-// Index = parent.depth clamped to 0..3
+
+
 const CHILD_COUNT_MIN: [usize; 4] = [3, 3, 2, 1];
 const CHILD_COUNT_RAND: [usize; 4] = [3, 3, 3, 3];
 
-// Aggressive thinning (keeps overall sparse structure)
-// Keep child only if (sj & mask) == 0
+
+
 const CHILD_SPAWN_THIN_MASK: [u32; 4] = [
-    3,  // depth=0: keep ~1/4
-    7,  // depth=1: keep ~1/8
-    15, // depth=2: keep ~1/16
-    31, // depth>=3: keep ~1/32
+    3,  
+    7,  
+    15, 
+    31, 
 ];
 
-// Spawn position along parent
+
 const CHILD_SPAWN_T_MIN: f32 = 0.32;
 const CHILD_SPAWN_T_RAND: f32 = 0.58;
 
-// SHORTER children
+
 const CHILD_LEN_M_MIN: f32 = 0.35;
 const CHILD_LEN_M_RAND: f32 = 1.05;
 const CHILD_LEN_M_FLOOR: f32 = 0.28;
 
-// Clamp children harder vs parent length
+
 const CHILD_MAXLEN_A: f32 = 0.48;
 const CHILD_MAXLEN_B: f32 = 0.18;
 
-// Direction shaping
+
 const CHILD_FAN_AMP_BASE: f32 = 0.95;
 const CHILD_FAN_AMP_DEPTH: f32 = 0.38;
 
@@ -109,7 +109,7 @@ const CHILD_UP_BASE: f32 = 0.10;
 const CHILD_UP_DEPTH: f32 = 0.10;
 const CHILD_UP_RAND: f32 = 0.28;
 
-// Radius shrink factor by child depth (depth=1..)
+
 const CHILD_SHRINK: [f32; 4] = [0.58, 0.52, 0.46, 0.40];
 
 const CHILD_R0_MIN_VOX: f32 = 0.70;
@@ -117,7 +117,7 @@ const CHILD_R1_MIN_VOX: f32 = 0.50;
 const CHILD_R1_SCALE_BASE: f32 = 0.34;
 const CHILD_R1_SCALE_RAND: f32 = 0.16;
 
-// Curvature
+
 const CHILD_BEND_M_MIN: f32 = 0.45;
 const CHILD_BEND_M_RAND: f32 = 1.25;
 const CHILD_C1_T: f32 = 0.28;
@@ -127,61 +127,61 @@ const CHILD_C2_BEND_SCALE: f32 = 0.78;
 const CHILD_C1_Y_BEND_SCALE: f32 = 0.34;
 const CHILD_C2_Y_BEND_SCALE: f32 = 0.26;
 
-// ----------------------------------------
-// Branch rasterization
-// ----------------------------------------
+
+
+
 
 const BRANCH_STEPS_MIN: i32 = 8;
 const BRANCH_STEPS_MAX: i32 = 30;
 const BRANCH_STEPS_BASE: f32 = 10.0;
 const BRANCH_STEPS_LEN_DIV_M: f32 = 0.30;
 
-// ----------------------------------------
-// Leaves
-// ----------------------------------------
+
+
+
 
 const LEAF_ALWAYS_TIP_FOR_ALL_BRANCHES: bool = true;
 const LEAF_RARE_SKIP_MASK: u32 = 16383;
 
-// Canopy extent along branches: more sleeves, distributed earlier
+
 const LEAF_SLEEVE_N: [usize; 5] = [3, 3, 4, 4, 5];
 const LEAF_SLEEVE_T_MIN: f32 = 0.14;
 const LEAF_SLEEVE_T_RAND: f32 = 0.78;
 
-// Disable extra offset tip tuft (tends to create little dense “buttons”)
+
 const LEAF_OFFSET_TIP_MASK: u32 = 0;
 
-// Bigger offsets = wider canopy without adding branches
+
 const LEAF_OFFSET_M_XZ: f32 = 0.95;
 const LEAF_OFFSET_M_Y: f32 = 0.46;
 
 const LEAF_SLEEVE_OFFSET_M_XZ: f32 = 0.62;
 const LEAF_SLEEVE_OFFSET_M_Y: f32 = 0.34;
 
-// Big tufts (canopy size)
+
 const TUFT_R_BASE: [f32; 5] = [0.42, 0.50, 0.60, 0.66, 0.72];
 const TUFT_R_RAND: [f32; 5] = [0.30, 0.36, 0.52, 0.60, 0.66];
 
-// Sparse/airy fill
+
 const LEAF_SPHERE_Y_SCALE: f32 = 1.16;
 const LEAF_SHELL_THRESH: f32 = 0.90;
 
-// TIP: visible but airy
-const TIP_GUARANTEED_GATE_MASK: u32 = 1;           // keep ~1/2 candidates
-const TIP_GUARANTEED_INTERIOR_KEEP_MASK: u32 = 31; // keep 1/32 interior
-const TIP_GUARANTEED_SHELL_DROP_MASK: u32 = 3;     // drop 1/4 near shell
 
-// SLEEVE: very sparse
-const TUFT_SPARSE_GATE_MASK: u32 = 15;             // keep ~1/16 candidates
-const TUFT_SPARSE_INTERIOR_KEEP_MASK: u32 = 255;   // keep 1/256 interior
-const TUFT_SPARSE_SHELL_DROP_MASK: u32 = 3;        // drop 1/4 near shell
+const TIP_GUARANTEED_GATE_MASK: u32 = 1;           
+const TIP_GUARANTEED_INTERIOR_KEEP_MASK: u32 = 31; 
+const TIP_GUARANTEED_SHELL_DROP_MASK: u32 = 3;     
 
-// Trunk wobble (meters)
+
+const TUFT_SPARSE_GATE_MASK: u32 = 15;             
+const TUFT_SPARSE_INTERIOR_KEEP_MASK: u32 = 255;   
+const TUFT_SPARSE_SHELL_DROP_MASK: u32 = 3;        
+
+
 const TRUNK_WOBBLE_M_MAX: f32 = 0.25;
 
-// ----------------------------------------
-// Crown at trunk tip (prevents "pruned top")
-// ----------------------------------------
+
+
+
 
 const TOP_CROWN_ENABLE: bool = true;
 const TOP_CROWN_RING_TUFTS: usize = 6;
@@ -189,22 +189,22 @@ const TOP_CROWN_R_SCALE: f32 = 1.65;
 const TOP_CROWN_RING_RAD_SCALE: f32 = 0.85;
 const TOP_CROWN_LIFT_M: f32 = 0.45;
 
-// ================================================================================================
 
-/// Procedural tree instance (voxel units for positions/sizes).
+
+
 #[derive(Clone, Copy)]
 struct Tree {
     tx: i32,
     tz: i32,
-    base_y: i32,   // touches ground
-    trunk_h: i32,  // voxels
-    crown_r: i32,  // voxels (horizontal extent)
-    trunk_r0: f32, // voxels radius at base
-    trunk_r1: f32, // voxels radius near top
+    base_y: i32,   
+    trunk_h: i32,  
+    crown_r: i32,  
+    trunk_r0: f32, 
+    trunk_r1: f32, 
     seed: u32,
 }
 
-/// A single curved branch segment (cubic bezier), plus metadata for recursion.
+
 #[derive(Clone, Copy)]
 struct Branch {
     ax: f32,
@@ -226,16 +226,16 @@ struct Branch {
     seed: u32,
 }
 
-/// Per-chunk cache of trees that can affect material queries.
+
 pub struct TreeCache {
     trees: Vec<Tree>,
 }
 
-/// Chunk-local voxel mask for trees (fast O(1) queries in the chunk build).
-/// mask codes: 0 = none, 1 = wood, 2 = leaf
+
+
 pub struct TreeMaskCache {
-    pub origin: [i32; 3], // chunk origin in world-voxel coords
-    pub size: i32,        // chunk side in voxels
+    pub origin: [i32; 3], 
+    pub size: i32,        
     mask: Vec<u8>,
     stride_z: usize,
     stride_y: usize,
@@ -249,7 +249,7 @@ fn idx3_strided(stride_z: usize, stride_y: usize, x: i32, y: i32, z: i32) -> usi
 impl TreeMaskCache {
     #[inline(always)]
     pub fn material_local(&self, lx: usize, ly: usize, lz: usize) -> u32 {
-        // caller guarantees in-bounds
+        
         let i = ly * self.stride_y + lz * self.stride_z + lx;
         match unsafe { *self.mask.get_unchecked(i) } {
             1 => WOOD,
@@ -275,9 +275,9 @@ impl TreeMaskCache {
 }
 
 impl WorldGen {
-    // -------------------------------------------------------------------------
-    // Small math helpers
-    // -------------------------------------------------------------------------
+    
+    
+    
 
     #[inline(always)]
     fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -325,7 +325,7 @@ impl WorldGen {
         (ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx)
     }
 
-    /// Orthonormal basis around direction `w` (unit). Returns (u, v, w).
+    
     #[inline(always)]
     fn basis_from_w(
         w: (f32, f32, f32),
@@ -342,9 +342,9 @@ impl WorldGen {
         ((ux, uy, uz), (vx, vy, vz), (wx, wy, wz))
     }
 
-    // -------------------------------------------------------------------------
-    // Knob helpers (compact)
-    // -------------------------------------------------------------------------
+    
+    
+    
 
     #[inline(always)]
     fn idx4(d: u8) -> usize {
@@ -368,7 +368,7 @@ impl WorldGen {
 
     #[inline(always)]
     fn shrink_for_child_depth(depth: u8) -> f32 {
-        // child depth starts at 1, so map 1->0, 2->1, 3->2, 4+->3
+        
         let i = ((depth as usize).saturating_sub(1)).min(3);
         CHILD_SHRINK[i]
     }
@@ -384,23 +384,23 @@ impl WorldGen {
         TUFT_R_BASE[i] + TUFT_R_RAND[i] * u01(hash_u32(seed))
     }
 
-    // -------------------------------------------------------------------------
-    // Tree placement + params
-    // -------------------------------------------------------------------------
+    
+    
+    
 
     #[inline]
     fn tree_at_meter_cell(
         &self,
         xm: i32,
         zm: i32,
-    ) -> Option<(u32 /*seed*/, i32 /*trunk_h_vox*/, i32 /*crown_r_vox*/)> {
+    ) -> Option<(u32 , i32 , i32 )> {
         let r = hash2(self.seed, xm, zm);
         if (r % TREE_CELL_MOD) != 0 {
             return None;
         }
 
-        let trunk_h_m = 5 + (hash_u32(r) % 6) as i32; // 5..10m
-        let crown_r_m = 3 + (hash_u32(r ^ 0xBEEF) % 4) as i32; // 3..6m
+        let trunk_h_m = 5 + (hash_u32(r) % 6) as i32; 
+        let crown_r_m = 3 + (hash_u32(r ^ 0xBEEF) % 4) as i32; 
         let vpm = config::VOXELS_PER_METER;
 
         Some((r, trunk_h_m * vpm, crown_r_m * vpm))
@@ -414,7 +414,7 @@ impl WorldGen {
 
         let vpm = config::VOXELS_PER_METER as f32;
 
-        // trunk radii (voxels): base ~0.45..0.75m, top ~0.18..0.30m
+        
         let r0 = 0.45 * vpm + u01(hash_u32(seed ^ 0x1111)) * (0.30 * vpm);
         let r1 = 0.18 * vpm + u01(hash_u32(seed ^ 0x2222)) * (0.12 * vpm);
 
@@ -430,7 +430,7 @@ impl WorldGen {
         })
     }
 
-    /// Build a per-chunk tree cache. Call once per chunk build.
+    
     pub fn build_tree_cache<F: Fn(i32, i32) -> i32>(
         &self,
         chunk_ox: i32,
@@ -440,7 +440,7 @@ impl WorldGen {
     ) -> TreeCache {
         let vpm = config::VOXELS_PER_METER;
 
-        // Extra slack because canopy tufts can extend beyond crown_r
+        
         let pad_m = 10;
 
         let xm0 = chunk_ox.div_euclid(vpm) - pad_m;
@@ -464,8 +464,8 @@ impl WorldGen {
                     continue;
                 };
 
-                // Conservative XZ AABB reject vs chunk footprint
-                let r = t.crown_r + 5 * vpm; // extra slack for large tufts
+                
+                let r = t.crown_r + 5 * vpm; 
                 let x0 = t.tx - r;
                 let x1 = t.tx + r;
                 let z0 = t.tz - r;
@@ -487,7 +487,7 @@ impl WorldGen {
         TreeCache { trees }
     }
 
-    /// Build a tree cache + chunk-local voxel mask (fast O(1) tree material queries).
+    
     pub fn build_tree_cache_with_mask<F: Fn(i32, i32) -> i32>(
         &self,
         chunk_ox: i32,
@@ -522,9 +522,9 @@ impl WorldGen {
         (cache, out)
     }
 
-    // -------------------------------------------------------------------------
-    // Geometry helpers
-    // -------------------------------------------------------------------------
+    
+    
+    
 
     #[inline]
     fn trunk_radius_at(tree: &Tree, y: i32) -> f32 {
@@ -543,9 +543,9 @@ impl WorldGen {
         ((a - 0.5) * 2.0 * amp, (b - 0.5) * 2.0 * amp)
     }
 
-    // -------------------------------------------------------------------------
-    // Primary layout
-    // -------------------------------------------------------------------------
+    
+    
+    
 
     #[inline]
     fn primary_count(&self, tree: &Tree) -> usize {
@@ -553,7 +553,7 @@ impl WorldGen {
         let span = (PRIMARY_MAX - PRIMARY_MIN + 1) as u32;
         let mut n = PRIMARY_MIN + (r % span) as usize;
 
-        // tiny bias extremes sometimes
+        
         if (r & 31) == 0 {
             n = PRIMARY_MIN;
         } else if (r & 63) == 1 {
@@ -582,7 +582,7 @@ impl WorldGen {
             out[i] = (y_base + jitter).clamp(y_lo, y_hi);
         }
 
-        // insertion sort ascending
+        
         for i in 1..count.min(32) {
             let mut j = i;
             while j > 0 && out[j - 1] > out[j] {
@@ -594,9 +594,9 @@ impl WorldGen {
         out
     }
 
-    // -------------------------------------------------------------------------
-    // Branch generation
-    // -------------------------------------------------------------------------
+    
+    
+    
 
     fn child_branches_from_parent(&self, parent: &Branch, tree_seed: u32, out: &mut Vec<Branch>) {
         if parent.depth >= MAX_BRANCH_DEPTH {
@@ -700,14 +700,14 @@ impl WorldGen {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Rasterization into chunk-local mask
-    // -------------------------------------------------------------------------
+    
+    
+    
 
     fn raster_tree_into_mask(&self, tree: &Tree, out: &mut TreeMaskCache) {
         let side = out.size;
 
-        // --- trunk ---
+        
         let top_y = tree.base_y + tree.trunk_h;
         let y0 = tree.base_y.max(out.origin[1]);
         let y1 = top_y.min(out.origin[1] + side - 1);
@@ -737,7 +737,7 @@ impl WorldGen {
             }
         }
 
-        // --- top crown (leaf cluster at trunk tip) ---
+        
         if TOP_CROWN_ENABLE {
             let vpm_f = config::VOXELS_PER_METER as f32;
 
@@ -751,7 +751,7 @@ impl WorldGen {
             let crown_r =
                 Self::tuft_r_m(0, tree.seed ^ 0xC0A7_0001) * vpm_f * TOP_CROWN_R_SCALE;
 
-            // center tuft (tip profile)
+            
             self.raster_sphere_leaf_tuft_with_masks(
                 out,
                 cx,
@@ -764,7 +764,7 @@ impl WorldGen {
                 TIP_GUARANTEED_SHELL_DROP_MASK,
             );
 
-            // ring tufts (sleeve profile) for a crown silhouette
+            
             let ring_r = crown_r * TOP_CROWN_RING_RAD_SCALE;
             for i in 0..TOP_CROWN_RING_TUFTS {
                 let rr = hash_u32(tree.seed ^ 0xC0A7_1E99 ^ (i as u32).wrapping_mul(0x9E37_79B9));
@@ -788,7 +788,7 @@ impl WorldGen {
             }
         }
 
-        // --- branches ---
+        
         let vpm_f = config::VOXELS_PER_METER as f32;
 
         let primary_count = self.primary_count(tree);
@@ -797,7 +797,7 @@ impl WorldGen {
 
         let mut branches: Vec<Branch> = Vec::with_capacity(BRANCH_CAP.min(1024));
 
-        // primary branches
+        
         for i in 0..primary_count.min(32) {
             let sy = starts[i];
             let br_seed = hash_u32(tree.seed ^ 0xB000 ^ (i as u32).wrapping_mul(0x9E37_79B9));
@@ -874,7 +874,7 @@ impl WorldGen {
             });
         }
 
-        // BFS recursion (generate)
+        
         let mut k = 0usize;
         while k < branches.len() && branches.len() < BRANCH_CAP {
             let b = branches[k];
@@ -882,7 +882,7 @@ impl WorldGen {
             k += 1;
         }
 
-        // wood raster
+        
         for b in &branches {
             let len_m = b.len / vpm_f;
             let steps = (BRANCH_STEPS_BASE + (len_m / BRANCH_STEPS_LEN_DIV_M)).round() as i32;
@@ -890,7 +890,7 @@ impl WorldGen {
             self.raster_bezier_wood(out, b, steps);
         }
 
-        // leaves raster
+        
         for b in &branches {
             if (hash_u32(b.seed ^ 0x1357_2468) & LEAF_RARE_SKIP_MASK) == 0 {
                 continue;
@@ -898,7 +898,7 @@ impl WorldGen {
 
             let tuft_r = Self::tuft_r_m(b.depth, b.seed ^ 0x4440) * vpm_f;
 
-            // tip tuft
+            
             if LEAF_ALWAYS_TIP_FOR_ALL_BRANCHES {
                 self.raster_sphere_leaf_tuft_with_masks(
                     out,
@@ -913,7 +913,7 @@ impl WorldGen {
                 );
             }
 
-            // sleeve tufts along branch
+            
             let sleeve_n = Self::sleeve_n(b.depth);
             for si in 0..sleeve_n {
                 let rr = hash_u32(b.seed ^ 0x9000_1000 ^ (si as u32).wrapping_mul(0x9E37_79B9));
@@ -937,7 +937,7 @@ impl WorldGen {
                 );
             }
 
-            // extra offset tip tuft (disabled by LEAF_OFFSET_TIP_MASK=0)
+            
             let h = hash_u32(b.seed ^ 0xABC0_0001);
             if (h & LEAF_OFFSET_TIP_MASK) != 0 {
                 let rr = hash_u32(b.seed ^ 0xABC0_0002);
@@ -960,9 +960,9 @@ impl WorldGen {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Wood rasterization
-    // -------------------------------------------------------------------------
+    
+    
+    
 
     fn raster_bezier_wood(&self, out: &mut TreeMaskCache, b: &Branch, steps: i32) {
         let steps = steps.max(2);
@@ -1007,8 +1007,8 @@ impl WorldGen {
         }
         let len = len2.sqrt();
 
-        // Step size in voxels. 0.75 tends to be safe (no holes) but not too expensive.
-        let step = (0.75_f32).max(0.40_f32 * r0.max(r1)); // tune
+        
+        let step = (0.75_f32).max(0.40_f32 * r0.max(r1)); 
         let n = (len / step).ceil() as i32;
 
         let inv_n = 1.0 / (n as f32);
@@ -1055,9 +1055,9 @@ impl WorldGen {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Leaf rasterization
-    // -------------------------------------------------------------------------
+    
+    
+    
 
     fn raster_sphere_leaf_tuft_with_masks(
         &self,
@@ -1090,7 +1090,7 @@ impl WorldGen {
         let shell_r = LEAF_SHELL_THRESH * rr;
         let shell2 = shell_r * shell_r;
 
-        // pre-xor seeds so the hot loop doesn’t
+        
         let seed_gate   = seed ^ 0xA11C_E5ED;
         let seed_in     = seed ^ 0xCAFE_BABE;
         let seed_shell  = seed ^ 0xD00D_F00D;
@@ -1110,7 +1110,7 @@ impl WorldGen {
                 let dxy2 = dx2 + dy2;
                 if dxy2 > r2 { continue; }
 
-                // scanline extent in z
+                
                 let zext = (r2 - dxy2).sqrt();
                 let minz = ((cz - zext).floor() as i32).max(oz);
                 let maxz = ((cz + zext).ceil()  as i32).min(max_z);
@@ -1118,12 +1118,12 @@ impl WorldGen {
                 let lx = x - ox;
 
                 for z in minz..=maxz {
-                    // gate AFTER sphere test (still correct)
+                    
                     if (hash3(seed_gate, x, y, z) & gate_mask) != 0 {
                         continue;
                     }
 
-                    // interior vs shell based on true d2
+                    
                     let dz = (z as f32) - cz;
                     let d2 = dxy2 + dz * dz;
 
@@ -1142,11 +1142,11 @@ impl WorldGen {
     }
 
 
-    // -------------------------------------------------------------------------
-    // SVO bounds helper
-    // -------------------------------------------------------------------------
+    
+    
+    
 
-    /// Used by the SVO builder to stamp conservative tree-top bounds.
+    
     pub fn tree_instance_at_meter(&self, xm: i32, zm: i32) -> Option<(i32, i32)> {
         let (_seed, trunk_h_vox, crown_r_vox) = self.tree_at_meter_cell(xm, zm)?;
         Some((trunk_h_vox, crown_r_vox))

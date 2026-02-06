@@ -1,8 +1,8 @@
-//// --------------------------------------------------------------------------
-//// Shading
-//// --------------------------------------------------------------------------
 
-// Performance gates for primary pass (world-space distance).
+
+
+
+
 const VOXEL_AO_MAX_DIST       : f32 = 40.0;
 const LOCAL_LIGHT_MAX_DIST    : f32 = 50.0;
 const FAR_SHADING_DIST        : f32 = 80.0;
@@ -139,8 +139,8 @@ fn shade_hit_split(
 ) -> ShadeOut {
   let base_hdr = shade_hit(ro, rd, hg, sky_up, seed);
 
-  // Local voxel lighting from MAT_LIGHT blocks.
-  // Keep it separate so it can be temporally accumulated without fog.
+  
+  
   var local_hdr = vec3<f32>(0.0);
   var local_w   = 0.0;
 
@@ -167,7 +167,7 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
 
   var base = base_albedo(hg.mat, hp, hg.t);
 
-  // Gate extra grass work harder in primary
+  
   if (hg.mat == MAT_GRASS) {
     if (grass_allowed_primary(hg.t, hg.n, seed)) {
       let vs  = cam.voxel_params.x;
@@ -191,7 +191,7 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
 
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
-  // AO for voxels: only when the hit is a real voxel hit (not sky / miss)
+  
   var ao = 1.0;
   if (hg.hit != 0u && hg.t <= VOXEL_AO_MAX_DIST) {
     ao = voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
@@ -206,7 +206,7 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
     ambient *= vec3<f32>(0.92, 0.95, 1.05);
   }
 
-  // Leaf dapple (cheap) - keep as-is
+  
   var dapple = 1.0;
   if (hg.mat == MAT_LEAF && hg.t <= FAR_SHADING_DIST) {
     let time_s = cam.voxel_params.y;
@@ -254,7 +254,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
   }
   let diff = max(dot(ch.n, SUN_DIR), 0.0);
 
-  // AO-lite for terrain: gate hard for grass in primary
+  
   var ao = 1.0;
   if (ch.mat == MAT_GRASS && grass_allowed_primary(ch.t, ch.n, seed) && ch.t <= FAR_SHADING_DIST) {
     let lvl  = clip_best_level(hp.xz, 2);

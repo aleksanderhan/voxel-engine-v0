@@ -1,6 +1,6 @@
-//// --------------------------------------------------------------------------
-//// Phase
-//// --------------------------------------------------------------------------
+
+
+
 
 fn phase_mie(costh: f32) -> f32 {
   let g = PHASE_G;
@@ -10,7 +10,7 @@ fn phase_mie(costh: f32) -> f32 {
 }
 
 fn phase_blended(costh: f32) -> f32 {
-  let mie = phase_mie(costh);     // HG already gives small backscatter
-  let iso = INV_4PI;              // isotropic baseline
+  let mie = phase_mie(costh);     
+  let iso = INV_4PI;              
   return mix(iso, mie, PHASE_MIE_W);
 }

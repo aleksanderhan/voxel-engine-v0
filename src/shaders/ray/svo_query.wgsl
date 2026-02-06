@@ -1,6 +1,6 @@
-//// --------------------------------------------------------------------------
-//// SVO query (leaf query + convenience predicates)
-//// --------------------------------------------------------------------------
+
+
+
 
 struct LeafQuery {
   bmin : vec3<f32>,
@@ -19,16 +19,16 @@ fn query_leaf_at(
   var bmin: vec3<f32> = root_bmin;
   var size: f32 = root_size;
 
-  // ------------------------------------------------------------------------
-  // Macro occupancy early-out (8x8x8). If the macro cell is empty => MAT_AIR.
-  // ------------------------------------------------------------------------
+  
+  
+  
   if (macro_base != INVALID_U32) {
     let cell = macro_cell_size(root_size);
 
-    // local position in chunk (meters)
+    
     let lp = p_in - root_bmin;
 
-    // macro coords 0..7
+    
     let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
     let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
     let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
@@ -58,9 +58,9 @@ fn query_leaf_at(
 
     let max_d = chunk_max_depth();
     if (d >= max_d) {
-      // We are at voxel resolution; if the node still isn't a LEAF_U32, treat missing child as air,
-      // but DO NOT blanket-return air here earlier than max depth.
-      // The loop will keep descending until leaf/missing child; this is just a safety stop.
+      
+      
+      
       return LeafQuery(bmin, size, MAT_AIR);
     }
 
@@ -100,24 +100,24 @@ fn make_air_leaf(bmin: vec3<f32>, size: f32) -> LeafQuery {
   return LeafQuery(bmin, size, MAT_AIR);
 }
 
-// Returns leaf material at world position by first locating the chunk.
+
 fn query_leaf_world(p: vec3<f32>) -> LeafQuery {
   let vs = cam.voxel_params.x;
   let chunk_size_m = f32(cam.chunk_size) * vs;
 
-  // Convert world meters -> chunk coords
+  
   let c = chunk_coord_from_pos(p, chunk_size_m);
 
-  // Look up streamed chunk slot
+  
   let slot = grid_lookup_slot(c.x, c.y, c.z);
   if (slot == INVALID_U32 || slot >= cam.chunk_count) {
-    // Outside loaded grid => air
+    
     return make_air_leaf(p, vs);
   }
 
   let ch = chunks[slot];
 
-  // Build the chunk's root box in meters
+  
   let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * vs;
   let root_size = f32(cam.chunk_size) * vs;
 

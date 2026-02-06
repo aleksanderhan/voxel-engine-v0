@@ -1,7 +1,7 @@
-// src/svo/builder_ropes.rs
-//
-// Rope building on CPU for packed SVO nodes.
-// Ropes provide neighbor pointers for traversal.
+
+
+
+
 
 use crate::render::gpu_types::{NodeGpu, NodeRopesGpu};
 
@@ -39,7 +39,7 @@ fn child_idx(nodes: &[NodeGpu], parent_idx: u32, ci: u32) -> u32 {
         return INVALID;
     }
 
-    // number of children before ci in the packed array
+    
     let before = mask & (bit - 1);
     let rank = before.count_ones() as u32;
 
@@ -84,7 +84,7 @@ fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
 
     let child_of_ci = compute_child_of_ci(p);
 
-    // For each existing child, compute its ropes.
+    
     for ci in 0u32..8u32 {
         if (mask & (1u32 << ci)) == 0 {
             continue;
@@ -103,7 +103,7 @@ fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
 
         let sib = |sci: u32| -> u32 { child_of_ci[sci as usize] };
 
-        // +X / -X
+        
         let px = if hx == 0 {
             let s = sib(sib_x);
             if s != INVALID {
@@ -126,7 +126,7 @@ fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
             descend_one(nodes, pr.nx, 1, hy, hz)
         };
 
-        // +Y / -Y
+        
         let py = if hy == 0 {
             let s = sib(sib_y);
             if s != INVALID {
@@ -149,7 +149,7 @@ fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
             descend_one(nodes, pr.ny, hx, 1, hz)
         };
 
-        // +Z / -Z
+        
         let pz = if hz == 0 {
             let s = sib(sib_z);
             if s != INVALID {
@@ -175,7 +175,7 @@ fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
         ropes[self_child as usize] = NodeRopesGpu { px, nx, py, ny, pz, nz, _pad0: 0, _pad1: 0 };
     }
 
-    // Recurse into existing children
+    
     for ci in 0u32..8u32 {
         if (mask & (1u32 << ci)) == 0 {
             continue;
@@ -189,7 +189,7 @@ fn build_ropes_rec(nodes: &[NodeGpu], ropes: &mut [NodeRopesGpu], idx: u32) {
 
 pub fn build_ropes(nodes: &[NodeGpu]) -> Vec<NodeRopesGpu> {
     let mut ropes = vec![ropes_invalid(); nodes.len()];
-    // Root external ropes are invalid => stay INVALID.
+    
     build_ropes_rec(nodes, &mut ropes, 0);
     ropes
 }

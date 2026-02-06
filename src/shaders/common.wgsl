@@ -1,27 +1,27 @@
-// src/shaders/common.wgsl
-// -----------------------
-// src/shaders/common.wgsl
-//
-// Shared WGSL:
-// - Constants / tuning knobs
-// - GPU-side struct defs + scene bindings (group 0)
-// - Shared math + grid helpers + hashes/noise
-//
-// NOTE: Pass-specific textures/images + compute entrypoints live in ray_main.wgsl.
 
-//// --------------------------------------------------------------------------
-//// IDs / numeric
-//// --------------------------------------------------------------------------
 
-const LEAF_U32    : u32 = 0xFFFFFFFFu; // Node.child_base sentinel
+
+
+
+
+
+
+
+
+
+
+
+
+
+const LEAF_U32    : u32 = 0xFFFFFFFFu; 
 const INVALID_U32 : u32 = 0xFFFFFFFFu;
 
 const BIG_F32 : f32 = 1e30;
 const EPS_INV : f32 = 1e-8;
 
-//// --------------------------------------------------------------------------
-//// Feature toggles
-//// --------------------------------------------------------------------------
+
+
+
 
 const ENABLE_GRASS   : bool = true;
 const ENABLE_CLIPMAP : bool = true;
@@ -30,9 +30,9 @@ const ENABLE_CLOUDS  : bool = true;
 const ENABLE_FOG     : bool = true;
 const ENABLE_BLOOM   : bool = true;
 
-//// --------------------------------------------------------------------------
-//// Materials
-//// --------------------------------------------------------------------------
+
+
+
 
 const MAT_AIR   : u32 = 0u;
 const MAT_GRASS : u32 = 1u;
@@ -42,17 +42,17 @@ const MAT_WOOD  : u32 = 4u;
 const MAT_LEAF  : u32 = 5u;
 const MAT_LIGHT : u32 = 6u;
 
-//// --------------------------------------------------------------------------
-//// Sun / sky (shared, but shading logic lives in ray_core.wgsl)
-//// --------------------------------------------------------------------------
+
+
+
 
 const SUN_DIR       : vec3<f32> = vec3<f32>(0.61237244, 0.5, 0.61237244);
 const SUN_COLOR     : vec3<f32> = vec3<f32>(1.0, 0.94, 0.72);
 const SUN_INTENSITY : f32       = 5.0;
 
-//// --------------------------------------------------------------------------
-//// Shadows / volumetric shadowing
-//// --------------------------------------------------------------------------
+
+
+
 
 const SHADOW_BIAS  : f32 = 2e-4;
 
@@ -63,9 +63,9 @@ const LEAF_LIGHT_TRANSMIT  : f32 = 0.50;
 const GRASS_LIGHT_TRANSMIT : f32 = 0.70;
 const MIN_TRANS            : f32 = 0.03;
 
-//// --------------------------------------------------------------------------
-//// Godrays (tuning knobs)
-//// --------------------------------------------------------------------------
+
+
+
 
 const GODRAY_ENERGY_BOOST    : f32 = 8.0;
 const GODRAY_KNEE_INTEGRATE  : f32 = 0.35;
@@ -76,9 +76,9 @@ const GODRAY_FADE_FAR  : f32 = 80.0;
 
 const GODRAY_KNEE_COMPOSITE : f32 = 0.25;
 
-//// --------------------------------------------------------------------------
-//// Fog / volumetrics
-//// --------------------------------------------------------------------------
+
+
+
 
 const FOG_HEIGHT_FALLOFF : f32 = 0.18;
 const FOG_MAX_DIST       : f32 = 120.0;
@@ -105,80 +105,80 @@ const GODRAY_HAZE_NEAR_FADE  : f32 = 18.0;
 
 const GODRAY_TV_CUTOFF   : f32 = 0.02;
 
-// If near-camera shafts look under-sampled: MIN_STEPS 8 → 10/12
-// If mid/far looks under-sampled: STEPS_PER_METER 1.0 → 1.25
-// If still too slow: STEPS_PER_METER 1.0 → 0.75 (keep MIN_STEPS)
+
+
+
 const GODRAY_STEPS_FAST  : u32 = 24u;
 const GODRAY_STEPS_PER_METER = 1.25;
-const GODRAY_MIN_STEPS: u32 = 8u;        // keep some detail near silhouettes
-const GODRAY_STEP_Q:   u32 = 4u;         // quantize step count to reduce temporal shimmer
+const GODRAY_MIN_STEPS: u32 = 8u;        
+const GODRAY_STEP_Q:   u32 = 4u;         
 
 const GODRAY_SHAFT_GAIN: f32 = 3.0;
 
-const GODRAY_EDGE_ENERGY_BOOST: f32 = 2.5; // try 1.0 .. 4.0
+const GODRAY_EDGE_ENERGY_BOOST: f32 = 2.5; 
 
-//// --------------------------------------------------------------------------
-//// Phase
-//// --------------------------------------------------------------------------
+
+
+
 
 const INV_4PI     : f32 = 0.0795774715;
 const PHASE_G     : f32 = 0.15;
 const PHASE_MIE_W : f32 = 0.20;
 
-//// --------------------------------------------------------------------------
-//// Clouds (cheap volumetric slab)
-//// --------------------------------------------------------------------------
 
-// Vertical slab in meters
+
+
+
+
 const CLOUD_BASE_H : f32 = 170.0;
 const CLOUD_TOP_H  : f32 = 250.0;
 
-// Horizontal scale and wind
+
 const CLOUD_UV_SCALE : f32       = 0.0016;
 const CLOUD_WIND     : vec2<f32> = vec2<f32>(0.020, 0.012);
 
-// Coverage thresholding (raise coverage => fewer clouds)
+
 const CLOUD_COVERAGE : f32 = 0.40;
 const CLOUD_SOFTNESS : f32 = 0.08;
 
-// Density + shaping
-const CLOUD_DENSITY     : f32 = 0.058; // extinction scale (bigger = thicker/darker)
-const CLOUD_PUFF_POW    : f32 = 1.8;   // >1 makes denser cores, airier edges
-const CLOUD_DETAIL_W    : f32 = 0.35;  // detail noise weight
 
-// March quality
-const CLOUD_STEPS_VIEW  : u32 = 8u;  // view ray steps in sky
-const CLOUD_STEPS_LIGHT : u32 = 4u;  // sun-light shadow steps
+const CLOUD_DENSITY     : f32 = 0.058; 
+const CLOUD_PUFF_POW    : f32 = 1.8;   
+const CLOUD_DETAIL_W    : f32 = 0.35;  
 
-// Horizon fade (keep)
+
+const CLOUD_STEPS_VIEW  : u32 = 8u;  
+const CLOUD_STEPS_LIGHT : u32 = 4u;  
+
+
 const CLOUD_HORIZON_Y0 : f32 = 0.02;
 const CLOUD_HORIZON_Y1 : f32 = 0.25;
 
-// Appearance knobs
+
 const CLOUD_BASE_COL   : vec3<f32> = vec3<f32>(0.72, 0.74, 0.76);
 const CLOUD_SILVER_POW : f32       = 8.0;
 const CLOUD_SILVER_STR : f32       = 0.6;
 
-// How much clouds attenuate SUNLIGHT hitting the world
+
 const CLOUD_SHADOW_ABSORB   : f32 = 6.0;
 const CLOUD_SHADOW_STRENGTH : f32 = 0.8;
 
-// Sun-disc dim behavior (keep)
+
 const CLOUD_DIM_SUN_DISC : bool = true;
 
-// NEW: make sun-disc dim track *visual opacity* (T_view) strongly.
-// If a cloud looks opaque-ish, the disc should vanish quickly.
-const CLOUD_SUN_DISC_DIM_POW   : f32 = 8.0;  // try 4..12 (bigger = dimmer disc)
-const CLOUD_SUN_DISC_DIM_FLOOR : f32 = 0.0;  // set ~0.01 if you want “always visible” sun
 
-// Godray coupling (keep)
+
+const CLOUD_SUN_DISC_DIM_POW   : f32 = 8.0;  
+const CLOUD_SUN_DISC_DIM_FLOOR : f32 = 0.0;  
+
+
 const CLOUD_GODRAY_W : f32 = 0.50;
 
 const SKY_EXPOSURE : f32 = 0.40;
 
-//// --------------------------------------------------------------------------
-//// Leaf wind (displaced cubes)
-//// --------------------------------------------------------------------------
+
+
+
 
 const WIND_CELL_FREQ : f32       = 2.5;
 const WIND_DIR_XZ    : vec2<f32> = vec2<f32>(0.9, 0.4);
@@ -207,9 +207,9 @@ const LEAF_LOD_DISP_END   : f32 = 70.0;
 const WIND_PHASE_OFF_1 : vec3<f32> = vec3<f32>(19.0, 7.0, 11.0);
 const TAU             : f32        = 6.28318530718;
 
-//// --------------------------------------------------------------------------
-//// Ray / post
-//// --------------------------------------------------------------------------
+
+
+
 
 const PRIMARY_NUDGE_VOXEL_FRAC : f32 = 1e-4;
 
@@ -222,9 +222,9 @@ const COMPOSITE_SHARPEN : f32 = 0.1;
 
 const POST_EXPOSURE : f32 = 0.15;
 
-//// --------------------------------------------------------------------------
-//// Grass “hair” (procedural blades)
-//// --------------------------------------------------------------------------
+
+
+
 
 const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.20;
 const GRASS_BLADE_COUNT           : u32 = 2u;
@@ -249,18 +249,18 @@ const GRASS_SEGS_FAR : u32 = 1u;
 const GRASS_TRACE_STEPS_MID : u32 = 6u;
 const GRASS_TRACE_STEPS_FAR : u32 = 4u;
 
-// Primary-pass grass gating (tune these)
-const GRASS_PRIMARY_MAX_DIST : f32 = 20.0; // meters-ish
-const GRASS_PRIMARY_MIN_NY   : f32 = 0.60; // only fairly upward normals
-const GRASS_PRIMARY_RATE_MASK: u32 = 3u;   // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
+
+const GRASS_PRIMARY_MAX_DIST : f32 = 20.0; 
+const GRASS_PRIMARY_MIN_NY   : f32 = 0.60; 
+const GRASS_PRIMARY_RATE_MASK: u32 = 3u;   
 
 
-// Misc
+
 const ALBEDO_VAR_GAIN = 3.5;
 
-//// --------------------------------------------------------------------------
-//// GPU structs (must match Rust layouts)
-//// --------------------------------------------------------------------------
+
+
+
 
 struct Node {
   child_base : u32,
@@ -299,7 +299,7 @@ struct Camera {
   grid_origin_chunk : vec4<i32>,
   grid_dims         : vec4<u32>,
 
-  // xy = render size in pixels, zw = present size in pixels
+  
   render_present_px : vec4<u32>,
 };
 
@@ -315,9 +315,9 @@ struct ChunkMeta {
   _pad2        : u32,
 };
 
-//// --------------------------------------------------------------------------
-//// Scene bindings (group 0) - shared across passes
-//// --------------------------------------------------------------------------
+
+
+
 
 @group(0) @binding(0) var<uniform> cam : Camera;
 @group(0) @binding(1) var<storage, read> chunks     : array<ChunkMeta>;
@@ -328,18 +328,18 @@ struct ChunkMeta {
 @group(0) @binding(11) var<storage, read> chunk_colinfo : array<u32>;
 
 
-//// --------------------------------------------------------------------------
-//// Shared helpers
-//// --------------------------------------------------------------------------
 
-const MACRO_DIM : u32 = 8u;              // 8x8x8 macro cells per chunk
-const MACRO_WORDS_PER_CHUNK : u32 = 16u; // 512 bits / 32
+
+
+
+const MACRO_DIM : u32 = 8u;              
+const MACRO_WORDS_PER_CHUNK : u32 = 16u; 
 
 fn macro_cell_size(root_size: f32) -> f32 {
   return root_size / f32(MACRO_DIM);
 }
 
-// bit index = mx + 8*(my + 8*mz) in [0..511]
+
 fn macro_bit_index(mx: u32, my: u32, mz: u32) -> u32 {
   return mx + MACRO_DIM * (my + MACRO_DIM * mz);
 }
@@ -357,9 +357,9 @@ fn safe_inv(x: f32) -> f32 {
 
 fn safe_normalize(v: vec3<f32>) -> vec3<f32> {
   let l2 = dot(v, v);
-  // 1e-12 is conservative for f32; tweak if you want.
+  
   if (l2 <= 1e-12) {
-    return vec3<f32>(0.0, 1.0, 0.0); // arbitrary stable fallback
+    return vec3<f32>(0.0, 1.0, 0.0); 
   }
   return v * inverseSqrt(l2);
 }
@@ -450,7 +450,7 @@ fn grid_lookup_slot(cx: i32, cy: i32, cz: i32) -> u32 {
 }
 
 fn chunk_coord_from_pos(p: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
-  // Bias inward to avoid precision-induced chunk flips at exact boundaries.
+  
   let eps = 1e-6 * chunk_size_m;
   let px = p.x - sign(p.x) * eps;
   let py = p.y - sign(p.y) * eps;
@@ -463,7 +463,7 @@ fn chunk_coord_from_pos(p: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
 }
 
 fn chunk_coord_from_pos_dir(p: vec3<f32>, rd: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
-  // Bias along ray direction to stay on the same side of boundaries during DDA.
+  
   let eps = 1e-6 * chunk_size_m;
   let px = p.x + sign(rd.x) * eps;
   let py = p.y + sign(rd.y) * eps;
@@ -476,17 +476,17 @@ fn chunk_coord_from_pos_dir(p: vec3<f32>, rd: vec3<f32>, chunk_size_m: f32) -> v
 }
 
 fn chunk_max_depth() -> u32 {
-  // chunk_size is power-of-two; log2 = 31 - clz
+  
   return 31u - countLeadingZeros(cam.chunk_size);
 }
 
-// ---- Column info (64x64) ----
+
 
 fn col_idx_64(ix: u32, iz: u32) -> u32 {
-  return iz * 64u + ix; // 0..4095
+  return iz * 64u + ix; 
 }
 
-// returns (y8, mat8). y8==255 => empty column.
+
 fn colinfo_load(ch: ChunkMeta, ix: u32, iz: u32) -> vec2<u32> {
   let idx  = col_idx_64(ix, iz);
   let word = chunk_colinfo[ch.colinfo_base + (idx >> 1u)];
@@ -497,14 +497,14 @@ fn colinfo_load(ch: ChunkMeta, ix: u32, iz: u32) -> vec2<u32> {
   return vec2<u32>(y8, mat8);
 }
 
-//// --------------------------------------------------------------------------
-//// Hash / noise helpers (shared)
-//// --------------------------------------------------------------------------
 
-const U32_TO_F01 : f32 = 1.0 / 4294967296.0; // 2^-32
+
+
+
+const U32_TO_F01 : f32 = 1.0 / 4294967296.0; 
 
 fn hash_u32(x: u32) -> u32 {
-  // Murmur3 finalizer-like mix (good diffusion, cheap)
+  
   var v = x;
   v ^= v >> 16u;
   v *= 0x7feb352du;
@@ -515,11 +515,11 @@ fn hash_u32(x: u32) -> u32 {
 }
 
 fn hash2_u32(x: u32, y: u32) -> u32 {
-  // simple combine then mix
+  
   return hash_u32(x * 0x8da6b343u ^ y * 0xd8163841u);
 }
 
-// Replacement: 2D -> [0,1)
+
 fn hash12(p: vec2<f32>) -> f32 {
   let ix: u32 = bitcast<u32>(i32(floor(p.x)));
   let iy: u32 = bitcast<u32>(i32(floor(p.y)));
@@ -577,13 +577,13 @@ fn present_dims_f() -> vec2<f32> {
   return vec2<f32>(f32(cam.render_present_px.z), f32(cam.render_present_px.w));
 }
 
-// Map a present pixel center (in present pixel coords) -> normalized UV over render
+
 fn uv_render_from_present_px(px_present: vec2<f32>) -> vec2<f32> {
   let pd = present_dims_f();
   return (px_present) / pd;
 }
 
-// Map present pixel center -> render pixel center (float)
+
 fn px_render_from_present_px(px_present: vec2<f32>) -> vec2<f32> {
   let rd = render_dims_f();
   let uv = uv_render_from_present_px(px_present);
@@ -599,13 +599,13 @@ fn ip_render_from_present_px(px_present: vec2<f32>) -> vec2<i32> {
 }
 
 fn is_nan_f32(x: f32) -> bool {
-  // NaN is the only float where x != x
+  
   return x != x;
 }
 
 fn is_inf_f32(x: f32) -> bool {
-  // Treat very large magnitude as inf/overflow.
-  // f32 max is ~3.4e38; choose a slightly smaller guard.
+  
+  
   return abs(x) > 1.0e30;
 }
 

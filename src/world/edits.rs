@@ -1,9 +1,9 @@
-// src/world/edits.rs
-// ------------------
-//
-// Stores per-voxel edits as CHUNK-LOCAL linear indices (0..CHUNK_SIZE^3-1).
-// This matches builder.rs usage:
-//   for e in edits { scratch.material[e.idx as usize] = e.mat; }
+
+
+
+
+
+
 
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -15,8 +15,8 @@ use crate::world::WorldGen;
 
 #[inline(always)]
 pub fn idx_xyz(lx: i32, ly: i32, lz: i32, cs: i32) -> u32 {
-    // Choose ONE layout and use it everywhere.
-    // I strongly recommend x + y*cs + z*cs*cs (x,y,z) because it's the usual row-major 3D.
+    
+    
     (lx as u32) + (ly as u32) * (cs as u32) + (lz as u32) * (cs as u32) * (cs as u32)
 }
 
@@ -29,12 +29,12 @@ pub fn voxel_to_chunk_local(
 ) -> (ChunkKey, i32, i32, i32) {
     let cs = config::CHUNK_SIZE as i32;
 
-    // Absolute chunk coords in XYZ
+    
     let cx = wx.div_euclid(cs);
     let cy = wy.div_euclid(cs);
     let cz = wz.div_euclid(cs);
 
-    // Chunk-local coords in [0..cs)
+    
     let lx = wx.rem_euclid(cs);
     let ly = wy.rem_euclid(cs);
     let lz = wz.rem_euclid(cs);
@@ -45,17 +45,17 @@ pub fn voxel_to_chunk_local(
 
 #[derive(Clone, Copy, Debug)]
 pub struct EditEntry {
-    /// Chunk-local linear index:
-    /// idx = y*CHUNK_SIZE*CHUNK_SIZE + z*CHUNK_SIZE + x
+    
+    
     pub idx: u32,
     pub mat: u32,
 }
 
 #[derive(Default)]
 struct ChunkEdits {
-    // Always kept sorted by idx.
+    
     list: Vec<EditEntry>,
-    // Frozen snapshot for worker threads.
+    
     frozen: Arc<[EditEntry]>,
     dirty: bool,
 }
@@ -111,7 +111,7 @@ impl ChunkEdits {
 
     fn snapshot(&mut self) -> Arc<[EditEntry]> {
         if self.dirty {
-            // list is already sorted; just freeze.
+            
             self.frozen = Arc::from(self.list.clone().into_boxed_slice());
             self.dirty = false;
         }
@@ -124,8 +124,8 @@ impl ChunkEdits {
 }
 
 pub struct EditStore {
-    // Sparse per-chunk overrides.
-    // Per-chunk list kept sorted by idx so lookups are fast.
+    
+    
     map: RwLock<HashMap<ChunkKey, ChunkEdits>>,
 }
 
@@ -161,8 +161,8 @@ impl EditStore {
         Some(y * cs_u * cs_u + z * cs_u + x)
     }
 
-    /// Set/overwrite a single voxel override inside a chunk.
-    /// Stores AIR too (so “dig” is a real override).
+    
+    
     pub fn apply_voxel(&self, key: ChunkKey, lx: i32, ly: i32, lz: i32, mat: u32) {
         let Some(idx) = Self::local_idx(lx, ly, lz) else { return; };
 
@@ -171,7 +171,7 @@ impl EditStore {
         chunk.set_idx(idx, mat);
     }
 
-    /// Returns Some(mat) if there is an override for that voxel.
+    
     pub fn get_override(&self, key: ChunkKey, lx: i32, ly: i32, lz: i32) -> Option<u32> {
         let idx = Self::local_idx(lx, ly, lz)?;
         let map = self.map_read();
@@ -179,8 +179,8 @@ impl EditStore {
         chunk.get_idx(idx)
     }
 
-    /// Snapshot all edits for a chunk to send to a worker thread.
-    /// (Your build code already calls this.)
+    
+    
     pub fn snapshot(&self, key: ChunkKey) -> Arc<[EditEntry]> {
         let mut map = self.map_write();
         match map.get_mut(&key) {

@@ -1,6 +1,6 @@
-//// --------------------------------------------------------------------------
-//// Composite helpers (godray upsample + tonemap)
-//// --------------------------------------------------------------------------
+
+
+
 
 fn bright_extract_hue(x: vec3<f32>, thresh: f32) -> vec3<f32> {
   let lum_w = vec3<f32>(0.2126, 0.7152, 0.0722);
@@ -23,27 +23,27 @@ fn composite_pixel_mapped(
   godray_samp: sampler,
   depth_full: texture_2d<f32>
 ) -> vec4<f32> {
-  // --- render dims (color buffer) ---
+  
   let rd_u = textureDimensions(color_tex);
   let rd_i = vec2<i32>(i32(rd_u.x), i32(rd_u.y));
   let rd_f = vec2<f32>(f32(rd_u.x), f32(rd_u.y));
 
-  // Clamp render ip
+  
   let ip_r = vec2<i32>(
     clamp(ip_render.x, 0, rd_i.x - 1),
     clamp(ip_render.y, 0, rd_i.y - 1)
   );
 
-  // Base color in render space
+  
   let base = textureLoad(color_tex, ip_r, 0).xyz;
 
-  // --- full dims (depth buffer) ---
+  
   let fd_u = textureDimensions(depth_full);
   let fd_i = vec2<i32>(i32(fd_u.x), i32(fd_u.y));
   let fd_f = vec2<f32>(f32(fd_u.x), f32(fd_u.y));
 
-  // Map render pixel -> full pixel (important!)
-  // px_render is in render pixel coords; convert to full pixel coords.
+  
+  
   let px_full = px_render * (fd_f / rd_f);
 
   let ip_f = vec2<i32>(
@@ -51,23 +51,23 @@ fn composite_pixel_mapped(
     clamp(i32(floor(px_full.y)), 0, fd_i.y - 1)
   );
 
-  // UV for godray sampling MUST match the full-res screen mapping
+  
   let uv_full = (px_full + vec2<f32>(0.5)) / fd_f;
 
-  // Godray taps in godray texel units
+  
   let gd_u = textureDimensions(godray_tex);
   let gd_f = vec2<f32>(f32(gd_u.x), f32(gd_u.y));
   let du = vec2<f32>(1.0 / gd_f.x, 0.0);
   let dv = vec2<f32>(0.0, 1.0 / gd_f.y);
 
-  // Sample godrays in the correct UV space
+  
   let gC = godray_sample_linear(uv_full,       godray_tex, godray_samp);
   let gE = godray_sample_linear(uv_full + du,  godray_tex, godray_samp);
   let gW = godray_sample_linear(uv_full - du,  godray_tex, godray_samp);
   let gN = godray_sample_linear(uv_full + dv,  godray_tex, godray_samp);
   let gS = godray_sample_linear(uv_full - dv,  godray_tex, godray_samp);
 
-  // Depth edge weights MUST be full-res taps too
+  
   let d0 = textureLoad(depth_full, ip_f, 0).x;
 
   let ipE = vec2<i32>(min(ip_f.x + 1, fd_i.x - 1), ip_f.y);
@@ -97,27 +97,27 @@ fn composite_pixel_mapped(
   let god_far   = smoothstep(GODRAY_FADE_NEAR, GODRAY_FADE_FAR, d0);
   let god_scale = GODRAY_COMPOSITE_SCALE * mix(1.0, 0.25, god_far);
 
-  // --- Keep far godrays more "sun-yellow" instead of washing to white ---
+  
   let lum_w = vec3<f32>(0.2126, 0.7152, 0.0722);
 
-  // Sun hue normalized (avoid divide-by-zero)
+  
   let sun_hue = normalize(max(SUN_COLOR, vec3<f32>(1e-4)));
 
-  // Match brightness but enforce sun hue
+  
   let g_lum = max(dot(god_lin, lum_w), 0.0);
   let god_sun = sun_hue * g_lum;
 
-  // Apply more hue-lock as distance increases
-  let hue_lock = 0.55 * god_far;          // try 0.35..0.85
+  
+  let hue_lock = 0.55 * god_far;          
   god_lin = mix(god_lin, god_sun, hue_lock);
 
-  // Optional extra warmth (subtle) for very far shafts
-  let warm = mix(vec3<f32>(1.0), vec3<f32>(1.08, 1.03, 0.92), god_far); // tweak to taste
+  
+  let warm = mix(vec3<f32>(1.0), vec3<f32>(1.08, 1.03, 0.92), god_far); 
   god_lin *= warm;
 
   var hdr = max(base + god_scale * god_lin, vec3<f32>(0.0));
 
-  // Bloom (hue-preserving + distance-faded)
+  
   let bloom_thresh = 1.4;
   let bloom_k      = 0.12;
   let bloom_k_eff  = bloom_k * mix(1.0, 0.0, god_far);
@@ -144,7 +144,7 @@ fn composite_pixel_mapped(
   let bloom_max = 0.35 * max(hdr, vec3<f32>(0.0));
   hdr += bloom_k_eff * min(bloom, bloom_max);
 
-  // Distance-safe saturation compensation (HDR)
+  
   let l_hdr  = max(dot(hdr, lum_w), 1e-6);
   let gray_h = vec3<f32>(l_hdr);
 
@@ -157,48 +157,48 @@ fn composite_pixel_mapped(
 
   hdr = mix(gray_h, hdr, sat_boost);
 
-  // --- Grade knobs (constants or uniforms)
+  
   let exposure = 1.10;
   let contrast = 1.05;
-  let temp     = 0.03; // +warm, -cool
+  let temp     = 0.03; 
 
   hdr *= exposure;
 
-  // temperature: push R up, B down a bit
+  
   hdr *= vec3<f32>(1.0 + temp, 1.0, 1.0 - temp);
 
-  // contrast around mid-gray
+  
   let mid = vec3<f32>(0.18);
   hdr = (hdr - mid) * contrast + mid;
   hdr = max(hdr, vec3<f32>(0.0));
 
 
-  // --- Filmic tonemap (single global tonemap) ---
-  let white_point: f32 = 6.0; // try 4..10 (bigger = brighter highlights)
+  
+  let white_point: f32 = 6.0; 
   var c = tonemap_filmic_white_scale(hdr * POST_EXPOSURE, white_point);
 
-  // Clamp to display range (still linear at this point)
+  
   c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
 
-  // Optional tiny "print" bias (keep subtle)
+  
   c = pow(c, vec3<f32>(0.98));
 
-  // Dither/grain before gamma
+  
   let fi = f32(cam.frame_index & 255u);
   let n0 = hash12(px_render + vec2<f32>(fi, 0.0)) - 0.5;
   let n1 = hash12(px_render * 0.73 + vec2<f32>(0.0, fi)) - 0.5;
   let n  = 0.6 * n0 + 0.4 * n1;
   c += vec3<f32>(n / 1536.0);
 
-  // Gamma encode to LDR output
+  
   let ldr = gamma_encode(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)));
   return vec4<f32>(ldr, 1.0);
 }
 
-// LUT-less filmic tonemap (Hable/Uncharted2-style), per-channel.
-// Input: HDR linear. Output: LDR-ish (0..~1), still linear until gamma.
+
+
 fn tonemap_filmic_hable(x: vec3<f32>) -> vec3<f32> {
-  // These are the classic Hable curve constants.
+  
   let A: f32 = 0.22;
   let B: f32 = 0.30;
   let C: f32 = 0.10;
@@ -212,8 +212,8 @@ fn tonemap_filmic_hable(x: vec3<f32>) -> vec3<f32> {
   return (num / max(den, vec3<f32>(1e-6))) - vec3<f32>(E / F);
 }
 
-// Optional: normalize so "white" maps nicely.
-// (Keeps highlights from feeling dim if you raise exposure.)
+
+
 fn tonemap_filmic_white_scale(x: vec3<f32>, white_point: f32) -> vec3<f32> {
   let w = tonemap_filmic_hable(vec3<f32>(white_point));
   let invw = vec3<f32>(1.0) / max(w, vec3<f32>(1e-6));

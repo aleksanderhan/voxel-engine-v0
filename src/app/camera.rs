@@ -1,4 +1,4 @@
-// src/camera.rs
+
 use glam::{Mat4, Vec3};
 
 use crate::app::config;
@@ -11,7 +11,7 @@ pub struct Camera {
     fovy_rad: f32,
     z_near: f32,
     z_far: f32,
-    // movement tuning
+    
     speed_mps: f32,
     mouse_sens: f32,
     sprint_mul: f32,
@@ -25,7 +25,7 @@ pub struct CameraFrame {
 
 impl Camera {
     pub fn new(aspect: f32) -> Self {
-        let _ = aspect; // kept for future (if you want aspect-dependent params)
+        let _ = aspect; 
         Self {
             pos: Vec3::new((config::CHUNK_SIZE as f32 * config::VOXEL_SIZE_M_F32) * 0.5, 20.0, -20.0),
             yaw: 0.0,
@@ -54,7 +54,7 @@ impl Camera {
     }
 
     pub fn integrate_input(&mut self, input: &mut InputState, dt: f32) {
-        // mouse look
+        
         if input.focused {
             let (dx, dy) = input.take_mouse_delta();
             self.yaw -= dx * self.mouse_sens;
@@ -63,7 +63,7 @@ impl Camera {
             let _ = input.take_mouse_delta();
         }
 
-        // basis
+        
         let forward = Vec3::new(
             self.yaw.sin() * self.pitch.cos(),
             self.pitch.sin(),
@@ -74,7 +74,7 @@ impl Camera {
         let right = forward.cross(Vec3::Y).normalize();
         let up = right.cross(forward).normalize();
 
-        // movement intent
+        
         let k = input.keys;
         let mut vel = Vec3::ZERO;
         if k.w { vel += forward; }

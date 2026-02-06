@@ -1,4 +1,4 @@
-// src/svo/mips.rs
+
 
 use rayon::prelude::*;
 
@@ -26,7 +26,7 @@ pub fn build_minmax_mip_inplace<'a>(
         max_levels.resize_with(levels, Vec::new);
     }
 
-    // lvl 0
+    
     min_levels[0].resize(base.len(), 0);
     min_levels[0].copy_from_slice(base);
 
@@ -35,8 +35,8 @@ pub fn build_minmax_mip_inplace<'a>(
 
     let mut cur_side = side;
 
-    // Optimization (2): compute min+max for each level in one traversal.
-    // Optimization (6): parallelize by output rows (z).
+    
+    
     for lvl in 1..levels {
         let next_side = cur_side / 2;
         let need = (next_side * next_side) as usize;
@@ -131,13 +131,13 @@ pub fn build_max_mip_inplace<'a>(
         levels.resize_with(nlevels, Vec::new);
     }
 
-    // lvl 0
+    
     levels[0].resize(base.len(), 0);
     levels[0].copy_from_slice(base);
 
     let mut cur_side = side;
 
-    // Optimization (6): parallelize by output rows (z).
+    
     for lvl in 1..nlevels {
         let next_side = cur_side / 2;
         let need = (next_side * next_side) as usize;

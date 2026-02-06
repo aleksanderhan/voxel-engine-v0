@@ -1,9 +1,9 @@
-// src/render/gpu_types.rs
-// -----------------------
-//
-// Fix: ClipLevelParams now has `packed_offsets`, but we keep its existing
-// `inv_cell_size_m` field on CPU side.
-// GPU uniform uses vec4 per level with packed offsets in .w.
+
+
+
+
+
+
 
 use bytemuck::{Pod, Zeroable};
 use crate::app::config;
@@ -14,7 +14,7 @@ pub struct NodeGpu {
     pub child_base: u32,
     pub child_mask: u32,
     pub material: u32,
-    pub key: u32, // packed spatial key: level + coord at that level
+    pub key: u32, 
 }
 
 #[repr(C)]
@@ -69,20 +69,20 @@ pub struct CameraGpu {
     pub render_present_px: [u32; 4],
 }
 
-/// Clipmap uniform payload.
-///
-/// Matches `shaders/clipmap.wgsl`.
-///
-/// Per level vec4<f32>:
-///   x = origin_x_m
-///   y = origin_z_m
-///   z = cell_size_m
-///   w = unused (0)
-///
-/// Per level vec4<u32>:
-///   x = off_x (toroidal offset in texels)
-///   y = off_z
-///   z/w unused (0)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct ClipmapGpu {
@@ -105,7 +105,7 @@ impl ClipmapGpu {
 
             level[i] = [p.origin_x_m, p.origin_z_m, p.cell_size_m, 0.0];
 
-            // NOTE: these fields change on CPU side in the next patch (ClipLevelParams)
+            
             offset[i] = [p.off_x, p.off_z, 0, 0];
         }
 
@@ -124,10 +124,10 @@ impl ClipmapGpu {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct OverlayGpu {
-    // packed digits: d0 | d1<<8 | d2<<16 | d3<<24 (d0=ones, d3=thousands)
+    
     pub digits_packed: u32,
 
-    // HUD rectangle in framebuffer pixel coords (top-left origin)
+    
     pub origin_x: u32,
     pub origin_y: u32,
     pub total_w:  u32,
@@ -136,13 +136,13 @@ pub struct OverlayGpu {
     pub scale:    u32,
     pub stride:   u32,
 
-    // --- NEW: mode label ("DIG", "DIRT", "STONE", ...)
-    pub text_len: u32, // number of chars <= 12
-    pub text_p0:  u32, // 4 ASCII bytes packed little-endian
-    pub text_p1:  u32, // 4 ASCII bytes
-    pub text_p2:  u32, // 4 ASCII bytes
+    
+    pub text_len: u32, 
+    pub text_p0:  u32, 
+    pub text_p1:  u32, 
+    pub text_p2:  u32, 
 
-    // pad to 64 bytes (uniform structs are effectively 16-byte aligned)
+    
     pub _pad0:    u32,
 }
 
@@ -155,7 +155,7 @@ fn pack4(a: u8, b: u8, c: u8, d: u8) -> u32 {
 }
 
 fn pack_text_12(s: &str) -> (u32, u32, u32, u32) {
-    // Uppercase, ASCII only, pad with spaces, clamp to 12 chars.
+    
     let mut buf = [b' '; 12];
     for (i, ch) in s.bytes().take(12).enumerate() {
         let u = if (b'a'..=b'z').contains(&ch) { ch - 32 } else { ch };
@@ -177,7 +177,7 @@ impl OverlayGpu {
         _height: u32,
         scale: u32,
     ) -> Self {
-        // ---- FPS digits ----
+        
         let mut v = fps.min(9999);
         let d0 = (v % 10) as u32; v /= 10;
         let d1 = (v % 10) as u32; v /= 10;
@@ -185,7 +185,7 @@ impl OverlayGpu {
         let d3 = (v % 10) as u32;
         let digits_packed = d0 | (d1 << 8) | (d2 << 16) | (d3 << 24);
 
-        // ---- Layout (same as before) ----
+        
         let margin: u32 = 12;
         let digit_w = 3 * scale;
         let digit_h = 5 * scale;
@@ -199,15 +199,15 @@ impl OverlayGpu {
         let origin_x = ox_i.max(0) as u32;
         let origin_y = oy_i.max(0) as u32;
 
-        // ---- Label ----
-        // IMPORTANT: use material IDs -> strings (NOT raw ID bytes).
+        
+        
         let label: &str = match edit_mat {
             crate::world::materials::AIR   => "AIR",
             crate::world::materials::DIRT  => "DIRT",
             crate::world::materials::STONE => "STONE",
             crate::world::materials::WOOD  => "WOOD",
             crate::world::materials::LIGHT => "LIGHT",
-            _ => "UNKNOWN", // fallback;
+            _ => "UNKNOWN", 
         };
 
         let (text_len, text_p0, text_p1, text_p2) = pack_text_12(label);

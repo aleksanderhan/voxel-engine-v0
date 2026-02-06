@@ -1,4 +1,4 @@
-// src/streaming/manager/stats.rs
+
 use crate::streaming::types::*;
 use super::ChunkManager;
 use crate::svo::builder::BuildTimingsMs;
@@ -47,9 +47,9 @@ pub fn stats(mgr: &mut ChunkManager) -> Option<StreamStats> {
     }
     s.orphan_queued = orphan;
 
-    // ---------------------------------------------------------------------
-    // Drain timing window (only called on profiler cadence)
-    // ---------------------------------------------------------------------
+    
+    
+    
     let w = mgr.timing.drain();
 
     s.builds_done     = w.builds_done;

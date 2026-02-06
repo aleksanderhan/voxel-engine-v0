@@ -1,7 +1,7 @@
-// src/svo/builder_prefix.rs
-//
-// Prefix sum / summed-volume table for solid occupancy.
-// prefix[x,y,z] = sum of occupancy in [0..x)×[0..y)×[0..z)
+
+
+
+
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -29,7 +29,7 @@ pub fn ensure_prefix(prefix: &mut Vec<u32>, side: usize) {
     }
 }
 
-/// Query sum over cube [x0..x0+size) × [y0..y0+size) × [z0..z0+size)
+
 pub fn prefix_sum_cube(prefix: &[u32], side: usize, x0: usize, y0: usize, z0: usize, size: usize) -> u32 {
     let dim = side + 1;
     let x1 = x0 + size;
@@ -50,8 +50,8 @@ pub fn prefix_sum_cube(prefix: &[u32], side: usize, x0: usize, y0: usize, z0: us
     s as u32
 }
 
-/// Pass 1: write occupancy and prefix along X for each (y,z) row.
-/// Layout: idx_prefix(dim,x,y,z) => x contiguous.
+
+
 pub fn prefix_pass_x(prefix: &mut [u32], material: &[u8], side: usize, cancel: &AtomicBool) {
     let dim = side + 1;
     let plane = dim * dim;
@@ -65,7 +65,7 @@ pub fn prefix_pass_x(prefix: &mut [u32], material: &[u8], side: usize, cancel: &
         let slab = &mut prefix[slab0..slab0 + plane];
 
         for y in 1..=side {
-            // prefix row slice for this (y,z): x contiguous
+            
             let row = &mut slab[y * dim..(y + 1) * dim];
 
             let base_m = ((y - 1) * side * side) + ((z - 1) * side);
@@ -73,7 +73,7 @@ pub fn prefix_pass_x(prefix: &mut [u32], material: &[u8], side: usize, cancel: &
             let mut run: u32 = 0;
             row[0] = 0;
 
-            // x = 1..=side writes row[x]
+            
             for x in 1..=side {
                 let m = unsafe { *material.get_unchecked(base_m + (x - 1)) };
                 run += (m != (AIR as u8)) as u32;
@@ -85,7 +85,7 @@ pub fn prefix_pass_x(prefix: &mut [u32], material: &[u8], side: usize, cancel: &
     }
 }
 
-/// Pass 2: prefix along Y within each Z-plane.
+
 pub fn prefix_pass_y(prefix: &mut [u32], side: usize, cancel: &AtomicBool) {
     let dim = side + 1;
     let plane = dim * dim;
@@ -112,7 +112,7 @@ pub fn prefix_pass_y(prefix: &mut [u32], side: usize, cancel: &AtomicBool) {
 }
 
 
-/// Pass 3: prefix along Z: prefix[x,y,z] += prefix[x,y,z-1].
+
 pub fn prefix_pass_z(prefix: &mut [u32], side: usize, cancel: &AtomicBool) {
     let dim = side + 1;
     let plane = dim * dim;

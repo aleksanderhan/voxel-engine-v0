@@ -1,6 +1,6 @@
-//// --------------------------------------------------------------------------
-//// Grass: SDF blades + tracing
-//// --------------------------------------------------------------------------
+
+
+
 
 struct GrassCell {
   bmin_m : vec3<f32>,
@@ -58,7 +58,7 @@ fn grass_root_uv(cell_id_vox: vec3<f32>, i: u32) -> vec2<f32> {
 }
 
 fn grass_wind_xz(root_m: vec3<f32>, t: f32, strength: f32) -> vec2<f32> {
-  // wind_field returns vec3; we only use XZ for bending
+  
   let w = wind_field(root_m, t) * strength;
   return vec2<f32>(w.x, w.z);
 }
@@ -77,11 +77,11 @@ fn grass_sdf_lod(
   let top_y   = cell_bmin_m.y + vs;
   let layer_h = GRASS_LAYER_HEIGHT_VOX * vs;
 
-  // Quick vertical reject
+  
   let y01 = (p_m.y - top_y) / max(layer_h, 1e-6);
   if (y01 < 0.0 || y01 > 1.0) { return BIG_F32; }
 
-  // Cheap horizontal reject
+  
   let over = GRASS_OVERHANG_VOX * vs;
   if (p_m.x < cell_bmin_m.x - over || p_m.x > cell_bmin_m.x + vs + over ||
       p_m.z < cell_bmin_m.z - over || p_m.z > cell_bmin_m.z + vs + over) {
@@ -90,7 +90,7 @@ fn grass_sdf_lod(
 
   let blade_len = layer_h * (0.65 + 0.35 * hash31(cell_id_vox + vec3<f32>(9.1, 3.7, 5.2)));
 
-  // LOD selection (as before)
+  
   var blade_count: u32 = GRASS_BLADE_COUNT;
   var segs: u32 = u32(max(3.0, floor(GRASS_VOXEL_SEGS)));
   if (lod == 1u) {
@@ -108,11 +108,11 @@ fn grass_sdf_lod(
 
   var dmin = BIG_F32;
 
-  // constants used every blade
+  
   let inset = 0.12;
 
   for (var i: u32 = 0u; i < blade_count; i = i + 1u) {
-    // One hash => u,v,phase
+    
     let uvp = grass_blade_params(cell_id_vox, i);
 
     let ux = mix(inset, 1.0 - inset, uvp.x);
@@ -124,20 +124,20 @@ fn grass_sdf_lod(
       cell_bmin_m.z + uz * vs
     );
 
-    // Phase as a small Y offset into the wind field (keeps variety)
+    
     let ph = uvp.z;
 
-    // Compute wind ONCE per blade (XZ only)
+    
     let w_xz = grass_wind_xz(root + vec3<f32>(0.0, ph, 0.0), time_s, strength);
 
-    // Segment loop: only cheap math + sdf_box
+    
     for (var s: u32 = 0u; s < segs; s = s + 1u) {
       let t01 = (f32(s) + 0.5) * inv_segs;
       let y   = t01 * blade_len;
 
-      // Same “shape” as before:
-      // - height factor: (0.55 + 0.45*t01)
-      // - then scaled by (blade_len * t01)
+      
+      
+      
       let height_factor = (0.55 + 0.45 * t01);
       let bend_mag      = (blade_len * t01) * height_factor;
 
@@ -158,16 +158,16 @@ fn grass_sdf_lod(
 
 
 fn grass_blade_params(cell_id_vox: vec3<f32>, i: u32) -> vec3<f32> {
-  // returns (u, v, phase)
+  
   let fi = f32(i);
 
-  // One hash per blade
+  
   let h = hash31(cell_id_vox + vec3<f32>(fi * 7.3, 1.1, 2.9));
 
-  // Derive 3 decorrelated-ish values from h
-  let u = fract(h * 1.61803398875);  // golden ratio-ish
-  let v = fract(h * 2.41421356237);  // sqrt(2)+1-ish
-  let p = fract(h * 3.14159265359);  // pi-ish
+  
+  let u = fract(h * 1.61803398875);  
+  let v = fract(h * 2.41421356237);  
+  let p = fract(h * 3.14159265359);  
   return vec3<f32>(u, v, p);
 }
 
@@ -179,7 +179,7 @@ fn grass_sdf_normal_lod(
   strength: f32,
   lod: u32
 ) -> vec3<f32> {
-  // Mid/far: cheap approximation is good enough visually
+  
   if (lod != 0u) {
     return vec3<f32>(0.0, 1.0, 0.0);
   }
@@ -268,7 +268,7 @@ fn try_grass_slab_hit(
   var t0 = max(rt_slab.x, t_min);
   var t1 = min(rt_slab.y, t_max);
 
-  // clip by true solid voxel cube (avoid "inside voxel" artifacts)
+  
   let vox_bmin = cell_bmin;
   let vox_bmax = cell_bmin + vec3<f32>(vs);
   let rt_vox   = intersect_aabb(ro, rd, vox_bmin, vox_bmax);
@@ -285,15 +285,15 @@ fn try_grass_slab_hit(
     return GrassHit(false, BIG_F32, vec3<f32>(0.0));
   }
 
-  // ---- NEW: pick LOD based on distance along the ray
+  
   let lod = grass_lod_from_t(t0);
-  // -----------------------------------------------
+  
 
   return grass_layer_trace_lod(ro, rd, t0, t1, cell_bmin, cell_id_vox, time_s, strength, lod);
 }
 
 fn grass_lod_from_t(t: f32) -> u32 {
-  // 0 = near, 1 = mid, 2 = far
+  
   if (t >= GRASS_LOD_FAR_START) { return 2u; }
   if (t >= GRASS_LOD_MID_START) { return 1u; }
   return 0u;
@@ -303,7 +303,7 @@ fn grass_allowed_primary(t: f32, n: vec3<f32>, seed: u32) -> bool {
   if (t > GRASS_PRIMARY_MAX_DIST) { return false; }
   if (n.y < GRASS_PRIMARY_MIN_NY) { return false; }
 
-  // subsample in primary pass (temporal if your seed includes frame index)
+  
   if ((seed & GRASS_PRIMARY_RATE_MASK) != 0u) { return false; }
 
   return true;

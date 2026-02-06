@@ -1,13 +1,13 @@
-// src/render/shaders.rs
-//
-// Centralized shader sources. WGSL has no native include mechanism in wgpu,
-// so we concatenate multiple WGSL files into a single source string.
+
+
+
+
 
 pub const RAY_CS_WGSL: &str = concat!(
     include_str!("../shaders/common.wgsl"),
     "\n",
 
-    // ray_core split into concern-specific modules (order matters)
+    
     include_str!("../shaders/ray/clouds.wgsl"),
     "\n",
     include_str!("../shaders/ray/phase.wgsl"),

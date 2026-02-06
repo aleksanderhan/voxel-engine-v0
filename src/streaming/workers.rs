@@ -1,4 +1,4 @@
-// src/streaming/workers.rs
+
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Instant;
 
@@ -12,7 +12,7 @@ use crate::streaming::build_pool::BUILD_POOL;
 use super::types::{BuildDone, BuildJob};
 
 pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender<BuildDone>) {
-    // Single dispatcher: keeps rx_job FIFO small and lets the pool schedule work.
+    
     std::thread::spawn(move || {
         while let Ok(job) = rx_job.recv() {
             let gen = gen.clone();
@@ -47,8 +47,8 @@ pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Se
                     0,
                 ];
 
-                // NOTE: we're already running on a BUILD_POOL worker thread,
-                // so do NOT call BUILD_POOL.install(...) here.
+                
+                
                 let BuildOutput {
                     nodes,
                     macro_words,

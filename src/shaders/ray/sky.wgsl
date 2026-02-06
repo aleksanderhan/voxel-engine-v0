@@ -1,6 +1,6 @@
-//// --------------------------------------------------------------------------
-//// Sky
-//// --------------------------------------------------------------------------
+
+
+
 
 fn sky_bg(rd: vec3<f32>) -> vec3<f32> {
   let a0: f32 = -0.10; let b0: f32 =  0.85;
@@ -41,21 +41,21 @@ fn sky_sun(rd: vec3<f32>) -> vec3<f32> {
 }
 
 fn sky_color(rd: vec3<f32>) -> vec3<f32> {
-  // Background (no sun) + separate sun term
+  
   let bg  = sky_bg(rd);
   let sun = sky_sun(rd);
 
-  var T_view: f32 = 1.0;         // view transmittance through clouds
-  var acc  = vec3<f32>(0.0);     // cloud radiance
+  var T_view: f32 = 1.0;         
+  var acc  = vec3<f32>(0.0);     
 
-  // ------------------------------------------------------------------------
-  // Volumetric slab clouds (cheap front-to-back)
-  // ------------------------------------------------------------------------
+  
+  
+  
   if (rd.y > 0.01) {
     let ro = cam.cam_pos.xyz;
     let time_s = cam.voxel_params.y;
 
-    // Intersect view ray with slab [CLOUD_BASE_H .. CLOUD_TOP_H]
+    
     let y0 = CLOUD_BASE_H;
     let y1 = CLOUD_TOP_H;
 
@@ -68,13 +68,13 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
     t_enter = max(t_enter, 0.0);
 
     if (t_exit > t_enter) {
-      // Fade clouds out near horizon
+      
       let horizon2 = clamp((rd.y - CLOUD_HORIZON_Y0) / CLOUD_HORIZON_Y1, 0.0, 1.0);
 
       let steps = CLOUD_STEPS_VIEW;
       let dt    = (t_exit - t_enter) / f32(max(steps, 1u));
 
-      // Phase for forward scattering (cheap + stable)
+      
       let phase = phase_blended(dot(rd, SUN_DIR));
 
       for (var i: u32 = 0u; i < steps; i = i + 1u) {
@@ -85,20 +85,20 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
         dens *= horizon2;
 
         if (dens > 1e-4) {
-          // Self-shadow towards sun (adds “volume”)
+          
           let Tl = cloud_light_transmittance(p, time_s);
 
-          // Silver lining bias near sun direction
+          
           let toward_sun = clamp(dot(rd, SUN_DIR), 0.0, 1.0);
           let silver = pow(toward_sun, CLOUD_SILVER_POW) * CLOUD_SILVER_STR;
 
           let cloud_col = mix(CLOUD_BASE_COL, vec3<f32>(1.0), silver);
 
-          // Beer-Lambert step extinction
+          
           let tau = CLOUD_DENSITY * dens * dt;
           let a   = 1.0 - exp(-tau);
 
-          // Single-scatter-ish add
+          
           let scatter = cloud_col * (SUN_COLOR * SUN_INTENSITY) * (phase * Tl);
 
           acc   += T_view * a * scatter;
@@ -110,23 +110,23 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
     }
   }
 
-  // ------------------------------------------------------------------------
-  // Composite: background attenuated by clouds + cloud radiance
-  // ------------------------------------------------------------------------
+  
+  
+  
   var col = bg * T_view + acc;
 
-  // ------------------------------------------------------------------------
-  // Separately attenuated sun (disc/halo/glow) through clouds
-  //
-  // FIX:
-  // Drive sun-disc attenuation from the same *visual* cloud transmittance T_view,
-  // and raise it to a power so moderately-opaque clouds kill the disc.
-  // ------------------------------------------------------------------------
+  
+  
+  
+  
+  
+  
+  
   var T_sun: f32 = 1.0;
 
   if (CLOUD_DIM_SUN_DISC && rd.y > 0.01) {
-    // If a cloud makes the sky behind it dim (T_view < 1),
-    // the disc should dim *much more*.
+    
+    
     T_sun = pow(clamp(T_view, 0.0, 1.0), CLOUD_SUN_DISC_DIM_POW);
     T_sun = max(T_sun, CLOUD_SUN_DISC_DIM_FLOOR);
   }

@@ -1,6 +1,6 @@
-// src/render/state/bindgroups.rs
-//
-// Bind group creation.
+
+
+
 
 use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
 
@@ -47,22 +47,22 @@ fn make_primary_bg(
                 binding: 5,
                 resource: wgpu::BindingResource::TextureView(&textures.depth.view),
             },
-            // NEW: local lighting output
+            
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: wgpu::BindingResource::TextureView(&textures.local.view),
             },
-            // shifted clipmap params uniform
+            
             wgpu::BindGroupEntry {
                 binding: 7,
                 resource: buffers.clipmap.as_entire_binding(),
             },
-            // shifted clipmap height texture array
+            
             wgpu::BindGroupEntry {
                 binding: 8,
                 resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
             },
-            // shifted storage buffers
+            
             wgpu::BindGroupEntry {
                 binding: 9,
                 resource: buffers.macro_occ.as_entire_binding(),
@@ -129,7 +129,7 @@ fn make_godray_bg(
     depth_view: &wgpu::TextureView,
     hist_view: &wgpu::TextureView,
     out_view: &wgpu::TextureView,
-    hist_sampler: &wgpu::Sampler,   // NEW
+    hist_sampler: &wgpu::Sampler,   
     label: &str,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {

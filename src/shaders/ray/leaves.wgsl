@@ -1,11 +1,11 @@
-//// --------------------------------------------------------------------------
-//// Leaves (displaced cube intersection)
-//// --------------------------------------------------------------------------
+
+
+
 
 fn leaf_cube_offset(bmin: vec3<f32>, size: f32, time_s: f32, strength: f32) -> vec3<f32> {
   let center = bmin + vec3<f32>(0.5 * size);
 
-  // fade displacement with distance to camera
+  
   let d = length(center - cam.cam_pos.xyz);
   let fade = smoothstep(LEAF_LOD_DISP_START, LEAF_LOD_DISP_END, d);
   let strength_eff = strength * (1.0 - fade);

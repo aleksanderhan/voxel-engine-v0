@@ -1,5 +1,5 @@
-// src/render/state/mod.rs
-// -----------------------
+
+
 mod bindgroups;
 mod buffers;
 mod layout;
@@ -49,12 +49,12 @@ pub struct Renderer {
 
     clip_scratch: Vec<u8>,
 
-    // --- GPU timestamp profiling (optional) ---
+    
     ts_enabled: bool,
-    ts_period_ns: f64,              // ns per timestamp tick
+    ts_period_ns: f64,              
     ts_qs: Option<wgpu::QuerySet>,
-    ts_resolve: Option<wgpu::Buffer>,   // QUERY_RESOLVE | COPY_SRC
-    ts_readback: Option<wgpu::Buffer>,  // COPY_DST | MAP_READ
+    ts_resolve: Option<wgpu::Buffer>,   
+    ts_readback: Option<wgpu::Buffer>,  
 
 }
 
@@ -84,7 +84,7 @@ fn merge_adjacent(mut regions: Vec<Region>) -> Vec<Region> {
     out
 }
 
-// T must be Pod so we can cast to bytes safely.
+
 fn push_typed_region<T: Pod>(regions: &mut Vec<Region>, off_elems: u32, stride: u64, slice: &[T]) {
     if slice.is_empty() { return; }
     let off = (off_elems as u64) * stride;
@@ -104,7 +104,7 @@ fn batch_write_meta(
     uploads: &[crate::streaming::ChunkUpload],
     chunk_capacity: u32,
 ) {
-    // Collect (slot, meta)
+    
     let mut items: Vec<(u32, crate::render::gpu_types::ChunkMetaGpu)> = Vec::with_capacity(uploads.len());
     for u in uploads {
         if u.slot < chunk_capacity {
@@ -113,10 +113,10 @@ fn batch_write_meta(
     }
     if items.is_empty() { return; }
 
-    // Sort by slot so we can find contiguous runs
+    
     items.sort_by_key(|(slot, _)| *slot);
 
-    // Emit contiguous runs of slots as one write each
+    
     let mut i = 0usize;
     while i < items.len() {
         let start_slot = items[i].0;
@@ -126,7 +126,7 @@ fn batch_write_meta(
             run_len += 1;
         }
 
-        // Build a contiguous vec of metas and write once
+        
         let mut run: Vec<crate::render::gpu_types::ChunkMetaGpu> = Vec::with_capacity(run_len);
         for k in 0..run_len {
             run.push(items[i + k].1);
@@ -178,7 +178,7 @@ impl Renderer {
                 count: TS_COUNT,
             });
 
-            let bytes = (TS_COUNT as u64) * 8; // u64 timestamps
+            let bytes = (TS_COUNT as u64) * 8; 
             let resolve = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("ts_resolve"),
                 size: bytes,
@@ -193,7 +193,7 @@ impl Renderer {
                 mapped_at_creation: false,
             });
 
-            let period = queue.get_timestamp_period() as f64; // ns per tick
+            let period = queue.get_timestamp_period() as f64; 
             (Some(qs), Some(resolve), Some(readback), period)
         } else {
             (None, None, None, 0.0)
@@ -216,7 +216,7 @@ impl Renderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest, // level 0 anyway
+            mipmap_filter: wgpu::FilterMode::Nearest, 
             ..Default::default()
         });
 
@@ -356,13 +356,13 @@ impl Renderer {
 
             cpass.set_pipeline(&self.pipelines.composite);
 
-            // group(0) must match layouts.scene now
+            
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
 
-            // group(1) is still empty (or you can omit setting it)
+            
             cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
 
-            // group(2) is your composite textures
+            
             cpass.set_bind_group(2, &self.bind_groups.composite[pong], &[]);
 
             let gx = (width + 7) / 8;
@@ -401,7 +401,7 @@ impl Renderer {
         let u32_stride  = std::mem::size_of::<u32>() as u64;
         let rope_stride = std::mem::size_of::<crate::render::gpu_types::NodeRopesGpu>() as u64;
 
-        // 1) Meta in big runs
+        
         batch_write_meta(
             self.queue(),
             &self.buffers.chunk,
@@ -410,14 +410,14 @@ impl Renderer {
             self.buffers.chunk_capacity,
         );
 
-        // 2) Nodes / macro / ropes / colinfo as merged byte regions
+        
         let mut node_regions: Vec<Region> = Vec::new();
         let mut macro_regions: Vec<Region> = Vec::new();
         let mut rope_regions: Vec<Region> = Vec::new();
         let mut colinfo_regions: Vec<Region> = Vec::new();
 
         for u in uploads {
-            // nodes
+            
             if !u.nodes.is_empty() {
                 let needed = u.nodes.len() as u32;
                 if u.node_base + needed <= self.buffers.node_capacity {
@@ -425,7 +425,7 @@ impl Renderer {
                 }
             }
 
-            // macro occupancy (u32)
+            
             if !u.macro_words.is_empty() {
                 let needed = u.macro_words.len() as u32;
                 if u.meta.macro_base + needed <= self.buffers.macro_capacity_u32 {
@@ -433,7 +433,7 @@ impl Renderer {
                 }
             }
 
-            // ropes
+            
             if !u.ropes.is_empty() {
                 let needed = u.ropes.len() as u32;
                 if u.node_base + needed <= self.buffers.rope_capacity {
@@ -441,7 +441,7 @@ impl Renderer {
                 }
             }
 
-            // colinfo (u32)
+            
             if !u.colinfo_words.is_empty() {
                 let needed = u.colinfo_words.len() as u32;
                 if u.meta.colinfo_base + needed <= self.buffers.colinfo_capacity_u32 {
@@ -450,7 +450,7 @@ impl Renderer {
             }
         }
 
-        // Merge adjacent regions so we do far fewer write_buffer calls
+        
         for r in merge_adjacent(node_regions) {
             self.queue.write_buffer(&self.buffers.node, r.off, &r.data);
         }
@@ -474,20 +474,20 @@ impl Renderer {
     ) {
         let scratch = &mut self.clip_scratch;
 
-        // 1) texture patches
+        
         for u in uploads {
             let w = u.w as usize;
             let h = u.h as usize;
             if w == 0 || h == 0 { continue; }
 
-            let row_bytes = w * 4;                 // R32Float => 4 bytes/texel
-            let padded = align_up(row_bytes, 256); // required
+            let row_bytes = w * 4;                 
+            let padded = align_up(row_bytes, 256); 
             let needed = padded * h;
 
             scratch.clear();
             scratch.resize(needed, 0);
 
-            // copy row-by-row into padded scratch
+            
             let src: &[u8] = bytemuck::cast_slice(&u.data_f32);
             for row in 0..h {
                 let s0 = row * row_bytes;
@@ -513,7 +513,7 @@ impl Renderer {
             );
         }
 
-        // 2) uniform
+        
         self.queue.write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
     }
 
@@ -533,26 +533,26 @@ impl Renderer {
     pub fn read_gpu_timings_ms_blocking(&self) -> Option<GpuTimingsMs> {
         if !self.ts_enabled { return None; }
 
-        // Kick off an async map on the readback buffer
+        
         let readback = self.ts_readback.as_ref().unwrap();
         let slice = readback.slice(..);
 
-        // one-shot channel to wait for map completion
+        
         let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
 
         slice.map_async(wgpu::MapMode::Read, move |res| {
             let _ = tx.send(res);
         });
 
-        // Ensure GPU finished the copy into readback AND drive mapping to completion
+        
         self.device.poll(wgpu::Maintain::Wait);
 
-        // Wait for the mapping callback
+        
         let map_ok = pollster::block_on(async { rx.receive().await })
             .expect("map_async dropped")
             .expect("map_async failed");
 
-        // Read 8 u64 timestamps
+        
         let data = slice.get_mapped_range();
         let words: &[u64] = bytemuck::cast_slice(&data);
         if words.len() < 8 {
@@ -566,8 +566,8 @@ impl Renderer {
         drop(data);
         readback.unmap();
 
-        // Convert ticks -> ms
-        // ts_period_ns = ns per tick
+        
+        
         let ns = self.ts_period_ns;
         let to_ms = |a: u64, b: u64| -> f64 { (b.saturating_sub(a) as f64) * ns * 1e-6 };
 

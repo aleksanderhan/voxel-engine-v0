@@ -1,4 +1,4 @@
-// src/world/mod.rs
+
 pub mod generator;
 pub mod materials;
 pub mod hash;

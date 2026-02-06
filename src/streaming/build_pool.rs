@@ -1,4 +1,4 @@
-// src/streaming/build_pool.rs
+
 use once_cell::sync::Lazy;
 use rayon::ThreadPool;
 use std::cell::RefCell;
@@ -18,7 +18,7 @@ thread_local! {
 
 pub static BUILD_POOL: Lazy<ThreadPool> = Lazy::new(|| {
     ThreadPoolBuilder::new()
-        .num_threads(4) // tune: start with 2..(num cores / 2)
+        .num_threads(4) 
         .thread_name(|i| format!("chunk-build-{}", i))
         .build()
         .expect("failed to build chunk build thread pool")
@@ -31,7 +31,7 @@ pub fn build_chunk_svo_sparse_cancelable_tls(
     cancel: &AtomicBool,
     edits: &[EditEntry],
 ) -> BuildOutput {
-    // Take a scratch out of TLS WITHOUT holding the RefCell borrow during the build.
+    
     let mut scratch = TLS_SCRATCH.with(|cell| {
         cell.borrow_mut().pop().unwrap_or_else(BuildScratch::new)
     });
@@ -45,7 +45,7 @@ pub fn build_chunk_svo_sparse_cancelable_tls(
         edits,
     );
 
-    // Return scratch to the per-thread pool.
+    
     TLS_SCRATCH.with(|cell| {
         cell.borrow_mut().push(scratch);
     });

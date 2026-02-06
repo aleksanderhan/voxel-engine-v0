@@ -1,6 +1,6 @@
-//// --------------------------------------------------------------------------
-//// AABB helpers (vectorized slab + reuse)
-//// --------------------------------------------------------------------------
+
+
+
 
 fn max3(v: vec3<f32>) -> f32 { return max(v.x, max(v.y, v.z)); }
 fn min3(v: vec3<f32>) -> f32 { return min(v.x, min(v.y, v.z)); }
@@ -12,7 +12,7 @@ struct CubeSlab {
   t_exit  : f32,
 };
 
-// Compute slab interval for axis-aligned cube using precomputed inv(rd).
+
 fn cube_slab_inv(
   ro: vec3<f32>,
   inv: vec3<f32>,
@@ -36,12 +36,12 @@ fn cube_slab_inv(
 struct BoxHit {
   hit    : bool,
   t      : f32,
-  t_exit : f32,        // <-- add this so callsites can step without recomputing
+  t_exit : f32,        
   n      : vec3<f32>,
 };
 
-// Normal + hit interval computed from a precomputed slab.
-// (Uses argmax(tminv) for face selection; no eps comparisons.)
+
+
 fn cube_hit_normal_from_slab(
   rd: vec3<f32>,
   slab: CubeSlab,
@@ -54,7 +54,7 @@ fn cube_hit_normal_from_slab(
     return BoxHit(false, BIG_F32, slab.t_exit, vec3<f32>(0.0));
   }
 
-  // Which axis produced t_enter? (argmax of tminv)
+  
   var axis: u32 = 0u;
   var best: f32 = slab.tminv.x;
   if (slab.tminv.y > best) { best = slab.tminv.y; axis = 1u; }
@@ -68,7 +68,7 @@ fn cube_hit_normal_from_slab(
   return BoxHit(true, t0, slab.t_exit, n);
 }
 
-// Keep your original signature, but now vectorized internally.
+
 fn aabb_hit_normal_inv(
   ro: vec3<f32>,
   rd: vec3<f32>,

@@ -9,14 +9,14 @@ use super::keep;
 pub fn ensure_column_cache(mgr: &mut ChunkManager, world: &WorldGen, center: ChunkKey) {
     let new_origin = keep::keep_origin_for(center);
 
-    // IMPORTANT: column cache is XZ-only; ignore Y when deciding if it moved.
+    
     let old_origin = mgr.grid.grid_origin_chunk;
     let origin_changed_xz =
         mgr.ground.col_ground_y_vox.is_empty()
         || new_origin[0] != old_origin[0]
         || new_origin[2] != old_origin[2];
 
-    // Always publish full new origin for the 3D grid (Y matters there).
+    
     mgr.grid.grid_origin_chunk = new_origin;
 
     if !origin_changed_xz {
@@ -38,7 +38,7 @@ fn update_column_ground_cache(
     let nz = nx;
     let len = (nx * nz) as usize;
 
-    // first time / resize => full rebuild
+    
     if mgr.ground.col_ground_y_vox.len() != len || mgr.ground.col_ground_y_vox.is_empty() {
         mgr.ground.col_ground_y_vox.resize(len, 0);
         let ox = new_origin[0];
@@ -62,7 +62,7 @@ fn update_column_ground_cache(
         return;
     }
 
-    // teleport => rebuild
+    
     if dx_chunks.abs() >= nx || dz_chunks.abs() >= nz {
         let ox = new_origin[0];
         let oz = new_origin[2];
@@ -71,7 +71,7 @@ fn update_column_ground_cache(
                 let cx = ox + dx;
                 let cz = oz + dz;
                 mgr.ground.col_ground_y_vox[(dz * nx + dx) as usize] =
-                    compute_ground_y_vox_at_column(world, cx, cz); // <-- WAS compute_ground_cy_at_column
+                    compute_ground_y_vox_at_column(world, cx, cz); 
             }
         }
         return;
@@ -97,7 +97,7 @@ fn update_column_ground_cache(
             } else {
                 let cx = ox_new + ix;
                 let cz = oz_new + iz;
-                newv[dst_idx] = compute_ground_y_vox_at_column(world, cx, cz); // <-- WAS compute_ground_cy_at_column
+                newv[dst_idx] = compute_ground_y_vox_at_column(world, cx, cz); 
             }
 
         }

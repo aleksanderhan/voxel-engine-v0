@@ -1,6 +1,6 @@
-//// --------------------------------------------------------------------------
-//// Sun transmittance (geometry-only + full with clouds)
-//// --------------------------------------------------------------------------
+
+
+
 fn trace_chunk_shadow_trans_interval(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -29,15 +29,15 @@ fn trace_chunk_shadow_trans_interval(
 
     let q = query_leaf_at(pq, root_bmin, root_size, ch.node_base, ch.macro_base);
 
-    // slab once (for stepping)
+    
     let slab    = cube_slab_inv(ro, inv, q.bmin, q.size);
     let t_leave = slab.t_exit;
 
     if (q.mat != MAT_AIR) {
       if (q.mat == MAT_LEAF) {
         if (VOLUME_DISPLACED_LEAVES) {
-          // --- NEW: distance gate for displaced-leaf shadow test ---
-          // If far, skip expensive displaced intersection and just apply transmit.
+          
+          
           let center = q.bmin + vec3<f32>(0.5 * q.size);
           let d = length(center - cam.cam_pos.xyz);
 
@@ -55,7 +55,7 @@ fn trace_chunk_shadow_trans_interval(
           } else {
             trans *= LEAF_LIGHT_TRANSMIT;
           }
-          // --------------------------------------------------------
+          
 
           tcur = max(t_leave, tcur) + nudge_s;
           continue;
@@ -138,7 +138,7 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   var trans = 1.0;
   let max_chunk_steps = min((gd.x + gd.y + gd.z) * 6u + 8u, 512u);
 
-  // ---- HOISTED: grid bounds for the DDA loop (was recomputed each step)
+  
   let ox: i32 = go.x;
   let oy: i32 = go.y;
   let oz: i32 = go.z;
@@ -151,7 +151,7 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let gx1: i32 = ox + nx;
   let gy1: i32 = oy + ny;
   let gz1: i32 = oz + nz;
-  // ---------------------------------------------------------------
+  
 
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }
@@ -178,7 +178,7 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
       else               { cz += step_z; t_local = tMaxZ; tMaxZ += tDeltaZ; }
     }
 
-    // bounds check (now uses hoisted constants)
+    
     if (cx < gx0 || cy < gy0 || cz < gz0 || cx >= gx1 || cy >= gy1 || cz >= gz1) { break; }
   }
 

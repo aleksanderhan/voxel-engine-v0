@@ -1,4 +1,4 @@
-// src/physics/step.rs
+
 use glam::Vec3;
 use rayon::prelude::*;
 
@@ -14,8 +14,8 @@ use super::{
 
 
 
-/// Fixed-step physics driver.
-/// Owns the player body for now; later this owns articulations too.
+
+
 pub struct Physics {
     pub fixed_dt: f32,
     accum: f32,
@@ -23,11 +23,11 @@ pub struct Physics {
     pub player: PlayerBody,
     pub tuning: PlayerTuning,
 
-    // previous state for interpolation
+    
     prev_player_pos: Vec3,
     prev_player_vel: Vec3,
 
-    // view orientation (keep in physics so camera becomes a pure view-projection thing)
+    
     pub yaw: f32,
     pub pitch: f32,
 
@@ -67,23 +67,23 @@ impl Physics {
             steps += 1;
         }
 
-        // Drop excess backlog to prevent spiral-of-death
+        
         if self.accum > self.fixed_dt {
             self.accum = self.fixed_dt;
         }
     }
 
 
-    /// Call once per rendered frame; internally advances fixed steps.
-    ///
-    /// Returns the recommended camera "eye" position in world meters.
+    
+    
+    
     pub fn step_frame<W: WorldQuery + Sync>(
         &mut self,
         input: &mut InputState,
         dt_frame: f32,
         world: &W,
     ) -> Vec3 {
-        // 1) mouse look -> yaw/pitch (once per rendered frame)
+        
         if input.focused {
             let (dx, dy) = input.take_mouse_delta();
             self.yaw -= dx * self.mouse_sens;
@@ -92,15 +92,15 @@ impl Physics {
             let _ = input.take_mouse_delta();
         }
 
-        // 2) cache frame intent ONCE (deterministic across fixed ticks)
+        
         let desired = self.desired_move_velocity(input);
 
-        // 3) queue jump intent
+        
         if input.keys.space {
             self.player.jump_queued = true;
         }
 
-        // 4) fixed-step loop (capped)
+        
         self.accum += dt_frame.min(0.05);
 
         let max_steps: u32 = 4;
@@ -115,12 +115,12 @@ impl Physics {
             steps += 1;
         }
 
-        // Drop excess backlog to prevent spiral-of-death
+        
         if self.accum > self.fixed_dt {
             self.accum = self.fixed_dt;
         }
 
-        // 5) return interpolated camera eye for rendering
+        
         self.interpolated_eye()
     }
 
@@ -194,13 +194,13 @@ impl Physics {
             self.player.on_ground = false;
         }
 
-        // gravity
+        
         vel.y += self.tuning.gravity_mps2 * dt;
 
-        // integrate
+        
         let pos_pred = self.player.pos + vel * dt;
 
-        // collide + ground
+        
         let (pos_new, vel_new, on_ground, n, cell) =
             crate::physics::collision::resolve_sphere_world(
                 world,
@@ -215,7 +215,7 @@ impl Physics {
         self.player.vel = vel_new;
         self.player.on_ground = on_ground;
 
-        // contact bookkeeping
+        
         self.player.contact.valid = cell.is_some();
         if let Some((vx, vy, vz)) = cell {
             self.player.contact.cell = (vx, vy, vz);
@@ -225,7 +225,7 @@ impl Physics {
             self.player.contact = crate::physics::collision::WorldContact::default();
         }
 
-        // once grounded, clear jump queue (otherwise holding space could re-trigger)
+        
         if self.player.on_ground {
             self.player.jump_queued = false;
         }

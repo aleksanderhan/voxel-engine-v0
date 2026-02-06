@@ -1,46 +1,46 @@
-// src/shaders/ray/light.wgsl
-// --------------------------
-// Cheap voxel light gather for MAT_LIGHT voxels.
-//
-// What changed (for TAA-friendly behavior):
-// - Removed "empty air bail" (it caused random hit/miss speckle in open air)
-// - Normalization uses a CONSTANT denom (LIGHT_RAYS), so early-exit doesn’t boost brightness
-//
-// NOTE: Temporal accumulation is done in a separate pass; this file just produces
-// a noisy but unbiased estimate (local radiance) suitable for accumulation.
 
-// -----------------------------------------------------------------------------
-// Tunables
-// -----------------------------------------------------------------------------
 
-// How far rays march in voxels (controls “search radius” for lights)
-const LIGHT_MAX_DIST_VOX : u32 = 32u;   // try 16..64
 
-// Number of rays
-const LIGHT_RAYS : u32 = 24u;          // try 16..32
 
-// Softens inverse-square near the light (in voxels)
+
+
+
+
+
+
+
+
+
+
+
+
+const LIGHT_MAX_DIST_VOX : u32 = 32u;   
+
+
+const LIGHT_RAYS : u32 = 24u;          
+
+
 const LIGHT_SOFT_RADIUS_VOX : f32 = 3.0;
 
-// Clamp minimum distance to avoid blow-ups (in voxels)
+
 const LIGHT_NEAR_CLAMP_VOX : f32 = 1.25;
 
-// Finite range rolloff (in voxels). Past this, contributions fade to ~0.
-const LIGHT_RANGE_VOX : f32 = 80.0;     // try 32..96
 
-// Direct diffuse “wrap” (0 = pure Lambert, 0.1..0.25 = nicer in caves)
+const LIGHT_RANGE_VOX : f32 = 80.0;     
+
+
 const LIGHT_WRAP : f32 = 0.15;
 
-// Gains
-const LIGHT_DIRECT_GAIN   : f32 = 1.00;
-const LIGHT_INDIRECT_GAIN : f32 = 0.65; // cheap “bounce fill”
 
-// Stop after N light hits (perf only; output is normalized with LIGHT_RAYS)
+const LIGHT_DIRECT_GAIN   : f32 = 1.00;
+const LIGHT_INDIRECT_GAIN : f32 = 0.65; 
+
+
 const LIGHT_EARLY_HITS : u32 = 24u;
 
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
+
+
+
 
 fn hash3_i32(p: vec3<i32>) -> u32 {
   let ux = u32(p.x) * 73856093u;
@@ -63,32 +63,32 @@ fn rot_about_axis(v: vec3<f32>, axis: vec3<f32>, ang: f32) -> vec3<f32> {
   return v * c + cross(a, v) * s + a * dot(a, v) * (1.0 - c);
 }
 
-// Use your real HDR emission for lighting too.
+
 fn light_emission_radiance() -> vec3<f32> {
   return material_emission(MAT_LIGHT);
 }
 
-// -----------------------------------------------------------------------------
-// Direction set
-// -----------------------------------------------------------------------------
+
+
+
 
 fn sphere_dir_local(i: u32, count: u32) -> vec3<f32> {
   let fi = f32(i);
   let count_f = max(1.0, f32(count));
-  let golden = 2.399963229728653; // golden angle in radians
+  let golden = 2.399963229728653; 
   let y = 1.0 - 2.0 * ((fi + 0.5) / count_f);
   let r = sqrt(max(0.0, 1.0 - y * y));
   let phi = golden * fi;
   return vec3<f32>(cos(phi) * r, sin(phi) * r, y);
 }
 
-// -----------------------------------------------------------------------------
-// 3D DDA: walk voxels along ray without skipping 1-voxel lights
-// -----------------------------------------------------------------------------
 
-// Returns vec4(hitPosWS.xyz, hitFlag).
-// hitFlag = 1: hit a light voxel
-// hitFlag = 0: no light (either blocked by solid or ran out of steps)
+
+
+
+
+
+
 fn dda_hit_light(p0: vec3<f32>, dir: vec3<f32>, max_steps: u32, vs: f32) -> vec4<f32> {
   var gpos = p0 / max(vs, 1e-6);
   var cell = vec3<i32>(floor(gpos));
@@ -130,11 +130,11 @@ fn dda_hit_light(p0: vec3<f32>, dir: vec3<f32>, max_steps: u32, vs: f32) -> vec4
     }
 
     if (leaf.mat != MAT_AIR) {
-      // SOLID blocks the ray
+      
       return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
 
-    // step to next voxel boundary
+    
     if (tMax.x < tMax.y) {
       if (tMax.x < tMax.z) { cell.x += step.x; tMax.x += tDelta.x; }
       else                 { cell.z += step.z; tMax.z += tDelta.z; }
@@ -147,9 +147,9 @@ fn dda_hit_light(p0: vec3<f32>, dir: vec3<f32>, max_steps: u32, vs: f32) -> vec4
   return vec4<f32>(0.0, 0.0, 0.0, 0.0);
 }
 
-// -----------------------------------------------------------------------------
-// Main local light gather
-// -----------------------------------------------------------------------------
+
+
+
 
 fn gather_voxel_lights(
   hp: vec3<f32>,
@@ -163,19 +163,19 @@ fn gather_voxel_lights(
 
   let vs = cam.voxel_params.x;
 
-  // nudge off surface to reduce self hits
+  
   let p0 = hp + n * (0.75 * vs);
 
-  // basis for orienting directions
+  
   let tbn = make_tbn(n);
 
-  // de-pattern rotation: stable per surface cell (no per-frame noise)
+  
   let surf_v = vec3<i32>(floor((hp - root_bmin) / max(vs, 1e-6)));
   let h0 = hash3_i32(surf_v);
   let h1 = hash_u32(h0);
   let rot = 6.28318530718 * (f32(h1 & 1023u) / 1024.0);
 
-  // attenuation helpers
+  
   let soft_r  = LIGHT_SOFT_RADIUS_VOX * vs;
   let soft_r2 = soft_r * soft_r;
 
@@ -204,21 +204,21 @@ fn gather_voxel_lights(
       let r  = sqrt(r2);
       let ldir_ws = L / r;
 
-      // direct wrap diffuse (subtle)
+      
       let ndl_raw = dot(n, ldir_ws);
       let ndl = clamp((ndl_raw + LIGHT_WRAP) / (1.0 + LIGHT_WRAP), 0.0, 1.0);
 
-      // finite range rolloff
+      
       var att_range = clamp(1.0 - (r2 / max(range2, 1e-6)), 0.0, 1.0);
       att_range = att_range * att_range;
 
-      // softened inverse-square
+      
       let falloff = 1.0 / (r2 + soft_r2);
 
-      // DIRECT
+      
       sum += Le * (LIGHT_DIRECT_GAIN * ndl * falloff * att_range);
 
-      // INDIRECT FILL (cheap “bounce”)
+      
       if (r2 < 0.35 * range2) {
         let bounce = LIGHT_INDIRECT_GAIN * falloff * att_range;
         sum += Le * (0.25 * bounce);
@@ -230,7 +230,7 @@ fn gather_voxel_lights(
     }
   }
 
-  // IMPORTANT: constant denom so early exits don't boost brightness
+  
   let denom = max(1.0, f32(LIGHT_RAYS));
   return sum * (1.0 / denom);
 }

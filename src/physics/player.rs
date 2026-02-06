@@ -1,13 +1,13 @@
-// src/physics/player.rs
+
 use glam::Vec3;
 use crate::physics::collision::WorldContact;
 
-/// A simple dynamic body for now (you'll later replace/extend this with an articulated body).
+
 #[derive(Clone, Copy, Debug)]
 pub struct PlayerBody {
-    pub pos: Vec3,      // meters
-    pub vel: Vec3,      // m/s
-    pub radius: f32,    // meters (sphere collider)
+    pub pos: Vec3,      
+    pub vel: Vec3,      
+    pub radius: f32,    
     pub on_ground: bool,
     pub jump_queued: bool,
     pub contact: WorldContact,
@@ -26,7 +26,7 @@ impl PlayerBody {
     }
 }
 
-/// Movement/physics tuning parameters.
+
 #[derive(Clone, Copy, Debug)]
 pub struct PlayerTuning {
     pub speed_mps: f32,
@@ -40,10 +40,10 @@ pub struct PlayerTuning {
 
     pub jump_speed_mps: f32,
 
-    /// How much velocity to keep after collision along the normal (0 = fully remove into-surface component).
+    
     pub normal_restitution: f32,
 
-    /// How many push-out iterations we do per step (more = more stable in corners, but slower).
+    
     pub solver_iters: u32,
 }
 
