@@ -5,6 +5,7 @@ pub mod workers;
 
 pub mod cache;
 pub mod manager;
+pub mod build_pool;
 
 pub use manager::ChunkManager;
 pub use types::ChunkUpload;

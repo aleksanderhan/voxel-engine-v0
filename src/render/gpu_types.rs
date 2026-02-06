@@ -39,6 +39,10 @@ pub struct ChunkMetaGpu {
     pub node_count: u32,
     pub macro_base: u32,
     pub colinfo_base: u32,
+    pub macro_empty: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 #[repr(C)]
@@ -130,22 +134,58 @@ pub struct OverlayGpu {
 
     pub digit_h:  u32,
     pub scale:    u32,
-    pub stride:   u32, // digit_w + gap
-    pub _pad0:    u32, // explicit padding to 32 bytes
+    pub stride:   u32,
+
+    // --- NEW: mode label ("DIG", "DIRT", "STONE", ...)
+    pub text_len: u32, // number of chars <= 12
+    pub text_p0:  u32, // 4 ASCII bytes packed little-endian
+    pub text_p1:  u32, // 4 ASCII bytes
+    pub text_p2:  u32, // 4 ASCII bytes
+
+    // pad to 64 bytes (uniform structs are effectively 16-byte aligned)
+    pub _pad0:    u32,
+}
+
+
+fn pack4(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    (a as u32)
+        | ((b as u32) << 8)
+        | ((c as u32) << 16)
+        | ((d as u32) << 24)
+}
+
+fn pack_text_12(s: &str) -> (u32, u32, u32, u32) {
+    // Uppercase, ASCII only, pad with spaces, clamp to 12 chars.
+    let mut buf = [b' '; 12];
+    for (i, ch) in s.bytes().take(12).enumerate() {
+        let u = if (b'a'..=b'z').contains(&ch) { ch - 32 } else { ch };
+        buf[i] = u;
+    }
+
+    let len = s.len().min(12) as u32;
+    let p0 = pack4(buf[0], buf[1], buf[2], buf[3]);
+    let p1 = pack4(buf[4], buf[5], buf[6], buf[7]);
+    let p2 = pack4(buf[8], buf[9], buf[10], buf[11]);
+    (len, p0, p1, p2)
 }
 
 impl OverlayGpu {
-    pub fn from_fps_and_dims(fps: u32, width: u32, _height: u32, scale: u32) -> Self {
-        // digits
+    pub fn from_fps_and_edit(
+        fps: u32,
+        edit_mat: u32,
+        width: u32,
+        _height: u32,
+        scale: u32,
+    ) -> Self {
+        // ---- FPS digits ----
         let mut v = fps.min(9999);
         let d0 = (v % 10) as u32; v /= 10;
         let d1 = (v % 10) as u32; v /= 10;
         let d2 = (v % 10) as u32; v /= 10;
         let d3 = (v % 10) as u32;
-
         let digits_packed = d0 | (d1 << 8) | (d2 << 16) | (d3 << 24);
 
-        // layout
+        // ---- Layout (same as before) ----
         let margin: u32 = 12;
         let digit_w = 3 * scale;
         let digit_h = 5 * scale;
@@ -159,6 +199,19 @@ impl OverlayGpu {
         let origin_x = ox_i.max(0) as u32;
         let origin_y = oy_i.max(0) as u32;
 
+        // ---- Label ----
+        // IMPORTANT: use material IDs -> strings (NOT raw ID bytes).
+        let label: &str = match edit_mat {
+            crate::world::materials::AIR   => "AIR",
+            crate::world::materials::DIRT  => "DIRT",
+            crate::world::materials::STONE => "STONE",
+            crate::world::materials::WOOD  => "WOOD",
+            crate::world::materials::LIGHT => "LIGHT",
+            _ => "UNKNOWN", // fallback;
+        };
+
+        let (text_len, text_p0, text_p1, text_p2) = pack_text_12(label);
+
         Self {
             digits_packed,
             origin_x,
@@ -167,6 +220,10 @@ impl OverlayGpu {
             digit_h,
             scale,
             stride,
+            text_len,
+            text_p0,
+            text_p1,
+            text_p2,
             _pad0: 0,
         }
     }

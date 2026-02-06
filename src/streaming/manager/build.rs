@@ -1,22 +1,36 @@
+// src/streaming/manager/build.rs
 use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
     Arc,
 };
+use std::time::Instant;
+
 
 use crossbeam_channel::TrySendError;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 
-use crate::streaming::priority::priority_score;
 use crate::streaming::types::*;
 use crate::{render::gpu_types::{NodeGpu, NodeRopesGpu}};
 use crate::app::config;
 
 use super::{ground, keep, slots};
 use super::ChunkManager;
+use crate::streaming::priority::{priority_score_streaming};
 
 // src/streaming/manager/build.rs
+
+
+#[inline(always)]
+fn y_band_min_dyn(mgr: &ChunkManager) -> i32 {
+    if mgr.build.cam_below_ground { y_band_min() } else { 0 }
+}
+
+#[inline(always)]
+fn y_band_max_dyn(_mgr: &ChunkManager) -> i32 {
+    y_band_max()
+}
 
 #[inline(always)]
 fn in_keep(mgr: &ChunkManager, center: ChunkKey, k: ChunkKey) -> bool {
@@ -27,22 +41,27 @@ fn in_keep(mgr: &ChunkManager, center: ChunkKey, k: ChunkKey) -> bool {
     let dx = k.x - center.x;
     let dz = k.z - center.z;
 
-    // OLD:
-    // if dx < -config::KEEP_RADIUS || dx > config::KEEP_RADIUS { return false; }
-    // if dz < -config::KEEP_RADIUS || dz > config::KEEP_RADIUS { return false; }
-
     // NEW: circular keep
     let r = config::KEEP_RADIUS;
     if dx*dx + dz*dz > r*r {
         return false;
     }
 
+    let ar = config::ACTIVE_RADIUS;
+    if dx*dx + dz*dz > ar*ar {
+        if !super::visibility::column_visible(mgr, k.x, k.z) {
+            return false;
+        }
+    }
+
+
     let Some(ground_cy) = ground::ground_cy_for_column(mgr, k.x, k.z) else {
         return false;
     };
 
     let dy = k.y - ground_cy;
-    dy >= y_band_min() && dy <= y_band_max()
+    dy >= y_band_min_dyn(mgr) && dy <= y_band_max_dyn(mgr)
+
 }
 
 
@@ -70,50 +89,30 @@ fn queue_build_front(mgr: &mut ChunkManager, center: ChunkKey, k: ChunkKey) {
     heap_push(mgr, center, k, 100_000.0);
 }
 
-pub fn ensure_priority_box(mgr: &mut ChunkManager, center: ChunkKey) {
-    let n = mgr.offsets.priority_offsets.len();
-
-    for i in 0..n {
-        // copy the tuple out; immutable borrow ends right here
-        let (dx, dy, dz) = mgr.offsets.priority_offsets[i];
-
-        let x = center.x + dx;
-        let z = center.z + dz;
-
-        let Some(ground_cy_col) = ground::ground_cy_for_column(mgr, x, z) else { continue; };
-        let k = ChunkKey { x, y: ground_cy_col + dy, z };
-
-        match mgr.build.chunks.get(&k) {
-            Some(ChunkState::Resident(_))
-            | Some(ChunkState::Uploading(_))
-            | Some(ChunkState::Queued)
-            | Some(ChunkState::Building) => {
-                if matches!(mgr.build.chunks.get(&k), Some(ChunkState::Queued)) {
-                    queue_build_front(mgr, center, k);
-                }
-            }
-            None => {
-                if mgr.cache.get(&k).is_some() {
-                    let _ = try_promote_from_cache(mgr, center, k);
-                    continue;
-                }
-
-                let c = cancel_token(mgr, k);
-                c.store(false, AtomicOrdering::Relaxed);
-                queue_build_front(mgr, center, k);
-
-            }
-        }
-    }
-}
-
 
 pub fn enqueue_active_ring(mgr: &mut ChunkManager, center: ChunkKey) {
     let n_active = mgr.offsets.active_offsets.len();
     for i in 0..n_active {
         let (dx, dy, dz) = mgr.offsets.active_offsets[i];
+
+        if dy < y_band_min_dyn(mgr) || dy > y_band_max_dyn(mgr) {
+            continue;
+        }
+
         let x = center.x + dx;
         let z = center.z + dz;
+
+        // Outside priority radius: only consider columns that are in the 360° PVS.
+        let ddx = x - center.x;
+        let ddz = z - center.z;
+        let ar = config::ACTIVE_RADIUS;
+        if dx*dx + dz*dz > ar*ar {
+            if !super::visibility::column_visible(mgr, x, z) {
+                continue;
+            }
+        }
+
+
 
         let Some(ground_cy_col) = ground::ground_cy_for_column(mgr, x, z) else {
             continue;
@@ -149,7 +148,6 @@ pub fn unload_outside_keep(mgr: &mut ChunkManager, center: ChunkKey) {
 
     for &k in mgr.build.chunks.keys() {
         if mgr.pinned.contains(&k) { continue; }
-        if slots::in_priority_box(mgr, center, k) { continue; }
 
         if keep::in_active_xz(center, k) {
             match mgr.build.chunks.get(&k) {
@@ -170,8 +168,24 @@ pub fn unload_outside_keep(mgr: &mut ChunkManager, center: ChunkKey) {
 }
 
 pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
-    let mut attempts = 0usize;
-    let max_attempts = mgr.build.build_heap.len().max(1);
+    // ---------------------------------------------------------------------
+    // 0) Re-inject deferred queued keys back into the heap.
+    //     build_queue is used when we couldn't dispatch (tx full)
+    //     or couldn't allocate arena/slot (upload deferral).
+    //     Without this, those chunks stall until center changes.
+    // ---------------------------------------------------------------------
+    let reinject_cap = 64usize.min(mgr.build.build_queue.len());
+    for _ in 0..reinject_cap {
+        let Some(k) = mgr.build.build_queue.pop_front() else { break; };
+
+        // Only re-score if it is STILL queued (it might have been canceled/promoted).
+        if !matches!(mgr.build.chunks.get(&k), Some(ChunkState::Queued)) {
+            continue;
+        }
+
+        // Keep it queued; just make it eligible for dispatch again.
+        heap_push(mgr, center, k, 0.0);
+    }
 
     // Reserve some capacity so edits (rebuilds) don’t sit behind streaming.
     let reserve_for_rebuilds = 2usize;
@@ -182,34 +196,31 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         config::MAX_IN_FLIGHT
     };
 
-
-    // Also dispatch rebuilds for already-slotted chunks (no state changes).
+    // ---------------------------------------------------------------------
+    // 1) Dispatch rebuilds for already-slotted chunks.
+    // ---------------------------------------------------------------------
     while mgr.build.in_flight < config::MAX_IN_FLIGHT {
         let Some(k) = mgr.build.rebuild_queue.pop_front() else { break; };
         mgr.build.rebuild_set.remove(&k);
 
-        // Must still exist and still be slotted.
         let Some(st) = mgr.build.chunks.get(&k) else { continue; };
         if !matches!(st, ChunkState::Resident(_) | ChunkState::Uploading(_)) {
             continue;
         }
 
-        // If it’s outside keep, skip (optional but consistent with your other logic).
         if !in_keep(mgr, center, k) {
             continue;
         }
 
-        // Make a fresh cancel token and replace the stored one,
-        // so stale completions get dropped by Arc::ptr_eq in harvest_done_builds.
+        // Fresh cancel token so stale completions get dropped.
         let cancel = Arc::new(AtomicBool::new(false));
         mgr.build.cancels.insert(k, cancel.clone());
 
         let edits = mgr.edits.snapshot(k);
 
-        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel, edits }) {
+        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel, edits, enqueued_at: Instant::now() }) {
             Ok(()) => mgr.build.in_flight += 1,
             Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
-                // Put it back and stop trying this frame.
                 mgr.build.rebuild_set.insert(job.key);
                 mgr.build.rebuild_queue.push_front(job.key);
                 break;
@@ -217,6 +228,11 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // 2) Dispatch normal queued builds from the heap.
+    // ---------------------------------------------------------------------
+    let mut attempts = 0usize;
+    let max_attempts = mgr.build.build_heap.len().max(1);
 
     while mgr.build.in_flight < max_normal_in_flight && attempts < max_attempts {
         attempts += 1;
@@ -224,21 +240,17 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         let Some(item) = mgr.build.build_heap.pop() else { break; };
         let k = item.key;
 
-        // Heap contains stale entries; only queued chunks may be dispatched/canceled here.
         let Some(st) = mgr.build.chunks.get(&k) else {
-            // Not tracked anymore.
-            continue;
+            continue; // Not tracked anymore
         };
 
-        // Ignore anything that isn't currently queued.
         if !matches!(st, ChunkState::Queued) {
-            continue;
+            continue; // stale heap entry
         }
 
         // Now it's safe to update queued bookkeeping.
         mgr.build.queued_set.remove(&k);
 
-        // If it's outside keep, just cancel/remove the queued entry.
         if !in_keep(mgr, center, k) {
             cancel_token(mgr, k).store(true, AtomicOrdering::Relaxed);
             mgr.build.chunks.remove(&k);
@@ -246,7 +258,7 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
             continue;
         }
 
-        // If cached, drop queued tracking and try promote.
+        // If cached, try promote instead of rebuilding.
         if mgr.cache.get(&k).is_some() {
             mgr.build.chunks.remove(&k);
             mgr.build.cancels.remove(&k);
@@ -261,19 +273,20 @@ pub fn dispatch_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         cancel.store(false, AtomicOrdering::Relaxed);
 
         let edits = mgr.edits.snapshot(k);
-        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone(), edits }) {
+        match mgr.build.tx_job.try_send(BuildJob { key: k, cancel: cancel.clone(), edits, enqueued_at: Instant::now() }) {
             Ok(()) => mgr.build.in_flight += 1,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                // Put it back as queued and ensure it will be retried soon.
                 mgr.build.chunks.insert(k, ChunkState::Queued);
-                mgr.build.build_queue.push_front(k);
-                mgr.build.queued_set.insert(k);
+                if mgr.build.queued_set.insert(k) {
+                    mgr.build.build_queue.push_front(k);
+                }
                 break;
             }
         }
     }
-
-
 }
+
 
 pub fn harvest_done_builds(mgr: &mut ChunkManager, center: ChunkKey) {
     let done_backlog = mgr.build.rx_done.len();
@@ -291,6 +304,18 @@ pub fn harvest_done_builds(mgr: &mut ChunkManager, center: ChunkKey) {
         // Drop stale completions (job from an old cancel token)
         let Some(cur_cancel) = mgr.build.cancels.get(&done.key) else { continue; };
         if !Arc::ptr_eq(cur_cancel, &done.cancel) { continue; }
+
+        let canceled = done.canceled || done.cancel.load(AtomicOrdering::Relaxed);
+        let nodes_n = done.tim.nodes.max(done.nodes.len() as u32);
+
+        // Record timing window FIRST (even if we'll discard the result due to keep/cancel)
+        mgr.timing.record_build(
+            done.queue_ms,
+            done.build_ms,
+            nodes_n,
+            canceled,
+            &done.tim,
+        );
 
         if done.canceled || done.cancel.load(AtomicOrdering::Relaxed) {
             mgr.build.chunks.remove(&done.key);
@@ -317,15 +342,6 @@ pub fn harvest_done_builds(mgr: &mut ChunkManager, center: ChunkKey) {
 }
 
 fn try_promote_from_cache(mgr: &mut ChunkManager, center: ChunkKey, key: ChunkKey) -> bool {
-    // If priority box isn't ready, defer non-priority promotions.
-    if !slots::priority_box_ready(mgr, center) && !slots::in_priority_box(mgr, center, key) {
-        mgr.build.chunks.insert(key, ChunkState::Queued);
-        if mgr.build.queued_set.insert(key) {
-            mgr.build.build_queue.push_back(key);
-        }
-        return false;
-    }
-
     let Some(e) = mgr.cache.get(&key) else { return false; };
 
     let nodes = e.nodes.clone();
@@ -347,6 +363,7 @@ fn try_promote_from_cache(mgr: &mut ChunkManager, center: ChunkKey, key: ChunkKe
     ok
 }
 
+
 fn on_build_done(
     mgr: &mut ChunkManager,
     center: ChunkKey,
@@ -359,8 +376,20 @@ fn on_build_done(
     if let Some(c) = mgr.build.cancels.get(&key) {
         if c.load(AtomicOrdering::Relaxed) {
             mgr.build.chunks.remove(&key);
+            mgr.build.cancels.remove(&key);
             return;
         }
+    }
+
+    // Reject clearly invalid outputs early (also avoids caching garbage).
+    if nodes.is_empty()
+        || macro_words.len() != MACRO_WORDS_PER_CHUNK_USIZE
+        || ropes.len() != nodes.len()
+        || colinfo_words.len() != COLINFO_WORDS_PER_CHUNK_USIZE
+    {
+        mgr.build.chunks.remove(&key);
+        mgr.build.cancels.remove(&key);
+        return;
     }
 
     let nodes_arc: Arc<[NodeGpu]> = nodes.into();
@@ -382,7 +411,6 @@ fn on_build_done(
             );
 
             if ok {
-                // cache the new version once
                 mgr.cache.put(key, nodes_arc, macro_arc, ropes_arc, colinfo_arc);
             }
             return;
@@ -399,20 +427,21 @@ fn on_build_done(
         colinfo_arc.clone(),
     );
 
-    // Defer GPU upload for non-priority until priority box is GPU-ready.
-    if !slots::priority_box_ready(mgr, center) && !slots::in_priority_box(mgr, center, key) {
-        mgr.build.chunks.insert(key, ChunkState::Queued);
-        if mgr.build.queued_set.insert(key) {
-            mgr.build.build_queue.push_back(key);
-        }
-        return;
-    }
-
     let ok = slots::try_make_uploading(mgr, center, key, nodes_arc, macro_arc, ropes_arc, colinfo_arc);
+
     if !ok {
-        mgr.build.chunks.remove(&key);
+        // IMPORTANT:
+        // try_make_uploading() already defers by setting ChunkState::Queued + pushing into build_queue
+        // when arena/slot allocation fails. Do NOT delete that state here, or the chunk will vanish
+        // until center changes.
+        //
+        // If try_make_uploading considered it fatal, it removed the entry itself; clean up cancels too.
+        if mgr.build.chunks.get(&key).is_none() {
+            mgr.build.cancels.remove(&key);
+        }
     }
 }
+
 
 
 #[derive(Clone, Copy)]
@@ -454,13 +483,12 @@ fn make_prio(score: f32) -> u32 {
 #[inline]
 fn heap_push(mgr: &mut ChunkManager, center: ChunkKey, k: ChunkKey, boost: f32) {
     let cam_fwd = mgr.build.last_cam_fwd;
-    let mut s = priority_score(k, center, cam_fwd) - boost;
+    let mut s = priority_score_streaming(mgr, k, center, cam_fwd) - boost;
 
-    if super::slots::in_priority_box(mgr, center, k) {
-        s -= 20_000.0;
-    } else if super::keep::in_active_xz(center, k) {
+    if super::keep::in_active_xz(center, k) {
         s -= 10_000.0;
     }
+
 
     mgr.build.heap_tie = mgr.build.heap_tie.wrapping_add(1).max(1);
 
@@ -513,14 +541,17 @@ pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec
             } &&
             {
                 let idx = ((k.z - origin[2]) * nx + (k.x - origin[0])) as usize;
-                mgr.ground.col_ground_cy.get(idx).is_some()
+                // if idx is in-bounds, we have a cached value
+                idx < mgr.ground.col_ground_y_vox.len()
             } &&
             {
                 let idx = ((k.z - origin[2]) * nx + (k.x - origin[0])) as usize;
-                let ground_cy = mgr.ground.col_ground_cy[idx];
+                let ground_y_vox = mgr.ground.col_ground_y_vox[idx];
+                let ground_cy = ground_y_vox.div_euclid(config::CHUNK_SIZE as i32);
                 let dy = k.y - ground_cy;
                 dy >= y_band_min() && dy <= y_band_max()
             };
+
 
         if keep_it {
             kept.push(k);
@@ -542,11 +573,9 @@ pub fn rebuild_build_heap(mgr: &mut ChunkManager, center: ChunkKey, cam_fwd: Vec
     // Score + heapify
     let mut items: Vec<HeapItem> = Vec::with_capacity(kept.len());
     for (i, k) in kept.into_iter().enumerate() {
-        let mut s = priority_score(k, center, cam_fwd);
+        let mut s = priority_score_streaming(mgr, k, center, cam_fwd);
 
-        if super::slots::in_priority_box(mgr, center, k) {
-            s -= 20_000.0;
-        } else if super::keep::in_active_xz(center, k) {
+        if super::keep::in_active_xz(center, k) {
             s -= 10_000.0;
         }
 

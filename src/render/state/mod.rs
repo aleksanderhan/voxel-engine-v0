@@ -210,12 +210,12 @@ impl Renderer {
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("linear_clamp_sampler"),
+            label: Some("nearest_clamp_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::FilterMode::Nearest, // level 0 anyway
             ..Default::default()
         });
@@ -226,8 +226,8 @@ impl Renderer {
         let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
 
         let render_scale = config::RENDER_SCALE;
-        let internal_w = ((width as f32) * render_scale).round() as u32;
-        let internal_h = ((height as f32) * render_scale).round() as u32;
+        let internal_w = ((width as f32) * render_scale).round().max(1.0) as u32;
+        let internal_h = ((height as f32) * render_scale).round().max(1.0) as u32;
         
         let textures = create_textures(&device, width, height, internal_w, internal_h);
         let bind_groups = create_bind_groups(&device, &layouts, &buffers, &textures, &sampler);
@@ -283,8 +283,8 @@ impl Renderer {
     }
 
     pub fn resize_output(&mut self, width: u32, height: u32) {
-        self.internal_w = ((width as f32) * self.render_scale).round() as u32;
-        self.internal_h = ((height as f32) * self.render_scale).round() as u32;
+        self.internal_w = ((width as f32) * self.render_scale).round().max(1.0) as u32;
+        self.internal_h = ((height as f32) * self.render_scale).round().max(1.0) as u32;
 
         self.textures = create_textures(&self.device, width, height, self.internal_w, self.internal_h);
 
@@ -480,7 +480,7 @@ impl Renderer {
             let h = u.h as usize;
             if w == 0 || h == 0 { continue; }
 
-            let row_bytes = w * 2;                 // R16Float => 2 bytes/texel
+            let row_bytes = w * 4;                 // R32Float => 4 bytes/texel
             let padded = align_up(row_bytes, 256); // required
             let needed = padded * h;
 
@@ -488,12 +488,13 @@ impl Renderer {
             scratch.resize(needed, 0);
 
             // copy row-by-row into padded scratch
-            let src: &[u8] = bytemuck::cast_slice(&u.data_f16);
+            let src: &[u8] = bytemuck::cast_slice(&u.data_f32);
             for row in 0..h {
                 let s0 = row * row_bytes;
                 let d0 = row * padded;
                 scratch[d0..d0 + row_bytes].copy_from_slice(&src[s0..s0 + row_bytes]);
             }
+
 
             self.queue.write_texture(
                 wgpu::ImageCopyTexture {

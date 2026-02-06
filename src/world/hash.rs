@@ -28,3 +28,8 @@ pub fn hash3(seed: u32, x: i32, y: i32, z: i32) -> u32 {
 pub fn u01(v: u32) -> f32 {
     (v as f32) * (1.0 / 4294967296.0)
 }
+
+#[inline(always)]
+pub fn s11(n: u32) -> f32 {
+    (u01(n) - 0.5) * 2.0
+}

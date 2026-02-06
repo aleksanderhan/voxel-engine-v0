@@ -2,29 +2,37 @@
 use glam::{Vec2, Vec3};
 use super::types::ChunkKey;
 
-pub fn priority_score(k: ChunkKey, center: ChunkKey, cam_fwd: Vec3) -> f32 {
+use crate::streaming::ChunkManager;
+use crate::streaming::manager::ground;
+
+#[inline]
+pub fn priority_score_streaming(mgr: &ChunkManager, k: ChunkKey, center: ChunkKey, cam_fwd: Vec3) -> f32 {
+    // 1) primary: XZ distance only (don’t penalize elevation differences between columns)
+    let dx = (k.x - center.x) as f32;
+    let dz = (k.z - center.z) as f32;
+    let dist2_xz = dx * dx + dz * dz;
+
+    // 2) secondary: local vertical offset within the column band (usually small: -2..2 or 0..2)
+    let ground_cy = ground::ground_cy_for_column(mgr, k.x, k.z).unwrap_or(center.y);
+    let local_dy = (k.y - ground_cy) as f32;
+
+    // Keep this small so it never beats a 1-step XZ shell difference.
+    let y_term = 0.25 * local_dy * local_dy;
+
+    // 3) tiny directional tie-break within same XZ shell
     let mut f = Vec2::new(cam_fwd.x, cam_fwd.z);
     if f.length_squared() > 1e-6 {
         f = f.normalize();
     } else {
         f = Vec2::ZERO;
     }
-    chunk_priority_score(k, center, f)
-}
 
-// keep this function as-is, but make it visible inside the module file
-fn chunk_priority_score(k: ChunkKey, c: ChunkKey, fwd_xz: Vec2) -> f32 {
-    let dx = (k.x - c.x) as f32;
-    let dz = (k.z - c.z) as f32;
-    let dy = (k.y - c.y) as f32;
+    let dist = dist2_xz.sqrt().max(1e-3);
+    let dir = dx * f.x + dz * f.y;
+    let dir_norm = (dir / dist).clamp(-1.0, 1.0);
 
-    let base = dx.abs() + dz.abs() + 2.0 * dy.abs();
-    let dir = dx * fwd_xz.x + dz * fwd_xz.y;
+    // keep < 0.5 so it can’t jump shells
+    let dir_bias = -0.49 * dir_norm;
 
-    let front_bonus = 0.75;
-    let behind_penalty = 0.25;
-
-    let bias = if dir >= 0.0 { -front_bonus * dir } else { -behind_penalty * dir };
-
-    base + bias
+    dist2_xz + y_term + dir_bias
 }

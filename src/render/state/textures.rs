@@ -19,10 +19,14 @@ pub struct TextureSet {
     pub output: OutputTex,
     pub color: Tex2D,
     pub depth: Tex2D,
-    pub godray: [Tex2D; 2],
 
+    // per-pixel local lighting term (unfogged), written by primary
+    pub local: Tex2D,
+    
+    pub godray: [Tex2D; 2],
     pub clip_height: Tex2DArray,
 }
+
 
 pub fn quarter_dim(x: u32) -> u32 {
     (x + 3) / 4
@@ -123,7 +127,7 @@ pub fn create_textures(
         "color_tex",
         internal_w,
         internal_h,
-        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureFormat::Rgba32Float,
         rw_tex_usage,
     );
 
@@ -142,7 +146,7 @@ pub fn create_textures(
             "godray_a",
             internal_w,
             internal_h,
-            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Rgba32Float,
             rw_tex_usage,
         ),
         make_tex2d(
@@ -150,26 +154,37 @@ pub fn create_textures(
             "godray_b",
             internal_w,
             internal_h,
-            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureFormat::Rgba32Float,
             rw_tex_usage,
         ),
     ];
 
-    // FP16 clipmap height: R16Float (half bandwidth vs R32Float)
+    // Clipmap height: R32Float
     let clip_height = make_tex2d_array(
         device,
         "clip_height",
         config::CLIPMAP_RES,
         config::CLIPMAP_RES,
         config::CLIPMAP_LEVELS,
-        wgpu::TextureFormat::R16Float,
+        wgpu::TextureFormat::R32Float,
         wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
     );
+
+    let local = make_tex2d(
+        device,
+        "local_tex",
+        internal_w,
+        internal_h,
+        wgpu::TextureFormat::Rgba32Float,
+        rw_tex_usage,
+    );
+
 
     TextureSet {
         output,
         color,
         depth,
+        local,
         godray,
         clip_height,
     }

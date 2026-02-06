@@ -5,45 +5,27 @@ use crate::app::config;
 use super::{ChunkManager};
 use super::keep;
 
-#[inline]
-fn compute_ground_cy_at_column(world: &WorldGen, cx: i32, cz: i32) -> i32 {
-    let cs = config::CHUNK_SIZE as i32;
-    let half = cs / 2;
-    let wx = cx * cs + half;
-    let wz = cz * cs + half;
-    let ground_y_vox = world.ground_height(wx, wz);
-    ground_y_vox.div_euclid(cs)
-}
 
 pub fn ensure_column_cache(mgr: &mut ChunkManager, world: &WorldGen, center: ChunkKey) {
     let new_origin = keep::keep_origin_for(center);
-    let origin_changed = mgr.ground.col_ground_cy.is_empty() || new_origin != mgr.grid.grid_origin_chunk;
 
-    if !origin_changed {
+    // IMPORTANT: column cache is XZ-only; ignore Y when deciding if it moved.
+    let old_origin = mgr.grid.grid_origin_chunk;
+    let origin_changed_xz =
+        mgr.ground.col_ground_y_vox.is_empty()
+        || new_origin[0] != old_origin[0]
+        || new_origin[2] != old_origin[2];
+
+    // Always publish full new origin for the 3D grid (Y matters there).
+    mgr.grid.grid_origin_chunk = new_origin;
+
+    if !origin_changed_xz {
         return;
     }
 
-    let old_origin = mgr.grid.grid_origin_chunk;
-
-    // publish new origin first (so indexing uses it)
-    mgr.grid.grid_origin_chunk = new_origin;
-
     update_column_ground_cache(mgr, world, old_origin, new_origin);
     mgr.grid.grid_dirty = true;
-}
 
-pub fn ground_cy_for_column(mgr: &ChunkManager, cx: i32, cz: i32) -> Option<i32> {
-    let [ox, _, oz] = mgr.grid.grid_origin_chunk;
-
-    let nx = (2 * config::KEEP_RADIUS + 1) as i32;
-    let nz = nx;
-
-    let ix = cx - ox;
-    let iz = cz - oz;
-    if ix < 0 || iz < 0 || ix >= nx || iz >= nz { return None; }
-
-    let idx = (iz * nx + ix) as usize;
-    mgr.ground.col_ground_cy.get(idx).copied()
 }
 
 fn update_column_ground_cache(
@@ -57,20 +39,21 @@ fn update_column_ground_cache(
     let len = (nx * nz) as usize;
 
     // first time / resize => full rebuild
-    if mgr.ground.col_ground_cy.len() != len || mgr.ground.col_ground_cy.is_empty() {
-        mgr.ground.col_ground_cy.resize(len, 0);
+    if mgr.ground.col_ground_y_vox.len() != len || mgr.ground.col_ground_y_vox.is_empty() {
+        mgr.ground.col_ground_y_vox.resize(len, 0);
         let ox = new_origin[0];
         let oz = new_origin[2];
         for dz in 0..nz {
             for dx in 0..nx {
                 let cx = ox + dx;
                 let cz = oz + dz;
-                mgr.ground.col_ground_cy[(dz * nx + dx) as usize] =
-                    compute_ground_cy_at_column(world, cx, cz);
+                mgr.ground.col_ground_y_vox[(dz * nx + dx) as usize] =
+                    compute_ground_y_vox_at_column(world, cx, cz);
             }
         }
         return;
     }
+
 
     let dx_chunks = new_origin[0] - old_origin[0];
     let dz_chunks = new_origin[2] - old_origin[2];
@@ -87,14 +70,15 @@ fn update_column_ground_cache(
             for dx in 0..nx {
                 let cx = ox + dx;
                 let cz = oz + dz;
-                mgr.ground.col_ground_cy[(dz * nx + dx) as usize] =
-                    compute_ground_cy_at_column(world, cx, cz);
+                mgr.ground.col_ground_y_vox[(dz * nx + dx) as usize] =
+                    compute_ground_y_vox_at_column(world, cx, cz); // <-- WAS compute_ground_cy_at_column
             }
         }
         return;
     }
 
-    let old = std::mem::take(&mut mgr.ground.col_ground_cy);
+
+    let old = std::mem::take(&mut mgr.ground.col_ground_y_vox);
     let mut newv = vec![0i32; len];
 
     let ox_new = new_origin[0];
@@ -113,10 +97,43 @@ fn update_column_ground_cache(
             } else {
                 let cx = ox_new + ix;
                 let cz = oz_new + iz;
-                newv[dst_idx] = compute_ground_cy_at_column(world, cx, cz);
+                newv[dst_idx] = compute_ground_y_vox_at_column(world, cx, cz); // <-- WAS compute_ground_cy_at_column
             }
+
         }
     }
 
-    mgr.ground.col_ground_cy = newv;
+    mgr.ground.col_ground_y_vox = newv;
+}
+
+#[inline]
+fn compute_ground_y_vox_at_column(world: &WorldGen, cx: i32, cz: i32) -> i32 {
+    let cs = config::CHUNK_SIZE as i32;
+    let half = cs / 2;
+    let wx = cx * cs + half;
+    let wz = cz * cs + half;
+    world.ground_height(wx, wz)
+}
+
+#[inline]
+pub fn column_index(mgr: &ChunkManager, cx: i32, cz: i32) -> Option<usize> {
+    let [ox, _, oz] = mgr.grid.grid_origin_chunk;
+    let nx = (2 * config::KEEP_RADIUS + 1) as i32;
+    let nz = nx;
+
+    let ix = cx - ox;
+    let iz = cz - oz;
+    if ix < 0 || iz < 0 || ix >= nx || iz >= nz { return None; }
+
+    Some((iz * nx + ix) as usize)
+}
+
+pub fn ground_y_vox_for_column(mgr: &ChunkManager, cx: i32, cz: i32) -> Option<i32> {
+    let idx = column_index(mgr, cx, cz)?;
+    mgr.ground.col_ground_y_vox.get(idx).copied()
+}
+
+pub fn ground_cy_for_column(mgr: &ChunkManager, cx: i32, cz: i32) -> Option<i32> {
+    let y_vox = ground_y_vox_for_column(mgr, cx, cz)?;
+    Some(y_vox.div_euclid(config::CHUNK_SIZE as i32))
 }

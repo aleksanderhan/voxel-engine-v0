@@ -1,7 +1,9 @@
+// src/streaming/manager/stats.rs
 use crate::streaming::types::*;
 use super::ChunkManager;
+use crate::svo::builder::BuildTimingsMs;
 
-pub fn stats(mgr: &ChunkManager) -> Option<StreamStats> {
+pub fn stats(mgr: &mut ChunkManager) -> Option<StreamStats> {
     let mut s = StreamStats::default();
 
     if let Some(c) = mgr.build.last_center {
@@ -44,6 +46,60 @@ pub fn stats(mgr: &ChunkManager) -> Option<StreamStats> {
         }
     }
     s.orphan_queued = orphan;
+
+    // ---------------------------------------------------------------------
+    // Drain timing window (only called on profiler cadence)
+    // ---------------------------------------------------------------------
+    let w = mgr.timing.drain();
+
+    s.builds_done     = w.builds_done;
+    s.builds_canceled = w.builds_canceled;
+
+    if w.builds_done > 0 {
+        let n = w.builds_done as f64;
+
+        s.queue_ms_avg = w.queue_ms_sum / n;
+        s.queue_ms_max = w.queue_ms_max;
+
+        s.build_ms_avg = w.build_ms_sum / n;
+        s.build_ms_max = w.build_ms_max;
+
+        s.nodes_avg = (w.nodes_sum as f64) / n;
+        s.nodes_max = w.nodes_max;
+
+        let mut bt_avg = w.bt_sum;
+        bt_avg.total         /= n;
+        bt_avg.height_cache  /= n;
+        bt_avg.tree_mask     /= n;
+        bt_avg.ground_2d     /= n;
+        bt_avg.ground_mip    /= n;
+        bt_avg.tree_top      /= n;
+        bt_avg.tree_mip      /= n;
+        bt_avg.material_fill /= n;
+        bt_avg.cave_mask     /= n; 
+        bt_avg.colinfo       /= n;
+        bt_avg.colinfo_pack  /= n;
+        bt_avg.prefix_x      /= n;
+        bt_avg.prefix_y      /= n;
+        bt_avg.prefix_z      /= n;
+        bt_avg.macro_occ     /= n;
+        bt_avg.svo_build     /= n;
+        bt_avg.ropes         /= n;
+
+        s.bt_avg = bt_avg;
+        s.bt_max = w.bt_max;
+    } else {
+        s.queue_ms_avg = 0.0;
+        s.queue_ms_max = 0.0;
+        s.build_ms_avg = 0.0;
+        s.build_ms_max = 0.0;
+        s.nodes_avg = 0.0;
+        s.nodes_max = 0;
+
+        s.bt_avg = BuildTimingsMs::default();
+        s.bt_max = BuildTimingsMs::default();
+    }
+
 
     Some(s)
 }

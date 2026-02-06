@@ -11,15 +11,17 @@ pub struct Layouts {
     pub blit: wgpu::BindGroupLayout,
 }
 
-fn bgl_sampler(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+fn bgl_sampler_non_filtering(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility,
-        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
         count: None,
     }
 }
-
 
 fn bgl_uniform(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
@@ -116,34 +118,46 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         entries: &scene_entries,
     });
 
-    // PRIMARY: add clipmap uniform + clipmap height texture array
-    // bindings:
-    // 0 camera
-    // 1 chunks
-    // 2 nodes
-    // 3 chunk_grid
-    // 4 color storage
-    // 5 depth storage
-    // 6 clipmap uniform
-    // 7 clipmap height texture array (R32Float)
-    // 8 macro_occ
-    let mut primary_entries = Vec::with_capacity(8);
-    primary_entries.extend_from_slice(&scene_entries);
+    // PRIMARY bindings:
+    // 0 camera (uniform)
+    // 1 chunks (storage_ro)
+    // 2 nodes (storage_ro)
+    // 3 chunk_grid (storage_ro)
+    // 4 color (storage write)
+    // 5 depth (storage write)
+    // 6 local lighting (storage write)
+    // 7 clipmap params (uniform)
+    // 8 clipmap height texture array (sampled)
+    // 9 macro_occ (storage_ro)
+    // 10 node_ropes (storage_ro)
+    // 11 colinfo (storage_ro)
+    let primary_entries: [wgpu::BindGroupLayoutEntry; 12] = [
+        bgl_uniform(0, cs_vis),
+        bgl_storage_ro(1, cs_vis),
+        bgl_storage_ro(2, cs_vis),
+        bgl_storage_ro(3, cs_vis),
 
-    primary_entries.push(bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba16Float));
-    primary_entries.push(bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float));
+        bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba32Float),
+        bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float),
+        bgl_storage_tex_wo(6, cs_vis, wgpu::TextureFormat::Rgba32Float), // local
 
-    primary_entries.push(bgl_uniform(6, cs_vis));
-    primary_entries.push(bgl_tex_sample_2d_array(
-        7,
-        cs_vis,
-        wgpu::TextureSampleType::Float { filterable: false },
-    ));
+        bgl_uniform(7, cs_vis),
+        bgl_tex_sample_2d_array(
+            8,
+            cs_vis,
+            wgpu::TextureSampleType::Float { filterable: false },
+        ),
+
+        bgl_storage_ro(9, cs_vis),
+        bgl_storage_ro(10, cs_vis),
+        bgl_storage_ro(11, cs_vis),
+    ];
 
     let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("primary_bgl"),
         entries: &primary_entries,
     });
+
 
     let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("godray_bgl"),
@@ -156,10 +170,10 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             bgl_tex_sample_2d(
                 1,
                 cs_vis,
-                wgpu::TextureSampleType::Float { filterable: true },
+                wgpu::TextureSampleType::Float { filterable: false },
             ),
-            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
-            bgl_sampler(3, cs_vis), // sampler for history
+            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba32Float),
+            bgl_sampler_non_filtering(3, cs_vis), // sampler for history
         ],
     });
 
@@ -169,14 +183,14 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             bgl_tex_sample_2d(
                 0,
                 cs_vis,
-                wgpu::TextureSampleType::Float { filterable: true },
+                wgpu::TextureSampleType::Float { filterable: false },
             ),
             bgl_tex_sample_2d(
                 1,
                 cs_vis,
-                wgpu::TextureSampleType::Float { filterable: true },
+                wgpu::TextureSampleType::Float { filterable: false },
             ),
-            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba16Float),
+            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba32Float),
 
             // full-res depth for depth-aware upsample
             bgl_tex_sample_2d(
@@ -186,7 +200,17 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             ),
 
             // NEW: sampler for godray_tex (used by textureSampleLevel)
-            bgl_sampler(4, cs_vis),
+            bgl_sampler_non_filtering(4, cs_vis),
+
+            // binding 5: local_hist_tex (sampled)
+            bgl_tex_sample_2d(
+                5,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            // binding 6: sampler (can reuse same sampler type)
+            bgl_sampler_non_filtering(6, cs_vis),
+
         ],
     });
 
@@ -201,12 +225,12 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             bgl_tex_sample_2d(
                 0,
                 wgpu::ShaderStages::FRAGMENT,
-                wgpu::TextureSampleType::Float { filterable: true },
+                wgpu::TextureSampleType::Float { filterable: false },
             ),
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                 count: None,
             },
             bgl_uniform(2, wgpu::ShaderStages::FRAGMENT),

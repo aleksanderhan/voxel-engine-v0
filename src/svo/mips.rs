@@ -179,22 +179,3 @@ pub fn build_max_mip_inplace<'a>(
         levels: &levels[..],
     }
 }
-
-impl<'a> MaxMipView<'a> {
-    #[inline]
-    pub fn query_max(&self, x0: i32, z0: i32, size: u32) -> i32 {
-        debug_assert!(size.is_power_of_two());
-        debug_assert!(size <= self.root_side);
-        debug_assert!(x0 >= 0 && z0 >= 0);
-
-        let level = size.trailing_zeros() as usize;
-        debug_assert!(level < self.levels.len());
-
-        let side = self.root_side >> level;
-        let x = (x0 as u32) / size;
-        let z = (z0 as u32) / size;
-        let idx = (z * side + x) as usize;
-
-        self.levels[level][idx]
-    }
-}

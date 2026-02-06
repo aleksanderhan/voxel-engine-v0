@@ -29,17 +29,10 @@ pub fn build_offsets(radius: i32) -> Vec<(i32, i32, i32)> {
 
 #[inline(always)]
 pub fn in_active_xz(center: ChunkKey, k: ChunkKey) -> bool {
-    let ar = config::ACTIVE_RADIUS.max(PRIORITY_RADIUS);
+    let ar = config::ACTIVE_RADIUS;
     let dx = k.x - center.x;
     let dz = k.z - center.z;
     dx*dx + dz*dz <= ar*ar
-}
-
-#[inline(always)]
-pub fn in_priority_xz(center: ChunkKey, k: ChunkKey) -> bool {
-    let dx = k.x - center.x;
-    let dz = k.z - center.z;
-    dx*dx + dz*dz <= PRIORITY_RADIUS*PRIORITY_RADIUS
 }
 
 pub fn keep_origin_for(center: ChunkKey) -> [i32; 3] {

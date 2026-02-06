@@ -29,7 +29,7 @@ use crate::{
     streaming::ChunkManager,
     world::WorldGen,
 };
-use crate::world::materials::{AIR, DIRT, STONE, WOOD};
+use crate::world::materials::{AIR, DIRT, STONE, WOOD, LIGHT};
 
 pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
     let mut app = App::new(window).await;
@@ -139,6 +139,7 @@ impl App {
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps.formats[0];
         let present_mode = choose_present_mode(&surface_caps);
+        println!("present_mode = {:?}", present_mode);
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -148,7 +149,7 @@ impl App {
             present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 3,
+            desired_maximum_frame_latency: 2,
         };
 
         let renderer =
@@ -175,10 +176,10 @@ impl App {
 
         let edit_modes = vec![
             EditMode::Dig,
-            EditMode::Place(AIR), // “place air” mode if you want it explicitly
             EditMode::Place(DIRT),
             EditMode::Place(STONE),
             EditMode::Place(WOOD),
+            EditMode::Place(LIGHT),
         ];
 
         // --- Profiling (default off) ---------------------------------------------------------
@@ -296,7 +297,9 @@ impl App {
         self.prev_view_proj = glam::Mat4::from_cols_array_2d(&camera_gpu.view_proj);
         self.has_prev_view_proj = true;
 
-        self.finish_frame_profiling(frame_start);
+        // IMPORTANT: "render_ms" should exclude finish_frame_profiling overhead
+        let render_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+        self.finish_frame_profiling(render_ms);
     }
 
     fn compute_frame_dt_seconds(&mut self) -> f32 {
@@ -481,8 +484,14 @@ impl App {
             self.fps_last_update = Instant::now();
         }
 
-        let overlay = OverlayGpu::from_fps_and_dims(
+        let edit_value = match self.edit_modes[self.edit_mode] {
+            EditMode::Dig => crate::world::materials::AIR,   // or keep a dedicated “DIG” path if you prefer
+            EditMode::Place(m) => m,
+        };
+
+        let overlay = OverlayGpu::from_fps_and_edit(
             self.fps_value,
+            edit_value,
             self.surface_config.width,
             self.surface_config.height,
             8,
@@ -491,6 +500,7 @@ impl App {
 
         self.profiler.overlay(profiler::FrameProf::end_ms(t0));
     }
+
 
     fn apply_chunk_uploads_and_refresh_grid(&mut self) {
         let t0 = self.profiler.start();
@@ -607,12 +617,13 @@ impl App {
         self.profiler.present(profiler::FrameProf::end_ms(t0));
     }
 
-    fn finish_frame_profiling(&mut self, frame_start: Instant) {
+    fn finish_frame_profiling(&mut self, render_ms: f64) {
         if !self.profiler.enabled() {
             return;
         }
 
-        // Readback timings only when printing; keep default path cheap.
+        let prof_start = Instant::now();
+
         let gpu_timings_ms = if self.profiler.should_print() {
             self.renderer.read_gpu_timings_ms_blocking()
         } else {
@@ -625,9 +636,10 @@ impl App {
             None
         };
 
-        let frame_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
-        self.profiler.end_frame(frame_ms, streaming_stats, gpu_timings_ms);
+        let prof_overhead_ms = prof_start.elapsed().as_secs_f64() * 1000.0;
+        self.profiler.end_frame(render_ms, prof_overhead_ms, streaming_stats, gpu_timings_ms);
     }
+
 
     fn update_editor(&mut self) {
         // scroll wheel selects mode
@@ -659,21 +671,41 @@ impl App {
         let max_dist_m = 80.0;
         let voxel = config::VOXEL_SIZE_M_F32;
 
-        let Some((hit_w, prev_w)) = self.raycast_voxel(eye, dir, max_dist_m, voxel) else {
+        let Some((hit_w, place_w, enter_n)) = self.raycast_voxel(eye, dir, max_dist_m, voxel) else {
             return;
         };
 
-        let hit_mat = self.sample_voxel_material(hit_w.0, hit_w.1, hit_w.2);
-        println!("hit voxel {:?} mat={}", hit_w, hit_mat);
+        println!("HIT  = {:?} mat={}", hit_w, self.sample_voxel_material(hit_w.0, hit_w.1, hit_w.2));
+        println!("PLACE= {:?} mat={}", place_w, self.sample_voxel_material(place_w.0, place_w.1, place_w.2));
+        println!("enter_n = {:?}", enter_n);
 
-        // choose target voxel depending on mode
+        // Decide edit operation.
+        // Rule:
+        // - Dig replaces the HIT voxel with AIR.
+        // - Place writes ONLY into the PREV voxel (adjacent empty). Never overwrite solids.
         let (tx, ty, tz, mat) = match self.edit_modes[self.edit_mode] {
             EditMode::Dig => (hit_w.0, hit_w.1, hit_w.2, crate::world::materials::AIR),
-            EditMode::Place(m) => (prev_w.0, prev_w.1, prev_w.2, m),
+
+            EditMode::Place(m) => {
+                // Absolute guarantee: we never write into hit voxel when placing.
+                if place_w == hit_w {
+                    panic!("BUG: place_w == hit_w  hit={:?} place={:?} enter_n={:?}", hit_w, place_w, enter_n);
+                }
+
+                // Only place into empty.
+                let place_mat = self.sample_voxel_material(place_w.0, place_w.1, place_w.2);
+                if place_mat != AIR {
+                    println!("blocked: place_w {:?} is not AIR (mat={})", place_w, place_mat);
+                    return;
+                }
+
+                (place_w.0, place_w.1, place_w.2, m)
+            }
+
         };
 
         // chunk key + local coords
-        let (key, lx, ly, lz) = crate::world::edits::voxel_to_chunk_local( &self.world, tx, ty, tz);
+        let (key, lx, ly, lz) = crate::world::edits::voxel_to_chunk_local(&self.world, tx, ty, tz);
 
         println!("edit key={:?} state={:?}", key, self.chunks.build.chunks.get(&key));
 
@@ -682,6 +714,24 @@ impl App {
 
         // write edit override
         self.chunks.edits.apply_voxel(key, lx, ly, lz, mat);
+
+        let (hit_key, hit_lx, hit_ly, hit_lz) =
+            crate::world::edits::voxel_to_chunk_local(&self.world, hit_w.0, hit_w.1, hit_w.2);
+        let (pl_key, pl_lx, pl_ly, pl_lz) =
+            crate::world::edits::voxel_to_chunk_local(&self.world, tx, ty, tz);
+
+        let hit_override = self.chunks.edits.get_override(hit_key, hit_lx, hit_ly, hit_lz);
+        let pl_override  = self.chunks.edits.get_override(pl_key, pl_lx, pl_ly, pl_lz);
+
+        println!("override hit  {:?} local=({}, {}, {}) -> {:?}", hit_key, hit_lx, hit_ly, hit_lz, hit_override);
+        println!("override place {:?} local=({}, {}, {}) -> {:?}", pl_key, pl_lx, pl_ly, pl_lz, pl_override);
+
+
+        let verify = self.chunks.edits.get_override(key, lx, ly, lz);
+        println!(
+            "edit verify key={:?} local=({}, {}, {}) wrote={} readback={:?}",
+            key, lx, ly, lz, mat, verify
+        );
 
         // force a rebuild soon
         self.enqueue_chunk_rebuild_now(key);
@@ -693,11 +743,13 @@ impl App {
         dir_m: glam::Vec3,
         max_dist_m: f32,
         voxel_m: f32,
-    ) -> Option<((i32, i32, i32), (i32, i32, i32))> {
+    ) -> Option<((i32, i32, i32), (i32, i32, i32), (i32, i32, i32))> {
         let dir = dir_m.normalize();
-        let mut t = 0.0f32;
 
-        // start voxel
+        // Nudge origin slightly along the ray to avoid starting exactly on voxel boundaries.
+        let origin_m = origin_m + dir * (voxel_m * 1e-4);
+
+        // Start voxel (cell containing origin)
         let mut vx = (origin_m.x / voxel_m).floor() as i32;
         let mut vy = (origin_m.y / voxel_m).floor() as i32;
         let mut vz = (origin_m.z / voxel_m).floor() as i32;
@@ -746,41 +798,64 @@ impl App {
             voxel_m / dir.z.abs()
         };
 
-        let mut prev = (vx, vy, vz);
-
-        // march
         let max_t = max_dist_m;
+        let mut t = 0.0f32;
+
+        // Deterministic single-axis stepping:
+        // - We step EXACTLY ONE axis per iteration.
+        // - On ties we use a stable priority (X then Y then Z).
+        // This removes edge/corner ambiguity that causes placement to "flip".
         for _ in 0..512 {
-            // hard cap
-            // sample voxel (worldgen + edits)
-            if self.sample_voxel_material(vx, vy, vz) != crate::world::materials::AIR {
-                return Some(((vx, vy, vz), prev));
+            // Choose next crossing axis (stable tie-break)
+            let mut axis = 0; // 0=x, 1=y, 2=z
+            let mut t_next = t_max_x;
+
+            if t_max_y < t_next || (t_max_y == t_next && axis > 1) {
+                axis = 1;
+                t_next = t_max_y;
+            }
+            if t_max_z < t_next || (t_max_z == t_next && axis > 2) {
+                axis = 2;
+                t_next = t_max_z;
             }
 
-            prev = (vx, vy, vz);
-
-            // advance along smallest t_max
-            if t_max_x < t_max_y && t_max_x < t_max_z {
-                vx += step_x;
-                t = t_max_x;
-                t_max_x += t_delta_x;
-            } else if t_max_y < t_max_z {
-                vy += step_y;
-                t = t_max_y;
-                t_max_y += t_delta_y;
-            } else {
-                vz += step_z;
-                t = t_max_z;
-                t_max_z += t_delta_z;
-            }
-
-            if t > max_t {
+            if t_next > max_t {
                 break;
+            }
+
+            // Step exactly one axis, and set enter_n to the face we crossed.
+            let enter_n = match axis {
+                0 => {
+                    vx += step_x;
+                    t_max_x += t_delta_x;
+                    (-step_x, 0, 0)
+                }
+                1 => {
+                    vy += step_y;
+                    t_max_y += t_delta_y;
+                    (0, -step_y, 0)
+                }
+                _ => {
+                    vz += step_z;
+                    t_max_z += t_delta_z;
+                    (0, 0, -step_z)
+                }
+            };
+
+            t = t_next;
+
+            // Now inside the newly-entered voxel.
+            if self.sample_voxel_material(vx, vy, vz) != AIR {
+                let hit_w = (vx, vy, vz);
+                // Place in the adjacent voxel on the entered face (outside the solid).
+                let place_w = (vx + enter_n.0, vy + enter_n.1, vz + enter_n.2);
+                return Some((hit_w, place_w, enter_n));
             }
         }
 
         None
     }
+
 
     fn sample_voxel_material(&self, wx: i32, wy: i32, wz: i32) -> u32 {
         let cs = config::CHUNK_SIZE as i32;
@@ -805,23 +880,24 @@ impl App {
 
 }
 
-fn choose_present_mode(surface_caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
-    // Mailbox: low latency + avoids tearing (if supported).
-    // Fifo: always supported, vsync.
-    // Immediate: lowest latency but can tear.
-    if surface_caps
-        .present_modes
-        .contains(&wgpu::PresentMode::Mailbox)
-    {
+fn choose_present_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {
+    // For profiling: avoid vsync blocking.
+    // Use --profile as the switch (or add a dedicated flag).
+    let profiling = std::env::args().any(|a| a == "--profile");
+
+    if profiling && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+        return wgpu::PresentMode::Immediate;
+    }
+
+    if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
         wgpu::PresentMode::Mailbox
-    } else if surface_caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
+    } else if caps.present_modes.contains(&wgpu::PresentMode::FifoRelaxed) {
+        wgpu::PresentMode::FifoRelaxed
+    } else if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
         wgpu::PresentMode::Fifo
-    } else if surface_caps
-        .present_modes
-        .contains(&wgpu::PresentMode::Immediate)
-    {
+    } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
         wgpu::PresentMode::Immediate
     } else {
-        surface_caps.present_modes[0]
+        caps.present_modes[0]
     }
 }

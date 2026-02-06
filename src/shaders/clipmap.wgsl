@@ -4,14 +4,7 @@
 // Toroidal (ring) clipmap storage, but NO LOD selection in shader.
 // We always sample a single fixed level (coarsest by default).
 
-const CLIP_LEVELS_MAX : u32 = 16u;
-
-// March tuning
-const HF_MAX_STEPS : u32 = 96u;
-const HF_BISECT    : u32 = 5u;
-
-// dt clamp (meters along ray)
-const HF_DT_MAX : f32 = 48.0;
+// Tunables live in common.wgsl.
 
 struct ClipmapParams {
   levels      : u32,
@@ -22,8 +15,8 @@ struct ClipmapParams {
   offset      : array<vec4<u32>, CLIP_LEVELS_MAX>,
 };
 
-@group(0) @binding(6) var<uniform> clip : ClipmapParams;
-@group(0) @binding(7) var clip_height : texture_2d_array<f32>;
+@group(0) @binding(7) var<uniform> clip : ClipmapParams;
+@group(0) @binding(8) var clip_height : texture_2d_array<f32>;
 
 fn imod(a: i32, m: i32) -> i32 {
   var r = a % m;
@@ -40,13 +33,11 @@ struct HSample { h: f32, ok: bool };
 
 fn clip_height_at_level_ok(world_xz: vec2<f32>, level: u32) -> HSample {
   let res_i = max(i32(clip.res), 1);
-  let p = clip.level[level];
-  let origin = vec2<f32>(p.x, p.y);
-  let cell   = max(p.z, 1e-6);
 
-  let uv = (world_xz - origin) / cell;
-  let ix = i32(floor(uv.x));
-  let iz = i32(floor(uv.y));
+  let st = clip_st(world_xz, level);
+
+  let ix = i32(floor(st.x));
+  let iz = i32(floor(st.y));
 
   if (ix < 0 || iz < 0 || ix >= res_i || iz >= res_i) {
     return HSample(0.0, false);
@@ -59,6 +50,7 @@ fn clip_height_at_level_ok(world_xz: vec2<f32>, level: u32) -> HSample {
   let h = textureLoad(clip_height, vec2<i32>(sx, sz), i32(level), 0).x;
   return HSample(h, true);
 }
+
 
 fn clip_height_texel(level: u32, ix: i32, iz: i32) -> f32 {
   let res_i = max(i32(clip.res), 1);
@@ -140,6 +132,13 @@ struct ClipHit {
 };
 
 fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> ClipHit {
+  if (!ENABLE_CLIPMAP) {
+    return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+  }
+  if (clip.levels == 0u) {
+    return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+  }
+
   // Same behavior: only trace when ray points downward.
   if (rd.y >= -1e-4) {
     return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
@@ -156,6 +155,9 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
 
   // Initial signed height
   var h0: f32   = clip_height_at_level(p.xz, lvl);
+  if (h0 <= -0.5 * BIG_F32) {
+    return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+  }
   var s_prev: f32 = p.y - h0;
   var t_prev: f32 = t;
 
@@ -168,6 +170,9 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
     lvl = clip_ensure_contains(p.xz, lvl, guard);
 
     let h: f32 = clip_height_at_level(p.xz, lvl);
+    if (h <= -0.5 * BIG_F32) {
+      return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+    }
     let s: f32 = p.y - h;
 
     // Crossing from above -> below: refine with bisection at SAME lvl.
@@ -180,6 +185,9 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
         let pm = ro + rd * m;
 
         let hm = clip_height_at_level(pm.xz, lvl);
+        if (hm <= -0.5 * BIG_F32) {
+          return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
+        }
         let sm = pm.y - hm;
 
         if (sm > 0.0) { a = m; } else { b = m; }
@@ -246,15 +254,19 @@ fn apply_material_variation_clip(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> ve
 
 fn clip_level_contains(xz: vec2<f32>, level: u32, guard: i32) -> bool {
   let res_i = max(i32(clip.res), 1);
-  let p = clip.level[level];
-  let origin = vec2<f32>(p.x, p.y);
-  let cell   = max(p.z, 1e-6);
 
-  let uv = (xz - origin) / cell;
-  let ix = i32(floor(uv.x));
-  let iz = i32(floor(uv.y));
+  let st = clip_st(xz, level);
 
-  return (ix >= guard) && (iz >= guard) && (ix < (res_i - guard)) && (iz < (res_i - guard));
+  let ix0 = i32(floor(st.x));
+  let iz0 = i32(floor(st.y));
+  let ix1 = ix0 + 1;
+  let iz1 = iz0 + 1;
+
+  // Need full bilerp footprint inside [0..res-1]
+  return (ix0 >= guard) &&
+         (iz0 >= guard) &&
+         (ix1 < (res_i - guard)) &&
+         (iz1 < (res_i - guard));
 }
 
 // Finest available level that contains xz (coverage-based).
@@ -269,6 +281,9 @@ fn clip_best_level(xz: vec2<f32>, guard: i32) -> u32 {
 // Ensure containment by moving only to coarser levels.
 fn clip_ensure_contains(xz: vec2<f32>, lvl_in: u32, guard: i32) -> u32 {
   let n = min(clip.levels, CLIP_LEVELS_MAX);
+  if (n == 0u) {
+    return 0u;
+  }
   var lvl = min(lvl_in, n - 1u);
   loop {
     if (clip_level_contains(xz, lvl, guard) || lvl >= (n - 1u)) { break; }
@@ -276,3 +291,16 @@ fn clip_ensure_contains(xz: vec2<f32>, lvl_in: u32, guard: i32) -> u32 {
   }
   return lvl;
 }
+
+fn clip_st(world_xz: vec2<f32>, level: u32) -> vec2<f32> {
+  let p = clip.level[level];
+  let origin = vec2<f32>(p.x, p.y);
+  let cell   = max(p.z, 1e-6);
+
+  // uv in texel units, texel centers are at N+0.5
+  let uv = (world_xz - origin) / cell;
+
+  // st is aligned so integer ix/iz index texel centers (matches clip_height_at_level)
+  return uv - vec2<f32>(0.5, 0.5);
+}
+  

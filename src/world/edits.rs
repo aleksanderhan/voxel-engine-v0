@@ -13,39 +13,35 @@ use crate::app::config;
 use crate::streaming::types::ChunkKey;
 use crate::world::WorldGen;
 
+#[inline(always)]
+pub fn idx_xyz(lx: i32, ly: i32, lz: i32, cs: i32) -> u32 {
+    // Choose ONE layout and use it everywhere.
+    // I strongly recommend x + y*cs + z*cs*cs (x,y,z) because it's the usual row-major 3D.
+    (lx as u32) + (ly as u32) * (cs as u32) + (lz as u32) * (cs as u32) * (cs as u32)
+}
+
 #[inline]
 pub fn voxel_to_chunk_local(
-    world: &WorldGen,
+    _world: &WorldGen,
     wx: i32,
     wy: i32,
     wz: i32,
 ) -> (ChunkKey, i32, i32, i32) {
     let cs = config::CHUNK_SIZE as i32;
-    let half = cs / 2;
 
-    // Chunk column in XZ
+    // Absolute chunk coords in XYZ
     let cx = wx.div_euclid(cs);
+    let cy = wy.div_euclid(cs);
     let cz = wz.div_euclid(cs);
 
-    // Chunk-local XZ
+    // Chunk-local coords in [0..cs)
     let lx = wx.rem_euclid(cs);
+    let ly = wy.rem_euclid(cs);
     let lz = wz.rem_euclid(cs);
-
-    // IMPORTANT: match streaming/ground.rs: compute ground at column *center*
-    let col_wx = cx * cs + half;
-    let col_wz = cz * cs + half;
-    let ground_y_vox = world.ground_height(col_wx, col_wz);
-    let ground_cy = ground_y_vox.div_euclid(cs);
-
-    // Compute dy in chunk units relative to the ground voxel height at the column center.
-    let dy_chunks = (wy - ground_y_vox).div_euclid(cs);
-    let cy = ground_cy + dy_chunks;
-
-    // Chunk-local Y relative to that computed cy
-    let ly = (wy - cy * cs).rem_euclid(cs);
 
     (ChunkKey { x: cx, y: cy, z: cz }, lx, ly, lz)
 }
+
 
 #[derive(Clone, Copy, Debug)]
 pub struct EditEntry {

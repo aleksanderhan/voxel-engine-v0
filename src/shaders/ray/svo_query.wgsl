@@ -1,4 +1,3 @@
-// src/shaders/ray/svo_query.wgsl
 //// --------------------------------------------------------------------------
 //// SVO query (leaf query + convenience predicates)
 //// --------------------------------------------------------------------------
@@ -24,27 +23,38 @@ fn query_leaf_at(
   // Macro occupancy early-out (8x8x8). If the macro cell is empty => MAT_AIR.
   // ------------------------------------------------------------------------
   if (macro_base != INVALID_U32) {
-    let cell = macro_cell_size(root_size);
+  let cell = macro_cell_size(root_size);
 
-    // local position in chunk (meters)
-    let lp = p_in - root_bmin;
+  let lp = p_in - root_bmin;
 
-    // macro coords 0..7
-    let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
-    let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
-    let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
-
-    let bit = macro_bit_index(mx, my, mz);
-
-    if (!macro_test(macro_base, bit)) {
-      let macro_bmin = root_bmin + vec3<f32>(
-        f32(mx) * cell,
-        f32(my) * cell,
-        f32(mz) * cell
-      );
-      return LeafQuery(macro_bmin, cell, MAT_AIR);
-    }
+  // If query point is outside this chunk cube, DO NOT clamp into macro cell 0.
+  // Treat as "not empty" so traversal continues normally, or return air safely.
+  if (lp.x < 0.0 || lp.y < 0.0 || lp.z < 0.0 ||
+      lp.x >= root_size || lp.y >= root_size || lp.z >= root_size) {
+    // safest: outside chunk => air
+    return LeafQuery(root_bmin, root_size, MAT_AIR);
   }
+
+  let mx_i = i32(floor(lp.x / cell));
+  let my_i = i32(floor(lp.y / cell));
+  let mz_i = i32(floor(lp.z / cell));
+
+  if (mx_i < 0 || my_i < 0 || mz_i < 0 ||
+      mx_i >= i32(MACRO_DIM) || my_i >= i32(MACRO_DIM) || mz_i >= i32(MACRO_DIM)) {
+    return LeafQuery(root_bmin, root_size, MAT_AIR);
+  }
+
+  let mx = u32(mx_i);
+  let my = u32(my_i);
+  let mz = u32(mz_i);
+
+  let bit = macro_bit_index(mx, my, mz);
+  if (!macro_test(macro_base, bit)) {
+    // macro cell empty => definitely air
+    return LeafQuery(root_bmin, root_size, MAT_AIR);
+  }
+}
+
 
 
   let min_leaf: f32 = cam.voxel_params.x;
@@ -95,4 +105,32 @@ fn query_leaf_at(
   }
 
   return LeafQuery(bmin, size, MAT_AIR);
+}
+
+fn make_air_leaf(bmin: vec3<f32>, size: f32) -> LeafQuery {
+  return LeafQuery(bmin, size, MAT_AIR);
+}
+
+// Returns leaf material at world position by first locating the chunk.
+fn query_leaf_world(p: vec3<f32>) -> LeafQuery {
+  let vs = cam.voxel_params.x;
+  let chunk_size_m = f32(cam.chunk_size) * vs;
+
+  // Convert world meters -> chunk coords
+  let c = chunk_coord_from_pos(p, chunk_size_m);
+
+  // Look up streamed chunk slot
+  let slot = grid_lookup_slot(c.x, c.y, c.z);
+  if (slot == INVALID_U32 || slot >= cam.chunk_count) {
+    // Outside loaded grid => air
+    return make_air_leaf(p, vs);
+  }
+
+  let ch = chunks[slot];
+
+  // Build the chunk's root box in meters
+  let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * vs;
+  let root_size = f32(cam.chunk_size) * vs;
+
+  return query_leaf_at(p, root_bmin, root_size, ch.node_base, ch.macro_base);
 }

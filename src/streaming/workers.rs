@@ -1,28 +1,28 @@
 // src/streaming/workers.rs
 use std::sync::{Arc, atomic::Ordering};
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::app::config;
-use crate::{
-    render::gpu_types::{NodeGpu, NodeRopesGpu},
-    svo::{build_chunk_svo_sparse_cancelable_with_scratch, BuildScratch},
-    world::WorldGen,
-};
-
+use crate::world::WorldGen;
+use crate::svo::builder::{BuildOutput, BuildTimingsMs};
+use crate::streaming::build_pool::build_chunk_svo_sparse_cancelable_tls;
+use crate::streaming::build_pool::BUILD_POOL;
 use super::types::{BuildDone, BuildJob};
 
 pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Sender<BuildDone>) {
-    for _ in 0..config::WORKER_THREADS {
-        let gen = gen.clone();
-        let rx_job = rx_job.clone();
-        let tx_done = tx_done.clone();
+    // Single dispatcher: keeps rx_job FIFO small and lets the pool schedule work.
+    std::thread::spawn(move || {
+        while let Ok(job) = rx_job.recv() {
+            let gen = gen.clone();
+            let tx_done = tx_done.clone();
 
-        std::thread::spawn(move || {
-            let mut scratch = BuildScratch::new();
-
-            while let Ok(job) = rx_job.recv() {
+            BUILD_POOL.spawn_fifo(move || {
                 let k = job.key;
+
+                let t_start = Instant::now();
+                let queue_ms = (t_start - job.enqueued_at).as_secs_f64() * 1000.0;
 
                 if job.cancel.load(Ordering::Relaxed) {
                     let _ = tx_done.send(BuildDone {
@@ -33,8 +33,11 @@ pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Se
                         macro_words: Vec::new(),
                         ropes: Vec::new(),
                         colinfo_words: Vec::new(),
+                        tim: BuildTimingsMs::default(),
+                        queue_ms,
+                        build_ms: 0.0,
                     });
-                    continue;
+                    return;
                 }
 
                 let origin = [
@@ -44,15 +47,21 @@ pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Se
                     0,
                 ];
 
-                let (nodes, macro_words, ropes, colinfo_words): (Vec<NodeGpu>, Vec<u32>, Vec<NodeRopesGpu>, Vec<u32>) =
-                    build_chunk_svo_sparse_cancelable_with_scratch(
-                        &gen,
-                        [origin[0], origin[1], origin[2]],
-                        config::CHUNK_SIZE,
-                        job.cancel.as_ref(),
-                        &mut scratch,
-                        &job.edits,
-                    );
+                // NOTE: we're already running on a BUILD_POOL worker thread,
+                // so do NOT call BUILD_POOL.install(...) here.
+                let BuildOutput {
+                    nodes,
+                    macro_words,
+                    ropes,
+                    colinfo_words,
+                    timings: tim,
+                } = build_chunk_svo_sparse_cancelable_tls(
+                    &gen,
+                    [origin[0], origin[1], origin[2]],
+                    config::CHUNK_SIZE,
+                    &job.cancel,
+                    &job.edits,
+                );
 
                 let canceled = job.cancel.load(Ordering::Relaxed);
                 let (nodes, macro_words, ropes) = if canceled {
@@ -61,6 +70,7 @@ pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Se
                     (nodes, macro_words, ropes)
                 };
 
+                let build_ms = t_start.elapsed().as_secs_f64() * 1000.0;
                 let _ = tx_done.send(BuildDone {
                     key: k,
                     cancel: job.cancel,
@@ -69,8 +79,11 @@ pub fn spawn_workers(gen: Arc<WorldGen>, rx_job: Receiver<BuildJob>, tx_done: Se
                     macro_words,
                     ropes,
                     colinfo_words,
+                    tim,
+                    queue_ms,
+                    build_ms,
                 });
-            }
-        });
-    }
+            });
+        }
+    });
 }

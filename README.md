@@ -71,7 +71,7 @@ The renderer is compute-driven, writing into intermediate textures, then present
 
 ### Pass 1: Primary (compute)
 - Writes:
-  - `color_tex` (HDR color, **RGBA16F** / “half-float HDR”)
+  - `color_tex` (HDR color, **RGBA32F** / “full-float HDR”)
   - `depth_tex` (scene depth proxy, **R32F**)
 - Uses:
   - Camera + scene buffers
@@ -134,7 +134,7 @@ A compact 64×64 per-chunk “column-top map” packs `(y, material)` per (x,z) 
 
 A toroidal clipmap stores height patches in a 2D array texture:
 
-- Format: **R16Float** (half bandwidth vs R32F)
+- Format: **R32Float**
 - Layout: `texture_2d_array`, one layer per clipmap level
 - CPU updates decide which patches to upload each frame
 
@@ -177,9 +177,9 @@ When GPU timestamps are enabled, the renderer resolves timestamps into a buffer 
 
 ## Rendering data formats (quick cheat sheet)
 
-- **HDR color**: `Rgba16Float`
+- **HDR color**: `Rgba32Float`
 - **Depth proxy**: `R32Float`
-- **Clipmap height**: `R16Float` array texture
+- **Clipmap height**: `R32Float` array texture
 - **GPU scene buffers**: storage buffers (`NodeGpu`, `ChunkMetaGpu`, macro occupancy bits, rope links, column info)
 
 ---

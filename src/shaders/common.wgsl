@@ -20,6 +20,17 @@ const BIG_F32 : f32 = 1e30;
 const EPS_INV : f32 = 1e-8;
 
 //// --------------------------------------------------------------------------
+//// Feature toggles
+//// --------------------------------------------------------------------------
+
+const ENABLE_GRASS   : bool = true;
+const ENABLE_CLIPMAP : bool = true;
+const ENABLE_GODRAYS : bool = true;
+const ENABLE_CLOUDS  : bool = true;
+const ENABLE_FOG     : bool = true;
+const ENABLE_BLOOM   : bool = true;
+
+//// --------------------------------------------------------------------------
 //// Materials
 //// --------------------------------------------------------------------------
 
@@ -29,6 +40,7 @@ const MAT_DIRT  : u32 = 2u;
 const MAT_STONE : u32 = 3u;
 const MAT_WOOD  : u32 = 4u;
 const MAT_LEAF  : u32 = 5u;
+const MAT_LIGHT : u32 = 6u;
 
 //// --------------------------------------------------------------------------
 //// Sun / sky (shared, but shading logic lives in ray_core.wgsl)
@@ -126,7 +138,7 @@ const CLOUD_UV_SCALE : f32       = 0.0016;
 const CLOUD_WIND     : vec2<f32> = vec2<f32>(0.020, 0.012);
 
 // Coverage thresholding (raise coverage => fewer clouds)
-const CLOUD_COVERAGE : f32 = 0.30;
+const CLOUD_COVERAGE : f32 = 0.40;
 const CLOUD_SOFTNESS : f32 = 0.08;
 
 // Density + shaping
@@ -211,6 +223,64 @@ const COMPOSITE_SHARPEN : f32 = 0.1;
 const POST_EXPOSURE : f32 = 0.15;
 
 //// --------------------------------------------------------------------------
+//// Clipmap heightfield tuning
+//// --------------------------------------------------------------------------
+
+const CLIP_LEVELS_MAX : u32 = 16u;
+
+// March tuning
+const HF_MAX_STEPS : u32 = 96u;
+const HF_BISECT    : u32 = 5u;
+
+// dt clamp (meters along ray)
+const HF_DT_MAX : f32 = 48.0;
+
+//// --------------------------------------------------------------------------
+//// Local voxel light gather (MAT_LIGHT)
+//// --------------------------------------------------------------------------
+
+// How far rays march in voxels (controls “search radius” for lights)
+const LIGHT_MAX_DIST_VOX : u32 = 32u;   // try 16..64
+
+// Number of rays
+const LIGHT_RAYS : u32 = 24u;          // try 16..32
+
+// Softens inverse-square near the light (in voxels)
+const LIGHT_SOFT_RADIUS_VOX : f32 = 3.0;
+
+// Clamp minimum distance to avoid blow-ups (in voxels)
+const LIGHT_NEAR_CLAMP_VOX : f32 = 1.25;
+
+// Finite range rolloff (in voxels). Past this, contributions fade to ~0.
+const LIGHT_RANGE_VOX : f32 = 80.0;     // try 32..96
+
+// Direct diffuse “wrap” (0 = pure Lambert, 0.1..0.25 = nicer in caves)
+const LIGHT_WRAP : f32 = 0.15;
+
+// Gains
+const LIGHT_DIRECT_GAIN   : f32 = 1.00;
+const LIGHT_INDIRECT_GAIN : f32 = 0.65; // cheap “bounce fill”
+
+// Stop after N light hits (perf only; output is normalized with LIGHT_RAYS)
+const LIGHT_EARLY_HITS : u32 = 24u;
+
+//// --------------------------------------------------------------------------
+//// Shading gates (world-space distance)
+//// --------------------------------------------------------------------------
+
+const VOXEL_AO_MAX_DIST     : f32 = 40.0;
+const LOCAL_LIGHT_MAX_DIST  : f32 = 50.0;
+const FAR_SHADING_DIST      : f32 = 80.0;
+const PRIMARY_CLOUD_SHADOWS : bool = false;
+
+//// --------------------------------------------------------------------------
+//// Local TAA
+//// --------------------------------------------------------------------------
+
+// Tune this: lower = steadier but slower response
+const LOCAL_TAA_ALPHA : f32 = 0.12;
+
+//// --------------------------------------------------------------------------
 //// Grass “hair” (procedural blades)
 //// --------------------------------------------------------------------------
 
@@ -238,9 +308,9 @@ const GRASS_TRACE_STEPS_MID : u32 = 6u;
 const GRASS_TRACE_STEPS_FAR : u32 = 4u;
 
 // Primary-pass grass gating (tune these)
-const GRASS_PRIMARY_MAX_DIST : f32 = 35.0; // meters-ish
+const GRASS_PRIMARY_MAX_DIST : f32 = 20.0; // meters-ish
 const GRASS_PRIMARY_MIN_NY   : f32 = 0.60; // only fairly upward normals
-const GRASS_PRIMARY_RATE_MASK: u32 = 1u;   // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
+const GRASS_PRIMARY_RATE_MASK: u32 = 3u;   // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
 
 
 // Misc
@@ -297,6 +367,10 @@ struct ChunkMeta {
   node_count   : u32,
   macro_base   : u32,
   colinfo_base : u32,
+  macro_empty  : u32,
+  _pad0        : u32,
+  _pad1        : u32,
+  _pad2        : u32,
 };
 
 //// --------------------------------------------------------------------------
@@ -307,9 +381,10 @@ struct ChunkMeta {
 @group(0) @binding(1) var<storage, read> chunks     : array<ChunkMeta>;
 @group(0) @binding(2) var<storage, read> nodes      : array<Node>;
 @group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
-@group(0) @binding(8) var<storage, read> macro_occ : array<u32>;
-@group(0) @binding(9) var<storage, read> node_ropes: array<NodeRopes>;
-@group(0) @binding(10) var<storage, read> chunk_colinfo : array<u32>;
+@group(0) @binding(9)  var<storage, read> macro_occ : array<u32>;
+@group(0) @binding(10) var<storage, read> node_ropes: array<NodeRopes>;
+@group(0) @binding(11) var<storage, read> chunk_colinfo : array<u32>;
+
 
 //// --------------------------------------------------------------------------
 //// Shared helpers
@@ -337,6 +412,16 @@ fn macro_test(macro_base: u32, bit: u32) -> bool {
 fn safe_inv(x: f32) -> f32 {
   return select(1.0 / x, BIG_F32, abs(x) < EPS_INV);
 }
+
+fn safe_normalize(v: vec3<f32>) -> vec3<f32> {
+  let l2 = dot(v, v);
+  // 1e-12 is conservative for f32; tweak if you want.
+  if (l2 <= 1e-12) {
+    return vec3<f32>(0.0, 1.0, 0.0); // arbitrary stable fallback
+  }
+  return v * inverseSqrt(l2);
+}
+
 
 fn ray_dir_from_pixel(px: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
   let ndc = vec4<f32>(
@@ -423,10 +508,28 @@ fn grid_lookup_slot(cx: i32, cy: i32, cz: i32) -> u32 {
 }
 
 fn chunk_coord_from_pos(p: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
+  // Bias inward to avoid precision-induced chunk flips at exact boundaries.
+  let eps = 1e-6 * chunk_size_m;
+  let px = p.x - sign(p.x) * eps;
+  let py = p.y - sign(p.y) * eps;
+  let pz = p.z - sign(p.z) * eps;
   return vec3<i32>(
-    i32(floor(p.x / chunk_size_m)),
-    i32(floor(p.y / chunk_size_m)),
-    i32(floor(p.z / chunk_size_m))
+    i32(floor(px / chunk_size_m)),
+    i32(floor(py / chunk_size_m)),
+    i32(floor(pz / chunk_size_m))
+  );
+}
+
+fn chunk_coord_from_pos_dir(p: vec3<f32>, rd: vec3<f32>, chunk_size_m: f32) -> vec3<i32> {
+  // Bias along ray direction to stay on the same side of boundaries during DDA.
+  let eps = 1e-6 * chunk_size_m;
+  let px = p.x + sign(rd.x) * eps;
+  let py = p.y + sign(rd.y) * eps;
+  let pz = p.z + sign(rd.z) * eps;
+  return vec3<i32>(
+    i32(floor(px / chunk_size_m)),
+    i32(floor(py / chunk_size_m)),
+    i32(floor(pz / chunk_size_m))
   );
 }
 
@@ -551,4 +654,30 @@ fn ip_render_from_present_px(px_present: vec2<f32>) -> vec2<i32> {
   let ix = clamp(i32(floor(pr.x)), 0, i32(rd.x) - 1);
   let iy = clamp(i32(floor(pr.y)), 0, i32(rd.y) - 1);
   return vec2<i32>(ix, iy);
+}
+
+fn is_nan_f32(x: f32) -> bool {
+  // NaN is the only float where x != x
+  return x != x;
+}
+
+fn is_inf_f32(x: f32) -> bool {
+  // Treat very large magnitude as inf/overflow.
+  // f32 max is ~3.4e38; choose a slightly smaller guard.
+  return abs(x) > 1.0e30;
+}
+
+fn is_bad_vec3(v: vec3<f32>) -> bool {
+  return is_nan_f32(v.x) || is_nan_f32(v.y) || is_nan_f32(v.z) ||
+         is_inf_f32(v.x) || is_inf_f32(v.y) || is_inf_f32(v.z);
+}
+
+fn ray_eps_vec(rd: vec3<f32>, eps: f32) -> vec3<f32> {
+  // Push inside the next cell on each axis deterministically.
+  // Using >= keeps it stable when rd component is exactly 0.
+  return vec3<f32>(
+    select(-eps, eps, rd.x >= 0.0),
+    select(-eps, eps, rd.y >= 0.0),
+    select(-eps, eps, rd.z >= 0.0)
+  );
 }

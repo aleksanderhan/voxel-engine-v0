@@ -1,4 +1,3 @@
-// src/shaders/ray/phase.wgsl
 //// --------------------------------------------------------------------------
 //// Phase
 //// --------------------------------------------------------------------------
@@ -15,5 +14,3 @@ fn phase_blended(costh: f32) -> f32 {
   let iso = INV_4PI;              // isotropic baseline
   return mix(iso, mie, PHASE_MIE_W);
 }
-
-

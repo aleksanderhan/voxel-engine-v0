@@ -1,4 +1,3 @@
-// src/shaders/ray/chunk_trace.wgsl
 // --------------------------------------------------------------------------
 // HitGeom + chunk tracing (rope traversal + macro occupancy)
 //
@@ -81,6 +80,13 @@ fn macro_cell_query(
   let cell = macro_cell_size(root_size);
   let lp   = p_in - root_bmin;
 
+  if (lp.x < 0.0 || lp.y < 0.0 || lp.z < 0.0 ||
+      lp.x >= root_size || lp.y >= root_size || lp.z >= root_size) {
+    // outside chunk => don't claim empty
+    return MacroCell(vec3<f32>(0.0), 0.0, false);
+  }
+
+
   let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
   let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
   let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
@@ -137,21 +143,54 @@ fn rope_next_local(node_base: u32, local_idx: u32, face: u32) -> u32 {
   return r.nz;
 }
 
-fn exit_face_from_slab(rd: vec3<f32>, slab: CubeSlab) -> u32 {
+// Add this near exit_face_from_slab
+struct ExitFaceRes {
+  face : u32,   // 0..5
+  amb  : u32,   // 1 => ambiguous (edge/corner exit)
+};
+
+fn exit_face_from_slab_safe(rd: vec3<f32>, slab: CubeSlab) -> ExitFaceRes {
   // 0=+X,1=-X,2=+Y,3=-Y,4=+Z,5=-Z
-  let tx = slab.tmaxv.x;
-  let ty = slab.tmaxv.y;
-  let tz = slab.tmaxv.z;
+  let te = slab.t_exit;
+  let eps = 1e-5 * max(1.0, abs(te));
 
+  // IMPORTANT: ignore near-zero ray components (prevents nonsense matches)
+  let mx = (abs(rd.x) >= EPS_INV) && (abs(slab.tmaxv.x - te) <= eps);
+  let my = (abs(rd.y) >= EPS_INV) && (abs(slab.tmaxv.y - te) <= eps);
+  let mz = (abs(rd.z) >= EPS_INV) && (abs(slab.tmaxv.z - te) <= eps);
+
+  let cx = select(0u, 1u, mx);
+  let cy = select(0u, 1u, my);
+  let cz = select(0u, 1u, mz);
+  let c  = cx + cy + cz;
+
+  // Edge/corner exit => ambiguous; don't rope-jump.
+  if (c >= 2u) {
+    return ExitFaceRes(0u, 1u);
+  }
+
+  // Single-axis (or fallback)
   var axis: u32 = 0u;
-  var best: f32 = tx;
-  if (ty < best) { best = ty; axis = 1u; }
-  if (tz < best) { best = tz; axis = 2u; }
 
-  if (axis == 0u) { return select(1u, 0u, rd.x > 0.0); }
-  if (axis == 1u) { return select(3u, 2u, rd.y > 0.0); }
-  return select(5u, 4u, rd.z > 0.0);
+  if (c == 1u) {
+    // choose the matching axis
+    if (mx) { axis = 0u; }
+    if (my) { axis = 1u; }
+    if (mz) { axis = 2u; }
+  } else {
+    // fallback: argmin(tmaxv) (same intent as your old fallback)
+    var bestv: f32 = slab.tmaxv.x;
+    axis = 0u;
+    if (slab.tmaxv.y < bestv) { bestv = slab.tmaxv.y; axis = 1u; }
+    if (slab.tmaxv.z < bestv) { bestv = slab.tmaxv.z; axis = 2u; }
+  }
+
+  if (axis == 0u) { return ExitFaceRes(select(1u, 0u, rd.x > 0.0), 0u); }
+  if (axis == 1u) { return ExitFaceRes(select(3u, 2u, rd.y > 0.0), 0u); }
+  return ExitFaceRes(select(5u, 4u, rd.z > 0.0), 0u);
 }
+
+
 
 // --------------------------------------------------------------------------
 // Sparse descend from an arbitrary node cube (start_idx is LOCAL)
@@ -242,31 +281,16 @@ fn descend_leaf_sparse(
 // => descend starting from that neighbor node (NOT from root).
 // --------------------------------------------------------------------------
 // --------------------------------------------------------------------------
-// Macro 3D DDA (digital differential analyzer) for macro occupancy stepping
+// Macro occupancy query (robust per-step query; no persistent DDA state)
 // --------------------------------------------------------------------------
 
-struct MacroDDA {
-  valid  : bool,
-  cell   : f32,
-
-  mx     : i32,
-  my     : i32,
-  mz     : i32,
-
-  stepX  : i32,
-  stepY  : i32,
-  stepZ  : i32,
-
-  tMaxX  : f32,
-  tMaxY  : f32,
-  tMaxZ  : f32,
-
-  tDeltaX: f32,
-  tDeltaY: f32,
-  tDeltaZ: f32,
+struct MacroStep {
+  valid : bool,
+  empty : bool,
+  t_exit: f32,
 };
 
-fn macro_dda_init(
+fn macro_cell_query_at_t(
   ro: vec3<f32>,
   rd: vec3<f32>,
   inv: vec3<f32>,
@@ -274,118 +298,60 @@ fn macro_dda_init(
   root_bmin: vec3<f32>,
   root_size: f32,
   macro_base: u32
-) -> MacroDDA {
-  var m: MacroDDA;
-  m.valid = (macro_base != INVALID_U32);
-  if (!m.valid) {
-    m.cell = 0.0;
-    return m;
+) -> MacroStep {
+  var out: MacroStep;
+  out.valid = false;
+  out.empty = false;
+  out.t_exit = tcur;
+
+  if (macro_base == INVALID_U32) {
+    return out;
   }
 
-  m.cell = macro_cell_size(root_size);
-
-  let p  = ro + rd * tcur;
+  let cell = macro_cell_size(root_size);
+  let p = ro + rd * tcur;
   let lp = p - root_bmin;
 
-  // current macro cell indices
-  let mx0 = i32(floor(lp.x / m.cell));
-  let my0 = i32(floor(lp.y / m.cell));
-  let mz0 = i32(floor(lp.z / m.cell));
-
-  // clamp into [0 .. MACRO_DIM-1]
-  let md = i32(MACRO_DIM) - 1;
-  m.mx = clamp(mx0, 0, md);
-  m.my = clamp(my0, 0, md);
-  m.mz = clamp(mz0, 0, md);
-
-  m.stepX = select(-1, 1, rd.x > 0.0);
-  m.stepY = select(-1, 1, rd.y > 0.0);
-  m.stepZ = select(-1, 1, rd.z > 0.0);
-
-  // next boundary plane index in macro grid space
-  let nx = m.mx + select(0, 1, m.stepX > 0);
-  let ny = m.my + select(0, 1, m.stepY > 0);
-  let nz = m.mz + select(0, 1, m.stepZ > 0);
-
-  // boundary positions in world space
-  let bx = root_bmin.x + f32(nx) * m.cell;
-  let by = root_bmin.y + f32(ny) * m.cell;
-  let bz = root_bmin.z + f32(nz) * m.cell;
-
-  // tMax values in ray-t space
-  m.tMaxX = select(BIG_F32, tcur + (bx - p.x) * inv.x, abs(rd.x) >= EPS_INV);
-  m.tMaxY = select(BIG_F32, tcur + (by - p.y) * inv.y, abs(rd.y) >= EPS_INV);
-  m.tMaxZ = select(BIG_F32, tcur + (bz - p.z) * inv.z, abs(rd.z) >= EPS_INV);
-
-  // tDelta: distance (in t) to cross one macro cell along each axis
-  m.tDeltaX = select(BIG_F32, m.cell * abs(inv.x), abs(rd.x) >= EPS_INV);
-  m.tDeltaY = select(BIG_F32, m.cell * abs(inv.y), abs(rd.y) >= EPS_INV);
-  m.tDeltaZ = select(BIG_F32, m.cell * abs(inv.z), abs(rd.z) >= EPS_INV);
-
-  return m;
-}
-
-fn macro_dda_exit_t(m: MacroDDA, t_exit: f32) -> f32 {
-  return min(t_exit, min(m.tMaxX, min(m.tMaxY, m.tMaxZ)));
-}
-
-fn macro_dda_step_and_refresh(
-  m: ptr<function, MacroDDA>,
-  macro_base: u32,
-  macro_empty: ptr<function, bool>
-) {
-  // --- step to next macro cell along smallest tMax axis
-  if ((*m).tMaxX < (*m).tMaxY) {
-    if ((*m).tMaxX < (*m).tMaxZ) {
-      (*m).mx += (*m).stepX;
-      (*m).tMaxX += (*m).tDeltaX;
-    } else {
-      (*m).mz += (*m).stepZ;
-      (*m).tMaxZ += (*m).tDeltaZ;
-    }
-  } else {
-    if ((*m).tMaxY < (*m).tMaxZ) {
-      (*m).my += (*m).stepY;
-      (*m).tMaxY += (*m).tDeltaY;
-    } else {
-      (*m).mz += (*m).stepZ;
-      (*m).tMaxZ += (*m).tDeltaZ;
-    }
+  if (lp.x < 0.0 || lp.y < 0.0 || lp.z < 0.0 ||
+      lp.x >= root_size || lp.y >= root_size || lp.z >= root_size) {
+    return out;
   }
 
-  // --- bounds check
-  let md = i32(MACRO_DIM) - 1;
-  if ((*m).mx < 0 || (*m).my < 0 || (*m).mz < 0 ||
-      (*m).mx > md || (*m).my > md || (*m).mz > md) {
-    (*m).valid = false;
-    (*macro_empty) = false;
-    return;
+  let mx_i = i32(floor(lp.x / cell));
+  let my_i = i32(floor(lp.y / cell));
+  let mz_i = i32(floor(lp.z / cell));
+
+  if (mx_i < 0 || my_i < 0 || mz_i < 0 ||
+      mx_i >= i32(MACRO_DIM) || my_i >= i32(MACRO_DIM) || mz_i >= i32(MACRO_DIM)) {
+    return out;
   }
 
-  // --- refresh cached emptiness for the new cell
-  let mxu = u32((*m).mx);
-  let myu = u32((*m).my);
-  let mzu = u32((*m).mz);
-  let bit = macro_bit_index(mxu, myu, mzu);
-  (*macro_empty) = !macro_test(macro_base, bit);
+  let mx = u32(mx_i);
+  let my = u32(my_i);
+  let mz = u32(mz_i);
+  let bit = macro_bit_index(mx, my, mz);
+
+  out.valid = true;
+  out.empty = !macro_test(macro_base, bit);
+
+  let nx = mx_i + select(0, 1, rd.x > 0.0);
+  let ny = my_i + select(0, 1, rd.y > 0.0);
+  let nz = mz_i + select(0, 1, rd.z > 0.0);
+
+  let bx = root_bmin.x + f32(nx) * cell;
+  let by = root_bmin.y + f32(ny) * cell;
+  let bz = root_bmin.z + f32(nz) * cell;
+
+  let tMaxX = select(BIG_F32, tcur + (bx - p.x) * inv.x, abs(rd.x) >= EPS_INV);
+  let tMaxY = select(BIG_F32, tcur + (by - p.y) * inv.y, abs(rd.y) >= EPS_INV);
+  let tMaxZ = select(BIG_F32, tcur + (bz - p.z) * inv.z, abs(rd.z) >= EPS_INV);
+
+  out.t_exit = min(tMaxX, min(tMaxY, tMaxZ));
+    return out;
 }
-
-fn macro_chunk_is_empty(macro_base: u32) -> bool {
-  // If there's no macro data, we can't prove emptiness.
-  if (macro_base == INVALID_U32) { return false; }
-
-  // 16 u32 words = 512 bits (8*8*8)
-  var any: u32 = 0u;
-  for (var i: u32 = 0u; i < MACRO_WORDS_PER_CHUNK; i = i + 1u) {
-    any |= macro_occ[macro_base + i];
-  }
-  return any == 0u;
-}
-
-
 
 // --------------------------------------------------------------------------
-// Rewritten traversal (macro DDA + leaf/rope traversal)
+// Rewritten traversal (macro occupancy + leaf/rope traversal)
 // --------------------------------------------------------------------------
 fn trace_chunk_rope_interval(
   ro: vec3<f32>,
@@ -406,7 +372,7 @@ fn trace_chunk_rope_interval(
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
 
   // Only probe grass when we are in small-enough air leaves
-  let grass_probe_max_leaf = 2.0 * vs;
+  let grass_probe_max_leaf = vs;
 
   let origin_vox_i = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
   let time_s       = cam.voxel_params.y;
@@ -415,45 +381,33 @@ fn trace_chunk_rope_interval(
   var have_leaf: bool = false;
   var leaf: LeafState;
 
-  // Macro DDA setup (valid==false if no macro data)
-  var m = macro_dda_init(ro, rd, inv, tcur, root_bmin, root_size, ch.macro_base);
-  var macro_empty: bool = false;
-  if (m.valid) {
-    let bit = macro_bit_index(u32(m.mx), u32(m.my), u32(m.mz));
-    macro_empty = !macro_test(ch.macro_base, bit);
-  }
-
-  let MAX_ITERS: u32 = 256u + cam.chunk_size * 8u;
+  let MAX_ITERS: u32 = 192u + cam.chunk_size * 4u;
 
   for (var it: u32 = 0u; it < MAX_ITERS; it = it + 1u) {
     if (tcur > t_exit) { break; }
 
     // ------------------------------------------------------------
-    // COARSE: macro empty jump using macro 3D DDA
+    // COARSE: macro empty jump using per-step macro occupancy
     // ------------------------------------------------------------
-    var t_macro_exit: f32 = t_exit;
+    let macro_step = macro_cell_query_at_t(
+      ro, rd, inv, tcur,
+      root_bmin, root_size,
+      ch.macro_base
+    );
 
-    if (m.valid) {
-      t_macro_exit = macro_dda_exit_t(m, t_exit);
-
-      if (macro_empty) {
-        // Jump across empty macro cell
-        tcur = max(t_macro_exit, tcur) + eps_step;
-        have_leaf = false;
-
-        if (tcur > t_exit) { break; }
-
-        // Enter next macro cell
-        macro_dda_step_and_refresh(&m, ch.macro_base, &macro_empty);
-        continue;
-      }
+    if (macro_step.valid && macro_step.empty) {
+      // Jump across empty macro cell
+      let t_macro_exit = min(t_exit, macro_step.t_exit);
+      tcur = max(t_macro_exit, tcur) + eps_step;
+      have_leaf = false;
+      continue;
     }
 
     // ------------------------------------------------------------
     // FINE: leaf traversal (rope traversal only on true leaf exit)
     // ------------------------------------------------------------
     let p  = ro + tcur * rd;
-    let pq = p + rd * (1e-4 * vs);
+    let pq = p + ray_eps_vec(rd, 1e-4 * vs);
 
     if (!have_leaf || !point_in_cube(pq, leaf.bmin, leaf.size)) {
       leaf = descend_leaf_sparse(pq, ch.node_base, 0u, root_bmin, root_size);
@@ -462,18 +416,6 @@ fn trace_chunk_rope_interval(
 
     let slab    = cube_slab_inv(ro, inv, leaf.bmin, leaf.size);
     let t_leave = slab.t_exit;
-
-    // Macro boundary event happens before leaf exit => advance to macro boundary
-    // IMPORTANT: do not treat as leaf exit; do not do ropes.
-    if (m.valid && (t_macro_exit < t_leave)) {
-      tcur = max(t_macro_exit, tcur) + eps_step;
-
-      if (tcur > t_exit) { break; }
-
-      macro_dda_step_and_refresh(&m, ch.macro_base, &macro_empty);
-      // leaf can straddle macro boundaries; keep cache
-      continue;
-    }
 
     // ------------------------------------------------------------
     // AIR leaf path
@@ -490,7 +432,7 @@ fn trace_chunk_rope_interval(
         grass_leaf_limit = cam.voxel_params.x;     // mid: only probe 1-voxel leaves
       }
 
-      if (lod_probe != 2u && leaf.size <= grass_leaf_limit) {
+      if (ENABLE_GRASS && lod_probe != 2u && leaf.size <= grass_leaf_limit) {
         let t0_probe = max(t_enter, tcur - eps_step);
         let t1_probe = min(t_leave, t_exit);
 
@@ -521,15 +463,23 @@ fn trace_chunk_rope_interval(
         }
       }
 
-
-      // True leaf exit => rope traversal
-      let face = exit_face_from_slab(rd, slab);
+      // True leaf exit => rope traversal (but bail out on edge/corner exits)
+      let ex = exit_face_from_slab_safe(rd, slab);
 
       tcur = max(t_leave, tcur) + eps_step;
       if (tcur > t_exit) { break; }
 
+      if (ex.amb != 0u) {
+        // Edge/corner exit: ropes are unstable here; re-descend next iter.
+        have_leaf = false;
+
+        continue;
+      }
+
+      let face = ex.face;
+
       let p_next  = ro + tcur * rd;
-      let pq_next = p_next + rd * (1e-4 * vs);
+      let pq_next = p_next + ray_eps_vec(rd, 1e-4 * vs);
 
       // CASE A: real AIR node exists -> use its ropes
       if (leaf.has_node) {
@@ -579,12 +529,14 @@ fn trace_chunk_rope_interval(
 
     // Displaced leaf material
     if (leaf.mat == MAT_LEAF) {
+      let tmin_iter = max(t_enter, tcur - eps_step);
       let h2 = leaf_displaced_cube_hit(
         ro, rd,
         leaf.bmin, leaf.size,
         time_s, strength,
-        t_enter, t_exit
+        tmin_iter, t_exit
       );
+
 
       if (h2.hit) {
         var out = miss_hitgeom();
@@ -606,10 +558,11 @@ fn trace_chunk_rope_interval(
     }
 
     // Solid hit
-    let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
+    let tmin_iter = max(t_enter, tcur - eps_step); // keep it inside the current chunk interval
+    let bh = cube_hit_normal_from_slab(rd, slab, tmin_iter, t_exit);
     if (bh.hit) {
       // Optional grass-on-solid-face probe when solid voxel is grass
-      if (leaf.mat == MAT_GRASS) {
+      if (ENABLE_GRASS && leaf.mat == MAT_GRASS) {
         let hp = ro + bh.t * rd;
 
         let cell = pick_grass_cell_in_chunk(
@@ -789,7 +742,7 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
       let ch = chunks[slot];
 
       // Skip trivially empty chunks (macro occupancy says "no bits set")
-      if (!macro_chunk_is_empty(ch.macro_base)) {
+      if (ch.macro_empty == 0u) {
         let cell_enter = start_t + t_local;
         let cell_exit  = start_t + min(tNextLocal, t_exit_local);
 
@@ -799,24 +752,26 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
     }
 
 
-    // Advance DDA
-    if (tMaxX < tMaxY) {
-      if (tMaxX < tMaxZ) {
-        lcx += step_x; idx_i += didx_x;
-        t_local = tMaxX; tMaxX += tDeltaX;
-      } else {
-        lcz += step_z; idx_i += didx_z;
-        t_local = tMaxZ; tMaxZ += tDeltaZ;
-      }
-    } else {
-      if (tMaxY < tMaxZ) {
-        lcy += step_y; idx_i += didx_y;
-        t_local = tMaxY; tMaxY += tDeltaY;
-      } else {
-        lcz += step_z; idx_i += didx_z;
-        t_local = tMaxZ; tMaxZ += tDeltaZ;
-      }
+    // --- tie-aware DDA advance (prevents skipping on edges/corners) ---
+    let epsTie = 1e-6 * max(1.0, abs(tNextLocal));
+
+    // Step all axes that match tNextLocal
+    if (abs(tMaxX - tNextLocal) <= epsTie) {
+      lcx += step_x; idx_i += didx_x;
+      tMaxX += tDeltaX;
     }
+    if (abs(tMaxY - tNextLocal) <= epsTie) {
+      lcy += step_y; idx_i += didx_y;
+      tMaxY += tDeltaY;
+    }
+    if (abs(tMaxZ - tNextLocal) <= epsTie) {
+      lcz += step_z; idx_i += didx_z;
+      tMaxZ += tDeltaZ;
+    }
+
+    t_local = tNextLocal;
+    // ---------------------------------------------------------------
+
 
     if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) { break; }
   }
@@ -925,7 +880,7 @@ fn probe_grass_columns_xz_dda(
 
   // Safety cap: max columns crossed within a tiny leaf is small.
   // Still cap to be safe in edge cases / long segments.
-  let MAX_COLS: u32 = 128u;
+  let MAX_COLS: u32 = 64u;
 
   for (var iter: u32 = 0u; iter < MAX_COLS; iter = iter + 1u) {
     if (t > t1) { break; }
@@ -964,15 +919,21 @@ fn probe_grass_columns_xz_dda(
     if (tNext >= t1) { break; }
 
     // Step across whichever boundary is hit first
-    if (tMaxX < tMaxZ) {
+    let tStep = min(tMaxX, tMaxZ);
+    let epsTie = 1e-6 * max(1.0, abs(tStep));
+
+    if (abs(tMaxX - tStep) <= epsTie) {
       lx += stepX;
-      t = tMaxX + eps;
       tMaxX += tDeltaX;
-    } else {
+    }
+    if (abs(tMaxZ - tStep) <= epsTie) {
       lz += stepZ;
-      t = tMaxZ + eps;
       tMaxZ += tDeltaZ;
     }
+
+    // advance t (keep your eps nudge)
+    t = tStep + eps;
+
 
     // Stop if we walked out of chunk xz bounds
     if (lx < 0 || lx > 63 || lz < 0 || lz > 63) { break; }
@@ -982,5 +943,3 @@ fn probe_grass_columns_xz_dda(
 
   return GrassHit(false, BIG_F32, vec3<f32>(0.0));
 }
-
-

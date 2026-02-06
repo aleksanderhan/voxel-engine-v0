@@ -47,28 +47,35 @@ fn make_primary_bg(
                 binding: 5,
                 resource: wgpu::BindingResource::TextureView(&textures.depth.view),
             },
-            // Clipmap params uniform
+            // NEW: local lighting output
             wgpu::BindGroupEntry {
                 binding: 6,
-                resource: buffers.clipmap.as_entire_binding(),
+                resource: wgpu::BindingResource::TextureView(&textures.local.view),
             },
-            // Clipmap height texture array
+            // shifted clipmap params uniform
             wgpu::BindGroupEntry {
                 binding: 7,
-                resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
+                resource: buffers.clipmap.as_entire_binding(),
             },
+            // shifted clipmap height texture array
             wgpu::BindGroupEntry {
                 binding: 8,
+                resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
+            },
+            // shifted storage buffers
+            wgpu::BindGroupEntry {
+                binding: 9,
                 resource: buffers.macro_occ.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 9,
+                binding: 10,
                 resource: buffers.node_ropes.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 10,
+                binding: 11,
                 resource: buffers.colinfo.as_entire_binding(),
             },
+
 
         ],
     })
@@ -158,6 +165,8 @@ fn make_composite_bg(
     output_view: &wgpu::TextureView,
     depth_view: &wgpu::TextureView,
     godray_sampler: &wgpu::Sampler,
+    local_hist_view: &wgpu::TextureView,
+    local_sampler: &wgpu::Sampler,
     label: &str,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -169,6 +178,8 @@ fn make_composite_bg(
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(output_view) },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(godray_sampler) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(local_hist_view) },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(local_sampler) },
         ],
     })
 }
@@ -248,6 +259,8 @@ pub fn create_bind_groups(
             &textures.output.view,
             &textures.depth.view,
             sampler,
+            &textures.local.view,
+            sampler,
             "composite_bg_read_a",
         ),
         make_composite_bg(
@@ -258,9 +271,12 @@ pub fn create_bind_groups(
             &textures.output.view,
             &textures.depth.view,
             sampler,
+            &textures.local.view,
+            sampler,
             "composite_bg_read_b",
         ),
     ];
+
 
     let blit = make_blit_bg(
         device,
