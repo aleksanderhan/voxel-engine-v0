@@ -366,6 +366,9 @@ impl Renderer {
             });
 
             cpass.set_pipeline(&self.pipelines.depth_resolve);
+            cpass.set_bind_group(0, &self.bind_groups.empty, &[]);
+            cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
+            cpass.set_bind_group(2, &self.bind_groups.empty, &[]);
             cpass.set_bind_group(3, &self.bind_groups.depth_resolve, &[]);
 
             let gx = (width + 7) / 8;
