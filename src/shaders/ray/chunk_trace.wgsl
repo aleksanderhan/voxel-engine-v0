@@ -281,7 +281,7 @@ fn descend_leaf_sparse(
 // => descend starting from that neighbor node (NOT from root).
 // --------------------------------------------------------------------------
 // --------------------------------------------------------------------------
-// Macro occupancy query (robust per-step query; no persistent DDA state)
+// Macro occupancy query (persistent DDA state)
 // --------------------------------------------------------------------------
 
 struct MacroStep {
@@ -290,7 +290,24 @@ struct MacroStep {
   t_exit: f32,
 };
 
-fn macro_cell_query_at_t(
+struct MacroDDAState {
+  enabled: bool,
+  mx     : i32,
+  my     : i32,
+  mz     : i32,
+  step_x : i32,
+  step_y : i32,
+  step_z : i32,
+  tMaxX  : f32,
+  tMaxY  : f32,
+  tMaxZ  : f32,
+  tDeltaX: f32,
+  tDeltaY: f32,
+  tDeltaZ: f32,
+  cell   : f32,
+};
+
+fn macro_dda_init(
   ro: vec3<f32>,
   rd: vec3<f32>,
   inv: vec3<f32>,
@@ -298,14 +315,25 @@ fn macro_cell_query_at_t(
   root_bmin: vec3<f32>,
   root_size: f32,
   macro_base: u32
-) -> MacroStep {
-  var out: MacroStep;
-  out.valid = false;
-  out.empty = false;
-  out.t_exit = tcur;
+) -> MacroDDAState {
+  var state: MacroDDAState;
+  state.enabled = false;
+  state.mx = 0;
+  state.my = 0;
+  state.mz = 0;
+  state.step_x = 0;
+  state.step_y = 0;
+  state.step_z = 0;
+  state.tMaxX = BIG_F32;
+  state.tMaxY = BIG_F32;
+  state.tMaxZ = BIG_F32;
+  state.tDeltaX = BIG_F32;
+  state.tDeltaY = BIG_F32;
+  state.tDeltaZ = BIG_F32;
+  state.cell = 0.0;
 
   if (macro_base == INVALID_U32) {
-    return out;
+    return state;
   }
 
   let cell = macro_cell_size(root_size);
@@ -314,7 +342,7 @@ fn macro_cell_query_at_t(
 
   if (lp.x < 0.0 || lp.y < 0.0 || lp.z < 0.0 ||
       lp.x >= root_size || lp.y >= root_size || lp.z >= root_size) {
-    return out;
+    return state;
   }
 
   let mx_i = i32(floor(lp.x / cell));
@@ -323,31 +351,97 @@ fn macro_cell_query_at_t(
 
   if (mx_i < 0 || my_i < 0 || mz_i < 0 ||
       mx_i >= i32(MACRO_DIM) || my_i >= i32(MACRO_DIM) || mz_i >= i32(MACRO_DIM)) {
+    return state;
+  }
+
+  state.enabled = true;
+  state.mx = mx_i;
+  state.my = my_i;
+  state.mz = mz_i;
+  state.step_x = select(-1, 1, rd.x > 0.0);
+  state.step_y = select(-1, 1, rd.y > 0.0);
+  state.step_z = select(-1, 1, rd.z > 0.0);
+  state.tDeltaX = abs(cell * inv.x);
+  state.tDeltaY = abs(cell * inv.y);
+  state.tDeltaZ = abs(cell * inv.z);
+  state.cell = cell;
+
+  if (abs(rd.x) >= EPS_INV) {
+    let next_ix = mx_i + select(0, 1, rd.x > 0.0);
+    let bx = root_bmin.x + f32(next_ix) * cell;
+    state.tMaxX = tcur + (bx - p.x) * inv.x;
+  }
+
+  if (abs(rd.y) >= EPS_INV) {
+    let next_iy = my_i + select(0, 1, rd.y > 0.0);
+    let by = root_bmin.y + f32(next_iy) * cell;
+    state.tMaxY = tcur + (by - p.y) * inv.y;
+  }
+
+  if (abs(rd.z) >= EPS_INV) {
+    let next_iz = mz_i + select(0, 1, rd.z > 0.0);
+    let bz = root_bmin.z + f32(next_iz) * cell;
+    state.tMaxZ = tcur + (bz - p.z) * inv.z;
+  }
+
+  return state;
+}
+
+fn macro_dda_t_exit(state: MacroDDAState) -> f32 {
+  return min(state.tMaxX, min(state.tMaxY, state.tMaxZ));
+}
+
+fn macro_dda_step(state: ptr<function, MacroDDAState>) {
+  let tNext = macro_dda_t_exit(*state);
+  let epsTie = 1e-6 * max(1.0, abs(tNext));
+
+  if (abs((*state).tMaxX - tNext) <= epsTie) {
+    (*state).mx += (*state).step_x;
+    (*state).tMaxX += (*state).tDeltaX;
+  }
+  if (abs((*state).tMaxY - tNext) <= epsTie) {
+    (*state).my += (*state).step_y;
+    (*state).tMaxY += (*state).tDeltaY;
+  }
+  if (abs((*state).tMaxZ - tNext) <= epsTie) {
+    (*state).mz += (*state).step_z;
+    (*state).tMaxZ += (*state).tDeltaZ;
+  }
+
+  if ((*state).mx < 0 || (*state).my < 0 || (*state).mz < 0 ||
+      (*state).mx >= i32(MACRO_DIM) ||
+      (*state).my >= i32(MACRO_DIM) ||
+      (*state).mz >= i32(MACRO_DIM)) {
+    (*state).enabled = false;
+  }
+}
+
+fn macro_dda_sync(state: ptr<function, MacroDDAState>, tcur: f32) {
+  for (var i: u32 = 0u; i < 32u; i = i + 1u) {
+    if (!(*state).enabled) { break; }
+    let t_exit = macro_dda_t_exit(*state);
+    if (tcur < t_exit) { break; }
+    macro_dda_step(state);
+  }
+}
+
+fn macro_dda_current(state: MacroDDAState, macro_base: u32) -> MacroStep {
+  var out: MacroStep;
+  out.valid = state.enabled;
+  out.empty = false;
+  out.t_exit = macro_dda_t_exit(state);
+
+  if (!state.enabled || macro_base == INVALID_U32) {
+    out.valid = false;
     return out;
   }
 
-  let mx = u32(mx_i);
-  let my = u32(my_i);
-  let mz = u32(mz_i);
+  let mx = u32(state.mx);
+  let my = u32(state.my);
+  let mz = u32(state.mz);
   let bit = macro_bit_index(mx, my, mz);
-
-  out.valid = true;
   out.empty = !macro_test(macro_base, bit);
-
-  let nx = mx_i + select(0, 1, rd.x > 0.0);
-  let ny = my_i + select(0, 1, rd.y > 0.0);
-  let nz = mz_i + select(0, 1, rd.z > 0.0);
-
-  let bx = root_bmin.x + f32(nx) * cell;
-  let by = root_bmin.y + f32(ny) * cell;
-  let bz = root_bmin.z + f32(nz) * cell;
-
-  let tMaxX = select(BIG_F32, tcur + (bx - p.x) * inv.x, abs(rd.x) >= EPS_INV);
-  let tMaxY = select(BIG_F32, tcur + (by - p.y) * inv.y, abs(rd.y) >= EPS_INV);
-  let tMaxZ = select(BIG_F32, tcur + (bz - p.z) * inv.z, abs(rd.z) >= EPS_INV);
-
-  out.t_exit = min(tMaxX, min(tMaxY, tMaxZ));
-    return out;
+  return out;
 }
 
 // --------------------------------------------------------------------------
@@ -370,6 +464,11 @@ fn trace_chunk_rope_interval(
   var tcur     = max(t_enter, 0.0) + eps_step;
 
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  var macro_state = macro_dda_init(
+    ro, rd, inv, tcur,
+    root_bmin, root_size,
+    ch.macro_base
+  );
 
   // Only probe grass when we are in small-enough air leaves
   let grass_probe_max_leaf = vs;
@@ -389,17 +488,20 @@ fn trace_chunk_rope_interval(
     // ------------------------------------------------------------
     // COARSE: macro empty jump using per-step macro occupancy
     // ------------------------------------------------------------
-    let macro_step = macro_cell_query_at_t(
-      ro, rd, inv, tcur,
-      root_bmin, root_size,
-      ch.macro_base
-    );
+    if (macro_state.enabled) {
+      macro_dda_sync(&macro_state, tcur);
+    }
+
+    let macro_step = macro_dda_current(macro_state, ch.macro_base);
 
     if (macro_step.valid && macro_step.empty) {
       // Jump across empty macro cell
       let t_macro_exit = min(t_exit, macro_step.t_exit);
       tcur = max(t_macro_exit, tcur) + eps_step;
       have_leaf = false;
+      if (macro_state.enabled && tcur >= macro_step.t_exit) {
+        macro_dda_step(&macro_state);
+      }
       continue;
     }
 
