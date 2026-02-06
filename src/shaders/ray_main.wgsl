@@ -161,31 +161,34 @@ fn main_primary(
   var hist_anchor_key  : u32 = INVALID_U32;
   var hist_anchor_coord: vec3<i32> = vec3<i32>(0);
   let tile_candidate_count = WG_TILE_COUNT_CACHED;
+  let has_tile_candidates = tile_candidate_count != 0u;
   let uv  = px / res;
 
-  let hist_guess = textureLoad(primary_hist_tex, ip, 0);
-  let t_hist_guess = hist_guess.x;
-  if (t_hist_guess > 1e-3) {
-    let p_ws = ro + rd * t_hist_guess;
-    let uv_prev = prev_uv_from_world(p_ws);
+  if (has_tile_candidates) {
+    let hist_guess = textureLoad(primary_hist_tex, ip, 0);
+    let t_hist_guess = hist_guess.x;
+    if (t_hist_guess > 1e-3) {
+      let p_ws = ro + rd * t_hist_guess;
+      let uv_prev = prev_uv_from_world(p_ws);
 
-    if (in_unit_square(uv_prev)) {
-      let hist_prev = textureSampleLevel(primary_hist_tex, primary_hist_samp, uv_prev, 0.0);
-      let t_prev = hist_prev.x;
-      let rel = abs(t_prev - t_hist_guess) / max(t_hist_guess, 1e-3);
-      let depth_ok = 1.0 - smoothstep(PRIMARY_HIT_DEPTH_REL0, PRIMARY_HIT_DEPTH_REL1, rel);
-      let vel_px = length((uv_prev - uv) * res);
-      let motion_ok = 1.0 - smoothstep(PRIMARY_HIT_MOTION_PX0, PRIMARY_HIT_MOTION_PX1, vel_px);
-      if (t_prev > 1e-3 && depth_ok > 0.5 && motion_ok > 0.5) {
-        t_hist = t_prev;
-        hist_valid = true;
-        let packed_z = bitcast<u32>(hist_prev.w);
-        if ((packed_z & 0x80000000u) != 0u) {
-          hist_anchor_key = bitcast<u32>(hist_prev.y);
-          let packed_xy = bitcast<u32>(hist_prev.z);
-          let xy = unpack_i16x2(packed_xy);
-          let z = unpack_i16(packed_z);
-          hist_anchor_coord = vec3<i32>(xy.x, xy.y, z);
+      if (in_unit_square(uv_prev)) {
+        let hist_prev = textureSampleLevel(primary_hist_tex, primary_hist_samp, uv_prev, 0.0);
+        let t_prev = hist_prev.x;
+        let rel = abs(t_prev - t_hist_guess) / max(t_hist_guess, 1e-3);
+        let depth_ok = 1.0 - smoothstep(PRIMARY_HIT_DEPTH_REL0, PRIMARY_HIT_DEPTH_REL1, rel);
+        let vel_px = length((uv_prev - uv) * res);
+        let motion_ok = 1.0 - smoothstep(PRIMARY_HIT_MOTION_PX0, PRIMARY_HIT_MOTION_PX1, vel_px);
+        if (t_prev > 1e-3 && depth_ok > 0.5 && motion_ok > 0.5) {
+          t_hist = t_prev;
+          hist_valid = true;
+          let packed_z = bitcast<u32>(hist_prev.w);
+          if ((packed_z & 0x80000000u) != 0u) {
+            hist_anchor_key = bitcast<u32>(hist_prev.y);
+            let packed_xy = bitcast<u32>(hist_prev.z);
+            let xy = unpack_i16x2(packed_xy);
+            let z = unpack_i16(packed_z);
+            hist_anchor_coord = vec3<i32>(xy.x, xy.y, z);
+          }
         }
       }
     }
@@ -193,35 +196,37 @@ fn main_primary(
 
   var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
   var used_hint = false;
-  if (hist_valid) {
-    let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
-    let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
-    let vt_hint = trace_scene_voxels_candidates(
-      ro,
-      rd,
-      t_start,
-      t_end,
-      hist_anchor_key != INVALID_U32,
-      hist_anchor_coord,
-      hist_anchor_key,
-      tile_candidate_count
-    );
-    if (vt_hint.best.hit != 0u) {
-      vt = vt_hint;
-      used_hint = true;
+  if (has_tile_candidates) {
+    if (hist_valid) {
+      let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
+      let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
+      let vt_hint = trace_scene_voxels_candidates(
+        ro,
+        rd,
+        t_start,
+        t_end,
+        hist_anchor_key != INVALID_U32,
+        hist_anchor_coord,
+        hist_anchor_key,
+        tile_candidate_count
+      );
+      if (vt_hint.best.hit != 0u) {
+        vt = vt_hint;
+        used_hint = true;
+      }
     }
-  }
-  if (!used_hint) {
-    vt = trace_scene_voxels_candidates(
-      ro,
-      rd,
-      0.0,
-      FOG_MAX_DIST,
-      false,
-      vec3<i32>(0),
-      INVALID_U32,
-      tile_candidate_count
-    );
+    if (!used_hint) {
+      vt = trace_scene_voxels_candidates(
+        ro,
+        rd,
+        0.0,
+        FOG_MAX_DIST,
+        false,
+        vec3<i32>(0),
+        INVALID_U32,
+        tile_candidate_count
+      );
+    }
   }
 
   // Outside streamed grid => heightfield or sky
@@ -262,24 +267,23 @@ fn main_primary(
     let frame = cam.frame_index;
     let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
 
-    var shadow_hist = shadow_hist_in[shadow_idx];
-    let uv_prev = prev_uv_from_world(hp);
-    if (in_unit_square(uv_prev)) {
-      let prev_px = vec2<i32>(
-        clamp(i32(uv_prev.x * f32(dims.x)), 0, i32(dims.x) - 1),
-        clamp(i32(uv_prev.y * f32(dims.y)), 0, i32(dims.y) - 1)
-      );
-      let prev_idx = u32(prev_px.y) * dims.x + u32(prev_px.x);
-      shadow_hist = shadow_hist_in[prev_idx];
-    }
-    shadow_hist = clamp(shadow_hist, 0.0, 1.0);
-
     let shadow_do = (seed & SHADOW_SUBSAMPLE_MASK) == 0u;
     if (shadow_do) {
+      var shadow_hist = shadow_hist_in[shadow_idx];
+      let uv_prev = prev_uv_from_world(hp);
+      if (in_unit_square(uv_prev)) {
+        let prev_px = vec2<i32>(
+          clamp(i32(uv_prev.x * f32(dims.x)), 0, i32(dims.x) - 1),
+          clamp(i32(uv_prev.y * f32(dims.y)), 0, i32(dims.y) - 1)
+        );
+        let prev_idx = u32(prev_px.y) * dims.x + u32(prev_px.x);
+        shadow_hist = shadow_hist_in[prev_idx];
+      }
+      shadow_hist = clamp(shadow_hist, 0.0, 1.0);
       let shadow_cur = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
       shadow_out = mix(shadow_hist, shadow_cur, SHADOW_TAA_ALPHA);
     } else {
-      shadow_out = shadow_hist;
+      shadow_out = clamp(shadow_hist_in[shadow_idx], 0.0, 1.0);
     }
 
     // Split shading (base + local)
