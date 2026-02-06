@@ -14,10 +14,10 @@
 // -----------------------------------------------------------------------------
 
 // How far rays march in voxels (controls “search radius” for lights)
-const LIGHT_MAX_DIST_VOX : u32 = 20u;   // try 16..64
+const LIGHT_MAX_DIST_VOX : u32 = 32u;   // try 16..64
 
 // Number of rays
-const LIGHT_RAYS : u32 = 8u;           // try 6..12
+const LIGHT_RAYS : u32 = 24u;          // try 16..32
 
 // Softens inverse-square near the light (in voxels)
 const LIGHT_SOFT_RADIUS_VOX : f32 = 3.0;
@@ -26,7 +26,7 @@ const LIGHT_SOFT_RADIUS_VOX : f32 = 3.0;
 const LIGHT_NEAR_CLAMP_VOX : f32 = 1.25;
 
 // Finite range rolloff (in voxels). Past this, contributions fade to ~0.
-const LIGHT_RANGE_VOX : f32 = 40.0;     // try 24..80
+const LIGHT_RANGE_VOX : f32 = 80.0;     // try 32..96
 
 // Direct diffuse “wrap” (0 = pure Lambert, 0.1..0.25 = nicer in caves)
 const LIGHT_WRAP : f32 = 0.15;
@@ -36,7 +36,7 @@ const LIGHT_DIRECT_GAIN   : f32 = 1.00;
 const LIGHT_INDIRECT_GAIN : f32 = 0.65; // cheap “bounce fill”
 
 // Stop after N light hits (perf only; output is normalized with LIGHT_RAYS)
-const LIGHT_EARLY_HITS : u32 = 2u;
+const LIGHT_EARLY_HITS : u32 = 24u;
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -72,28 +72,14 @@ fn light_emission_radiance() -> vec3<f32> {
 // Direction set
 // -----------------------------------------------------------------------------
 
-fn sphere_dir_local(i: u32) -> vec3<f32> {
-  switch(i) {
-    default: { return vec3<f32>(0.0, 0.0, 1.0); }
-
-    // axis
-    case 0u: { return vec3<f32>( 1.0,  0.0,  0.0); }
-    case 1u: { return vec3<f32>(-1.0,  0.0,  0.0); }
-    case 2u: { return vec3<f32>( 0.0,  1.0,  0.0); }
-    case 3u: { return vec3<f32>( 0.0, -1.0,  0.0); }
-    case 4u: { return vec3<f32>( 0.0,  0.0,  1.0); }
-    case 5u: { return vec3<f32>( 0.0,  0.0, -1.0); }
-
-    // diagonals
-    case 6u:  { return vec3<f32>( 1.0,  1.0,  1.0); }
-    case 7u:  { return vec3<f32>(-1.0,  1.0,  1.0); }
-    case 8u:  { return vec3<f32>( 1.0, -1.0,  1.0); }
-    case 9u:  { return vec3<f32>(-1.0, -1.0,  1.0); }
-    case 10u: { return vec3<f32>( 1.0,  1.0, -1.0); }
-    case 11u: { return vec3<f32>(-1.0,  1.0, -1.0); }
-    case 12u: { return vec3<f32>( 1.0, -1.0, -1.0); }
-    case 13u: { return vec3<f32>(-1.0, -1.0, -1.0); }
-  }
+fn sphere_dir_local(i: u32, count: u32) -> vec3<f32> {
+  let fi = f32(i);
+  let fn = max(1.0, f32(count));
+  let golden = 2.399963229728653; // golden angle in radians
+  let y = 1.0 - 2.0 * ((fi + 0.5) / fn);
+  let r = sqrt(max(0.0, 1.0 - y * y));
+  let phi = golden * fi;
+  return vec3<f32>(cos(phi) * r, sin(phi) * r, y);
 }
 
 // -----------------------------------------------------------------------------
@@ -171,8 +157,7 @@ fn gather_voxel_lights(
   root_bmin: vec3<f32>,
   root_size: f32,
   node_base: u32,
-  macro_base: u32,
-  seed: u32
+  macro_base: u32
 ) -> vec3<f32> {
   var hits: u32 = 0u;
 
@@ -184,10 +169,10 @@ fn gather_voxel_lights(
   // basis for orienting directions
   let tbn = make_tbn(n);
 
-  // de-pattern rotation: stable per surface cell, but mixed with per-pixel seed
+  // de-pattern rotation: stable per surface cell (no per-frame noise)
   let surf_v = vec3<i32>(floor((hp - root_bmin) / max(vs, 1e-6)));
   let h0 = hash3_i32(surf_v);
-  let h1 = hash_u32(h0 ^ seed);
+  let h1 = hash_u32(h0);
   let rot = 6.28318530718 * (f32(h1 & 1023u) / 1024.0);
 
   // attenuation helpers
@@ -205,7 +190,7 @@ fn gather_voxel_lights(
   var sum = vec3<f32>(0.0);
 
   for (var i: u32 = 0u; i < LIGHT_RAYS; i = i + 1u) {
-    var ldir = normalize(tbn * normalize(sphere_dir_local(i)));
+    var ldir = normalize(tbn * normalize(sphere_dir_local(i, LIGHT_RAYS)));
     ldir = normalize(rot_about_axis(ldir, n, rot));
 
     let hit = dda_hit_light(p0, ldir, LIGHT_MAX_DIST_VOX, vs);

@@ -144,8 +144,7 @@ fn shade_hit_split(
       hg.root_bmin,
       hg.root_size,
       hg.node_base,
-      hg.macro_base,
-      seed
+      hg.macro_base
     );
     local_w = 1.0;
   }
