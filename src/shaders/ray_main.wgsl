@@ -97,7 +97,9 @@ fn main_primary(
       px = tile_base + vec2<f32>(7.5, 7.5);
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
     }
-    WG_TILE_COUNT_CACHED = min(atomicLoad(&WG_TILE_COUNT), PRIMARY_MAX_TILE_CHUNKS);
+    let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
+    tile_sort_candidates_by_enter(raw_count);
+    WG_TILE_COUNT_CACHED = min(raw_count, PRIMARY_MAX_TILE_CHUNKS);
   }
   workgroupBarrier();
 
