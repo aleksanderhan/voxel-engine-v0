@@ -382,6 +382,7 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let rd_u = textureDimensions(color_tex);
   let rd_f = vec2<f32>(f32(rd_u.x), f32(rd_u.y));
+  let pd_f = present_dims_f();
 
   let fd_u = textureDimensions(depth_full);
   let fd_i = vec2<i32>(i32(fd_u.x), i32(fd_u.y));
@@ -398,7 +399,7 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
   var grass_hdr = vec3<f32>(0.0);
   if (t_depth > 1e-3 && t_depth < GRASS_DECORATE_MAX_DIST) {
     let ro = cam.cam_pos.xyz;
-    let rd = ray_dir_from_pixel(px_render, rd_f);
+    let rd = ray_dir_from_pixel(px_present, pd_f);
     let hp = ro + rd * t_depth;
     let hp_in = hp - rd * (1e-4 * cam.voxel_params.x);
     let leaf = query_leaf_world(hp_in);
@@ -406,7 +407,7 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (leaf.mat == MAT_GRASS) {
       let n = leaf_face_normal(hp_in, leaf);
       let frame = cam.frame_index;
-      let seed = (u32(ip_render.x) * 1973u) ^ (u32(ip_render.y) * 9277u) ^ (frame * 26699u);
+      let seed = (u32(ip_f.x) * 1973u) ^ (u32(ip_f.y) * 9277u) ^ (frame * 26699u);
 
       if (grass_allowed_decorate(t_depth, n, seed)) {
         let vs = cam.voxel_params.x;
