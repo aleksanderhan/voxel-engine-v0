@@ -308,3 +308,9 @@ fn grass_allowed_primary(t: f32, n: vec3<f32>, seed: u32) -> bool {
 
   return true;
 }
+
+fn grass_probe_allowed_primary(t: f32, seed: u32) -> bool {
+  if (t > GRASS_PRIMARY_MAX_DIST) { return false; }
+  if ((seed & GRASS_PRIMARY_RATE_MASK) != 0u) { return false; }
+  return true;
+}

@@ -376,6 +376,7 @@ fn trace_chunk_rope_interval(
   ro: vec3<f32>,
   rd: vec3<f32>,
   ch: ChunkMeta,
+  seed: u32,
   t_enter: f32,
   t_exit: f32
 ) -> HitGeom {
@@ -464,6 +465,51 @@ fn trace_chunk_rope_interval(
     // AIR leaf path
     // ------------------------------------------------------------
     if (leaf.mat == MAT_AIR) {
+      if (!grass_probe_allowed_primary(tcur, seed)) {
+        // True leaf exit => rope traversal
+        let face = exit_face_from_slab(rd, slab);
+
+        tcur = max(t_leave, tcur) + eps_step;
+        if (tcur > t_exit) { break; }
+
+        let p_next  = ro + tcur * rd;
+        let pq_next = p_next + rd * (1e-4 * vs);
+
+        // CASE A: real AIR node exists -> use its ropes
+        if (leaf.has_node) {
+          let nidx = rope_next_local(ch.node_base, leaf.anchor_idx, face);
+          if (nidx == INVALID_U32) { have_leaf = false; continue; }
+
+          let nk = node_at(ch.node_base, nidx).key;
+          let c1 = node_cube_from_key(root_bmin, root_size, nk);
+
+          if (point_in_cube(pq_next, c1.xyz, c1.w)) {
+            leaf = descend_leaf_sparse(
+              pq_next,
+              ch.node_base,
+              nidx,
+              c1.xyz, c1.w
+            );
+            have_leaf = true;
+            continue;
+          }
+
+          let nidx2 = rope_next_local(ch.node_base, leaf.anchor_idx, face);
+          if (nidx2 == INVALID_U32) { have_leaf = false; continue; }
+
+          let nk2 = node_at(ch.node_base, nidx2).key;
+          let c2  = node_cube_from_key(root_bmin, root_size, nk2);
+
+          leaf = descend_leaf_sparse(pq_next, ch.node_base, nidx2, c2.xyz, c2.w);
+          have_leaf = true;
+          continue;
+        }
+
+        // Fallback: re-descend from root next iter
+        have_leaf = false;
+        continue;
+      }
+
       // Grass probing scales with distance (LOD = level of detail):
       // - near: probe normally
       // - mid: probe only for smaller leaves
@@ -594,7 +640,7 @@ fn trace_chunk_rope_interval(
     let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
     if (bh.hit) {
       // Optional grass-on-solid-face probe when solid voxel is grass
-      if (leaf.mat == MAT_GRASS) {
+      if (leaf.mat == MAT_GRASS && grass_probe_allowed_primary(bh.t, seed)) {
         let hp = ro + bh.t * rd;
 
         let cell = pick_grass_cell_in_chunk(
@@ -659,6 +705,11 @@ struct VoxTraceResult {
 };
 
 fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
+  let seed: u32 = 0u;
+  return trace_scene_voxels_primary(ro, rd, seed);
+}
+
+fn trace_scene_voxels_primary(ro: vec3<f32>, rd: vec3<f32>, seed: u32) -> VoxTraceResult {
   if (cam.chunk_count == 0u) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0);
   }
@@ -778,7 +829,7 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
         let cell_enter = start_t + t_local;
         let cell_exit  = start_t + min(tNextLocal, t_exit_local);
 
-        let h = trace_chunk_rope_interval(ro, rd, ch, cell_enter, cell_exit);
+        let h = trace_chunk_rope_interval(ro, rd, ch, seed, cell_enter, cell_exit);
         if (h.hit != 0u && h.t < best.t) { best = h; }
       }
     }

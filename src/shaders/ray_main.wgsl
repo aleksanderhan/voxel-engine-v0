@@ -101,7 +101,7 @@ fn main_primary(
   // ------------------------------------------------------------
   // Case 2: voxel grid present => voxels, then heightfield fallback, then sky
   // ------------------------------------------------------------
-  let vt = trace_scene_voxels(ro, rd);
+  let vt = trace_scene_voxels_primary(ro, rd, seed);
 
   // Outside streamed grid => heightfield or sky
   if (!vt.in_grid) {
