@@ -65,7 +65,8 @@ fn unpack_i16x2(v: u32) -> vec2<i32> {
 @compute @workgroup_size(8, 8, 1)
 fn main_primary(
   @builtin(global_invocation_id) gid: vec3<u32>,
-  @builtin(local_invocation_index) lid: u32
+  @builtin(local_invocation_index) lid: u32,
+  @builtin(workgroup_id) wg_id: vec3<u32>
 ) {
   let dims = textureDimensions(color_img);
   if (gid.x >= dims.x || gid.y >= dims.y) { return; }
@@ -76,6 +77,34 @@ fn main_primary(
   }
   workgroupBarrier();
   let sky_up = WG_SKY_UP;
+
+  if (lid == 0u) {
+    atomicStore(&WG_TILE_COUNT, 0u);
+    if (cam.chunk_count != 0u) {
+      let res_tile = vec2<f32>(f32(dims.x), f32(dims.y));
+      let tile_origin = vec2<f32>(
+        f32(wg_id.x * TILE_SIZE),
+        f32(wg_id.y * TILE_SIZE)
+      );
+      let ro_tile = cam.cam_pos.xyz;
+
+      let px00 = tile_origin;
+      let px10 = tile_origin + vec2<f32>(f32(TILE_SIZE), 0.0);
+      let px01 = tile_origin + vec2<f32>(0.0, f32(TILE_SIZE));
+      let px11 = tile_origin + vec2<f32>(f32(TILE_SIZE), f32(TILE_SIZE));
+
+      let rd00 = ray_dir_from_pixel(px00, res_tile);
+      let rd10 = ray_dir_from_pixel(px10, res_tile);
+      let rd01 = ray_dir_from_pixel(px01, res_tile);
+      let rd11 = ray_dir_from_pixel(px11, res_tile);
+
+      tile_append_candidates_for_ray(ro_tile, rd00, 0.0, FOG_MAX_DIST);
+      tile_append_candidates_for_ray(ro_tile, rd10, 0.0, FOG_MAX_DIST);
+      tile_append_candidates_for_ray(ro_tile, rd01, 0.0, FOG_MAX_DIST);
+      tile_append_candidates_for_ray(ro_tile, rd11, 0.0, FOG_MAX_DIST);
+    }
+  }
+  workgroupBarrier();
 
   let res = vec2<f32>(f32(dims.x), f32(dims.y));
   let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
@@ -102,6 +131,7 @@ fn main_primary(
   var hist_valid : bool = false;
   var hist_anchor_key  : u32 = INVALID_U32;
   var hist_anchor_coord: vec3<i32> = vec3<i32>(0);
+  let tile_candidate_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
 
   let hist_guess = textureLoad(primary_hist_tex, ip, 0);
   let t_hist_guess = hist_guess.x;
@@ -172,14 +202,15 @@ fn main_primary(
   if (hist_valid) {
     let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
     let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
-    let vt_hint = trace_scene_voxels_interval(
+    let vt_hint = trace_scene_voxels_candidates(
       ro,
       rd,
       t_start,
       t_end,
       hist_anchor_key != INVALID_U32,
       hist_anchor_coord,
-      hist_anchor_key
+      hist_anchor_key,
+      tile_candidate_count
     );
     if (vt_hint.best.hit != 0u) {
       vt = vt_hint;
@@ -187,14 +218,15 @@ fn main_primary(
     }
   }
   if (!used_hint) {
-    vt = trace_scene_voxels_interval(
+    vt = trace_scene_voxels_candidates(
       ro,
       rd,
       0.0,
       FOG_MAX_DIST,
       false,
       vec3<i32>(0),
-      INVALID_U32
+      INVALID_U32,
+      tile_candidate_count
     );
   }
 
