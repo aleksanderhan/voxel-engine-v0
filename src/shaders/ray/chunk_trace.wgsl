@@ -392,8 +392,9 @@ fn trace_chunk_rope_interval(
   let root_bmin     = root_bmin_vox * vs;
   let root_size     = f32(cam.chunk_size) * vs;
 
-  let eps_step = 1e-4 * vs;
-  var tcur     = max(t_enter, 0.0) + eps_step;
+  let eps_step  = 1e-4 * vs;
+  let eps_query = 0.5 * eps_step;
+  var tcur      = max(t_enter, 0.0) + eps_step;
 
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
 
@@ -445,7 +446,7 @@ fn trace_chunk_rope_interval(
     // FINE: leaf traversal (rope traversal only on true leaf exit)
     // ------------------------------------------------------------
     let p  = ro + tcur * rd;
-    let pq = p + rd * (1e-4 * vs);
+    let pq = p + rd * eps_query;
 
     if (!have_leaf || !point_in_cube(pq, leaf.bmin, leaf.size)) {
       leaf = descend_leaf_sparse(pq, ch.node_base, 0u, root_bmin, root_size);
@@ -521,7 +522,7 @@ fn trace_chunk_rope_interval(
       if (tcur > t_exit) { break; }
 
       let p_next  = ro + tcur * rd;
-      let pq_next = p_next + rd * (1e-4 * vs);
+      let pq_next = p_next + rd * eps_query;
 
       // CASE A: real AIR node exists -> use its ropes
       if (leaf.has_node) {
@@ -571,11 +572,13 @@ fn trace_chunk_rope_interval(
 
     // Displaced leaf material
     if (leaf.mat == MAT_LEAF) {
+      let t_hit_min = max(t_enter, tcur - eps_step);
+
       let h2 = leaf_displaced_cube_hit(
         ro, rd,
         leaf.bmin, leaf.size,
         time_s, strength,
-        t_enter, t_exit
+        t_hit_min, t_exit
       );
 
       if (h2.hit) {
@@ -598,7 +601,8 @@ fn trace_chunk_rope_interval(
     }
 
     // Solid hit
-    let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
+    let t_hit_min = max(t_enter, tcur - eps_step);
+    let bh = cube_hit_normal_from_slab(rd, slab, t_hit_min, t_exit);
     if (bh.hit) {
       // Optional grass-on-solid-face probe when solid voxel is grass
       if (ENABLE_GRASS && leaf.mat == MAT_GRASS) {
