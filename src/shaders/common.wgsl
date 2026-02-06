@@ -214,12 +214,12 @@ const TAU             : f32        = 6.28318530718;
 const PRIMARY_NUDGE_VOXEL_FRAC : f32 = 1e-4;
 
 // Primary hit cache (temporal reprojection) tuning.
-const PRIMARY_HIT_MARGIN        : f32 = 0.15;
-const PRIMARY_HIT_WINDOW        : f32 = 1.20;
-const PRIMARY_HIT_DEPTH_REL0    : f32 = 0.05;
-const PRIMARY_HIT_DEPTH_REL1    : f32 = 0.20;
-const PRIMARY_HIT_MOTION_PX0    : f32 = 0.75;
-const PRIMARY_HIT_MOTION_PX1    : f32 = 2.50;
+const PRIMARY_HIT_MARGIN        : f32 = 0.08;
+const PRIMARY_HIT_WINDOW        : f32 = 0.60;
+const PRIMARY_HIT_DEPTH_REL0    : f32 = 0.04;
+const PRIMARY_HIT_DEPTH_REL1    : f32 = 0.12;
+const PRIMARY_HIT_MOTION_PX0    : f32 = 0.50;
+const PRIMARY_HIT_MOTION_PX1    : f32 = 1.75;
 
 const J0_SCALE : f32 = 1.31;
 const J1_SCALE : f32 = 2.11;
