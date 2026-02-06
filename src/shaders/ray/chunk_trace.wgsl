@@ -1113,7 +1113,8 @@ fn tile_append_candidates_for_ray(
 
 fn tile_sort_candidates_by_enter(count: u32) {
   if (count <= 1u) { return; }
-  let limit = min(count, MAX_TILE_CHUNKS);
+  let limit = min(count, PRIMARY_MAX_TILE_CHUNKS);
+  if (limit <= 1u) { return; }
   for (var i: u32 = 0u; i + 1u < limit; i = i + 1u) {
     var min_idx = i;
     var min_t = WG_TILE_ENTER[i];
