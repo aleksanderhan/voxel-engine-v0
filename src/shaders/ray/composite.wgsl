@@ -41,20 +41,24 @@ fn composite_pixel_mapped(
   let fd_i = vec2<i32>(i32(fd_u.x), i32(fd_u.y));
   let fd_f = vec2<f32>(f32(fd_u.x), f32(fd_u.y));
 
+  let use_full = (fd_i.x != rd_i.x) || (fd_i.y != rd_i.y);
+
   // Map render pixel -> full pixel (important!)
   // px_render is in render pixel coords; convert to full pixel coords.
-  let px_full = px_render * (fd_f / rd_f);
+  var px_full = px_render;
+  var ip_f = ip_r;
+  var uv_full = (px_render + vec2<f32>(0.5)) / rd_f;
+  var d0 = textureLoad(depth_render, ip_r, 0).x;
 
-  let ip_f = vec2<i32>(
-    clamp(i32(floor(px_full.x)), 0, fd_i.x - 1),
-    clamp(i32(floor(px_full.y)), 0, fd_i.y - 1)
-  );
-
-  // UV for godray sampling MUST match the full-res screen mapping
-  let uv_full = (px_full + vec2<f32>(0.5)) / fd_f;
-
-  // Depth edge weights MUST be full-res taps too
-  let d0 = textureLoad(depth_full, ip_f, 0).x;
+  if (use_full) {
+    px_full = px_render * (fd_f / rd_f);
+    ip_f = vec2<i32>(
+      clamp(i32(floor(px_full.x)), 0, fd_i.x - 1),
+      clamp(i32(floor(px_full.y)), 0, fd_i.y - 1)
+    );
+    uv_full = (px_full + vec2<f32>(0.5)) / fd_f;
+    d0 = textureLoad(depth_full, ip_f, 0).x;
+  }
 
   // Depth/normal-aware upsample of base color
   let px_render_clamped = vec2<f32>(
@@ -178,10 +182,17 @@ fn composite_pixel_mapped(
     let ipN = vec2<i32>(ip_f.x, min(ip_f.y + 1, fd_i.y - 1));
     let ipS = vec2<i32>(ip_f.x, max(ip_f.y - 1, 0));
 
-    let dE = textureLoad(depth_full, ipE, 0).x;
-    let dW = textureLoad(depth_full, ipW, 0).x;
-    let dN = textureLoad(depth_full, ipN, 0).x;
-    let dS = textureLoad(depth_full, ipS, 0).x;
+    var dE = textureLoad(depth_full, ipE, 0).x;
+    var dW = textureLoad(depth_full, ipW, 0).x;
+    var dN = textureLoad(depth_full, ipN, 0).x;
+    var dS = textureLoad(depth_full, ipS, 0).x;
+
+    if (!use_full) {
+      dE = textureLoad(depth_render, ipE, 0).x;
+      dW = textureLoad(depth_render, ipW, 0).x;
+      dN = textureLoad(depth_render, ipN, 0).x;
+      dS = textureLoad(depth_render, ipS, 0).x;
+    }
 
     let tol = 0.02 + 0.06 * smoothstep(10.0, 80.0, d0);
 

@@ -359,7 +359,7 @@ impl Renderer {
 
         }
 
-        {
+        if self.internal_w != width || self.internal_h != height {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("depth_resolve_pass"),
                 timestamp_writes: None,
