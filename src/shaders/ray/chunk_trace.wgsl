@@ -658,36 +658,26 @@ struct VoxTraceResult {
   t_exit  : f32,
 };
 
-fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>, t_max_hint: f32) -> VoxTraceResult {
-  if (cam.chunk_count == 0u) {
-    return VoxTraceResult(false, miss_hitgeom(), 0.0);
-  }
-
-  let voxel_size   = cam.voxel_params.x;
-  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
-
-  let go = cam.grid_origin_chunk;
-  let gd = cam.grid_dims;
-
-  // Grid bounds in meters
-  let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
-  let grid_bmax = grid_bmin + vec3<f32>(f32(gd.x), f32(gd.y), f32(gd.z)) * chunk_size_m;
-
-  // Ray vs grid AABB
-  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
-
-  // Only trace as far as fog can contribute (huge perf win on big loaded grids)
-  var t_enter = max(rtg.x, 0.0);
-  let t_exit  = min(rtg.y, min(FOG_MAX_DIST, t_max_hint));
-
+fn trace_chunks_in_range(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_enter: f32,
+  t_exit: f32,
+  go: vec4<i32>,
+  gd: vec4<u32>,
+  chunk_size_m: f32,
+  voxel_size: f32
+) -> HitGeom {
   if (t_exit < t_enter) {
-    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+    return miss_hitgeom();
   }
-
 
   // Nudge inside
   let nudge_p = PRIMARY_NUDGE_VOXEL_FRAC * voxel_size;
   let start_t = t_enter + nudge_p;
+  if (start_t > t_exit) {
+    return miss_hitgeom();
+  }
   let p0      = ro + start_t * rd;
 
   // World chunk coords at start
@@ -703,7 +693,7 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>, t_max_hint: f32) -> VoxTrace
   var lcz: i32 = c.z - go.z;
 
   if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) {
-    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+    return miss_hitgeom();
   }
 
   let stride_y: i32 = nx;
@@ -762,7 +752,6 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>, t_max_hint: f32) -> VoxTrace
 
   let max_chunk_steps = min(u32(rem_x + rem_y + rem_z) + 1u, 512u);
 
-
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }
 
@@ -782,7 +771,6 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>, t_max_hint: f32) -> VoxTrace
         if (h.hit != 0u && h.t < best.t) { best = h; }
       }
     }
-
 
     // Advance DDA
     if (tMaxX < tMaxY) {
@@ -806,7 +794,150 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>, t_max_hint: f32) -> VoxTrace
     if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) { break; }
   }
 
-  return VoxTraceResult(true, best, t_exit);
+  return best;
+}
+
+fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>, t_max_hint: f32) -> VoxTraceResult {
+  if (cam.chunk_count == 0u) {
+    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+  }
+
+  let voxel_size   = cam.voxel_params.x;
+  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
+
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+
+  // Grid bounds in meters
+  let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
+  let grid_bmax = grid_bmin + vec3<f32>(f32(gd.x), f32(gd.y), f32(gd.z)) * chunk_size_m;
+
+  // Ray vs grid AABB
+  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+
+  // Only trace as far as fog can contribute (huge perf win on big loaded grids)
+  var t_enter = max(rtg.x, 0.0);
+  let t_exit  = min(rtg.y, min(FOG_MAX_DIST, t_max_hint));
+
+  if (t_exit < t_enter) {
+    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+  }
+
+
+  let nx: i32 = i32(gd.x);
+  let ny: i32 = i32(gd.y);
+  let nz: i32 = i32(gd.z);
+
+  let super_size_m = chunk_size_m * f32(SUPERGRID_CHUNK_DIM);
+  let s_nx: i32 = i32((gd.x + SUPERGRID_CHUNK_DIM - 1u) / SUPERGRID_CHUNK_DIM);
+  let s_ny: i32 = i32((gd.y + SUPERGRID_CHUNK_DIM - 1u) / SUPERGRID_CHUNK_DIM);
+  let s_nz: i32 = i32((gd.z + SUPERGRID_CHUNK_DIM - 1u) / SUPERGRID_CHUNK_DIM);
+
+  let p0 = ro + t_enter * rd;
+  var scx: i32 = i32(floor((p0.x - grid_bmin.x) / super_size_m));
+  var scy: i32 = i32(floor((p0.y - grid_bmin.y) / super_size_m));
+  var scz: i32 = i32(floor((p0.z - grid_bmin.z) / super_size_m));
+
+  if (scx < 0 || scy < 0 || scz < 0 || scx >= s_nx || scy >= s_ny || scz >= s_nz) {
+    return VoxTraceResult(false, miss_hitgeom(), 0.0);
+  }
+
+  let stride_sy: i32 = s_nx;
+  let stride_sz: i32 = s_nx * s_ny;
+  var sidx: i32 = (scz * s_ny + scy) * s_nx + scx;
+
+  var t_local: f32 = 0.0;
+  let t_exit_local = max(t_exit - t_enter, 0.0);
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let step_x: i32 = select(-1, 1, rd.x > 0.0);
+  let step_y: i32 = select(-1, 1, rd.y > 0.0);
+  let step_z: i32 = select(-1, 1, rd.z > 0.0);
+
+  let bx = select(
+    grid_bmin.x + f32(scx) * super_size_m,
+    grid_bmin.x + f32(scx + 1) * super_size_m,
+    rd.x > 0.0
+  );
+  let by = select(
+    grid_bmin.y + f32(scy) * super_size_m,
+    grid_bmin.y + f32(scy + 1) * super_size_m,
+    rd.y > 0.0
+  );
+  let bz = select(
+    grid_bmin.z + f32(scz) * super_size_m,
+    grid_bmin.z + f32(scz + 1) * super_size_m,
+    rd.z > 0.0
+  );
+
+  var tMaxX: f32 = (bx - p0.x) * inv.x;
+  var tMaxY: f32 = (by - p0.y) * inv.y;
+  var tMaxZ: f32 = (bz - p0.z) * inv.z;
+
+  let tDeltaX: f32 = abs(super_size_m * inv.x);
+  let tDeltaY: f32 = abs(super_size_m * inv.y);
+  let tDeltaZ: f32 = abs(super_size_m * inv.z);
+
+  if (abs(rd.x) < EPS_INV) { tMaxX = BIG_F32; }
+  if (abs(rd.y) < EPS_INV) { tMaxY = BIG_F32; }
+  if (abs(rd.z) < EPS_INV) { tMaxZ = BIG_F32; }
+
+  let didx_x: i32 = select(-1, 1, rd.x > 0.0);
+  let didx_y: i32 = select(-stride_sy, stride_sy, rd.y > 0.0);
+  let didx_z: i32 = select(-stride_sz, stride_sz, rd.z > 0.0);
+
+  var rem_x: i32 = 0;
+  var rem_y: i32 = 0;
+  var rem_z: i32 = 0;
+
+  if (abs(rd.x) >= EPS_INV) {
+    rem_x = select(scx, (s_nx - 1 - scx), step_x > 0);
+  }
+  if (abs(rd.y) >= EPS_INV) {
+    rem_y = select(scy, (s_ny - 1 - scy), step_y > 0);
+  }
+  if (abs(rd.z) >= EPS_INV) {
+    rem_z = select(scz, (s_nz - 1 - scz), step_z > 0);
+  }
+
+  let max_super_steps = min(u32(rem_x + rem_y + rem_z) + 1u, 512u);
+
+  for (var s: u32 = 0u; s < max_super_steps; s = s + 1u) {
+    if (t_local > t_exit_local) { break; }
+
+    let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
+    let occ = supergrid_occ[u32(sidx)];
+    if (occ != 0u) {
+      let cell_enter = t_enter + t_local;
+      let cell_exit  = t_enter + min(tNextLocal, t_exit_local);
+      let h = trace_chunks_in_range(ro, rd, cell_enter, cell_exit, go, gd, chunk_size_m, voxel_size);
+      if (h.hit != 0u) {
+        return VoxTraceResult(true, h, t_exit);
+      }
+    }
+
+    if (tMaxX < tMaxY) {
+      if (tMaxX < tMaxZ) {
+        scx += step_x; sidx += didx_x;
+        t_local = tMaxX; tMaxX += tDeltaX;
+      } else {
+        scz += step_z; sidx += didx_z;
+        t_local = tMaxZ; tMaxZ += tDeltaZ;
+      }
+    } else {
+      if (tMaxY < tMaxZ) {
+        scy += step_y; sidx += didx_y;
+        t_local = tMaxY; tMaxY += tDeltaY;
+      } else {
+        scz += step_z; sidx += didx_z;
+        t_local = tMaxZ; tMaxZ += tDeltaZ;
+      }
+    }
+
+    if (scx < 0 || scy < 0 || scz < 0 || scx >= s_nx || scy >= s_ny || scz >= s_nz) { break; }
+  }
+
+  return VoxTraceResult(true, miss_hitgeom(), t_exit);
 }
 
 // --------------------------------------------------------------------------

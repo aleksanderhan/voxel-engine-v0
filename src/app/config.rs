@@ -18,6 +18,9 @@ pub const RENDER_SCALE: f32 = 0.5;
 pub const WORKER_THREADS: usize = 4;
 pub const MAX_IN_FLIGHT: usize = 16;
 
+// Chunk-grid supercell dimensions for coarse occupancy.
+pub const SUPERGRID_CHUNK_DIM: u32 = 4;
+
 // GPU node arena budget (storage buffer capacity).
 pub const NODE_BUDGET_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
 

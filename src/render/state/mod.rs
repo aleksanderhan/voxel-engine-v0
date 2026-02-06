@@ -304,6 +304,15 @@ impl Renderer {
         );
     }
 
+    pub fn write_supergrid_occ(&self, occ: &[u32]) {
+        let n = occ.len().min(self.buffers.supergrid_capacity as usize);
+        self.queue.write_buffer(
+            &self.buffers.supergrid_occ,
+            0,
+            bytemuck::cast_slice(&occ[..n]),
+        );
+    }
+
     pub fn write_camera(&self, cam: &CameraGpu) {
         self.queue
             .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));

@@ -96,6 +96,8 @@ pub(crate) struct GridState {
     pub grid_origin_chunk: [i32; 3],
     pub grid_dims: [u32; 3],
     pub chunk_grid: Vec<u32>,
+    pub supergrid_dims: [u32; 3],
+    pub supergrid_occ: Vec<u32>,
 }
 
 /// Column ground cache bucket.
@@ -145,6 +147,11 @@ impl ChunkManager {
         let ny = GRID_Y_COUNT;
 
         let grid_len = (nx * ny * nz) as usize;
+        let super = config::SUPERGRID_CHUNK_DIM;
+        let super_nx = (nx + super - 1) / super;
+        let super_ny = (ny + super - 1) / super;
+        let super_nz = (nz + super - 1) / super;
+        let super_len = (super_nx * super_ny * super_nz) as usize;
 
         let active_offsets = keep::build_offsets(config::ACTIVE_RADIUS);
 
@@ -185,6 +192,8 @@ impl ChunkManager {
                 grid_origin_chunk: [0, 0, 0],
                 grid_dims: [nx, ny, nz],
                 chunk_grid: vec![INVALID_U32; grid_len],
+                supergrid_dims: [super_nx, super_ny, super_nz],
+                supergrid_occ: vec![0; super_len],
             },
             ground: GroundState { col_ground_y_vox: Vec::new() },
             offsets: Offsets { active_offsets },
@@ -301,6 +310,7 @@ impl ChunkManager {
     pub fn grid_origin(&self) -> [i32; 3] { self.grid.grid_origin_chunk }
     pub fn grid_dims(&self) -> [u32; 3] { self.grid.grid_dims }
     pub fn chunk_grid(&self) -> &[u32] { &self.grid.chunk_grid }
+    pub fn supergrid_occ(&self) -> &[u32] { &self.grid.supergrid_occ }
 
     pub fn take_uploads(&mut self) -> Vec<ChunkUpload> {
         uploads::take_all(self)
@@ -445,4 +455,3 @@ impl StreamTimingWindow {
         std::mem::take(self)
     }
 }
-

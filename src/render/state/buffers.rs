@@ -19,11 +19,13 @@ pub struct Buffers {
     pub node: wgpu::Buffer,
     pub chunk: wgpu::Buffer,
     pub chunk_grid: wgpu::Buffer,
+    pub supergrid_occ: wgpu::Buffer,
 
     // --- Capacities ---
     pub node_capacity: u32,
     pub chunk_capacity: u32,
     pub grid_capacity: u32,
+    pub supergrid_capacity: u32,
 
     pub macro_occ: wgpu::Buffer,
     pub macro_capacity_u32: u32,
@@ -78,11 +80,24 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
     );
 
     let grid_capacity = chunk_capacity;
+    let super = config::SUPERGRID_CHUNK_DIM;
+    let nx = (2 * config::KEEP_RADIUS + 1) as u32;
+    let nz = nx;
+    let ny = crate::streaming::types::GRID_Y_COUNT;
+    let super_nx = (nx + super - 1) / super;
+    let super_ny = (ny + super - 1) / super;
+    let super_nz = (nz + super - 1) / super;
+    let supergrid_capacity = super_nx * super_ny * super_nz;
 
     let chunk_grid = make_storage_buffer(
         device,
         "chunk_grid_buf",
         (grid_capacity as u64) * (std::mem::size_of::<u32>() as u64),
+    );
+    let supergrid_occ = make_storage_buffer(
+        device,
+        "supergrid_occ_buf",
+        (supergrid_capacity as u64) * (std::mem::size_of::<u32>() as u64),
     );
 
     // ---- macro occupancy: 8^3 bits = 512 bits = 16 u32 words per chunk ----
@@ -117,9 +132,11 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         node,
         chunk,
         chunk_grid,
+        supergrid_occ,
         node_capacity,
         chunk_capacity,
         grid_capacity,
+        supergrid_capacity,
         macro_occ,
         macro_capacity_u32,
         node_ropes,

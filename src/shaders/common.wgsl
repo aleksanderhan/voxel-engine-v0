@@ -254,6 +254,8 @@ const GRASS_PRIMARY_MAX_DIST : f32 = 20.0; // meters-ish
 const GRASS_PRIMARY_MIN_NY   : f32 = 0.60; // only fairly upward normals
 const GRASS_PRIMARY_RATE_MASK: u32 = 3u;   // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
 
+const SUPERGRID_CHUNK_DIM : u32 = 4u;
+
 
 // Misc
 const ALBEDO_VAR_GAIN = 3.5;
@@ -326,6 +328,7 @@ struct ChunkMeta {
 @group(0) @binding(9)  var<storage, read> macro_occ : array<u32>;
 @group(0) @binding(10) var<storage, read> node_ropes: array<NodeRopes>;
 @group(0) @binding(11) var<storage, read> chunk_colinfo : array<u32>;
+@group(0) @binding(12) var<storage, read> supergrid_occ : array<u32>;
 
 
 //// --------------------------------------------------------------------------
