@@ -95,12 +95,42 @@ impl Clipmap {
     #[inline]
     fn sample_height_f32(world: &WorldGen, wx_m: f32, wz_m: f32) -> f32 {
         let vs = config::VOXEL_SIZE_M_F32;
+        let vpm = config::VOXELS_PER_METER;
 
         let wx_vx = (wx_m / vs).floor() as i32;
         let wz_vx = (wz_m / vs).floor() as i32;
 
-        let h_vx = world.ground_height(wx_vx, wz_vx);
-        (h_vx as f32) * vs
+        let mut max_vx = world.ground_height(wx_vx, wz_vx);
+
+        // Account for tree canopies by checking nearby meter cells for crowns.
+        const MAX_TREE_CROWN_R_M: i32 = 6;
+        let xm = wx_vx.div_euclid(vpm);
+        let zm = wz_vx.div_euclid(vpm);
+
+        for tz in (zm - MAX_TREE_CROWN_R_M)..=(zm + MAX_TREE_CROWN_R_M) {
+            for tx in (xm - MAX_TREE_CROWN_R_M)..=(xm + MAX_TREE_CROWN_R_M) {
+                let Some((trunk_h_vox, crown_r_vox)) = world.tree_instance_at_meter(tx, tz) else {
+                    continue;
+                };
+
+                let trunk_x = tx * vpm;
+                let trunk_z = tz * vpm;
+                let dx = wx_vx - trunk_x;
+                let dz = wz_vx - trunk_z;
+
+                if dx * dx + dz * dz > crown_r_vox * crown_r_vox {
+                    continue;
+                }
+
+                let base = world.ground_height(trunk_x, trunk_z);
+                let top = base + trunk_h_vox + crown_r_vox;
+                if top > max_vx {
+                    max_vx = top;
+                }
+            }
+        }
+
+        (max_vx as f32) * vs
     }
 
 
@@ -584,4 +614,3 @@ impl Clipmap {
     }
 
 }
-
