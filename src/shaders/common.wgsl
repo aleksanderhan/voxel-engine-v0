@@ -221,7 +221,7 @@ const PRIMARY_HIT_DEPTH_REL1    : f32 = 0.12;
 
 // Sun shadow temporal reuse (primary shading).
 const SHADOW_TAA_ALPHA      : f32 = 0.20;
-const SHADOW_SUBSAMPLE_MASK : u32 = 1u; // 0b1 => 1/2 pixels per frame (blue-noise via seed)
+const SHADOW_SUBSAMPLE_MASK : u32 = 3u; // 0b11 => 1/4 pixels per frame (blue-noise via seed)
 const PRIMARY_HIT_MOTION_PX0    : f32 = 0.50;
 const PRIMARY_HIT_MOTION_PX1    : f32 = 1.75;
 
@@ -282,7 +282,7 @@ const LIGHT_EARLY_HITS : u32 = 24u;
 
 const VOXEL_AO_MAX_DIST     : f32 = 40.0;
 const LOCAL_LIGHT_MAX_DIST  : f32 = 50.0;
-const FAR_SHADING_DIST      : f32 = 80.0;
+const FAR_SHADING_DIST      : f32 = 64.0;
 const PRIMARY_CLOUD_SHADOWS : bool = false;
 
 //// --------------------------------------------------------------------------
@@ -320,9 +320,9 @@ const GRASS_TRACE_STEPS_MID : u32 = 6u;
 const GRASS_TRACE_STEPS_FAR : u32 = 4u;
 
 // Primary-pass grass gating (tune these)
-const GRASS_PRIMARY_MAX_DIST : f32 = 20.0; // meters-ish
+const GRASS_PRIMARY_MAX_DIST : f32 = 14.0; // meters-ish
 const GRASS_PRIMARY_MIN_NY   : f32 = 0.60; // only fairly upward normals
-const GRASS_PRIMARY_RATE_MASK: u32 = 3u;   // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
+const GRASS_PRIMARY_RATE_MASK: u32 = 7u;   // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
 
 
 // Misc
