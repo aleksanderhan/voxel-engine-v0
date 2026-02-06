@@ -309,6 +309,10 @@ struct ChunkMeta {
   node_count   : u32,
   macro_base   : u32,
   colinfo_base : u32,
+  macro_empty  : u32,
+  _pad0        : u32,
+  _pad1        : u32,
+  _pad2        : u32,
 };
 
 //// --------------------------------------------------------------------------

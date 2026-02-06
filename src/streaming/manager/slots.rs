@@ -249,6 +249,7 @@ pub fn try_make_uploading(
 
     let macro_base = slot * MACRO_WORDS_PER_CHUNK;
     let colinfo_base = slot * COLINFO_WORDS_PER_CHUNK;
+    let macro_empty = u32::from(macro_words.iter().all(|word| *word == 0));
 
     let origin_vox = [
         key.x * config::CHUNK_SIZE as i32,
@@ -262,6 +263,10 @@ pub fn try_make_uploading(
         node_count: need,
         macro_base,
         colinfo_base,
+        macro_empty,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     };
 
     mgr.slots.chunk_meta.push(meta);
@@ -662,6 +667,7 @@ pub fn replace_chunk_contents(
     meta.node_count = need;
     meta.macro_base = slot * MACRO_WORDS_PER_CHUNK;
     meta.colinfo_base = slot * COLINFO_WORDS_PER_CHUNK;
+    meta.macro_empty = u32::from(macro_words.iter().all(|word| *word == 0));
     mgr.slots.chunk_meta[s] = meta;
 
     // Update state. IMPORTANT: keep node_count as allocation capacity (alloc_cap).

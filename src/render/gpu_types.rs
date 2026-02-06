@@ -39,6 +39,10 @@ pub struct ChunkMetaGpu {
     pub node_count: u32,
     pub macro_base: u32,
     pub colinfo_base: u32,
+    pub macro_empty: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 #[repr(C)]
