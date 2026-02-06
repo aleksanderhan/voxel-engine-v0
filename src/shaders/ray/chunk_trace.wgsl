@@ -381,7 +381,7 @@ fn trace_chunk_rope_interval(
   var have_leaf: bool = false;
   var leaf: LeafState;
 
-  let MAX_ITERS: u32 = 192u + cam.chunk_size * 4u;
+  let MAX_ITERS: u32 = 128u + cam.chunk_size * 2u; // 256 for 64³
 
   for (var it: u32 = 0u; it < MAX_ITERS; it = it + 1u) {
     if (tcur > t_exit) { break; }
