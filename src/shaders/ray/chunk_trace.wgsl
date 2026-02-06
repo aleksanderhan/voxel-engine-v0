@@ -658,7 +658,7 @@ struct VoxTraceResult {
   t_exit  : f32,
 };
 
-fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
+fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>, t_max_hint: f32) -> VoxTraceResult {
   if (cam.chunk_count == 0u) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0);
   }
@@ -678,7 +678,7 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
 
   // Only trace as far as fog can contribute (huge perf win on big loaded grids)
   var t_enter = max(rtg.x, 0.0);
-  let t_exit  = min(rtg.y, FOG_MAX_DIST);
+  let t_exit  = min(rtg.y, min(FOG_MAX_DIST, t_max_hint));
 
   if (t_exit < t_enter) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0);

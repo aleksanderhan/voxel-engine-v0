@@ -40,6 +40,17 @@
 
 var<workgroup> WG_SKY_UP : vec3<f32>;
 
+fn prev_uv_from_world(p_ws: vec3<f32>) -> vec2<f32> {
+  let clip = cam.prev_view_proj * vec4<f32>(p_ws, 1.0);
+  let invw = 1.0 / max(clip.w, 1e-6);
+  let ndc  = clip.xy * invw;
+  return ndc * 0.5 + vec2<f32>(0.5);
+}
+
+fn in_unit_square(uv: vec2<f32>) -> bool {
+  return all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main_primary(
   @builtin(global_invocation_id) gid: vec3<u32>,
@@ -68,6 +79,31 @@ fn main_primary(
 
   let frame = cam.frame_index;
   let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
+
+  // Temporal max distance hint from last frame depth proxy.
+  let uv_cur = px / res;
+  let hist0 = textureSampleLevel(godray_hist_tex, godray_hist_samp, uv_cur, 0.0);
+  var t_prev = hist0.w;
+
+  if (t_prev > 1e-3) {
+    let p_ws = ro + rd * t_prev;
+    let uv_prev = prev_uv_from_world(p_ws);
+    if (in_unit_square(uv_prev)) {
+      let hist1 = textureSampleLevel(godray_hist_tex, godray_hist_samp, uv_prev, 0.0);
+      if (hist1.w > 1e-3) {
+        t_prev = hist1.w;
+      }
+    }
+  }
+
+  let voxel_size = cam.voxel_params.x;
+  var vel_px = 0.0;
+  var t_max_hint = FOG_MAX_DIST;
+  if (t_prev > 1e-3) {
+    vel_px = length((prev_uv_from_world(ro + rd * t_prev) - uv_cur) * res);
+    let safety_margin = 2.0 * voxel_size + 0.5 * voxel_size * vel_px;
+    t_max_hint = min(FOG_MAX_DIST, t_prev + safety_margin);
+  }
 
   // Local output defaults: invalid (alpha=0) so TAA keeps history instead of blending black.
   var local_out = vec3<f32>(0.0);
@@ -101,7 +137,7 @@ fn main_primary(
   // ------------------------------------------------------------
   // Case 2: voxel grid present => voxels, then heightfield fallback, then sky
   // ------------------------------------------------------------
-  let vt = trace_scene_voxels(ro, rd);
+  let vt = trace_scene_voxels(ro, rd, t_max_hint);
 
   // Outside streamed grid => heightfield or sky
   if (!vt.in_grid) {
