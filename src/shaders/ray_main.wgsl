@@ -48,6 +48,7 @@
 @group(2) @binding(6) var local_samp     : sampler;
 
 var<workgroup> WG_SKY_UP : vec3<f32>;
+var<workgroup> WG_TILE_COUNT_CACHED : u32;
 
 fn pack_i16x2(a: i32, b: i32) -> u32 {
   return (u32(a) & 0xFFFFu) | ((u32(b) & 0xFFFFu) << 16u);
@@ -81,27 +82,25 @@ fn main_primary(
   if (lid == 0u) {
     atomicStore(&WG_TILE_COUNT, 0u);
     if (cam.chunk_count != 0u) {
-      let tile_origin = vec2<f32>(
+      let tile_base = vec2<f32>(
         f32(wg_id.x * TILE_SIZE),
         f32(wg_id.y * TILE_SIZE)
       );
       let ro_tile = cam.cam_pos.xyz;
 
-      let px00 = tile_origin;
-      let px10 = tile_origin + vec2<f32>(f32(TILE_SIZE), 0.0);
-      let px01 = tile_origin + vec2<f32>(0.0, f32(TILE_SIZE));
-      let px11 = tile_origin + vec2<f32>(f32(TILE_SIZE), f32(TILE_SIZE));
+      var px = tile_base + vec2<f32>(4.5, 4.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
 
-      let rd00 = ray_dir_from_pixel(px00);
-      let rd10 = ray_dir_from_pixel(px10);
-      let rd01 = ray_dir_from_pixel(px01);
-      let rd11 = ray_dir_from_pixel(px11);
-
-      tile_append_candidates_for_ray(ro_tile, rd00, 0.0, FOG_MAX_DIST);
-      tile_append_candidates_for_ray(ro_tile, rd10, 0.0, FOG_MAX_DIST);
-      tile_append_candidates_for_ray(ro_tile, rd01, 0.0, FOG_MAX_DIST);
-      tile_append_candidates_for_ray(ro_tile, rd11, 0.0, FOG_MAX_DIST);
+      px = tile_base + vec2<f32>(0.5, 0.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      px = tile_base + vec2<f32>(7.5, 0.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      px = tile_base + vec2<f32>(0.5, 7.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      px = tile_base + vec2<f32>(7.5, 7.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
     }
+    WG_TILE_COUNT_CACHED = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
   }
   workgroupBarrier();
 
@@ -161,7 +160,7 @@ fn main_primary(
   var hist_valid : bool = false;
   var hist_anchor_key  : u32 = INVALID_U32;
   var hist_anchor_coord: vec3<i32> = vec3<i32>(0);
-  let tile_candidate_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
+  let tile_candidate_count = WG_TILE_COUNT_CACHED;
   let uv  = px / res;
 
   let hist_guess = textureLoad(primary_hist_tex, ip, 0);

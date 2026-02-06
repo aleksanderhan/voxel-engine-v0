@@ -285,7 +285,7 @@ fn fs_main(
   // Assumes `img` is the presented/composited output (so its dimensions match screen).
   // If `img` is render-res instead of present-res, you should pass present dims via uniform
   // and use those instead.
-  let dims = vec2<u32>(cam.render_present_px.z, cam.render_present_px.w);
+  let dims = textureDimensions(img);
   let cx = i32(dims.x) / 2;
   let cy = i32(dims.y) / 2;
 
