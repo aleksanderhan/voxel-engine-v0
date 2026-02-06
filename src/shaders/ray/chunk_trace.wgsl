@@ -241,39 +241,14 @@ struct ExitFaceRes {
 
 fn exit_face_from_slab_safe(rd: vec3<f32>, slab: CubeSlab) -> ExitFaceRes {
   // 0=+X,1=-X,2=+Y,3=-Y,4=+Z,5=-Z
-  let te = slab.t_exit;
-  let eps = 1e-5 * max(1.0, abs(te));
+  let tx = slab.tmaxv.x;
+  let ty = slab.tmaxv.y;
+  let tz = slab.tmaxv.z;
 
-  // IMPORTANT: ignore near-zero ray components (prevents nonsense matches)
-  let mx = (abs(rd.x) >= EPS_INV) && (abs(slab.tmaxv.x - te) <= eps);
-  let my = (abs(rd.y) >= EPS_INV) && (abs(slab.tmaxv.y - te) <= eps);
-  let mz = (abs(rd.z) >= EPS_INV) && (abs(slab.tmaxv.z - te) <= eps);
-
-  let cx = select(0u, 1u, mx);
-  let cy = select(0u, 1u, my);
-  let cz = select(0u, 1u, mz);
-  let c  = cx + cy + cz;
-
-  // Edge/corner exit => ambiguous; don't rope-jump.
-  if (c >= 2u) {
-    return ExitFaceRes(0u, 1u);
-  }
-
-  // Single-axis (or fallback)
   var axis: u32 = 0u;
-
-  if (c == 1u) {
-    // choose the matching axis
-    if (mx) { axis = 0u; }
-    if (my) { axis = 1u; }
-    if (mz) { axis = 2u; }
-  } else {
-    // fallback: argmin(tmaxv) (same intent as your old fallback)
-    var bestv: f32 = slab.tmaxv.x;
-    axis = 0u;
-    if (slab.tmaxv.y < bestv) { bestv = slab.tmaxv.y; axis = 1u; }
-    if (slab.tmaxv.z < bestv) { bestv = slab.tmaxv.z; axis = 2u; }
-  }
+  var tmaxv: f32 = tx;
+  if (ty < tmaxv) { axis = 1u; tmaxv = ty; }
+  if (tz < tmaxv) { axis = 2u; }
 
   if (axis == 0u) { return ExitFaceRes(select(1u, 0u, rd.x > 0.0), 0u); }
   if (axis == 1u) { return ExitFaceRes(select(3u, 2u, rd.y > 0.0), 0u); }
