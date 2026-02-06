@@ -81,15 +81,7 @@ fn voxel_ao_local(
   let q3 = query_leaf_at(hp - b * r, root_bmin, root_size, node_base, macro_base);
   occ += select(0.0, 1.0, q3.mat != MAT_AIR);
 
-  let h0 = normalize(n + 0.65 * t + 0.35 * b);
-  let q4 = query_leaf_at(hp + h0 * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q4.mat != MAT_AIR);
-
-  let h1 = normalize(n - 0.65 * t + 0.35 * b);
-  let q5 = query_leaf_at(hp + h1 * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q5.mat != MAT_AIR);
-
-  let occ_n = occ * (1.0 / 6.0);
+  let occ_n = occ * (1.0 / 4.0);
   return clamp(1.0 - 0.70 * occ_n, 0.35, 1.0);
 }
 
