@@ -210,6 +210,18 @@ fn main_primary(
       if (vt_hint.best.hit != 0u) {
         vt = vt_hint;
         used_hint = true;
+      } else {
+        vt = trace_scene_voxels_interval(
+          ro,
+          rd,
+          t_start,
+          t_end,
+          hist_anchor_key != INVALID_U32,
+          hist_anchor_coord,
+          hist_anchor_key,
+          seed
+        );
+        used_hint = vt.best.hit != 0u;
       }
     }
     if (!used_hint) {
@@ -224,6 +236,18 @@ fn main_primary(
         tile_candidate_count,
         seed
       );
+      if (vt.best.hit == 0u) {
+        vt = trace_scene_voxels_interval(
+          ro,
+          rd,
+          0.0,
+          FOG_MAX_DIST,
+          false,
+          vec3<i32>(0),
+          INVALID_U32,
+          seed
+        );
+      }
     }
   }
 

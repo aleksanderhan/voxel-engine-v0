@@ -1098,7 +1098,7 @@ fn tile_append_candidates_for_ray(
     rem_z = select(lcz, (nz - 1 - lcz), step_z > 0);
   }
 
-  let max_chunk_steps = min(u32(rem_x + rem_y + rem_z) + 1u, 512u);
+  let max_chunk_steps = min(u32(rem_x + rem_y + rem_z) + 1u, 4096u);
 
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }
@@ -1362,7 +1362,7 @@ fn trace_scene_voxels_interval(
     rem_z = select(lcz, (nz - 1 - lcz), step_z > 0);
   }
 
-  let max_chunk_steps = min(u32(rem_x + rem_y + rem_z) + 1u, 512u);
+  let max_chunk_steps = min(u32(rem_x + rem_y + rem_z) + 1u, 4096u);
 
   var found_hit = false;
 
