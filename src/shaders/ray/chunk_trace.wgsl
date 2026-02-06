@@ -50,12 +50,12 @@ fn miss_hitgeom() -> HitGeom {
   return h;
 }
 
-// Strict half-open: [bmin, bmax)
-fn point_in_cube(p: vec3<f32>, bmin: vec3<f32>, size: f32) -> bool {
+// Epsilon-inclusive bounds for traversal stability
+fn point_in_cube_eps(p: vec3<f32>, bmin: vec3<f32>, size: f32) -> bool {
+  let eps = 1e-5 * max(1.0, size);
   let bmax = bmin + vec3<f32>(size);
-  return (p.x >= bmin.x && p.x < bmax.x) &&
-         (p.y >= bmin.y && p.y < bmax.y) &&
-         (p.z >= bmin.z && p.z < bmax.z);
+  return all(p >= (bmin - vec3<f32>(eps))) &&
+         all(p <= (bmax + vec3<f32>(eps)));
 }
 
 // --------------------------------------------------------------------------
@@ -722,8 +722,8 @@ fn trace_chunk_rope_interval_nomacro(
       }
     }
 
-    if (!have_leaf || !point_in_cube(pq, leaf_bmin, leaf.size)) {
-      if (anchor_node.valid && point_in_cube(pq, anchor_node.bmin, anchor_node.size)) {
+    if (!have_leaf || !point_in_cube_eps(pq, leaf_bmin, leaf.size)) {
+      if (anchor_node.valid && point_in_cube_eps(pq, anchor_node.bmin, anchor_node.size)) {
         leaf = descend_leaf_sparse(pq, ch.node_base, anchor_node.idx, anchor_node.bmin, anchor_node.size);
       } else {
         leaf = descend_leaf_sparse(pq, ch.node_base, 0u, root_bmin, root_size);
@@ -843,7 +843,7 @@ fn trace_chunk_rope_interval_nomacro(
 
       // CASE B: missing-child AIR (virtual cube) -> use anchor
       if (leaf.has_anchor) {
-        if (point_in_cube(pq_next, leaf.anchor_bmin, leaf.anchor_size)) {
+        if (point_in_cube_eps(pq_next, leaf.anchor_bmin, leaf.anchor_size)) {
           leaf = descend_leaf_sparse(
             pq_next,
             ch.node_base,
