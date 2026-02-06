@@ -409,7 +409,7 @@ const MACRO_DIM : u32 = 8u;              // 8x8x8 macro cells per chunk
 const MACRO_WORDS_PER_CHUNK : u32 = 16u; // 512 bits / 32
 const TILE_SIZE: u32 = 8u;
 const MAX_TILE_CHUNKS: u32 = 192u;
-const PRIMARY_MAX_TILE_CHUNKS: u32 = 16u;
+const PRIMARY_MAX_TILE_CHUNKS: u32 = 24u;
 
 var<workgroup> WG_TILE_COUNT : atomic<u32>;
 var<workgroup> WG_TILE_SLOTS : array<u32, MAX_TILE_CHUNKS>;

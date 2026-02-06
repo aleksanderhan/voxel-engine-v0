@@ -88,8 +88,10 @@ fn main_primary(
       );
       let ro_tile = cam.cam_pos.xyz;
 
-      // Single candidate ray per tile for fastest primary pass.
-      let px = tile_base + vec2<f32>(4.5, 4.5);
+      // Two candidate rays per tile to stabilize distant voxel selection.
+      var px = tile_base + vec2<f32>(4.5, 4.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      px = tile_base + vec2<f32>(1.5, 1.5);
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
     }
     let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
