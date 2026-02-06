@@ -441,7 +441,7 @@ fn trace_chunk_rope_interval(
   // Macro DDA setup (valid==false if no macro data)
   var m = macro_dda_init(ro, rd, inv, tcur, root_bmin, root_size, ch.macro_base);
   var macro_empty: bool = false;
-  //m.valid = false;
+  //m.valid = false; // <- THIS FIXES EVERYTHING!
 
   if (m.valid) {
     let bit = macro_bit_index(u32(m.mx), u32(m.my), u32(m.mz));
