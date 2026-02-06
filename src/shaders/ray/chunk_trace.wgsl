@@ -712,7 +712,14 @@ fn trace_chunk_rope_interval_nomacro(
     let p  = ro + tcur * rd;
     let pq = p + ray_eps_vec(rd, 1e-4 * vs);
 
-    if (!have_leaf || !point_in_cube(pq, leaf.bmin, leaf.size)) {
+    var leaf_bmin = leaf.bmin;
+    // If we already have a leaf and it's a LEAF material, use displaced bounds for containment
+    if (have_leaf && leaf.mat == MAT_LEAF) {
+      let off = leaf_cube_offset(leaf.bmin, leaf.size, time_s, strength);
+      leaf_bmin = leaf.bmin + off;
+    }
+
+    if (!have_leaf || !point_in_cube(pq, leaf_bmin, leaf.size)) {
       if (anchor_node.valid && point_in_cube(pq, anchor_node.bmin, anchor_node.size)) {
         leaf = descend_leaf_sparse(pq, ch.node_base, anchor_node.idx, anchor_node.bmin, anchor_node.size);
       } else {
@@ -725,7 +732,13 @@ fn trace_chunk_rope_interval_nomacro(
       have_leaf = true;
     }
 
-    let slab    = cube_slab_inv(ro, inv, leaf.bmin, leaf.size);
+    var slab_bmin = leaf.bmin;
+    if (leaf.mat == MAT_LEAF) {
+      let off = leaf_cube_offset(leaf.bmin, leaf.size, time_s, strength);
+      slab_bmin = leaf.bmin + off;
+    }
+
+    let slab    = cube_slab_inv(ro, inv, slab_bmin, leaf.size);
     let t_leave = slab.t_exit;
 
     // ------------------------------------------------------------
