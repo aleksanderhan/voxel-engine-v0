@@ -258,6 +258,9 @@ fn compute_godray_pixel(
   godray_hist_tex: texture_2d<f32>,
   godray_hist_samp: sampler
 ) -> vec4<f32> {
+  if (!ENABLE_GODRAYS) {
+    return vec4<f32>(0.0);
+  }
   let fdims_u = textureDimensions(depth_tex);
   let fdims_i = vec2<i32>(i32(fdims_u.x), i32(fdims_u.y));
   let res_full = vec2<f32>(f32(fdims_u.x), f32(fdims_u.y));

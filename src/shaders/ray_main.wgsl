@@ -175,6 +175,11 @@ fn main_godray(@builtin(global_invocation_id) gid3: vec3<u32>) {
   let gid = vec2<u32>(gid3.x, gid3.y);
   let hip = vec2<i32>(i32(gid.x), i32(gid.y));
 
+  if (!ENABLE_GODRAYS) {
+    textureStore(godray_out, hip, vec4<f32>(0.0));
+    return;
+  }
+
   let out_rgba = compute_godray_pixel(gid, depth_tex, godray_hist_tex, godray_hist_samp);
   textureStore(godray_out, hip, out_rgba);
 }
