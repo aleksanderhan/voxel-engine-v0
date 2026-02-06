@@ -728,7 +728,7 @@ struct VoxTraceResult {
   t_exit  : f32,
 };
 
-fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
+fn trace_scene_voxels_interval(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) -> VoxTraceResult {
   if (cam.chunk_count == 0u) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0);
   }
@@ -747,8 +747,8 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
   let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
 
   // Only trace as far as fog can contribute (huge perf win on big loaded grids)
-  var t_enter = max(rtg.x, 0.0);
-  let t_exit  = min(rtg.y, FOG_MAX_DIST);
+  var t_enter = max(max(rtg.x, 0.0), t_min);
+  let t_exit  = min(min(rtg.y, FOG_MAX_DIST), t_max);
 
   if (t_exit < t_enter) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0);
@@ -879,6 +879,10 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
   }
 
   return VoxTraceResult(true, best, t_exit);
+}
+
+fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
+  return trace_scene_voxels_interval(ro, rd, 0.0, FOG_MAX_DIST);
 }
 
 // --------------------------------------------------------------------------

@@ -22,6 +22,8 @@ pub struct TextureSet {
 
     // per-pixel local lighting term (unfogged), written by primary
     pub local: Tex2D,
+
+    pub primary_hit_hist: [Tex2D; 2],
     
     pub godray: [Tex2D; 2],
     pub clip_height: Tex2DArray,
@@ -140,6 +142,25 @@ pub fn create_textures(
         rw_tex_usage,
     );
 
+    let primary_hit_hist = [
+        make_tex2d(
+            device,
+            "primary_hit_hist_a",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::R32Float,
+            rw_tex_usage,
+        ),
+        make_tex2d(
+            device,
+            "primary_hit_hist_b",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::R32Float,
+            rw_tex_usage,
+        ),
+    ];
+
     let godray = [
         make_tex2d(
             device,
@@ -185,6 +206,7 @@ pub fn create_textures(
         color,
         depth,
         local,
+        primary_hit_hist,
         godray,
         clip_height,
     }
