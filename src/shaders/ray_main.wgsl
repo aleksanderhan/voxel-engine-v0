@@ -207,13 +207,26 @@ fn main_primary(
         tile_candidate_count,
         seed
       );
-      if (vt_hint.best.hit != 0u) {
-        vt = vt_hint;
+      var vt_hint_use = vt_hint;
+      if (vt_hint_use.best.hit == 0u) {
+        vt_hint_use = trace_scene_voxels_interval(
+          ro,
+          rd,
+          t_start,
+          vt_hint_use.t_exit,
+          hist_anchor_key != INVALID_U32,
+          hist_anchor_coord,
+          hist_anchor_key,
+          seed
+        );
+      }
+      if (vt_hint_use.best.hit != 0u) {
+        vt = vt_hint_use;
         used_hint = true;
       }
     }
     if (!used_hint) {
-      vt = trace_scene_voxels_candidates(
+      var vt_use = trace_scene_voxels_candidates(
         ro,
         rd,
         0.0,
@@ -224,6 +237,19 @@ fn main_primary(
         tile_candidate_count,
         seed
       );
+      if (vt_use.best.hit == 0u) {
+        vt_use = trace_scene_voxels_interval(
+          ro,
+          rd,
+          0.0,
+          vt_use.t_exit,
+          false,
+          vec3<i32>(0),
+          INVALID_U32,
+          seed
+        );
+      }
+      vt = vt_use;
     }
   }
 
