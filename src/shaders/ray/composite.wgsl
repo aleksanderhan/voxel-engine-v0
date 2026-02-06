@@ -100,8 +100,8 @@ fn composite_pixel_mapped(
     n_w = pow(max(dot(ref_n, n_s), 0.0), 4.0);
   }
   var w = w00 * d_w * n_w * select(0.0, 1.0, n_valid);
-  var c = textureLoad(color_tex, ip_s00, 0).xyz;
-  base += c * w;
+  var c_sample = textureLoad(color_tex, ip_s00, 0).xyz;
+  base += c_sample * w;
   wsum += w;
 
   // sample 10
@@ -115,8 +115,8 @@ fn composite_pixel_mapped(
     n_w = pow(max(dot(ref_n, n_s), 0.0), 4.0);
   }
   w = w10 * d_w * n_w * select(0.0, 1.0, n_valid);
-  c = textureLoad(color_tex, ip_s10, 0).xyz;
-  base += c * w;
+  c_sample = textureLoad(color_tex, ip_s10, 0).xyz;
+  base += c_sample * w;
   wsum += w;
 
   // sample 01
@@ -130,8 +130,8 @@ fn composite_pixel_mapped(
     n_w = pow(max(dot(ref_n, n_s), 0.0), 4.0);
   }
   w = w01 * d_w * n_w * select(0.0, 1.0, n_valid);
-  c = textureLoad(color_tex, ip_s01, 0).xyz;
-  base += c * w;
+  c_sample = textureLoad(color_tex, ip_s01, 0).xyz;
+  base += c_sample * w;
   wsum += w;
 
   // sample 11
@@ -145,8 +145,8 @@ fn composite_pixel_mapped(
     n_w = pow(max(dot(ref_n, n_s), 0.0), 4.0);
   }
   w = w11 * d_w * n_w * select(0.0, 1.0, n_valid);
-  c = textureLoad(color_tex, ip_s11, 0).xyz;
-  base += c * w;
+  c_sample = textureLoad(color_tex, ip_s11, 0).xyz;
+  base += c_sample * w;
   wsum += w;
 
   if (wsum > 0.0) {
