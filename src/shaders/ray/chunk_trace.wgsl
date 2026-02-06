@@ -995,7 +995,8 @@ fn tile_append_candidates_for_ray(
   let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
   let grid_bmax = grid_bmin + vec3<f32>(f32(gd.x), f32(gd.y), f32(gd.z)) * chunk_size_m;
 
-  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let rtg = intersect_aabb_inv(ro, inv, grid_bmin, grid_bmax);
   var t_enter = max(max(rtg.x, 0.0), t_min);
   let t_exit  = min(min(rtg.y, FOG_MAX_DIST), t_max);
 
@@ -1028,8 +1029,6 @@ fn tile_append_candidates_for_ray(
 
   var t_local: f32 = 0.0;
   let t_exit_local = max(t_exit - start_t, 0.0);
-
-  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
 
   let step_x: i32 = select(-1, 1, rd.x > 0.0);
   let step_y: i32 = select(-1, 1, rd.y > 0.0);
@@ -1124,7 +1123,8 @@ fn trace_scene_voxels_candidates(
   let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
   let grid_bmax = grid_bmin + vec3<f32>(f32(gd.x), f32(gd.y), f32(gd.z)) * chunk_size_m;
 
-  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let rtg = intersect_aabb_inv(ro, inv, grid_bmin, grid_bmax);
   var t_enter = max(max(rtg.x, 0.0), t_min);
   let t_exit  = min(min(rtg.y, FOG_MAX_DIST), t_max);
 
@@ -1137,7 +1137,6 @@ fn trace_scene_voxels_candidates(
   var best_anchor_key = INVALID_U32;
   var best_anchor_chunk = vec3<i32>(0);
 
-  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
   let root_size = f32(cam.chunk_size) * voxel_size;
   let max_candidates = min(candidate_count, MAX_TILE_CHUNKS);
 
@@ -1150,7 +1149,7 @@ fn trace_scene_voxels_candidates(
 
     let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * voxel_size;
     let root_bmax = root_bmin + vec3<f32>(root_size);
-    let rt_chunk = intersect_aabb(ro, rd, root_bmin, root_bmax);
+    let rt_chunk = intersect_aabb_inv(ro, inv, root_bmin, root_bmax);
 
     let cell_enter = max(rt_chunk.x, t_enter);
     let cell_exit  = min(rt_chunk.y, t_exit);
@@ -1211,7 +1210,8 @@ fn trace_scene_voxels_interval(
   let grid_bmax = grid_bmin + vec3<f32>(f32(gd.x), f32(gd.y), f32(gd.z)) * chunk_size_m;
 
   // Ray vs grid AABB
-  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let rtg = intersect_aabb_inv(ro, inv, grid_bmin, grid_bmax);
 
   // Only trace as far as fog can contribute (huge perf win on big loaded grids)
   var t_enter = max(max(rtg.x, 0.0), t_min);
@@ -1251,8 +1251,6 @@ fn trace_scene_voxels_interval(
   // DDA setup (in ray-param space, relative to p0)
   var t_local: f32 = 0.0;
   let t_exit_local = max(t_exit - start_t, 0.0);
-
-  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
 
   let step_x: i32 = select(-1, 1, rd.x > 0.0);
   let step_y: i32 = select(-1, 1, rd.y > 0.0);

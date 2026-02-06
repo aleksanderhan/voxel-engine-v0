@@ -504,6 +504,34 @@ fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>
   return vec2<f32>(t_enter, t_exit);
 }
 
+fn intersect_aabb_inv(ro: vec3<f32>, inv: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
+  var t0 = (bmin - ro) * inv;
+  var t1 = (bmax - ro) * inv;
+
+  let INV_PARALLEL: f32 = 1e20;
+
+  if (abs(inv.x) > INV_PARALLEL) {
+    if (ro.x < bmin.x || ro.x >= bmax.x) { return vec2<f32>(1.0, 0.0); }
+    t0.x = -BIG_F32; t1.x = BIG_F32;
+  }
+  if (abs(inv.y) > INV_PARALLEL) {
+    if (ro.y < bmin.y || ro.y >= bmax.y) { return vec2<f32>(1.0, 0.0); }
+    t0.y = -BIG_F32; t1.y = BIG_F32;
+  }
+  if (abs(inv.z) > INV_PARALLEL) {
+    if (ro.z < bmin.z || ro.z >= bmax.z) { return vec2<f32>(1.0, 0.0); }
+    t0.z = -BIG_F32; t1.z = BIG_F32;
+  }
+
+  let tminv = min(t0, t1);
+  let tmaxv = max(t0, t1);
+
+  let t_enter = max(tminv.x, max(tminv.y, tminv.z));
+  let t_exit  = min(tmaxv.x, min(tmaxv.y, tmaxv.z));
+
+  return vec2<f32>(t_enter, t_exit);
+}
+
 fn child_rank(mask: u32, ci: u32) -> u32 {
   let bit = 1u << ci;
   let lower = mask & (bit - 1u);

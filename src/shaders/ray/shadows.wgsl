@@ -97,7 +97,8 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let ro   = p + sun_dir * bias;
   let rd   = sun_dir;
 
-  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let rtg = intersect_aabb_inv(ro, inv, grid_bmin, grid_bmax);
   let t_enter = max(rtg.x, 0.0);
   let t_exit  = rtg.y;
   if (t_exit < t_enter) { return 1.0; }
@@ -112,8 +113,6 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   var cx: i32 = c.x;
   var cy: i32 = c.y;
   var cz: i32 = c.z;
-
-  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
 
   let step_x: i32 = select(-1, 1, rd.x > 0.0);
   let step_y: i32 = select(-1, 1, rd.y > 0.0);
