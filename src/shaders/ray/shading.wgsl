@@ -3,9 +3,9 @@
 //// --------------------------------------------------------------------------
 
 // Performance gates for primary pass (world-space distance).
-const VOXEL_AO_MAX_DIST       : f32 = 40.0;
-const LOCAL_LIGHT_MAX_DIST    : f32 = 50.0;
-const FAR_SHADING_DIST        : f32 = 80.0;
+const VOXEL_AO_MAX_DIST       : f32 = 32.0;
+const LOCAL_LIGHT_MAX_DIST    : f32 = 40.0;
+const FAR_SHADING_DIST        : f32 = 70.0;
 const PRIMARY_CLOUD_SHADOWS   : bool = false;
 
 fn color_for_material(m: u32) -> vec3<f32> {

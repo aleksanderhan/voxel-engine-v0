@@ -7,11 +7,11 @@
 const CLIP_LEVELS_MAX : u32 = 16u;
 
 // March tuning
-const HF_MAX_STEPS : u32 = 96u;
-const HF_BISECT    : u32 = 5u;
+const HF_MAX_STEPS : u32 = 72u;
+const HF_BISECT    : u32 = 4u;
 
 // dt clamp (meters along ray)
-const HF_DT_MAX : f32 = 48.0;
+const HF_DT_MAX : f32 = 64.0;
 
 struct ClipmapParams {
   levels      : u32,
