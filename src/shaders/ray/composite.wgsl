@@ -71,19 +71,6 @@ fn composite_pixel_mapped(
   );
 
   let frac = fract(px_render_clamped);
-  let sample_ips = array<vec2<i32>, 4>(
-    vec2<i32>(base_ip0.x, base_ip0.y),
-    vec2<i32>(base_ip1.x, base_ip0.y),
-    vec2<i32>(base_ip0.x, base_ip1.y),
-    vec2<i32>(base_ip1.x, base_ip1.y)
-  );
-  let sample_weights = array<vec2<f32>, 4>(
-    vec2<f32>(1.0 - frac.x, 1.0 - frac.y),
-    vec2<f32>(frac.x, 1.0 - frac.y),
-    vec2<f32>(1.0 - frac.x, frac.y),
-    vec2<f32>(frac.x, frac.y)
-  );
-
   let ref_normal_raw = textureLoad(normal_render, ip_r, 0);
   let ref_valid = ref_normal_raw.w > 0.5;
   let ref_n = normalize(ref_normal_raw.xyz * 2.0 - vec3<f32>(1.0));
@@ -92,26 +79,75 @@ fn composite_pixel_mapped(
   var wsum = 0.0;
   let tol = 0.02 + 0.06 * smoothstep(10.0, 80.0, d0);
 
-  for (var i: u32 = 0u; i < 4u; i = i + 1u) {
-    let ip_s = sample_ips[i];
-    let base_w = sample_weights[i].x * sample_weights[i].y;
+  let ip_s00 = vec2<i32>(base_ip0.x, base_ip0.y);
+  let ip_s10 = vec2<i32>(base_ip1.x, base_ip0.y);
+  let ip_s01 = vec2<i32>(base_ip0.x, base_ip1.y);
+  let ip_s11 = vec2<i32>(base_ip1.x, base_ip1.y);
 
-    let d_s = textureLoad(depth_render, ip_s, 0).x;
-    let d_w = 1.0 - smoothstep(0.0, tol, abs(d_s - d0));
+  let w00 = (1.0 - frac.x) * (1.0 - frac.y);
+  let w10 = frac.x * (1.0 - frac.y);
+  let w01 = (1.0 - frac.x) * frac.y;
+  let w11 = frac.x * frac.y;
 
-    let n_raw = textureLoad(normal_render, ip_s, 0);
-    let n_valid = n_raw.w > 0.5;
-    var n_w = 1.0;
-    if (ref_valid && n_valid) {
-      let n_s = normalize(n_raw.xyz * 2.0 - vec3<f32>(1.0));
-      n_w = pow(max(dot(ref_n, n_s), 0.0), 4.0);
-    }
-
-    let w = base_w * d_w * n_w * select(0.0, 1.0, n_valid);
-    let c = textureLoad(color_tex, ip_s, 0).xyz;
-    base += c * w;
-    wsum += w;
+  // sample 00
+  var d_s = textureLoad(depth_render, ip_s00, 0).x;
+  var d_w = 1.0 - smoothstep(0.0, tol, abs(d_s - d0));
+  var n_raw = textureLoad(normal_render, ip_s00, 0);
+  var n_valid = n_raw.w > 0.5;
+  var n_w = 1.0;
+  if (ref_valid && n_valid) {
+    let n_s = normalize(n_raw.xyz * 2.0 - vec3<f32>(1.0));
+    n_w = pow(max(dot(ref_n, n_s), 0.0), 4.0);
   }
+  var w = w00 * d_w * n_w * select(0.0, 1.0, n_valid);
+  var c = textureLoad(color_tex, ip_s00, 0).xyz;
+  base += c * w;
+  wsum += w;
+
+  // sample 10
+  d_s = textureLoad(depth_render, ip_s10, 0).x;
+  d_w = 1.0 - smoothstep(0.0, tol, abs(d_s - d0));
+  n_raw = textureLoad(normal_render, ip_s10, 0);
+  n_valid = n_raw.w > 0.5;
+  n_w = 1.0;
+  if (ref_valid && n_valid) {
+    let n_s = normalize(n_raw.xyz * 2.0 - vec3<f32>(1.0));
+    n_w = pow(max(dot(ref_n, n_s), 0.0), 4.0);
+  }
+  w = w10 * d_w * n_w * select(0.0, 1.0, n_valid);
+  c = textureLoad(color_tex, ip_s10, 0).xyz;
+  base += c * w;
+  wsum += w;
+
+  // sample 01
+  d_s = textureLoad(depth_render, ip_s01, 0).x;
+  d_w = 1.0 - smoothstep(0.0, tol, abs(d_s - d0));
+  n_raw = textureLoad(normal_render, ip_s01, 0);
+  n_valid = n_raw.w > 0.5;
+  n_w = 1.0;
+  if (ref_valid && n_valid) {
+    let n_s = normalize(n_raw.xyz * 2.0 - vec3<f32>(1.0));
+    n_w = pow(max(dot(ref_n, n_s), 0.0), 4.0);
+  }
+  w = w01 * d_w * n_w * select(0.0, 1.0, n_valid);
+  c = textureLoad(color_tex, ip_s01, 0).xyz;
+  base += c * w;
+  wsum += w;
+
+  // sample 11
+  d_s = textureLoad(depth_render, ip_s11, 0).x;
+  d_w = 1.0 - smoothstep(0.0, tol, abs(d_s - d0));
+  n_raw = textureLoad(normal_render, ip_s11, 0);
+  n_valid = n_raw.w > 0.5;
+  n_w = 1.0;
+  if (ref_valid && n_valid) {
+    let n_s = normalize(n_raw.xyz * 2.0 - vec3<f32>(1.0));
+    n_w = pow(max(dot(ref_n, n_s), 0.0), 4.0);
+  }
+  w = w11 * d_w * n_w * select(0.0, 1.0, n_valid);
+  c = textureLoad(color_tex, ip_s11, 0).xyz;
+  base += c * w;
+  wsum += w;
 
   if (wsum > 0.0) {
     base /= wsum;
