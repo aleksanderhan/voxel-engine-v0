@@ -966,6 +966,11 @@ fn chunk_coords_neighbor(a: vec3<i32>, b: vec3<i32>) -> bool {
 }
 
 fn tile_add_candidate(slot: u32, cell_enter: f32) {
+  if (slot < cam.chunk_count) {
+    let ch = chunks[slot];
+    if (ch.macro_empty != 0u) { return; }
+  }
+
   let count = atomicLoad(&WG_TILE_COUNT);
   for (var i: u32 = 0u; i < count && i < MAX_TILE_CHUNKS; i = i + 1u) {
     if (WG_TILE_SLOTS[i] == slot) {
