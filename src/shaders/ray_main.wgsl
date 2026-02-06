@@ -99,7 +99,7 @@ fn main_primary(
     let hf = clip_trace_heightfield(ro, rd, 0.0, fog_max);
 
     if (hf.hit) {
-      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+      let surface = select(shade_clip_hit_far(hf, sky_up), shade_clip_hit(ro, rd, hf, sky_up, seed), hf.t <= FAR_SHADING_DIST);
       let t_scene = min(hf.t, fog_max);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
@@ -129,7 +129,7 @@ fn main_primary(
     let hf = clip_trace_heightfield(ro, rd, 0.0, fog_max);
 
     if (hf.hit) {
-      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+      let surface = select(shade_clip_hit_far(hf, sky_up), shade_clip_hit(ro, rd, hf, sky_up, seed), hf.t <= FAR_SHADING_DIST);
       let t_scene = min(hf.t, fog_max);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
@@ -170,7 +170,7 @@ fn main_primary(
   let hf = clip_trace_heightfield(ro, rd, 0.0, fog_max);
 
   if (hf.hit) {
-    let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+    let surface = select(shade_clip_hit_far(hf, sky_up), shade_clip_hit(ro, rd, hf, sky_up, seed), hf.t <= FAR_SHADING_DIST);
     let t_scene = min(hf.t, fog_max);
     let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 

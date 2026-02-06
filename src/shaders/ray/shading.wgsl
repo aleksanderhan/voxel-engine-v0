@@ -124,6 +124,16 @@ fn material_emission(mat: u32) -> vec3<f32> {
   return vec3<f32>(0.0);
 }
 
+fn shade_hit_far(hg: HitGeom, sky_up: vec3<f32>) -> vec3<f32> {
+  let base = color_for_material(hg.mat);
+  let diff = max(dot(hg.n, SUN_DIR), 0.0);
+  let amb_col = hemi_ambient(hg.n, sky_up);
+  let ambient = amb_col * 0.03;
+  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff);
+  let emissive = material_emission(hg.mat);
+  return base * (ambient + direct) + emissive;
+}
+
 struct ShadeOut {
   base_hdr   : vec3<f32>,
   local_hdr  : vec3<f32>,
@@ -137,7 +147,7 @@ fn shade_hit_split(
   sky_up: vec3<f32>,
   seed: u32
 ) -> ShadeOut {
-  let base_hdr = shade_hit(ro, rd, hg, sky_up, seed);
+  let base_hdr = select(shade_hit_far(hg, sky_up), shade_hit(ro, rd, hg, sky_up, seed), hg.t <= FAR_SHADING_DIST);
 
   // Local voxel lighting from MAT_LIGHT blocks.
   // Keep it separate so it can be temporally accumulated without fog.
@@ -235,6 +245,16 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis_geom * Tc * dapple;
   let emissive = material_emission(hg.mat);
   return base * (ambient + direct) + 0.20 * spec_col + emissive;
+}
+
+fn shade_clip_hit_far(ch: ClipHit, sky_up: vec3<f32>) -> vec3<f32> {
+  let base = color_for_material(ch.mat);
+  let diff = max(dot(ch.n, SUN_DIR), 0.0);
+  let amb_col = hemi_ambient(ch.n, sky_up);
+  let ambient = amb_col * 0.03;
+  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff);
+  let emissive = material_emission(ch.mat);
+  return base * (ambient + direct) + emissive;
 }
 
 fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
