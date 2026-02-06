@@ -218,6 +218,10 @@ const PRIMARY_HIT_MARGIN        : f32 = 0.08;
 const PRIMARY_HIT_WINDOW        : f32 = 0.60;
 const PRIMARY_HIT_DEPTH_REL0    : f32 = 0.04;
 const PRIMARY_HIT_DEPTH_REL1    : f32 = 0.12;
+
+// Sun shadow temporal reuse (primary shading).
+const SHADOW_TAA_ALPHA      : f32 = 0.20;
+const SHADOW_SUBSAMPLE_MASK : u32 = 1u; // 0b1 => 1/2 pixels per frame (blue-noise via seed)
 const PRIMARY_HIT_MOTION_PX0    : f32 = 0.50;
 const PRIMARY_HIT_MOTION_PX1    : f32 = 1.75;
 
