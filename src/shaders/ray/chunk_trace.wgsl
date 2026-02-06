@@ -388,6 +388,12 @@ struct MacroDDAState {
   cell   : f32,
 };
 
+struct MacroInterval {
+  valid: bool,
+  t0   : f32,
+  t1   : f32,
+};
+
 fn macro_dda_init(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -466,6 +472,47 @@ fn macro_dda_init(
   }
 
   return state;
+}
+
+fn macro_coarse_interval_state(
+  state: ptr<function, MacroDDAState>,
+  macro_base: u32,
+  t_exit: f32,
+  eps_step: f32,
+  tcur: ptr<function, f32>
+) -> MacroInterval {
+  var out: MacroInterval;
+  out.valid = false;
+  out.t0 = 0.0;
+  out.t1 = 0.0;
+
+  if (macro_base == INVALID_U32) { return out; }
+  if (!(*state).enabled) { return out; }
+
+  let MAX_MACRO_ITERS: u32 = 128u;
+  for (var i: u32 = 0u; i < MAX_MACRO_ITERS; i = i + 1u) {
+    if (!(*state).enabled) { break; }
+    macro_dda_sync(state, (*tcur));
+    let step = macro_dda_current(*state, macro_base);
+    if (!step.valid) { break; }
+
+    let t_cell_exit = min(step.t_exit, t_exit);
+    if (!step.empty) {
+      out.valid = true;
+      out.t0 = (*tcur);
+      out.t1 = t_cell_exit;
+      return out;
+    }
+
+    (*tcur) = max(t_cell_exit, (*tcur)) + eps_step;
+    if ((*tcur) > t_exit) { break; }
+
+    if ((*state).enabled && (*tcur) >= step.t_exit) {
+      macro_dda_step(state);
+    }
+  }
+
+  return out;
 }
 
 fn macro_dda_t_exit(state: MacroDDAState) -> f32 {
@@ -934,6 +981,8 @@ fn trace_scene_voxels_interval(
   let didx_y: i32 = select(-stride_y, stride_y, rd.y > 0.0);
   let didx_z: i32 = select(-stride_z, stride_z, rd.z > 0.0);
 
+  let eps_step = 1e-4 * voxel_size;
+
   var best = miss_hitgeom();
   var best_anchor_valid = false;
   var best_anchor_key = INVALID_U32;
@@ -961,6 +1010,7 @@ fn trace_scene_voxels_interval(
 
   let max_chunk_steps = min(u32(rem_x + rem_y + rem_z) + 1u, 512u);
 
+  var found_hit = false;
 
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }
@@ -978,29 +1028,121 @@ fn trace_scene_voxels_interval(
         let cell_exit  = start_t + min(tNextLocal, t_exit_local);
 
         let cur_coord = vec3<i32>(go.x + lcx, go.y + lcy, go.z + lcz);
-        let use_anchor = anchor_valid &&
-          (slot == anchor_slot || chunk_coords_neighbor(cur_coord, anchor_coord));
-        let anchor_key_use = select(INVALID_U32, anchor_key, use_anchor);
 
-        let h = trace_chunk_rope_interval(
-          ro,
-          rd,
-          ch,
-          cell_enter,
-          cell_exit,
-          use_anchor,
-          anchor_key_use
-        );
-        if (h.hit.hit != 0u && h.hit.t < best.t) {
-          best = h.hit;
-          best_anchor_valid = h.anchor_valid;
-          best_anchor_key = h.anchor_key;
-          best_anchor_chunk = cur_coord;
+        let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * voxel_size;
+        let root_size = f32(cam.chunk_size) * voxel_size;
+
+        if (ch.macro_base == INVALID_U32) {
+          let use_anchor = anchor_valid &&
+            (slot == anchor_slot || chunk_coords_neighbor(cur_coord, anchor_coord));
+          let anchor_key_use = select(INVALID_U32, anchor_key, use_anchor);
+
+          let h = trace_chunk_rope_interval(
+            ro,
+            rd,
+            ch,
+            cell_enter,
+            cell_exit,
+            use_anchor,
+            anchor_key_use
+          );
+          if (h.hit.hit != 0u && h.hit.t < best.t) {
+            best = h.hit;
+            best_anchor_valid = h.anchor_valid;
+            best_anchor_key = h.anchor_key;
+            best_anchor_chunk = cur_coord;
+            found_hit = true;
+          }
+          anchor_valid = h.anchor_valid;
+          anchor_key = h.anchor_key;
+          anchor_coord = cur_coord;
+          anchor_slot = slot;
+        } else {
+          var t_scan = max(cell_enter, 0.0) + eps_step;
+          if (t_scan < cell_exit) {
+            var macro_state = macro_dda_init(
+              ro,
+              rd,
+              inv,
+              t_scan,
+              root_bmin,
+              root_size,
+              ch.macro_base
+            );
+
+            if (!macro_state.enabled) {
+              let use_anchor = anchor_valid &&
+                (slot == anchor_slot || chunk_coords_neighbor(cur_coord, anchor_coord));
+              let anchor_key_use = select(INVALID_U32, anchor_key, use_anchor);
+
+              let h = trace_chunk_rope_interval(
+                ro,
+                rd,
+                ch,
+                cell_enter,
+                cell_exit,
+                use_anchor,
+                anchor_key_use
+              );
+              if (h.hit.hit != 0u && h.hit.t < best.t) {
+                best = h.hit;
+                best_anchor_valid = h.anchor_valid;
+                best_anchor_key = h.anchor_key;
+                best_anchor_chunk = cur_coord;
+                found_hit = true;
+              }
+              anchor_valid = h.anchor_valid;
+              anchor_key = h.anchor_key;
+              anchor_coord = cur_coord;
+              anchor_slot = slot;
+            } else {
+              let MAX_COARSE_ITERS: u32 = 64u;
+
+              for (var c: u32 = 0u; c < MAX_COARSE_ITERS; c = c + 1u) {
+                if (t_scan >= cell_exit) { break; }
+
+                let coarse = macro_coarse_interval_state(
+                  &macro_state,
+                  ch.macro_base,
+                  cell_exit,
+                  eps_step,
+                  &t_scan
+                );
+
+                if (!coarse.valid) { break; }
+
+                let use_anchor = anchor_valid &&
+                  (slot == anchor_slot || chunk_coords_neighbor(cur_coord, anchor_coord));
+                let anchor_key_use = select(INVALID_U32, anchor_key, use_anchor);
+
+                let h = trace_chunk_rope_interval(
+                  ro,
+                  rd,
+                  ch,
+                  coarse.t0,
+                  coarse.t1,
+                  use_anchor,
+                  anchor_key_use
+                );
+                if (h.hit.hit != 0u && h.hit.t < best.t) {
+                  best = h.hit;
+                  best_anchor_valid = h.anchor_valid;
+                  best_anchor_key = h.anchor_key;
+                  best_anchor_chunk = cur_coord;
+                  found_hit = true;
+                  break;
+                }
+
+                anchor_valid = h.anchor_valid;
+                anchor_key = h.anchor_key;
+                anchor_coord = cur_coord;
+                anchor_slot = slot;
+
+                t_scan = coarse.t1 + eps_step;
+              }
+            }
+          }
         }
-        anchor_valid = h.anchor_valid;
-        anchor_key = h.anchor_key;
-        anchor_coord = cur_coord;
-        anchor_slot = slot;
       }
     }
 
@@ -1025,6 +1167,7 @@ fn trace_scene_voxels_interval(
     t_local = tNextLocal;
     // ---------------------------------------------------------------
 
+    if (found_hit) { break; }
 
     if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) { break; }
   }
