@@ -25,7 +25,7 @@
 
 // primary hit history (temporal reprojection)
 @group(0) @binding(12) var primary_hist_tex  : texture_2d<f32>;
-@group(0) @binding(13) var primary_hist_out  : texture_storage_2d<r32float, write>;
+@group(0) @binding(13) var primary_hist_out  : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(14) var primary_hist_samp : sampler;
 
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
@@ -44,6 +44,19 @@
 @group(2) @binding(6) var local_samp     : sampler;
 
 var<workgroup> WG_SKY_UP : vec3<f32>;
+
+fn pack_i16x2(a: i32, b: i32) -> u32 {
+  return (u32(a) & 0xFFFFu) | ((u32(b) & 0xFFFFu) << 16u);
+}
+
+fn unpack_i16(v: u32) -> i32 {
+  let s = i32(v & 0xFFFFu);
+  return select(s, s - 0x10000, (v & 0x8000u) != 0u);
+}
+
+fn unpack_i16x2(v: u32) -> vec2<i32> {
+  return vec2<i32>(unpack_i16(v), unpack_i16(v >> 16u));
+}
 
 @compute @workgroup_size(8, 8, 1)
 fn main_primary(
@@ -82,14 +95,18 @@ fn main_primary(
 
   var t_hist     : f32 = 0.0;
   var hist_valid : bool = false;
+  var hist_anchor_key  : u32 = INVALID_U32;
+  var hist_anchor_coord: vec3<i32> = vec3<i32>(0);
 
-  let t_hist_guess = textureLoad(primary_hist_tex, ip, 0).x;
+  let hist_guess = textureLoad(primary_hist_tex, ip, 0);
+  let t_hist_guess = hist_guess.x;
   if (t_hist_guess > 1e-3) {
     let p_ws = ro + rd * t_hist_guess;
     let uv_prev = prev_uv_from_world(p_ws);
 
     if (in_unit_square(uv_prev)) {
-      let t_prev = textureSampleLevel(primary_hist_tex, primary_hist_samp, uv_prev, 0.0).x;
+      let hist_prev = textureSampleLevel(primary_hist_tex, primary_hist_samp, uv_prev, 0.0);
+      let t_prev = hist_prev.x;
       let rel = abs(t_prev - t_hist_guess) / max(t_hist_guess, 1e-3);
       let depth_ok = 1.0 - smoothstep(PRIMARY_HIT_DEPTH_REL0, PRIMARY_HIT_DEPTH_REL1, rel);
       let vel_px = length((uv_prev - uv) * res);
@@ -97,6 +114,14 @@ fn main_primary(
       if (t_prev > 1e-3 && depth_ok > 0.5 && motion_ok > 0.5) {
         t_hist = t_prev;
         hist_valid = true;
+        let packed_z = bitcast<u32>(hist_prev.w);
+        if ((packed_z & 0x80000000u) != 0u) {
+          hist_anchor_key = bitcast<u32>(hist_prev.y);
+          let packed_xy = bitcast<u32>(hist_prev.z);
+          let xy = unpack_i16x2(packed_xy);
+          let z = unpack_i16(packed_z);
+          hist_anchor_coord = vec3<i32>(xy.x, xy.y, z);
+        }
       }
     }
   }
@@ -132,19 +157,35 @@ fn main_primary(
   // ------------------------------------------------------------
   // Case 2: voxel grid present => voxels, then heightfield fallback, then sky
   // ------------------------------------------------------------
-  var vt = VoxTraceResult(false, miss_hitgeom(), 0.0);
+  var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
   var used_hint = false;
   if (hist_valid) {
     let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
     let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
-    let vt_hint = trace_scene_voxels_interval(ro, rd, t_start, t_end);
+    let vt_hint = trace_scene_voxels_interval(
+      ro,
+      rd,
+      t_start,
+      t_end,
+      hist_anchor_key != INVALID_U32,
+      hist_anchor_coord,
+      hist_anchor_key
+    );
     if (vt_hint.best.hit != 0u) {
       vt = vt_hint;
       used_hint = true;
     }
   }
   if (!used_hint) {
-    vt = trace_scene_voxels_interval(ro, rd, 0.0, FOG_MAX_DIST);
+    vt = trace_scene_voxels_interval(
+      ro,
+      rd,
+      0.0,
+      FOG_MAX_DIST,
+      false,
+      vec3<i32>(0),
+      INVALID_U32
+    );
   }
 
   // Outside streamed grid => heightfield or sky
@@ -190,7 +231,20 @@ fn main_primary(
     textureStore(color_img, ip, vec4<f32>(col_base, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha = validity
-    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+    var packed_xy: u32 = 0u;
+    var packed_z: u32 = 0u;
+    var anchor_key: u32 = 0u;
+    if (vt.anchor_valid) {
+      packed_xy = pack_i16x2(vt.anchor_chunk.x, vt.anchor_chunk.y);
+      packed_z = pack_i16x2(vt.anchor_chunk.z, 0);
+      packed_z |= 0x80000000u;
+      anchor_key = vt.anchor_key;
+    }
+    textureStore(
+      primary_hist_out,
+      ip,
+      vec4<f32>(t_store, bitcast<f32>(anchor_key), bitcast<f32>(packed_xy), bitcast<f32>(packed_z))
+    );
     return;
   }
 
