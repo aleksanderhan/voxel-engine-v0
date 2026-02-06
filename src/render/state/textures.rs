@@ -19,6 +19,8 @@ pub struct TextureSet {
     pub output: OutputTex,
     pub color: Tex2D,
     pub depth: Tex2D,
+    pub depth_full: Tex2D,
+    pub normal: Tex2D,
 
     // per-pixel local lighting term (unfogged), written by primary
     pub local: Tex2D,
@@ -140,6 +142,15 @@ pub fn create_textures(
         rw_tex_usage,
     );
 
+    let depth_full = make_tex2d(
+        device,
+        "depth_full_tex",
+        out_w,
+        out_h,
+        wgpu::TextureFormat::R32Float,
+        rw_tex_usage,
+    );
+
     let godray = [
         make_tex2d(
             device,
@@ -179,11 +190,22 @@ pub fn create_textures(
         rw_tex_usage,
     );
 
+    let normal = make_tex2d(
+        device,
+        "normal_tex",
+        internal_w,
+        internal_h,
+        wgpu::TextureFormat::Rgba32Float,
+        rw_tex_usage,
+    );
+
 
     TextureSet {
         output,
         color,
         depth,
+        depth_full,
+        normal,
         local,
         godray,
         clip_height,

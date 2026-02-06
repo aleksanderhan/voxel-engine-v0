@@ -21,7 +21,9 @@ fn composite_pixel_mapped(
   color_tex: texture_2d<f32>,
   godray_tex: texture_2d<f32>,
   godray_samp: sampler,
-  depth_full: texture_2d<f32>
+  depth_full: texture_2d<f32>,
+  depth_render: texture_2d<f32>,
+  normal_render: texture_2d<f32>
 ) -> vec4<f32> {
   // --- render dims (color buffer) ---
   let rd_u = textureDimensions(color_tex);
@@ -33,9 +35,6 @@ fn composite_pixel_mapped(
     clamp(ip_render.x, 0, rd_i.x - 1),
     clamp(ip_render.y, 0, rd_i.y - 1)
   );
-
-  // Base color in render space
-  let base = textureLoad(color_tex, ip_r, 0).xyz;
 
   // --- full dims (depth buffer) ---
   let fd_u = textureDimensions(depth_full);
@@ -56,6 +55,69 @@ fn composite_pixel_mapped(
 
   // Depth edge weights MUST be full-res taps too
   let d0 = textureLoad(depth_full, ip_f, 0).x;
+
+  // Depth/normal-aware upsample of base color
+  let px_render_clamped = vec2<f32>(
+    clamp(px_render.x, 0.0, rd_f.x - 1.0),
+    clamp(px_render.y, 0.0, rd_f.y - 1.0)
+  );
+  let base_ip0 = vec2<i32>(
+    clamp(i32(floor(px_render_clamped.x)), 0, rd_i.x - 1),
+    clamp(i32(floor(px_render_clamped.y)), 0, rd_i.y - 1)
+  );
+  let base_ip1 = vec2<i32>(
+    clamp(base_ip0.x + 1, 0, rd_i.x - 1),
+    clamp(base_ip0.y + 1, 0, rd_i.y - 1)
+  );
+
+  let frac = fract(px_render_clamped);
+  let sample_ips = array<vec2<i32>, 4>(
+    vec2<i32>(base_ip0.x, base_ip0.y),
+    vec2<i32>(base_ip1.x, base_ip0.y),
+    vec2<i32>(base_ip0.x, base_ip1.y),
+    vec2<i32>(base_ip1.x, base_ip1.y)
+  );
+  let sample_weights = array<vec2<f32>, 4>(
+    vec2<f32>(1.0 - frac.x, 1.0 - frac.y),
+    vec2<f32>(frac.x, 1.0 - frac.y),
+    vec2<f32>(1.0 - frac.x, frac.y),
+    vec2<f32>(frac.x, frac.y)
+  );
+
+  let ref_normal_raw = textureLoad(normal_render, ip_r, 0);
+  let ref_valid = ref_normal_raw.w > 0.5;
+  let ref_n = normalize(ref_normal_raw.xyz * 2.0 - vec3<f32>(1.0));
+
+  var base = vec3<f32>(0.0);
+  var wsum = 0.0;
+  let tol = 0.02 + 0.06 * smoothstep(10.0, 80.0, d0);
+
+  for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+    let ip_s = sample_ips[i];
+    let base_w = sample_weights[i].x * sample_weights[i].y;
+
+    let d_s = textureLoad(depth_render, ip_s, 0).x;
+    let d_w = 1.0 - smoothstep(0.0, tol, abs(d_s - d0));
+
+    let n_raw = textureLoad(normal_render, ip_s, 0);
+    let n_valid = n_raw.w > 0.5;
+    var n_w = 1.0;
+    if (ref_valid && n_valid) {
+      let n_s = normalize(n_raw.xyz * 2.0 - vec3<f32>(1.0));
+      n_w = pow(max(dot(ref_n, n_s), 0.0), 4.0);
+    }
+
+    let w = base_w * d_w * n_w * select(0.0, 1.0, n_valid);
+    let c = textureLoad(color_tex, ip_s, 0).xyz;
+    base += c * w;
+    wsum += w;
+  }
+
+  if (wsum > 0.0) {
+    base /= wsum;
+  } else {
+    base = textureLoad(color_tex, ip_r, 0).xyz;
+  }
 
   var god_lin = vec3<f32>(0.0);
   var god_far: f32 = 0.0;

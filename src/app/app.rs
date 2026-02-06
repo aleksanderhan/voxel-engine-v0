@@ -110,6 +110,8 @@ pub struct App {
 
     edit_mode: usize,
     edit_modes: Vec<EditMode>,
+
+    last_gpu_timings: Option<crate::render::state::GpuTimingsMs>,
 }
 
 #[derive(Clone, Copy)]
@@ -214,6 +216,7 @@ impl App {
             free_cam: false,
             edit_mode: 0,
             edit_modes,
+            last_gpu_timings: None,
         }
     }
 
@@ -293,13 +296,23 @@ impl App {
 
         self.submit_and_present(encoder, swapchain_frame);
 
+        self.last_gpu_timings = self.renderer.read_gpu_timings_ms_blocking();
+        let mut reset_history = false;
+        if let Some(gpu) = self.last_gpu_timings {
+            reset_history = self.renderer.update_primary_scale(
+                self.surface_config.width,
+                self.surface_config.height,
+                gpu.primary,
+            );
+        }
+
         // Record temporal history for next frame.
         self.prev_view_proj = glam::Mat4::from_cols_array_2d(&camera_gpu.view_proj);
-        self.has_prev_view_proj = true;
+        self.has_prev_view_proj = !reset_history;
 
         // IMPORTANT: "render_ms" should exclude finish_frame_profiling overhead
         let render_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
-        self.finish_frame_profiling(render_ms);
+        self.finish_frame_profiling(render_ms, self.last_gpu_timings);
     }
 
     fn compute_frame_dt_seconds(&mut self) -> f32 {
@@ -617,7 +630,7 @@ impl App {
         self.profiler.present(profiler::FrameProf::end_ms(t0));
     }
 
-    fn finish_frame_profiling(&mut self, render_ms: f64) {
+    fn finish_frame_profiling(&mut self, render_ms: f64, gpu_timings_ms: Option<crate::render::state::GpuTimingsMs>) {
         if !self.profiler.enabled() {
             return;
         }
@@ -625,7 +638,7 @@ impl App {
         let prof_start = Instant::now();
 
         let gpu_timings_ms = if self.profiler.should_print() {
-            self.renderer.read_gpu_timings_ms_blocking()
+            gpu_timings_ms
         } else {
             None
         };

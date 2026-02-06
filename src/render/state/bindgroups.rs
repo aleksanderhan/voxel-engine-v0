@@ -8,6 +8,7 @@ pub struct BindGroups {
     pub primary: wgpu::BindGroup,
     pub scene: wgpu::BindGroup,
     pub godray: [wgpu::BindGroup; 2],
+    pub depth_resolve: wgpu::BindGroup,
     pub composite: [wgpu::BindGroup; 2],
     pub empty: wgpu::BindGroup,
     pub blit: wgpu::BindGroup,
@@ -52,27 +53,31 @@ fn make_primary_bg(
                 binding: 6,
                 resource: wgpu::BindingResource::TextureView(&textures.local.view),
             },
-            // shifted clipmap params uniform
             wgpu::BindGroupEntry {
                 binding: 7,
+                resource: wgpu::BindingResource::TextureView(&textures.normal.view),
+            },
+            // shifted clipmap params uniform
+            wgpu::BindGroupEntry {
+                binding: 8,
                 resource: buffers.clipmap.as_entire_binding(),
             },
             // shifted clipmap height texture array
             wgpu::BindGroupEntry {
-                binding: 8,
+                binding: 9,
                 resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
             },
             // shifted storage buffers
             wgpu::BindGroupEntry {
-                binding: 9,
+                binding: 10,
                 resource: buffers.macro_occ.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 10,
+                binding: 11,
                 resource: buffers.node_ropes.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 11,
+                binding: 12,
                 resource: buffers.colinfo.as_entire_binding(),
             },
 
@@ -167,6 +172,8 @@ fn make_composite_bg(
     godray_sampler: &wgpu::Sampler,
     local_hist_view: &wgpu::TextureView,
     local_sampler: &wgpu::Sampler,
+    depth_render_view: &wgpu::TextureView,
+    normal_view: &wgpu::TextureView,
     label: &str,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -180,6 +187,8 @@ fn make_composite_bg(
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(godray_sampler) },
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(local_hist_view) },
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(local_sampler) },
+            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(depth_render_view) },
+            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(normal_view) },
         ],
     })
 }
@@ -250,6 +259,21 @@ pub fn create_bind_groups(
         ),
     ];
 
+    let depth_resolve = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("depth_resolve_bg"),
+        layout: &layouts.depth_resolve,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&textures.depth.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&textures.depth_full.view),
+            },
+        ],
+    });
+
     let composite = [
         make_composite_bg(
             device,
@@ -257,10 +281,12 @@ pub fn create_bind_groups(
             &textures.color.view,
             &textures.godray[0].view,
             &textures.output.view,
-            &textures.depth.view,
+            &textures.depth_full.view,
             sampler,
             &textures.local.view,
             sampler,
+            &textures.depth.view,
+            &textures.normal.view,
             "composite_bg_read_a",
         ),
         make_composite_bg(
@@ -269,10 +295,12 @@ pub fn create_bind_groups(
             &textures.color.view,
             &textures.godray[1].view,
             &textures.output.view,
-            &textures.depth.view,
+            &textures.depth_full.view,
             sampler,
             &textures.local.view,
             sampler,
+            &textures.depth.view,
+            &textures.normal.view,
             "composite_bg_read_b",
         ),
     ];
@@ -290,6 +318,7 @@ pub fn create_bind_groups(
         primary,
         scene,
         godray,
+        depth_resolve,
         composite,
         empty,
         blit,

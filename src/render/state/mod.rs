@@ -225,7 +225,8 @@ impl Renderer {
 
         let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
 
-        let render_scale = config::RENDER_SCALE;
+        let render_scale = config::RENDER_SCALE
+            .clamp(config::PRIMARY_SCALE_MIN, config::PRIMARY_SCALE_MAX);
         let internal_w = ((width as f32) * render_scale).round().max(1.0) as u32;
         let internal_h = ((height as f32) * render_scale).round().max(1.0) as u32;
         
@@ -295,6 +296,34 @@ impl Renderer {
         self.ping = 0;
     }
 
+    pub fn update_primary_scale(&mut self, width: u32, height: u32, primary_ms: f64) -> bool {
+        if primary_ms <= 0.0 {
+            return false;
+        }
+
+        let current = self.render_scale;
+        let target = config::PRIMARY_TARGET_MS.max(0.1);
+        let ratio = (target / primary_ms as f32).sqrt();
+        let desired = (current * ratio)
+            .clamp(config::PRIMARY_SCALE_MIN, config::PRIMARY_SCALE_MAX);
+        let next = current + (desired - current) * config::PRIMARY_SCALE_SMOOTH;
+
+        if (next - current).abs() < config::PRIMARY_SCALE_EPS {
+            return false;
+        }
+
+        self.render_scale = next;
+        self.internal_w = ((width as f32) * self.render_scale).round().max(1.0) as u32;
+        self.internal_h = ((height as f32) * self.render_scale).round().max(1.0) as u32;
+
+        self.textures = create_textures(&self.device, width, height, self.internal_w, self.internal_h);
+        self.bind_groups = create_bind_groups(
+            &self.device, &self.layouts, &self.buffers, &self.textures, &self.sampler,
+        );
+        self.ping = 0;
+        true
+    }
+
     pub fn write_chunk_grid(&self, grid: &[u32]) {
         let n = grid.len().min(self.buffers.grid_capacity as usize);
         self.queue.write_buffer(
@@ -328,6 +357,20 @@ impl Renderer {
             let gy = (self.internal_h + 7) / 8;
             cpass.dispatch_workgroups(gx, gy, 1);
 
+        }
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("depth_resolve_pass"),
+                timestamp_writes: None,
+            });
+
+            cpass.set_pipeline(&self.pipelines.depth_resolve);
+            cpass.set_bind_group(3, &self.bind_groups.depth_resolve, &[]);
+
+            let gx = (width + 7) / 8;
+            let gy = (height + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
         }
 
         let ping = self.ping;

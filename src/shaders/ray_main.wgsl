@@ -22,6 +22,7 @@
 
 // local (noisy) voxel-light term output (HDR, NOT fogged)
 @group(0) @binding(6) var local_img : texture_storage_2d<rgba32float, write>;
+@group(0) @binding(7) var normal_img : texture_storage_2d<rgba32float, write>;
 
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
 @group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
@@ -37,6 +38,11 @@
 // accumulated local lighting (HDR, same res as internal render)
 @group(2) @binding(5) var local_hist_tex : texture_2d<f32>;
 @group(2) @binding(6) var local_samp     : sampler;
+@group(2) @binding(7) var depth_render   : texture_2d<f32>;
+@group(2) @binding(8) var normal_render  : texture_2d<f32>;
+
+@group(3) @binding(0) var depth_resolve_src : texture_2d<f32>;
+@group(3) @binding(1) var depth_resolve_dst : texture_storage_2d<r32float, write>;
 
 var<workgroup> WG_SKY_UP : vec3<f32>;
 
@@ -69,9 +75,11 @@ fn main_primary(
   let frame = cam.frame_index;
   let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
 
-  // Local output defaults: invalid (alpha=0) so TAA keeps history instead of blending black.
+  // Local/normal output defaults: invalid (alpha=0) so TAA keeps history instead of blending black.
   var local_out = vec3<f32>(0.0);
   var local_w   : f32 = 0.0;
+  var normal_out = vec3<f32>(0.0);
+  var normal_w : f32 = 0.0;
 
   // ------------------------------------------------------------
   // Case 1: no voxel chunks => heightfield or sky
@@ -83,10 +91,13 @@ fn main_primary(
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
+      normal_out = hf.n * 0.5 + vec3<f32>(0.5);
+      normal_w = 1.0;
 
       textureStore(color_img, ip, vec4<f32>(col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+      textureStore(normal_img, ip, vec4<f32>(normal_out, normal_w));
       return;
     }
 
@@ -95,6 +106,7 @@ fn main_primary(
     textureStore(color_img, ip, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    textureStore(normal_img, ip, vec4<f32>(normal_out, normal_w));
     return;
   }
 
@@ -111,10 +123,13 @@ fn main_primary(
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
+      normal_out = hf.n * 0.5 + vec3<f32>(0.5);
+      normal_w = 1.0;
 
       textureStore(color_img, ip, vec4<f32>(col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+      textureStore(normal_img, ip, vec4<f32>(normal_out, normal_w));
       return;
     }
 
@@ -122,6 +137,7 @@ fn main_primary(
     textureStore(color_img, ip, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    textureStore(normal_img, ip, vec4<f32>(normal_out, normal_w));
     return;
   }
 
@@ -138,10 +154,13 @@ fn main_primary(
     // Local is stored UNFOGGED for temporal accumulation
     local_out = sh.local_hdr;
     local_w   = sh.local_w;
+    normal_out = vt.best.n * 0.5 + vec3<f32>(0.5);
+    normal_w = 1.0;
 
     textureStore(color_img, ip, vec4<f32>(col_base, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha = validity
+    textureStore(normal_img, ip, vec4<f32>(normal_out, normal_w));
     return;
   }
 
@@ -152,10 +171,13 @@ fn main_primary(
     let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
     let t_scene = min(hf.t, FOG_MAX_DIST);
     let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
+    normal_out = hf.n * 0.5 + vec3<f32>(0.5);
+    normal_w = 1.0;
 
     textureStore(color_img, ip, vec4<f32>(col, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    textureStore(normal_img, ip, vec4<f32>(normal_out, normal_w));
     return;
   }
 
@@ -164,6 +186,28 @@ fn main_primary(
   textureStore(color_img, ip, vec4<f32>(sky, 1.0));
   textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
   textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+  textureStore(normal_img, ip, vec4<f32>(normal_out, normal_w));
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main_depth_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let full_dims = textureDimensions(depth_resolve_dst);
+  if (gid.x >= full_dims.x || gid.y >= full_dims.y) { return; }
+
+  let px_full = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+  let full_f = vec2<f32>(f32(full_dims.x), f32(full_dims.y));
+  let render_dims = textureDimensions(depth_resolve_src);
+  let render_f = vec2<f32>(f32(render_dims.x), f32(render_dims.y));
+
+  let px_render = px_full * (render_f / full_f);
+  let ip_render = vec2<i32>(
+    clamp(i32(floor(px_render.x)), 0, i32(render_dims.x) - 1),
+    clamp(i32(floor(px_render.y)), 0, i32(render_dims.y) - 1)
+  );
+
+  let d = textureLoad(depth_resolve_src, ip_render, 0).x;
+  let ip_full = vec2<i32>(i32(gid.x), i32(gid.y));
+  textureStore(depth_resolve_dst, ip_full, vec4<f32>(d, 0.0, 0.0, 0.0));
 }
 
 
@@ -202,7 +246,7 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
   let outc = composite_pixel_mapped(
     ip_render, px_render,
     color_tex, godray_tex, godray_samp,
-    depth_full
+    depth_full, depth_render, normal_render
   );
 
   // Sample accumulated local lighting in the SAME internal render UV space.

@@ -14,6 +14,11 @@ pub const VOXEL_SIZE_M_F64: f64 = 0.10;
 pub const VOXELS_PER_METER: i32 = 10; // 1.0 / 0.10
 
 pub const RENDER_SCALE: f32 = 0.5;
+pub const PRIMARY_SCALE_MIN: f32 = 0.5;
+pub const PRIMARY_SCALE_MAX: f32 = 1.0;
+pub const PRIMARY_TARGET_MS: f32 = 7.5;
+pub const PRIMARY_SCALE_SMOOTH: f32 = 0.2;
+pub const PRIMARY_SCALE_EPS: f32 = 0.01;
 
 pub const WORKER_THREADS: usize = 4;
 pub const MAX_IN_FLIGHT: usize = 16;

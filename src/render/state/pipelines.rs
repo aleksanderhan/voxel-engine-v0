@@ -20,6 +20,9 @@ pub struct Pipelines {
     /// Compute pipeline for the primary full-resolution pass (writes color/depth).
     pub primary: wgpu::ComputePipeline,
 
+    /// Compute pipeline to upsample depth to full resolution.
+    pub depth_resolve: wgpu::ComputePipeline,
+
     /// Compute pipeline for the quarter-resolution godray pass (ping-pong temporal).
     pub godray: wgpu::ComputePipeline,
 
@@ -102,6 +105,14 @@ pub fn create_pipelines(
         &[&layouts.scene, &layouts.godray],
     );
 
+    let depth_resolve = make_compute_pipeline(
+        device,
+        "depth_resolve_pipeline",
+        cs_module,
+        "main_depth_resolve",
+        &[&layouts.empty, &layouts.empty, &layouts.empty, &layouts.depth_resolve],
+    );
+
     // Composite pass:
     // Shader reads from @group(2) (color + godray + output storage).
     // wgpu requires the pipeline layout to include group(0) and group(1) slots too,
@@ -165,6 +176,7 @@ pub fn create_pipelines(
 
     Pipelines {
         primary,
+        depth_resolve,
         godray,
         composite,
         blit,

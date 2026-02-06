@@ -6,6 +6,7 @@ pub struct Layouts {
     pub primary: wgpu::BindGroupLayout,
     pub scene: wgpu::BindGroupLayout,
     pub godray: wgpu::BindGroupLayout,
+    pub depth_resolve: wgpu::BindGroupLayout,
     pub composite: wgpu::BindGroupLayout,
     pub empty: wgpu::BindGroupLayout,
     pub blit: wgpu::BindGroupLayout,
@@ -126,12 +127,13 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     // 4 color (storage write)
     // 5 depth (storage write)
     // 6 local lighting (storage write)
-    // 7 clipmap params (uniform)
-    // 8 clipmap height texture array (sampled)
-    // 9 macro_occ (storage_ro)
-    // 10 node_ropes (storage_ro)
-    // 11 colinfo (storage_ro)
-    let primary_entries: [wgpu::BindGroupLayoutEntry; 12] = [
+    // 7 normal (storage write)
+    // 8 clipmap params (uniform)
+    // 9 clipmap height texture array (sampled)
+    // 10 macro_occ (storage_ro)
+    // 11 node_ropes (storage_ro)
+    // 12 colinfo (storage_ro)
+    let primary_entries: [wgpu::BindGroupLayoutEntry; 13] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
@@ -140,17 +142,18 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba32Float),
         bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float),
         bgl_storage_tex_wo(6, cs_vis, wgpu::TextureFormat::Rgba32Float), // local
+        bgl_storage_tex_wo(7, cs_vis, wgpu::TextureFormat::Rgba32Float), // normal
 
-        bgl_uniform(7, cs_vis),
+        bgl_uniform(8, cs_vis),
         bgl_tex_sample_2d_array(
-            8,
+            9,
             cs_vis,
             wgpu::TextureSampleType::Float { filterable: false },
         ),
 
-        bgl_storage_ro(9, cs_vis),
         bgl_storage_ro(10, cs_vis),
         bgl_storage_ro(11, cs_vis),
+        bgl_storage_ro(12, cs_vis),
     ];
 
     let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -174,6 +177,18 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             ),
             bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba32Float),
             bgl_sampler_non_filtering(3, cs_vis), // sampler for history
+        ],
+    });
+
+    let depth_resolve = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("depth_resolve_bgl"),
+        entries: &[
+            bgl_tex_sample_2d(
+                0,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_storage_tex_wo(1, cs_vis, wgpu::TextureFormat::R32Float),
         ],
     });
 
@@ -211,6 +226,19 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             // binding 6: sampler (can reuse same sampler type)
             bgl_sampler_non_filtering(6, cs_vis),
 
+            // binding 7: low-res depth
+            bgl_tex_sample_2d(
+                7,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            // binding 8: low-res normal
+            bgl_tex_sample_2d(
+                8,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+
         ],
     });
 
@@ -241,6 +269,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         primary,
         scene,
         godray,
+        depth_resolve,
         composite,
         empty,
         blit,
