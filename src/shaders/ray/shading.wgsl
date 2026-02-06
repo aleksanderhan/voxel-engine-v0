@@ -2,11 +2,7 @@
 //// Shading
 //// --------------------------------------------------------------------------
 
-// Performance gates for primary pass (world-space distance).
-const VOXEL_AO_MAX_DIST       : f32 = 40.0;
-const LOCAL_LIGHT_MAX_DIST    : f32 = 50.0;
-const FAR_SHADING_DIST        : f32 = 80.0;
-const PRIMARY_CLOUD_SHADOWS   : bool = false;
+// Performance gates for primary pass (world-space distance) live in common.wgsl.
 
 fn color_for_material(m: u32) -> vec3<f32> {
   if (m == MAT_AIR)   { return vec3<f32>(0.0); }
@@ -187,8 +183,6 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   if (PRIMARY_CLOUD_SHADOWS) {
     Tc = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
   }
-  let vis_geom: f32 = 1.0;
-
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
   // AO for voxels: only when the hit is a real voxel hit (not sky / miss)
@@ -229,10 +223,10 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
 
     let f0   = material_f0(hg.mat);
     let fres = fresnel_schlick(ndv, f0);
-    spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis_geom * Tc;
+    spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * Tc;
   }
 
-  let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis_geom * Tc * dapple;
+  let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * Tc * dapple;
   let emissive = material_emission(hg.mat);
   return base * (ambient + direct) + 0.20 * spec_col + emissive;
 }

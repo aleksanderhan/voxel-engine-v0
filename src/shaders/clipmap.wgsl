@@ -4,14 +4,7 @@
 // Toroidal (ring) clipmap storage, but NO LOD selection in shader.
 // We always sample a single fixed level (coarsest by default).
 
-const CLIP_LEVELS_MAX : u32 = 16u;
-
-// March tuning
-const HF_MAX_STEPS : u32 = 96u;
-const HF_BISECT    : u32 = 5u;
-
-// dt clamp (meters along ray)
-const HF_DT_MAX : f32 = 48.0;
+// Tunables live in common.wgsl.
 
 struct ClipmapParams {
   levels      : u32,

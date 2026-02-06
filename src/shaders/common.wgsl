@@ -223,6 +223,64 @@ const COMPOSITE_SHARPEN : f32 = 0.1;
 const POST_EXPOSURE : f32 = 0.15;
 
 //// --------------------------------------------------------------------------
+//// Clipmap heightfield tuning
+//// --------------------------------------------------------------------------
+
+const CLIP_LEVELS_MAX : u32 = 16u;
+
+// March tuning
+const HF_MAX_STEPS : u32 = 96u;
+const HF_BISECT    : u32 = 5u;
+
+// dt clamp (meters along ray)
+const HF_DT_MAX : f32 = 48.0;
+
+//// --------------------------------------------------------------------------
+//// Local voxel light gather (MAT_LIGHT)
+//// --------------------------------------------------------------------------
+
+// How far rays march in voxels (controls “search radius” for lights)
+const LIGHT_MAX_DIST_VOX : u32 = 32u;   // try 16..64
+
+// Number of rays
+const LIGHT_RAYS : u32 = 24u;          // try 16..32
+
+// Softens inverse-square near the light (in voxels)
+const LIGHT_SOFT_RADIUS_VOX : f32 = 3.0;
+
+// Clamp minimum distance to avoid blow-ups (in voxels)
+const LIGHT_NEAR_CLAMP_VOX : f32 = 1.25;
+
+// Finite range rolloff (in voxels). Past this, contributions fade to ~0.
+const LIGHT_RANGE_VOX : f32 = 80.0;     // try 32..96
+
+// Direct diffuse “wrap” (0 = pure Lambert, 0.1..0.25 = nicer in caves)
+const LIGHT_WRAP : f32 = 0.15;
+
+// Gains
+const LIGHT_DIRECT_GAIN   : f32 = 1.00;
+const LIGHT_INDIRECT_GAIN : f32 = 0.65; // cheap “bounce fill”
+
+// Stop after N light hits (perf only; output is normalized with LIGHT_RAYS)
+const LIGHT_EARLY_HITS : u32 = 24u;
+
+//// --------------------------------------------------------------------------
+//// Shading gates (world-space distance)
+//// --------------------------------------------------------------------------
+
+const VOXEL_AO_MAX_DIST     : f32 = 40.0;
+const LOCAL_LIGHT_MAX_DIST  : f32 = 50.0;
+const FAR_SHADING_DIST      : f32 = 80.0;
+const PRIMARY_CLOUD_SHADOWS : bool = false;
+
+//// --------------------------------------------------------------------------
+//// Local TAA
+//// --------------------------------------------------------------------------
+
+// Tune this: lower = steadier but slower response
+const LOCAL_TAA_ALPHA : f32 = 0.12;
+
+//// --------------------------------------------------------------------------
 //// Grass “hair” (procedural blades)
 //// --------------------------------------------------------------------------
 

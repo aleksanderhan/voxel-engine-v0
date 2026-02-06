@@ -15,8 +15,7 @@
 @group(1) @binding(0) var local_in_tex   : texture_2d<f32>;
 @group(1) @binding(2) var local_hist_out : texture_storage_2d<rgba32float, write>;
 
-// Tune this: lower = steadier but slower response
-const LOCAL_TAA_ALPHA : f32 = 0.12;
+// Tunables live in common.wgsl.
 
 @compute @workgroup_size(8, 8, 1)
 fn main_local_taa(@builtin(global_invocation_id) gid: vec3<u32>) {

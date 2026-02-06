@@ -9,34 +9,7 @@
 // NOTE: Temporal accumulation is done in a separate pass; this file just produces
 // a noisy but unbiased estimate (local radiance) suitable for accumulation.
 
-// -----------------------------------------------------------------------------
-// Tunables
-// -----------------------------------------------------------------------------
-
-// How far rays march in voxels (controls “search radius” for lights)
-const LIGHT_MAX_DIST_VOX : u32 = 32u;   // try 16..64
-
-// Number of rays
-const LIGHT_RAYS : u32 = 24u;          // try 16..32
-
-// Softens inverse-square near the light (in voxels)
-const LIGHT_SOFT_RADIUS_VOX : f32 = 3.0;
-
-// Clamp minimum distance to avoid blow-ups (in voxels)
-const LIGHT_NEAR_CLAMP_VOX : f32 = 1.25;
-
-// Finite range rolloff (in voxels). Past this, contributions fade to ~0.
-const LIGHT_RANGE_VOX : f32 = 80.0;     // try 32..96
-
-// Direct diffuse “wrap” (0 = pure Lambert, 0.1..0.25 = nicer in caves)
-const LIGHT_WRAP : f32 = 0.15;
-
-// Gains
-const LIGHT_DIRECT_GAIN   : f32 = 1.00;
-const LIGHT_INDIRECT_GAIN : f32 = 0.65; // cheap “bounce fill”
-
-// Stop after N light hits (perf only; output is normalized with LIGHT_RAYS)
-const LIGHT_EARLY_HITS : u32 = 24u;
+// Tunables live in common.wgsl.
 
 // -----------------------------------------------------------------------------
 // Helpers
