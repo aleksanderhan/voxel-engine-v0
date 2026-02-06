@@ -291,7 +291,7 @@ struct MacroStep {
 };
 
 struct MacroDDAState {
-  active : bool,
+  enabled: bool,
   mx     : i32,
   my     : i32,
   mz     : i32,
@@ -317,7 +317,7 @@ fn macro_dda_init(
   macro_base: u32
 ) -> MacroDDAState {
   var state: MacroDDAState;
-  state.active = false;
+  state.enabled = false;
   state.mx = 0;
   state.my = 0;
   state.mz = 0;
@@ -354,7 +354,7 @@ fn macro_dda_init(
     return state;
   }
 
-  state.active = true;
+  state.enabled = true;
   state.mx = mx_i;
   state.my = my_i;
   state.mz = mz_i;
@@ -412,13 +412,13 @@ fn macro_dda_step(state: ptr<function, MacroDDAState>) {
       (*state).mx >= i32(MACRO_DIM) ||
       (*state).my >= i32(MACRO_DIM) ||
       (*state).mz >= i32(MACRO_DIM)) {
-    (*state).active = false;
+    (*state).enabled = false;
   }
 }
 
 fn macro_dda_sync(state: ptr<function, MacroDDAState>, tcur: f32) {
   for (var i: u32 = 0u; i < 32u; i = i + 1u) {
-    if (!(*state).active) { break; }
+    if (!(*state).enabled) { break; }
     let t_exit = macro_dda_t_exit(*state);
     if (tcur < t_exit) { break; }
     macro_dda_step(state);
@@ -427,11 +427,11 @@ fn macro_dda_sync(state: ptr<function, MacroDDAState>, tcur: f32) {
 
 fn macro_dda_current(state: MacroDDAState, macro_base: u32) -> MacroStep {
   var out: MacroStep;
-  out.valid = state.active;
+  out.valid = state.enabled;
   out.empty = false;
   out.t_exit = macro_dda_t_exit(state);
 
-  if (!state.active || macro_base == INVALID_U32) {
+  if (!state.enabled || macro_base == INVALID_U32) {
     out.valid = false;
     return out;
   }
@@ -488,7 +488,7 @@ fn trace_chunk_rope_interval(
     // ------------------------------------------------------------
     // COARSE: macro empty jump using per-step macro occupancy
     // ------------------------------------------------------------
-    if (macro_state.active) {
+    if (macro_state.enabled) {
       macro_dda_sync(&macro_state, tcur);
     }
 
@@ -499,7 +499,7 @@ fn trace_chunk_rope_interval(
       let t_macro_exit = min(t_exit, macro_step.t_exit);
       tcur = max(t_macro_exit, tcur) + eps_step;
       have_leaf = false;
-      if (macro_state.active && tcur >= macro_step.t_exit) {
+      if (macro_state.enabled && tcur >= macro_step.t_exit) {
         macro_dda_step(&macro_state);
       }
       continue;
