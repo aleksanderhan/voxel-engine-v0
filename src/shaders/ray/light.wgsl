@@ -74,9 +74,9 @@ fn light_emission_radiance() -> vec3<f32> {
 
 fn sphere_dir_local(i: u32, count: u32) -> vec3<f32> {
   let fi = f32(i);
-  let fn = max(1.0, f32(count));
+  let count_f = max(1.0, f32(count));
   let golden = 2.399963229728653; // golden angle in radians
-  let y = 1.0 - 2.0 * ((fi + 0.5) / fn);
+  let y = 1.0 - 2.0 * ((fi + 0.5) / count_f);
   let r = sqrt(max(0.0, 1.0 - y * y));
   let phi = golden * fi;
   return vec3<f32>(cos(phi) * r, sin(phi) * r, y);
