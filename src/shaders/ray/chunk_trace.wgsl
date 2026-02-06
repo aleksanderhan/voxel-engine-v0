@@ -1380,8 +1380,57 @@ fn trace_scene_voxels_interval(
   return VoxTraceResult(true, best, t_exit, best_anchor_valid, best_anchor_key, best_anchor_chunk);
 }
 
-fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
+fn hitgeom_from_clipmap(ch: ClipHit, ro: vec3<f32>, rd: vec3<f32>) -> HitGeom {
+  var h = miss_hitgeom();
+  h.hit = select(0u, 1u, ch.hit);
+  h.t   = ch.t;
+  h.n   = ch.n;
+  h.mat = ch.mat;
+  // The rest (root_bmin/node_base/macro_base) can stay default for clipmap hits.
+  return h;
+}
+
+fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
+  // 1) Fast terrain estimate (downward rays only inside clipmap code)
+  let ch = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+
+  // If clipmap says "terrain at t", we can:
+  // A) For FAR terrain: accept clipmap hit directly (skip voxel tracing)
+  // B) For NEAR terrain: voxel-trace only in a tight band near that t (huge speedup)
+  if (ch.hit) {
+    // Tune these two knobs:
+    // - far_skip_dist: beyond this, clipmap shading is "good enough" for primary
+    // - band: how much extra distance we allow for voxel detail around the clip hit
+    let far_skip_dist = FAR_SHADING_DIST;          // you already have this constant
+    let band          = 2.0 * cam.voxel_params.x;  // ~2 voxels in meters
+
+    if (ch.t >= far_skip_dist) {
+      // Skip the expensive voxel trace for far terrain
+      let best = hitgeom_from_clipmap(ch, ro, rd);
+      return VoxTraceResult(true, best, min(ch.t, FOG_MAX_DIST), false, INVALID_U32, vec3<i32>(0));
+    }
+
+    // Near: clamp voxel trace max distance to just around the terrain hit
+    let tmax_vox = min(FOG_MAX_DIST, ch.t + band);
+
+    // Reuse your existing voxel trace, but with a much smaller t_max
+    let v = trace_scene_voxels_interval(ro, rd, 0.0, tmax_vox, false, vec3<i32>(0), INVALID_U32);
+
+    // If voxels found something, keep it; otherwise fall back to clipmap hit
+    if (v.best.hit != 0u) {
+      return v;
+    } else {
+      let best = hitgeom_from_clipmap(ch, ro, rd);
+      return VoxTraceResult(true, best, min(ch.t, FOG_MAX_DIST), false, INVALID_U32, vec3<i32>(0));
+    }
+  }
+
+  // No clip terrain: keep current behavior (sky etc.)
   return trace_scene_voxels_interval(ro, rd, 0.0, FOG_MAX_DIST, false, vec3<i32>(0), INVALID_U32);
+}
+
+fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
+  return trace_scene_primary_fast(ro, rd);
 }
 
 // --------------------------------------------------------------------------
