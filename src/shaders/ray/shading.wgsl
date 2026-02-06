@@ -5,9 +5,6 @@
 // Performance gates for primary pass (world-space distance).
 const VOXEL_AO_MAX_DIST       : f32 = 40.0;
 const LOCAL_LIGHT_MAX_DIST    : f32 = 50.0;
-const CLOUD_SHADOW_FAST_DIST  : f32 = 60.0;
-const CLOUD_SHADOW_SKIP_DIST  : f32 = 120.0;
-const SHADOW_GEOM_MAX_DIST    : f32 = 70.0;
 const FAR_SHADING_DIST        : f32 = 80.0;
 
 fn color_for_material(m: u32) -> vec3<f32> {
@@ -187,18 +184,8 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   let vs        = cam.voxel_params.x;
   let hp_shadow = hp + hg.n * (0.75 * vs);
 
-  var Tc: f32 = 1.0;
-  if (hg.t <= CLOUD_SHADOW_SKIP_DIST) {
-    if (hg.t > CLOUD_SHADOW_FAST_DIST) {
-      Tc = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
-    } else {
-      Tc = cloud_sun_transmittance(hp_shadow, SUN_DIR);
-    }
-  }
-  var vis_geom: f32 = 1.0;
-  if (hg.t <= SHADOW_GEOM_MAX_DIST) {
-    vis_geom = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
-  }
+  let Tc = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
+  let vis_geom: f32 = 1.0;
 
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
@@ -258,19 +245,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
   let voxel_size = cam.voxel_params.x;
   let hp_shadow  = hp + ch.n * (0.75 * voxel_size);
 
-  var Tc: f32 = 1.0;
-  if (ch.t <= CLOUD_SHADOW_SKIP_DIST) {
-    if (ch.t > CLOUD_SHADOW_FAST_DIST) {
-      Tc = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
-    } else {
-      Tc = cloud_sun_transmittance(hp_shadow, SUN_DIR);
-    }
-  }
-  var vis_geom: f32 = 1.0;
-  if (ch.t <= SHADOW_GEOM_MAX_DIST) {
-    vis_geom = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
-  }
-  let vis = Tc * vis_geom;
+  let vis = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
   let diff = max(dot(ch.n, SUN_DIR), 0.0);
 
   // AO-lite for terrain: gate hard for grass in primary
