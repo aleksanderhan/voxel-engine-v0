@@ -114,9 +114,6 @@ fn main_primary(
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
 
-  let frame = cam.frame_index;
-  let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
-
   // Local output defaults: invalid (alpha=0) so TAA keeps history instead of blending black.
   var local_out = vec3<f32>(0.0);
   var local_w   : f32 = 0.0;
@@ -132,6 +129,8 @@ fn main_primary(
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
+      let frame = cam.frame_index;
+      let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let sky_bg_rd = sky_bg(rd);
@@ -232,6 +231,8 @@ fn main_primary(
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
+      let frame = cam.frame_index;
+      let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let sky_bg_rd = sky_bg(rd);
@@ -260,14 +261,17 @@ fn main_primary(
     let hp = ro + vt.best.t * rd;
     let hp_shadow = hp + vt.best.n * (0.75 * cam.voxel_params.x);
 
+    let frame = cam.frame_index;
+    let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
+
     var shadow_hist = shadow_hist_in[shadow_idx];
     let uv_prev = prev_uv_from_world(hp);
     if (in_unit_square(uv_prev)) {
       let prev_px = vec2<i32>(
-        clamp(i32(uv_prev.x * f32(dims_u.x)), 0, i32(dims_u.x) - 1),
-        clamp(i32(uv_prev.y * f32(dims_u.y)), 0, i32(dims_u.y) - 1)
+        clamp(i32(uv_prev.x * f32(dims.x)), 0, i32(dims.x) - 1),
+        clamp(i32(uv_prev.y * f32(dims.y)), 0, i32(dims.y) - 1)
       );
-      let prev_idx = u32(prev_px.y) * dims_u.x + u32(prev_px.x);
+      let prev_idx = u32(prev_px.y) * dims.x + u32(prev_px.x);
       shadow_hist = shadow_hist_in[prev_idx];
     }
     shadow_hist = clamp(shadow_hist, 0.0, 1.0);
@@ -319,6 +323,8 @@ fn main_primary(
   let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
   if (hf.hit) {
+    let frame = cam.frame_index;
+    let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
     let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
     let t_scene = min(hf.t, FOG_MAX_DIST);
     let sky_bg_rd = sky_bg(rd);
