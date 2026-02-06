@@ -331,11 +331,17 @@ fn macro_dda_init(
   let my0 = i32(floor(lp.y / m.cell));
   let mz0 = i32(floor(lp.z / m.cell));
 
-  // clamp into [0 .. MACRO_DIM-1]
+  // If the current point is outside the chunk cube, disable macro traversal.
+  // Do not clamp into macro cell 0/last because it can produce false hits.
   let md = i32(MACRO_DIM) - 1;
-  m.mx = clamp(mx0, 0, md);
-  m.my = clamp(my0, 0, md);
-  m.mz = clamp(mz0, 0, md);
+  if (mx0 < 0 || my0 < 0 || mz0 < 0 || mx0 > md || my0 > md || mz0 > md) {
+    m.valid = false;
+    return m;
+  }
+
+  m.mx = mx0;
+  m.my = my0;
+  m.mz = mz0;
 
   m.stepX = select(-1, 1, rd.x > 0.0);
   m.stepY = select(-1, 1, rd.y > 0.0);
