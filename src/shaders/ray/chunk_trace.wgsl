@@ -58,6 +58,15 @@ fn point_in_cube_eps(p: vec3<f32>, bmin: vec3<f32>, size: f32) -> bool {
          all(p <= (bmax + vec3<f32>(eps)));
 }
 
+fn safe_inv3(rd: vec3<f32>) -> vec3<f32> {
+  let eps = 1e-8;
+  return vec3<f32>(
+    1.0 / select(rd.x, sign(rd.x) * eps, abs(rd.x) < eps),
+    1.0 / select(rd.y, sign(rd.y) * eps, abs(rd.y) < eps),
+    1.0 / select(rd.z, sign(rd.z) * eps, abs(rd.z) < eps)
+  );
+}
+
 // --------------------------------------------------------------------------
 // Macro occupancy early-out (returns a MAT_AIR cube if empty, else size==0)
 // --------------------------------------------------------------------------
@@ -1086,7 +1095,7 @@ fn tile_append_candidates_for_ray(
   var t_local: f32 = 0.0;
   let t_exit_local = max(t_exit - start_t, 0.0);
 
-  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let inv = safe_inv3(rd);
 
   let step_x: i32 = select(-1, 1, rd.x > 0.0);
   let step_y: i32 = select(-1, 1, rd.y > 0.0);
@@ -1219,7 +1228,7 @@ fn trace_scene_voxels_candidates(
   var best_anchor_key = INVALID_U32;
   var best_anchor_chunk = vec3<i32>(0);
 
-  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let inv = safe_inv3(rd);
   let root_size = f32(cam.chunk_size) * voxel_size;
   let max_candidates = min(candidate_count, MAX_TILE_CHUNKS);
 
@@ -1338,7 +1347,7 @@ fn trace_scene_voxels_interval(
   var t_local: f32 = 0.0;
   let t_exit_local = max(t_exit - start_t, 0.0);
 
-  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let inv = safe_inv3(rd);
 
   let step_x: i32 = select(-1, 1, rd.x > 0.0);
   let step_y: i32 = select(-1, 1, rd.y > 0.0);
