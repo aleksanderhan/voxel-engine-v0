@@ -48,8 +48,11 @@ fn cube_hit_normal_from_slab(
   t_min: f32,
   t_max: f32
 ) -> BoxHit {
-  let t_min_relaxed = t_min - 1e-4;
-  let t0 = max(slab.t_enter, t_min_relaxed);
+  var t0 = max(slab.t_enter, t_min);
+  if (t_min > slab.t_enter && t_min < slab.t_exit && slab.t_enter >= 0.0) {
+    // If we're already inside the slab at t_min, return the true entry surface.
+    t0 = slab.t_enter;
+  }
 
   if (slab.t_exit < t0 || t0 > t_max) {
     return BoxHit(false, BIG_F32, slab.t_exit, vec3<f32>(0.0));
