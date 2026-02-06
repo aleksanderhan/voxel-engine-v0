@@ -80,6 +80,13 @@ fn macro_cell_query(
   let cell = macro_cell_size(root_size);
   let lp   = p_in - root_bmin;
 
+  if (lp.x < 0.0 || lp.y < 0.0 || lp.z < 0.0 ||
+      lp.x >= root_size || lp.y >= root_size || lp.z >= root_size) {
+    // outside chunk => don't claim empty
+    return MacroCell(vec3<f32>(0.0), 0.0, false);
+  }
+
+
   let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
   let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
   let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
