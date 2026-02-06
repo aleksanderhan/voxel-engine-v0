@@ -613,3 +613,13 @@ fn is_bad_vec3(v: vec3<f32>) -> bool {
   return is_nan_f32(v.x) || is_nan_f32(v.y) || is_nan_f32(v.z) ||
          is_inf_f32(v.x) || is_inf_f32(v.y) || is_inf_f32(v.z);
 }
+
+fn ray_eps_vec(rd: vec3<f32>, eps: f32) -> vec3<f32> {
+  // Push inside the next cell on each axis deterministically.
+  // Using >= keeps it stable when rd component is exactly 0.
+  return vec3<f32>(
+    select(-eps, eps, rd.x >= 0.0),
+    select(-eps, eps, rd.y >= 0.0),
+    select(-eps, eps, rd.z >= 0.0)
+  );
+}

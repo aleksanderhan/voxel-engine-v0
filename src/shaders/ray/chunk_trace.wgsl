@@ -445,7 +445,7 @@ fn trace_chunk_rope_interval(
     // FINE: leaf traversal (rope traversal only on true leaf exit)
     // ------------------------------------------------------------
     let p  = ro + tcur * rd;
-    let pq = p + rd * (1e-4 * vs);
+    let pq = p + ray_eps_vec(rd, 1e-4 * vs);
 
     if (!have_leaf || !point_in_cube(pq, leaf.bmin, leaf.size)) {
       leaf = descend_leaf_sparse(pq, ch.node_base, 0u, root_bmin, root_size);
@@ -521,7 +521,7 @@ fn trace_chunk_rope_interval(
       if (tcur > t_exit) { break; }
 
       let p_next  = ro + tcur * rd;
-      let pq_next = p_next + rd * (1e-4 * vs);
+      let pq_next = p_next + ray_eps_vec(rd, 1e-4 * vs);
 
       // CASE A: real AIR node exists -> use its ropes
       if (leaf.has_node) {
