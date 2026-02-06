@@ -386,19 +386,18 @@ fn build_height_cache<'g>(
         tim.cache_w = cache_w as u32;
         tim.cache_h = cache_h as u32;
 
-        scratch.height_cache
-            .par_chunks_mut(cache_w)
-            .enumerate()
-            .for_each(|(z, row)| {
-                if (z & 15) == 0 && should_cancel(cancel) {
-                    return;
-                }
-                let wz = cache_z0 + z as i32;
-                for x in 0..cache_w {
-                    let wx = cache_x0 + x as i32;
-                    row[x] = gen.ground_height(wx, wz);
-                }
-            });
+        for z in 0..cache_h {
+            if (z & 15) == 0 && should_cancel(cancel) {
+                break;
+            }
+            let wz = cache_z0 + z as i32;
+            let row_start = z * cache_w;
+            let row = &mut scratch.height_cache[row_start..row_start + cache_w];
+            for x in 0..cache_w {
+                let wx = cache_x0 + x as i32;
+                row[x] = gen.ground_height(wx, wz);
+            }
+        }
 
         scratch.height_cache_x0 = cache_x0;
         scratch.height_cache_z0 = cache_z0;
