@@ -284,7 +284,7 @@ fn descend_leaf_sparse(
 // Macro occupancy query (robust per-step query; no persistent DDA state)
 // --------------------------------------------------------------------------
 
-struct MacroCell {
+struct MacroStep {
   valid : bool,
   empty : bool,
   t_exit: f32,
@@ -298,8 +298,8 @@ fn macro_cell_query_at_t(
   root_bmin: vec3<f32>,
   root_size: f32,
   macro_base: u32
-) -> MacroCell {
-  var out: MacroCell;
+) -> MacroStep {
+  var out: MacroStep;
   out.valid = false;
   out.empty = false;
   out.t_exit = tcur;
@@ -347,7 +347,7 @@ fn macro_cell_query_at_t(
   let tMaxZ = select(BIG_F32, tcur + (bz - p.z) * inv.z, abs(rd.z) >= EPS_INV);
 
   out.t_exit = min(tMaxX, min(tMaxY, tMaxZ));
-  return out;
+    return out;
 }
 
 // --------------------------------------------------------------------------
@@ -389,15 +389,15 @@ fn trace_chunk_rope_interval(
     // ------------------------------------------------------------
     // COARSE: macro empty jump using per-step macro occupancy
     // ------------------------------------------------------------
-    let macro_cell = macro_cell_query_at_t(
+    let macro_step = macro_cell_query_at_t(
       ro, rd, inv, tcur,
       root_bmin, root_size,
       ch.macro_base
     );
 
-    if (macro_cell.valid && macro_cell.empty) {
+    if (macro_step.valid && macro_step.empty) {
       // Jump across empty macro cell
-      let t_macro_exit = min(t_exit, macro_cell.t_exit);
+      let t_macro_exit = min(t_exit, macro_step.t_exit);
       tcur = max(t_macro_exit, tcur) + eps_step;
       have_leaf = false;
       continue;
