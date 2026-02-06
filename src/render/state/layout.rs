@@ -4,6 +4,7 @@
 
 pub struct Layouts {
     pub primary: wgpu::BindGroupLayout,
+    pub primary_history: wgpu::BindGroupLayout,
     pub scene: wgpu::BindGroupLayout,
     pub godray: wgpu::BindGroupLayout,
     pub composite: wgpu::BindGroupLayout,
@@ -158,6 +159,18 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         entries: &primary_entries,
     });
 
+    let primary_history = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("primary_history_bgl"),
+        entries: &[
+            bgl_tex_sample_2d(
+                1,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_sampler_non_filtering(3, cs_vis),
+        ],
+    });
+
 
     let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("godray_bgl"),
@@ -239,6 +252,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
 
     Layouts {
         primary,
+        primary_history,
         scene,
         godray,
         composite,

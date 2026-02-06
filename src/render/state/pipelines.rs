@@ -81,13 +81,13 @@ pub fn create_pipelines(
     // Primary pass:
     // Uses:
     //   group(0) = layouts.primary (camera + scene buffers + storage outputs)
-    //   group(1) = layouts.godray  (history sampler inputs reused for t_max hint)
+    //   group(1) = layouts.primary_history (history sampler inputs reused for t_max hint)
     let primary = make_compute_pipeline(
         device,
         "primary_pipeline",
         cs_module,
         "main_primary",
-        &[&layouts.primary, &layouts.godray],
+        &[&layouts.primary, &layouts.primary_history],
     );
 
     // Godray pass:

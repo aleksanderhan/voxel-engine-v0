@@ -323,7 +323,7 @@ impl Renderer {
 
             cpass.set_pipeline(&self.pipelines.primary);
             cpass.set_bind_group(0, &self.bind_groups.primary, &[]);
-            cpass.set_bind_group(1, &self.bind_groups.godray[self.ping], &[]);
+            cpass.set_bind_group(1, &self.bind_groups.primary_history[self.ping], &[]);
 
             let gx = (self.internal_w + 7) / 8;
             let gy = (self.internal_h + 7) / 8;

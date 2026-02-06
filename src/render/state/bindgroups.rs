@@ -6,6 +6,7 @@ use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
 
 pub struct BindGroups {
     pub primary: wgpu::BindGroup,
+    pub primary_history: [wgpu::BindGroup; 2],
     pub scene: wgpu::BindGroup,
     pub godray: [wgpu::BindGroup; 2],
     pub composite: [wgpu::BindGroup; 2],
@@ -156,6 +157,28 @@ fn make_godray_bg(
     })
 }
 
+fn make_primary_history_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    hist_view: &wgpu::TextureView,
+    hist_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("primary_history_bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(hist_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(hist_sampler),
+            },
+        ],
+    })
+}
+
 
 fn make_composite_bg(
     device: &wgpu::Device,
@@ -222,6 +245,20 @@ pub fn create_bind_groups(
 ) -> BindGroups {
     let primary = make_primary_bg(device, &layouts.primary, buffers, textures);
     let scene = make_scene_bg(device, &layouts.scene, buffers);
+    let primary_history = [
+        make_primary_history_bg(
+            device,
+            &layouts.primary_history,
+            &textures.godray[0].view,
+            sampler,
+        ),
+        make_primary_history_bg(
+            device,
+            &layouts.primary_history,
+            &textures.godray[1].view,
+            sampler,
+        ),
+    ];
 
     let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("empty_bg"),
@@ -288,6 +325,7 @@ pub fn create_bind_groups(
 
     BindGroups {
         primary,
+        primary_history,
         scene,
         godray,
         composite,
