@@ -904,16 +904,36 @@ fn probe_grass_columns_xz_dda(
       let cell_bmin_m = vec3<f32>(f32(wx), f32(wy), f32(wz)) * vs;
       let id_vox      = vec3<f32>(f32(wx), f32(wy), f32(wz));
 
-      // Tight per-column interval [t, tNext]
-      let gh = try_grass_slab_hit(
-        ro, rd,
-        t, tNext,
-        cell_bmin_m, id_vox,
-        vs, time_s, strength
-      );
+      // ------------------------------------------------------------
+      // NEW: ultra-cheap vertical overlap test (kills most calls)
+      // Grass slab Y range:
+      let slab_y0 = cell_bmin_m.y + vs;
+      let slab_y1 = slab_y0 + (GRASS_LAYER_HEIGHT_VOX * vs);
 
-      if (gh.hit) { return gh; }
+      // Segment y range over [t, tNext]
+      // y(t) = ro.y + rd.y * t
+      let yA = ro.y + rd.y * t;
+      let yB = ro.y + rd.y * tNext;
+      let seg_y0 = min(yA, yB);
+      let seg_y1 = max(yA, yB);
+
+      // If segment doesn't cross the grass slab vertically, skip immediately.
+      if (seg_y1 < slab_y0 || seg_y0 > slab_y1) {
+        // no overlap => cannot hit grass in this column interval
+      } else {
+        // Tight per-column interval [t, tNext]
+        let gh = try_grass_slab_hit(
+          ro, rd,
+          t, tNext,
+          cell_bmin_m, id_vox,
+          vs, time_s, strength
+        );
+
+        if (gh.hit) { return gh; }
+      }
+      // ------------------------------------------------------------
     }
+
 
     // Move to next column
     if (tNext >= t1) { break; }
