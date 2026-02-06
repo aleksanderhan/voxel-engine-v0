@@ -221,7 +221,7 @@ const PRIMARY_HIT_DEPTH_REL1    : f32 = 0.12;
 
 // Sun shadow temporal reuse (primary shading).
 const SHADOW_TAA_ALPHA      : f32 = 0.20;
-const SHADOW_SUBSAMPLE_MASK : u32 = 3u; // 0b11 => 1/4 pixels per frame (blue-noise via seed)
+const SHADOW_SUBSAMPLE_MASK : u32 = 7u; // 0b111 => 1/8 pixels per frame (blue-noise via seed)
 const PRIMARY_HIT_MOTION_PX0    : f32 = 0.50;
 const PRIMARY_HIT_MOTION_PX1    : f32 = 1.75;
 
@@ -409,6 +409,7 @@ const MACRO_DIM : u32 = 8u;              // 8x8x8 macro cells per chunk
 const MACRO_WORDS_PER_CHUNK : u32 = 16u; // 512 bits / 32
 const TILE_SIZE: u32 = 8u;
 const MAX_TILE_CHUNKS: u32 = 512u;
+const PRIMARY_MAX_TILE_CHUNKS: u32 = 256u;
 
 var<workgroup> WG_TILE_COUNT : atomic<u32>;
 var<workgroup> WG_TILE_SLOTS : array<u32, MAX_TILE_CHUNKS>;
