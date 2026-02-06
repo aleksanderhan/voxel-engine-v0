@@ -369,20 +369,6 @@ fn macro_dda_step_and_refresh(
   (*macro_empty) = !macro_test(macro_base, bit);
 }
 
-fn macro_chunk_is_empty(macro_base: u32) -> bool {
-  // If there's no macro data, we can't prove emptiness.
-  if (macro_base == INVALID_U32) { return false; }
-
-  // 16 u32 words = 512 bits (8*8*8)
-  var any: u32 = 0u;
-  for (var i: u32 = 0u; i < MACRO_WORDS_PER_CHUNK; i = i + 1u) {
-    any |= macro_occ[macro_base + i];
-  }
-  return any == 0u;
-}
-
-
-
 // --------------------------------------------------------------------------
 // Rewritten traversal (macro DDA + leaf/rope traversal)
 // --------------------------------------------------------------------------
@@ -788,7 +774,7 @@ fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
       let ch = chunks[slot];
 
       // Skip trivially empty chunks (macro occupancy says "no bits set")
-      if (!macro_chunk_is_empty(ch.macro_base)) {
+      if (ch.macro_empty == 0u) {
         let cell_enter = start_t + t_local;
         let cell_exit  = start_t + min(tNextLocal, t_exit_local);
 
