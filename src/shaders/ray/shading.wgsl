@@ -57,6 +57,31 @@ fn base_albedo(mat: u32, hp: vec3<f32>, t: f32) -> vec3<f32> {
   return base;
 }
 
+fn macro_occ_at_ws(
+  p_ws: vec3<f32>,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  macro_base: u32
+) -> f32 {
+  if (macro_base == INVALID_U32) { return 0.0; }
+
+  let lp = p_ws - root_bmin;
+  if (lp.x < 0.0 || lp.y < 0.0 || lp.z < 0.0 ||
+      lp.x >= root_size || lp.y >= root_size || lp.z >= root_size) {
+    return 0.0;
+  }
+
+  let cell = macro_cell_size(root_size);
+  let mx = clamp(u32(floor(lp.x / cell)), 0u, MACRO_DIM - 1u);
+  let my = clamp(u32(floor(lp.y / cell)), 0u, MACRO_DIM - 1u);
+  let mz = clamp(u32(floor(lp.z / cell)), 0u, MACRO_DIM - 1u);
+
+  let bit = macro_bit_index(mx, my, mz);
+  // 1.0 means "occupied", 0.0 means "empty"
+  return select(0.0, 1.0, macro_test(macro_base, bit));
+}
+
+
 fn voxel_ao_local(
   hp: vec3<f32>,
   n: vec3<f32>,
@@ -65,29 +90,27 @@ fn voxel_ao_local(
   node_base: u32,
   macro_base: u32
 ) -> f32 {
+  // Macro-only AO: extremely fast, stable, and usually good enough.
+  // You can tune r independently of voxel size.
   let r = 0.75 * cam.voxel_params.x;
 
   let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
   let t = normalize(cross(up_ref, n));
   let b = normalize(cross(n, t));
 
+  // 4 taps (same pattern as before, but macro occupancy)
   var occ = 0.0;
+  occ += macro_occ_at_ws(hp + t * r, root_bmin, root_size, macro_base);
+  occ += macro_occ_at_ws(hp - t * r, root_bmin, root_size, macro_base);
+  occ += macro_occ_at_ws(hp + b * r, root_bmin, root_size, macro_base);
+  occ += macro_occ_at_ws(hp - b * r, root_bmin, root_size, macro_base);
 
-  let q0 = query_leaf_at(hp + t * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q0.mat != MAT_AIR);
+  let occ_n = occ * 0.25;
 
-  let q1 = query_leaf_at(hp - t * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q1.mat != MAT_AIR);
-
-  let q2 = query_leaf_at(hp + b * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q2.mat != MAT_AIR);
-
-  let q3 = query_leaf_at(hp - b * r, root_bmin, root_size, node_base, macro_base);
-  occ += select(0.0, 1.0, q3.mat != MAT_AIR);
-
-  let occ_n = occ * (1.0 / 4.0);
+  // Map to AO term (match your old curve-ish behavior)
   return clamp(1.0 - 0.70 * occ_n, 0.35, 1.0);
 }
+
 
 fn fresnel_schlick(ndv: f32, f0: f32) -> f32 {
   return f0 + (1.0 - f0) * pow(1.0 - clamp(ndv, 0.0, 1.0), 5.0);
