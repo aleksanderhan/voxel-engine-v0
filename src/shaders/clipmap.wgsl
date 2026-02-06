@@ -238,21 +238,21 @@ fn apply_material_variation_clip(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> ve
   var c = base;
 
   if (mat == MAT_GRASS) {
-    let v0 = material_variation_clip(hp, 3.0, 1.0);
-    let v1 = material_variation_clip(hp, 0.75, 0.35);
+    let v0 = material_variation_clip(hp, 3.0, 0.55);
+    let v1 = material_variation_clip(hp, 1.0, 0.20);
     let v  = v0 + v1;
 
-    c += vec3<f32>(0.10 * v, 0.18 * v, 0.06 * v);
-    c *= (1.0 + 0.06 * v);
+    c += vec3<f32>(0.06 * v, 0.12 * v, 0.04 * v);
+    c *= (1.0 + 0.04 * v);
     c = clamp(c, vec3<f32>(0.0), vec3<f32>(2.0));
   } else if (mat == MAT_DIRT) {
-    let v = material_variation_clip(hp, 1.5, 0.8);
-    c += vec3<f32>(0.05 * v, 0.03 * v, 0.01 * v);
-    c *= (1.0 + 0.08 * v);
+    let v = material_variation_clip(hp, 2.0, 0.45);
+    c += vec3<f32>(0.03 * v, 0.02 * v, 0.01 * v);
+    c *= (1.0 + 0.05 * v);
     c = clamp(c, vec3<f32>(0.0), vec3<f32>(2.0));
   } else if (mat == MAT_STONE) {
-    let v = material_variation_clip(hp, 2.0, 0.9);
-    c *= (1.0 + 0.10 * v);
+    let v = material_variation_clip(hp, 2.5, 0.5);
+    c *= (1.0 + 0.06 * v);
     c = clamp(c, vec3<f32>(0.0), vec3<f32>(2.0));
   }
 

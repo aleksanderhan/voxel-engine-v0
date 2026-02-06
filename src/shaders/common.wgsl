@@ -256,7 +256,7 @@ const GRASS_PRIMARY_RATE_MASK: u32 = 3u;   // 0 => all pixels, 1 => 1/2, 3 => 1/
 
 
 // Misc
-const ALBEDO_VAR_GAIN = 3.5;
+const ALBEDO_VAR_GAIN = 1.2;
 
 //// --------------------------------------------------------------------------
 //// GPU structs (must match Rust layouts)
