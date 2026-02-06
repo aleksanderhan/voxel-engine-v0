@@ -966,6 +966,11 @@ fn chunk_coords_neighbor(a: vec3<i32>, b: vec3<i32>) -> bool {
 }
 
 fn tile_add_candidate(slot: u32, cell_enter: f32) {
+  if (slot < cam.chunk_count) {
+    let ch = chunks[slot];
+    if (ch.macro_empty != 0u) { return; }
+  }
+
   let count = atomicLoad(&WG_TILE_COUNT);
   for (var i: u32 = 0u; i < count && i < MAX_TILE_CHUNKS; i = i + 1u) {
     if (WG_TILE_SLOTS[i] == slot) {
@@ -1186,6 +1191,8 @@ fn trace_scene_voxels_candidates(
 
     if (best.hit != 0u && cell_enter >= best.t) { continue; }
 
+    if (chunk_heightfield_early_skip(ro, rd, cell_enter, cell_exit, ch, voxel_size)) { continue; }
+
     let chunk_coord = vec3<i32>(
       ch.origin.x / i32(cam.chunk_size),
       ch.origin.y / i32(cam.chunk_size),
@@ -1353,33 +1360,35 @@ fn trace_scene_voxels_interval(
 
         let cur_coord = vec3<i32>(go.x + lcx, go.y + lcy, go.z + lcz);
 
-        let use_anchor = anchor_valid &&
-          (slot == anchor_slot || chunk_coords_neighbor(cur_coord, anchor_coord));
-        let anchor_key_use = select(INVALID_U32, anchor_key, use_anchor);
+        if (!chunk_heightfield_early_skip(ro, rd, cell_enter, cell_exit, ch, voxel_size)) {
+          let use_anchor = anchor_valid &&
+            (slot == anchor_slot || chunk_coords_neighbor(cur_coord, anchor_coord));
+          let anchor_key_use = select(INVALID_U32, anchor_key, use_anchor);
 
-        let h = trace_chunk_interval_stream_macro(
-          ro,
-          rd,
-          inv,
-          ch,
-          cell_enter,
-          cell_exit,
-          use_anchor,
-          anchor_key_use
-        );
-        if (h.hit.hit != 0u && h.hit.t < best.t) {
-          best = h.hit;
-          best_anchor_valid = h.anchor_valid;
-          best_anchor_key = h.anchor_key;
-          best_anchor_chunk = cur_coord;
-          found_hit = true;
-          break;
+          let h = trace_chunk_interval_stream_macro(
+            ro,
+            rd,
+            inv,
+            ch,
+            cell_enter,
+            cell_exit,
+            use_anchor,
+            anchor_key_use
+          );
+          if (h.hit.hit != 0u && h.hit.t < best.t) {
+            best = h.hit;
+            best_anchor_valid = h.anchor_valid;
+            best_anchor_key = h.anchor_key;
+            best_anchor_chunk = cur_coord;
+            found_hit = true;
+            break;
+          }
+
+          anchor_valid = h.anchor_valid;
+          anchor_key = h.anchor_key;
+          anchor_coord = cur_coord;
+          anchor_slot = slot;
         }
-
-        anchor_valid = h.anchor_valid;
-        anchor_key = h.anchor_key;
-        anchor_coord = cur_coord;
-        anchor_slot = slot;
       }
     }
 
@@ -1496,6 +1505,50 @@ fn colinfo_decode(e16: u32) -> ColInfo {
     return ColInfo(false, 0u, 0u);
   }
   return ColInfo(true, y8, mat8);
+}
+
+fn chunk_heightfield_early_skip(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_enter: f32,
+  t_exit: f32,
+  ch: ChunkMeta,
+  voxel_size: f32
+) -> bool {
+  if (ch.colinfo_base == INVALID_U32) { return false; }
+  if (rd.y >= 0.0) { return false; }
+
+  let y0 = ro.y + rd.y * t_enter;
+  let y1 = ro.y + rd.y * t_exit;
+  let seg_y_min = min(y0, y1);
+
+  let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * voxel_size;
+
+  let seg_len = max(t_exit - t_enter, 0.0);
+  let dt = seg_len * (1.0 / 3.0);
+
+  var found_candidate = false;
+  for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+    let t = t_enter + f32(i) * dt;
+    let p = ro + rd * t;
+
+    let lx_f = (p.x - root_bmin.x) / voxel_size;
+    let lz_f = (p.z - root_bmin.z) / voxel_size;
+    let lx = clamp(i32(floor(lx_f)), 0, 63);
+    let lz = clamp(i32(floor(lz_f)), 0, 63);
+
+    let e16 = colinfo_entry_u16(ch.colinfo_base, u32(lx), u32(lz));
+    let ci = colinfo_decode(e16);
+    if (!ci.valid) { continue; }
+
+    let top_y = root_bmin.y + (f32(ci.y_vox) + 1.0) * voxel_size;
+    if (seg_y_min <= top_y + 1e-3 * voxel_size) {
+      found_candidate = true;
+      break;
+    }
+  }
+
+  return !found_candidate;
 }
 
 
