@@ -249,8 +249,6 @@ fn compute_godray_pixel(
   }
   let fdims_u = textureDimensions(depth_tex);
   let fdims_i = vec2<i32>(i32(fdims_u.x), i32(fdims_u.y));
-  let res_full = vec2<f32>(f32(fdims_u.x), f32(fdims_u.y));
-
   let ro = cam.cam_pos.xyz;
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
@@ -301,7 +299,7 @@ fn compute_godray_pixel(
 
   // Ray dir for this pixel (with small sub-texel jitter)
   let px_center = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5) + 0.35 * j_rd;
-  let rd = ray_dir_from_pixel(px_center, res_full);
+  let rd = ray_dir_from_pixel(px_center);
 
   // Current (linear)
   var cur_lin = vec3<f32>(0.0);
