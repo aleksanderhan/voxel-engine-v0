@@ -182,16 +182,21 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   let vs        = cam.voxel_params.x;
   let hp_shadow = hp + hg.n * (0.75 * vs);
 
-  let Tc_full  = cloud_sun_transmittance(hp_shadow, SUN_DIR);
-  let Tc_fast  = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
-  let Tc       = select(Tc_full, Tc_fast, hg.t > CLOUD_SHADOW_FAST_DIST);
+  var Tc: f32 = 1.0;
+  if (hg.t > CLOUD_SHADOW_FAST_DIST) {
+    Tc = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
+  } else {
+    Tc = cloud_sun_transmittance(hp_shadow, SUN_DIR);
+  }
   let vis_geom = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
 
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
   // AO for voxels: only when the hit is a real voxel hit (not sky / miss)
-  let ao_full = voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
-  let ao = select(1.0, ao_full, hg.hit != 0u && hg.t <= VOXEL_AO_MAX_DIST);
+  var ao = 1.0;
+  if (hg.hit != 0u && hg.t <= VOXEL_AO_MAX_DIST) {
+    ao = voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
+  }
 
   let amb_col      = hemi_ambient(hg.n, sky_up);
   let amb_strength = select(0.10, 0.14, hg.mat == MAT_LEAF);
