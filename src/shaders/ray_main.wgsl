@@ -29,9 +29,8 @@
 @group(0) @binding(14) var primary_hist_samp : sampler;
 
 // Sun-shadow history (geom-only transmittance)
-@group(0) @binding(15) var shadow_hist_tex  : texture_2d<f32>;
-@group(0) @binding(16) var shadow_hist_out  : texture_storage_2d<r32float, write>;
-@group(0) @binding(17) var shadow_hist_samp : sampler;
+@group(0) @binding(15) var<storage, read> shadow_hist_in : array<f32>;
+@group(0) @binding(16) var<storage, read_write> shadow_hist_out : array<f32>;
 
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
 @group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
@@ -135,6 +134,9 @@ fn main_primary(
   // ------------------------------------------------------------
   // Case 1: no voxel chunks => heightfield or sky
   // ------------------------------------------------------------
+  let dims_u = textureDimensions(color_img);
+  let shadow_idx = u32(ip.y) * dims_u.x + u32(ip.x);
+
   if (cam.chunk_count == 0u) {
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
@@ -148,7 +150,7 @@ fn main_primary(
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-      textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+      shadow_hist_out[shadow_idx] = shadow_out;
       return;
     }
 
@@ -158,7 +160,7 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+    shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
 
@@ -210,7 +212,7 @@ fn main_primary(
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-      textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+      shadow_hist_out[shadow_idx] = shadow_out;
       return;
     }
 
@@ -219,7 +221,7 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+    shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
 
@@ -228,10 +230,15 @@ fn main_primary(
     let hp = ro + vt.best.t * rd;
     let hp_shadow = hp + vt.best.n * (0.75 * cam.voxel_params.x);
 
-    var shadow_hist = textureLoad(shadow_hist_tex, ip, 0).x;
+    var shadow_hist = shadow_hist_in[shadow_idx];
     let uv_prev = prev_uv_from_world(hp);
     if (in_unit_square(uv_prev)) {
-      shadow_hist = textureSampleLevel(shadow_hist_tex, shadow_hist_samp, uv_prev, 0.0).x;
+      let prev_px = vec2<i32>(
+        clamp(i32(uv_prev.x * f32(dims_u.x)), 0, i32(dims_u.x) - 1),
+        clamp(i32(uv_prev.y * f32(dims_u.y)), 0, i32(dims_u.y) - 1)
+      );
+      let prev_idx = u32(prev_px.y) * dims_u.x + u32(prev_px.x);
+      shadow_hist = shadow_hist_in[prev_idx];
     }
     shadow_hist = clamp(shadow_hist, 0.0, 1.0);
 
@@ -273,7 +280,7 @@ fn main_primary(
       ip,
       vec4<f32>(t_store, bitcast<f32>(anchor_key), bitcast<f32>(packed_xy), bitcast<f32>(packed_z))
     );
-    textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+    shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
 
@@ -290,7 +297,7 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+    shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
 
@@ -300,7 +307,7 @@ fn main_primary(
   textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
   textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
   textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-  textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+  shadow_hist_out[shadow_idx] = shadow_out;
 }
 
 

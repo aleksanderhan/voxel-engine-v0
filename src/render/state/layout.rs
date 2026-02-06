@@ -49,6 +49,19 @@ fn bgl_storage_ro(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGro
     }
 }
 
+fn bgl_storage_rw(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
 fn bgl_tex_sample_2d(
     binding: u32,
     visibility: wgpu::ShaderStages,
@@ -134,10 +147,9 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     // 12 primary hit history (sampled)
     // 13 primary hit history output (storage write)
     // 14 primary hit history sampler
-    // 15 sun-shadow history (sampled)
+    // 15 sun-shadow history (storage read)
     // 16 sun-shadow history output (storage write)
-    // 17 sun-shadow history sampler
-    let primary_entries: [wgpu::BindGroupLayoutEntry; 18] = [
+    let primary_entries: [wgpu::BindGroupLayoutEntry; 17] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
@@ -165,13 +177,8 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         ),
         bgl_storage_tex_wo(13, cs_vis, wgpu::TextureFormat::Rgba32Float),
         bgl_sampler_non_filtering(14, cs_vis),
-        bgl_tex_sample_2d(
-            15,
-            cs_vis,
-            wgpu::TextureSampleType::Float { filterable: false },
-        ),
-        bgl_storage_tex_wo(16, cs_vis, wgpu::TextureFormat::R32Float),
-        bgl_sampler_non_filtering(17, cs_vis),
+        bgl_storage_ro(15, cs_vis),
+        bgl_storage_rw(16, cs_vis),
     ];
 
     let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

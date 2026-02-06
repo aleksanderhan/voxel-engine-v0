@@ -20,8 +20,8 @@ fn make_primary_bg(
     textures: &TextureSet,
     hist_in: &wgpu::TextureView,
     hist_out: &wgpu::TextureView,
-    shadow_hist_in: &wgpu::TextureView,
-    shadow_hist_out: &wgpu::TextureView,
+    shadow_hist_in: &wgpu::Buffer,
+    shadow_hist_out: &wgpu::Buffer,
     sampler: &wgpu::Sampler,
     label: &str,
 ) -> wgpu::BindGroup {
@@ -95,15 +95,11 @@ fn make_primary_bg(
             },
             wgpu::BindGroupEntry {
                 binding: 15,
-                resource: wgpu::BindingResource::TextureView(shadow_hist_in),
+                resource: shadow_hist_in.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 16,
-                resource: wgpu::BindingResource::TextureView(shadow_hist_out),
-            },
-            wgpu::BindGroupEntry {
-                binding: 17,
-                resource: wgpu::BindingResource::Sampler(sampler),
+                resource: shadow_hist_out.as_entire_binding(),
             },
 
 
@@ -258,8 +254,8 @@ pub fn create_bind_groups(
             textures,
             &textures.primary_hit_hist[0].view,
             &textures.primary_hit_hist[1].view,
-            &textures.shadow_hist[0].view,
-            &textures.shadow_hist[1].view,
+            &textures.shadow_hist[0],
+            &textures.shadow_hist[1],
             sampler,
             "primary_bg_hist_a_to_b",
         ),
@@ -270,8 +266,8 @@ pub fn create_bind_groups(
             textures,
             &textures.primary_hit_hist[1].view,
             &textures.primary_hit_hist[0].view,
-            &textures.shadow_hist[1].view,
-            &textures.shadow_hist[0].view,
+            &textures.shadow_hist[1],
+            &textures.shadow_hist[0],
             sampler,
             "primary_bg_hist_b_to_a",
         ),
