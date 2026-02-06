@@ -90,10 +90,11 @@ fn main_primary(
   var t_max_hint = FOG_MAX_DIST;
   if (t_prev > 1e-3) {
     vel_px = length((prev_uv_from_world(ro + rd * t_prev) - uv_cur) * res);
-    let safety_margin = 2.0 * voxel_size + 0.5 * voxel_size * vel_px;
+    let safety_margin = 4.0 * voxel_size + 0.5 * voxel_size * vel_px;
     let t_hint = min(FOG_MAX_DIST, t_prev + safety_margin);
     let trust = 1.0 - smoothstep(0.6, 2.2, vel_px);
-    t_max_hint = mix(FOG_MAX_DIST, t_hint, trust);
+    let clamp_ok = select(0.0, 1.0, t_prev < (0.95 * FOG_MAX_DIST));
+    t_max_hint = mix(FOG_MAX_DIST, t_hint, trust * clamp_ok);
   }
 
   // Local output defaults: invalid (alpha=0) so TAA keeps history instead of blending black.
