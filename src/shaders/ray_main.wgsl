@@ -40,17 +40,6 @@
 
 var<workgroup> WG_SKY_UP : vec3<f32>;
 
-fn prev_uv_from_world(p_ws: vec3<f32>) -> vec2<f32> {
-  let clip = cam.prev_view_proj * vec4<f32>(p_ws, 1.0);
-  let invw = 1.0 / max(clip.w, 1e-6);
-  let ndc  = clip.xy * invw;
-  return ndc * 0.5 + vec2<f32>(0.5);
-}
-
-fn in_unit_square(uv: vec2<f32>) -> bool {
-  return all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
-}
-
 @compute @workgroup_size(8, 8, 1)
 fn main_primary(
   @builtin(global_invocation_id) gid: vec3<u32>,
