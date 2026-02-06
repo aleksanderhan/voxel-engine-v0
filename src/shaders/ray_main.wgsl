@@ -108,18 +108,11 @@ fn main_primary(
 
   let res = vec2<f32>(f32(dims.x), f32(dims.y));
   let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
-  let uv  = px / res;
 
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px, res);
 
-  // CHEAP sky used for fog coloration (no clouds/sun march)
-  let sky_bg_rd = sky_bg(rd);
-
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
-
-  let frame = cam.frame_index;
-  let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
 
   // Local output defaults: invalid (alpha=0) so TAA keeps history instead of blending black.
   var local_out = vec3<f32>(0.0);
@@ -127,11 +120,50 @@ fn main_primary(
   var t_store   : f32 = 0.0;
   var shadow_out: f32 = 1.0;
 
+  // ------------------------------------------------------------
+  // Case 1: no voxel chunks => heightfield or sky
+  // ------------------------------------------------------------
+  let shadow_idx = u32(ip.y) * dims.x + u32(ip.x);
+
+  if (cam.chunk_count == 0u) {
+    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+
+    if (hf.hit) {
+      let frame = cam.frame_index;
+      let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
+      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+      let t_scene = min(hf.t, FOG_MAX_DIST);
+      let sky_bg_rd = sky_bg(rd);
+      let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
+
+      t_store = t_scene;
+      textureStore(color_img, ip, vec4<f32>(col, 1.0));
+      textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+      textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+      textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+      shadow_hist_out[shadow_idx] = shadow_out;
+      return;
+    }
+
+    // True sky pixel: now pay for full sky (clouds + sun)
+    let sky = sky_color(rd);
+    textureStore(color_img, ip, vec4<f32>(sky, 1.0));
+    textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
+    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+    shadow_hist_out[shadow_idx] = shadow_out;
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // Case 2: voxel grid present => voxels, then heightfield fallback, then sky
+  // ------------------------------------------------------------
   var t_hist     : f32 = 0.0;
   var hist_valid : bool = false;
   var hist_anchor_key  : u32 = INVALID_U32;
   var hist_anchor_coord: vec3<i32> = vec3<i32>(0);
   let tile_candidate_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
+  let uv  = px / res;
 
   let hist_guess = textureLoad(primary_hist_tex, ip, 0);
   let t_hist_guess = hist_guess.x;
@@ -161,42 +193,6 @@ fn main_primary(
     }
   }
 
-  // ------------------------------------------------------------
-  // Case 1: no voxel chunks => heightfield or sky
-  // ------------------------------------------------------------
-  let dims_u = textureDimensions(color_img);
-  let shadow_idx = u32(ip.y) * dims_u.x + u32(ip.x);
-
-  if (cam.chunk_count == 0u) {
-    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
-
-    if (hf.hit) {
-      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
-      let t_scene = min(hf.t, FOG_MAX_DIST);
-      let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
-
-      t_store = t_scene;
-      textureStore(color_img, ip, vec4<f32>(col, 1.0));
-      textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
-      textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-      textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-      shadow_hist_out[shadow_idx] = shadow_out;
-      return;
-    }
-
-    // True sky pixel: now pay for full sky (clouds + sun)
-    let sky = sky_color(rd);
-    textureStore(color_img, ip, vec4<f32>(sky, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    shadow_hist_out[shadow_idx] = shadow_out;
-    return;
-  }
-
-  // ------------------------------------------------------------
-  // Case 2: voxel grid present => voxels, then heightfield fallback, then sky
-  // ------------------------------------------------------------
   var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
   var used_hint = false;
   if (hist_valid) {
@@ -235,8 +231,11 @@ fn main_primary(
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
+      let frame = cam.frame_index;
+      let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
+      let sky_bg_rd = sky_bg(rd);
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
       t_store = t_scene;
@@ -262,14 +261,17 @@ fn main_primary(
     let hp = ro + vt.best.t * rd;
     let hp_shadow = hp + vt.best.n * (0.75 * cam.voxel_params.x);
 
+    let frame = cam.frame_index;
+    let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
+
     var shadow_hist = shadow_hist_in[shadow_idx];
     let uv_prev = prev_uv_from_world(hp);
     if (in_unit_square(uv_prev)) {
       let prev_px = vec2<i32>(
-        clamp(i32(uv_prev.x * f32(dims_u.x)), 0, i32(dims_u.x) - 1),
-        clamp(i32(uv_prev.y * f32(dims_u.y)), 0, i32(dims_u.y) - 1)
+        clamp(i32(uv_prev.x * f32(dims.x)), 0, i32(dims.x) - 1),
+        clamp(i32(uv_prev.y * f32(dims.y)), 0, i32(dims.y) - 1)
       );
-      let prev_idx = u32(prev_px.y) * dims_u.x + u32(prev_px.x);
+      let prev_idx = u32(prev_px.y) * dims.x + u32(prev_px.x);
       shadow_hist = shadow_hist_in[prev_idx];
     }
     shadow_hist = clamp(shadow_hist, 0.0, 1.0);
@@ -288,6 +290,7 @@ fn main_primary(
     let t_scene = min(vt.best.t, FOG_MAX_DIST);
 
     // Fog only the base surface term (view-space medium)
+    let sky_bg_rd = sky_bg(rd);
     let col_base = apply_fog(sh.base_hdr, ro, rd, t_scene, sky_bg_rd);
 
     // Local is stored UNFOGGED for temporal accumulation
@@ -320,8 +323,11 @@ fn main_primary(
   let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
   if (hf.hit) {
+    let frame = cam.frame_index;
+    let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
     let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
     let t_scene = min(hf.t, FOG_MAX_DIST);
+    let sky_bg_rd = sky_bg(rd);
     let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
     t_store = t_scene;
