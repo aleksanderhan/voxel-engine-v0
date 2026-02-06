@@ -482,7 +482,7 @@ fn trace_chunk_rope_interval(
         grass_leaf_limit = cam.voxel_params.x;     // mid: only probe 1-voxel leaves
       }
 
-      if (lod_probe != 2u && leaf.size <= grass_leaf_limit) {
+      if (ENABLE_GRASS && lod_probe != 2u && leaf.size <= grass_leaf_limit) {
         let t0_probe = max(t_enter, tcur - eps_step);
         let t1_probe = min(t_leave, t_exit);
 
@@ -601,7 +601,7 @@ fn trace_chunk_rope_interval(
     let bh = cube_hit_normal_from_slab(rd, slab, t_enter, t_exit);
     if (bh.hit) {
       // Optional grass-on-solid-face probe when solid voxel is grass
-      if (leaf.mat == MAT_GRASS) {
+      if (ENABLE_GRASS && leaf.mat == MAT_GRASS) {
         let hp = ro + bh.t * rd;
 
         let cell = pick_grass_cell_in_chunk(

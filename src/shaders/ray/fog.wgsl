@@ -19,10 +19,12 @@ fn fog_inscatter(rd: vec3<f32>, fogc: vec3<f32>) -> vec3<f32> {
 }
 
 fn fog_density_primary() -> f32 {
+  if (!ENABLE_FOG) { return 0.0; }
   return max(cam.voxel_params.w * FOG_PRIMARY_SCALE, 0.0);
 }
 
 fn fog_density_godray() -> f32 {
+  if (!ENABLE_FOG) { return 0.0; }
   return max(cam.voxel_params.w * FOG_GODRAY_SCALE, 0.0);
 }
 
@@ -59,6 +61,9 @@ fn apply_fog(
   t_scene: f32,
   sky: vec3<f32>
 ) -> vec3<f32> {
+  if (!ENABLE_FOG) {
+    return surface;
+  }
   let T    = fog_transmittance_primary(ro, rd, t_scene);
   let fogc = fog_color_from_sky(rd, sky);
   let ins  = fog_inscatter(rd, fogc);

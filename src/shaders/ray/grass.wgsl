@@ -300,6 +300,7 @@ fn grass_lod_from_t(t: f32) -> u32 {
 }
 
 fn grass_allowed_primary(t: f32, n: vec3<f32>, seed: u32) -> bool {
+  if (!ENABLE_GRASS) { return false; }
   if (t > GRASS_PRIMARY_MAX_DIST) { return false; }
   if (n.y < GRASS_PRIMARY_MIN_NY) { return false; }
 
