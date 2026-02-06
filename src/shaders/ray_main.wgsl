@@ -88,13 +88,8 @@ fn main_primary(
       );
       let ro_tile = cam.cam_pos.xyz;
 
-      // Fewer candidate rays per tile for faster primary pass.
-      var px = tile_base + vec2<f32>(4.5, 4.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-
-      px = tile_base + vec2<f32>(0.5, 0.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-      px = tile_base + vec2<f32>(7.5, 7.5);
+      // Single candidate ray per tile for fastest primary pass.
+      let px = tile_base + vec2<f32>(4.5, 4.5);
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
     }
     let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
