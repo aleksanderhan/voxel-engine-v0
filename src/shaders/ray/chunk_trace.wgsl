@@ -965,10 +965,19 @@ fn chunk_coords_neighbor(a: vec3<i32>, b: vec3<i32>) -> bool {
   return (dx <= 1 && dy <= 1 && dz <= 1);
 }
 
-fn tile_add_candidate(slot: u32) {
+fn tile_add_candidate(slot: u32, cell_enter: f32) {
+  let count = atomicLoad(&WG_TILE_COUNT);
+  for (var i: u32 = 0u; i < count && i < MAX_TILE_CHUNKS; i = i + 1u) {
+    if (WG_TILE_SLOTS[i] == slot) {
+      WG_TILE_ENTER[i] = min(WG_TILE_ENTER[i], cell_enter);
+      return;
+    }
+  }
+
   let idx = atomicAdd(&WG_TILE_COUNT, 1u);
   if (idx < MAX_TILE_CHUNKS) {
     WG_TILE_SLOTS[idx] = slot;
+    WG_TILE_ENTER[idx] = cell_enter;
   }
 }
 
@@ -1072,7 +1081,7 @@ fn tile_append_candidates_for_ray(
 
     let slot = chunk_grid[u32(idx_i)];
     if (slot != INVALID_U32 && slot < cam.chunk_count) {
-      tile_add_candidate(slot);
+      tile_add_candidate(slot, start_t + t_local);
     }
 
     let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
@@ -1094,6 +1103,29 @@ fn tile_append_candidates_for_ray(
     t_local = tNextLocal;
 
     if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) { break; }
+  }
+}
+
+fn tile_sort_candidates_by_enter(count: u32) {
+  if (count <= 1u) { return; }
+  let limit = min(count, MAX_TILE_CHUNKS);
+  for (var i: u32 = 0u; i + 1u < limit; i = i + 1u) {
+    var min_idx = i;
+    var min_t = WG_TILE_ENTER[i];
+    for (var j: u32 = i + 1u; j < limit; j = j + 1u) {
+      if (WG_TILE_ENTER[j] < min_t) {
+        min_t = WG_TILE_ENTER[j];
+        min_idx = j;
+      }
+    }
+    if (min_idx != i) {
+      let tmp_slot = WG_TILE_SLOTS[i];
+      let tmp_t = WG_TILE_ENTER[i];
+      WG_TILE_SLOTS[i] = WG_TILE_SLOTS[min_idx];
+      WG_TILE_ENTER[i] = WG_TILE_ENTER[min_idx];
+      WG_TILE_SLOTS[min_idx] = tmp_slot;
+      WG_TILE_ENTER[min_idx] = tmp_t;
+    }
   }
 }
 
