@@ -1136,9 +1136,70 @@ fn trace_scene_voxels_candidates(
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
   let root_size = f32(cam.chunk_size) * voxel_size;
   let max_candidates = min(candidate_count, MAX_TILE_CHUNKS);
+  let select_limit = min(max_candidates, PRIMARY_MAX_TILE_CHUNKS);
+
+  var selected_count: u32 = 0u;
+  var selected_slots: array<u32, PRIMARY_MAX_TILE_CHUNKS>;
+  var selected_enter: array<f32, PRIMARY_MAX_TILE_CHUNKS>;
 
   for (var i: u32 = 0u; i < max_candidates; i = i + 1u) {
     let slot = WG_TILE_SLOTS[i];
+    if (slot == INVALID_U32 || slot >= cam.chunk_count) { continue; }
+
+    let ch = chunks[slot];
+    if (ch.macro_empty != 0u) { continue; }
+
+    let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * voxel_size;
+    let root_bmax = root_bmin + vec3<f32>(root_size);
+    let rt_chunk = intersect_aabb(ro, rd, root_bmin, root_bmax);
+
+    let cell_enter = max(rt_chunk.x, t_enter);
+    let cell_exit  = min(rt_chunk.y, t_exit);
+    if (cell_exit < cell_enter) { continue; }
+
+    if (best.hit != 0u && cell_enter >= best.t) { continue; }
+
+    if (selected_count < select_limit) {
+      selected_slots[selected_count] = slot;
+      selected_enter[selected_count] = cell_enter;
+      selected_count = selected_count + 1u;
+    } else {
+      var worst_idx: u32 = 0u;
+      var worst_t: f32 = selected_enter[0];
+      for (var w: u32 = 1u; w < select_limit; w = w + 1u) {
+        if (selected_enter[w] > worst_t) {
+          worst_t = selected_enter[w];
+          worst_idx = w;
+        }
+      }
+      if (cell_enter < worst_t) {
+        selected_slots[worst_idx] = slot;
+        selected_enter[worst_idx] = cell_enter;
+      }
+    }
+  }
+
+  for (var i: u32 = 0u; i + 1u < selected_count; i = i + 1u) {
+    var min_idx = i;
+    var min_t = selected_enter[i];
+    for (var j: u32 = i + 1u; j < selected_count; j = j + 1u) {
+      if (selected_enter[j] < min_t) {
+        min_t = selected_enter[j];
+        min_idx = j;
+      }
+    }
+    if (min_idx != i) {
+      let tmp_slot = selected_slots[i];
+      let tmp_t = selected_enter[i];
+      selected_slots[i] = selected_slots[min_idx];
+      selected_enter[i] = selected_enter[min_idx];
+      selected_slots[min_idx] = tmp_slot;
+      selected_enter[min_idx] = tmp_t;
+    }
+  }
+
+  for (var i: u32 = 0u; i < selected_count; i = i + 1u) {
+    let slot = selected_slots[i];
     if (slot == INVALID_U32 || slot >= cam.chunk_count) { continue; }
 
     let ch = chunks[slot];
