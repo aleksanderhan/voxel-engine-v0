@@ -241,8 +241,8 @@ const POST_EXPOSURE : f32 = 0.15;
 const CLIP_LEVELS_MAX : u32 = 16u;
 
 // March tuning
-const HF_MAX_STEPS : u32 = 96u;
-const HF_BISECT    : u32 = 5u;
+const HF_MAX_STEPS : u32 = 48u;  // 32..64 usually fine
+const HF_BISECT    : u32 = 3u;   // 2..3 is enough once stepping is stable
 
 // dt clamp (meters along ray)
 const HF_DT_MAX : f32 = 48.0;
@@ -409,7 +409,7 @@ const MACRO_DIM : u32 = 8u;              // 8x8x8 macro cells per chunk
 const MACRO_WORDS_PER_CHUNK : u32 = 16u; // 512 bits / 32
 const TILE_SIZE: u32 = 8u;
 const MAX_TILE_CHUNKS: u32 = 192u;
-const PRIMARY_MAX_TILE_CHUNKS: u32 = 64u;
+const PRIMARY_MAX_TILE_CHUNKS: u32 = 32u;
 
 var<workgroup> WG_TILE_COUNT : atomic<u32>;
 var<workgroup> WG_TILE_SLOTS : array<u32, MAX_TILE_CHUNKS>;

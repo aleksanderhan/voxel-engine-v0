@@ -107,6 +107,28 @@ fn clip_height_at_level(world_xz: vec2<f32>, level: u32) -> f32 {
   return mix(hx0, hx1, fz);
 }
 
+fn clip_height_at_level_nearest(world_xz: vec2<f32>, level: u32) -> f32 {
+  let res_i = max(i32(clip.res), 1);
+  let p = clip.level[level];
+  let origin = vec2<f32>(p.x, p.y);
+  let cell   = max(p.z, 1e-6);
+
+  // texel space where centers are at N+0.5
+  let uv = (world_xz - origin) / cell;
+  let st = uv - vec2<f32>(0.5, 0.5);
+
+  // nearest texel center
+  let ix = i32(floor(st.x + 0.5));
+  let iz = i32(floor(st.y + 0.5));
+
+  // toroidal wrap (no range checks)
+  let off = clip_offsets(level);
+  let sx = imod(ix + off.x, res_i);
+  let sz = imod(iz + off.y, res_i);
+
+  return textureLoad(clip_height, vec2<i32>(sx, sz), i32(level), 0).x;
+}
+
 fn clip_normal_at_level_2tap(world_xz: vec2<f32>, level: u32) -> vec3<f32> {
   let cell = clip.level[level].z;
 
@@ -154,7 +176,7 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
   var lvl: u32     = clip_best_level(p.xz, guard);
 
   // Initial signed height
-  var h0: f32   = clip_height_at_level(p.xz, lvl);
+  var h0: f32   = clip_height_at_level_nearest(p.xz, lvl);
   if (h0 <= -0.5 * BIG_F32) {
     return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
   }
@@ -169,7 +191,7 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
     // Coverage-only "LOD": ensure p is inside chosen level window (coarsen only).
     lvl = clip_ensure_contains(p.xz, lvl, guard);
 
-    let h: f32 = clip_height_at_level(p.xz, lvl);
+    let h: f32 = clip_height_at_level_nearest(p.xz, lvl);
     if (h <= -0.5 * BIG_F32) {
       return ClipHit(false, BIG_F32, vec3<f32>(0.0), MAT_AIR);
     }
@@ -209,10 +231,10 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
 
     let dt_y  = abs(s) / vy;
     let cell  = clip.level[lvl].z;
-    let dt_xz = (2.0 * cell) / vh; // ~2 texels per step in xz
+    let dt_xz = (6.0 * cell) / vh; // ~6 texels per step in xz
 
     var dt = min(dt_y, dt_xz);
-    dt = clamp(dt, 0.25, HF_DT_MAX);
+    dt = clamp(dt, 0.6, HF_DT_MAX);
 
     t = t + dt;
   }
