@@ -6,6 +6,9 @@
 const VOXEL_AO_MAX_DIST       : f32 = 40.0;
 const LOCAL_LIGHT_MAX_DIST    : f32 = 50.0;
 const CLOUD_SHADOW_FAST_DIST  : f32 = 60.0;
+const CLOUD_SHADOW_SKIP_DIST  : f32 = 120.0;
+const SHADOW_GEOM_MAX_DIST    : f32 = 70.0;
+const FAR_SHADING_DIST        : f32 = 80.0;
 
 fn color_for_material(m: u32) -> vec3<f32> {
   if (m == MAT_AIR)   { return vec3<f32>(0.0); }
@@ -164,7 +167,9 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   let hp = ro + hg.t * rd;
 
   var base = color_for_material(hg.mat);
-  base = apply_material_variation(base, hg.mat, hp);
+  if (hg.t <= FAR_SHADING_DIST) {
+    base = apply_material_variation(base, hg.mat, hp);
+  }
 
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
@@ -183,12 +188,17 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
   let hp_shadow = hp + hg.n * (0.75 * vs);
 
   var Tc: f32 = 1.0;
-  if (hg.t > CLOUD_SHADOW_FAST_DIST) {
-    Tc = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
-  } else {
-    Tc = cloud_sun_transmittance(hp_shadow, SUN_DIR);
+  if (hg.t <= CLOUD_SHADOW_SKIP_DIST) {
+    if (hg.t > CLOUD_SHADOW_FAST_DIST) {
+      Tc = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
+    } else {
+      Tc = cloud_sun_transmittance(hp_shadow, SUN_DIR);
+    }
   }
-  let vis_geom = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
+  var vis_geom: f32 = 1.0;
+  if (hg.t <= SHADOW_GEOM_MAX_DIST) {
+    vis_geom = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
+  }
 
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
 
@@ -208,29 +218,31 @@ fn shade_hit(ro: vec3<f32>, rd: vec3<f32>, hg: HitGeom, sky_up: vec3<f32>, seed:
 
   // Leaf dapple (cheap) - keep as-is
   var dapple = 1.0;
-  if (hg.mat == MAT_LEAF) {
+  if (hg.mat == MAT_LEAF && hg.t <= FAR_SHADING_DIST) {
     let time_s = cam.voxel_params.y;
     let d0 = sin(dot(hp.xz, vec2<f32>(3.0, 2.2)) + time_s * 3.5);
     let d1 = sin(dot(hp.xz, vec2<f32>(6.5, 4.1)) - time_s * 6.0);
     dapple = 0.90 + 0.10 * (0.6 * d0 + 0.4 * d1);
   }
 
-  let v = normalize(-rd);
-  let h = normalize(v + SUN_DIR);
+  var spec_col = vec3<f32>(0.0);
+  if (hg.t <= FAR_SHADING_DIST) {
+    let v = normalize(-rd);
+    let h = normalize(v + SUN_DIR);
 
-  let ndv = max(dot(hg.n, v), 0.0);
-  let ndh = max(dot(hg.n, h), 0.0);
+    let ndv = max(dot(hg.n, v), 0.0);
+    let ndh = max(dot(hg.n, h), 0.0);
 
-  let rough     = material_roughness(hg.mat);
-  let shininess = mix(8.0, 96.0, 1.0 - rough);
-  let spec      = pow(ndh, shininess);
+    let rough     = material_roughness(hg.mat);
+    let shininess = mix(8.0, 96.0, 1.0 - rough);
+    let spec      = pow(ndh, shininess);
 
-  let f0   = material_f0(hg.mat);
-  let fres = fresnel_schlick(ndv, f0);
+    let f0   = material_f0(hg.mat);
+    let fres = fresnel_schlick(ndv, f0);
+    spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis_geom * Tc;
+  }
 
   let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis_geom * Tc * dapple;
-  let spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * vis_geom * Tc;
-
   let emissive = material_emission(hg.mat);
   return base * (ambient + direct) + 0.20 * spec_col + emissive;
 }
