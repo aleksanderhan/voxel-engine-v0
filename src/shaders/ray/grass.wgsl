@@ -50,6 +50,13 @@ fn sdf_box(p: vec3<f32>, c: vec3<f32>, b: vec3<f32>) -> f32 {
   return outside + inside;
 }
 
+fn sdf_capsule(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r: f32) -> f32 {
+  let pa = p - a;
+  let ba = b - a;
+  let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+  return length(pa - ba * h) - r;
+}
+
 fn grass_root_uv(cell_id_vox: vec3<f32>, i: u32) -> vec2<f32> {
   let fi = f32(i);
   let u = hash31(cell_id_vox + vec3<f32>(fi, 0.0, 0.0));
@@ -101,55 +108,89 @@ fn grass_sdf_lod(
     segs = min(segs, GRASS_SEGS_FAR);
   }
 
-  let half_xz = GRASS_VOXEL_THICKNESS_VOX * vs;
   let inv_segs = 1.0 / max(f32(segs), 1.0);
-  let seg_h   = blade_len * inv_segs;
-  let half_y  = 0.5 * seg_h;
 
   var dmin = BIG_F32;
 
-  // constants used every blade
-  let inset = 0.12;
+  // --- CLUMPING: a few tuft centers per cell ---
+  // (small number keeps it cheap; makes “lush tufts” instead of uniform lawn)
+  let CLUMPS: u32 = 3u;
+
+  // tuft radius in-cell (in meters)
+  let clump_r = 0.22 * vs;
+
+  // base thickness in meters (this is your “lushness” knob)
+  let base_r = (GRASS_VOXEL_THICKNESS_VOX * vs) * 0.85;
 
   for (var i: u32 = 0u; i < blade_count; i = i + 1u) {
-    // One hash => u,v,phase
-    let uvp = grass_blade_params(cell_id_vox, i);
+    // (u,v,phase,widthRand)
+    let uvpw = grass_blade_params(cell_id_vox, i);
+    let u0 = uvpw.x;
+    let v0 = uvpw.y;
+    let ph = uvpw.z;
+    let wR = uvpw.w;
 
-    let ux = mix(inset, 1.0 - inset, uvp.x);
-    let uz = mix(inset, 1.0 - inset, uvp.y);
+    // pick clump index and its center (stable per cell)
+    let ci = i % CLUMPS;
+    let cfi = f32(ci);
+    let cu = hash31(cell_id_vox + vec3<f32>(13.7 + cfi, 2.1, 9.9));
+    let cv = hash31(cell_id_vox + vec3<f32>( 4.2 + cfi, 7.3, 1.4));
 
-    let root = vec3<f32>(
-      cell_bmin_m.x + ux * vs,
-      top_y,
-      cell_bmin_m.z + uz * vs
+    // clump center in [inset..1-inset]
+    let inset = 0.10;
+    let cux = mix(inset, 1.0 - inset, cu);
+    let cvz = mix(inset, 1.0 - inset, cv);
+
+    let clump_center = vec2<f32>(
+      cell_bmin_m.x + cux * vs,
+      cell_bmin_m.z + cvz * vs
     );
 
-    // Phase as a small Y offset into the wind field (keeps variety)
-    let ph = uvp.z;
+    // blade root starts near the clump center, but jittered inside a tuft radius
+    // (pulls blades into thick patches)
+    let ang = TAU * u0;
+    let rr  = clump_r * (0.15 + 0.85 * v0);
+    let root_xz = clump_center + vec2<f32>(cos(ang), sin(ang)) * rr;
 
-    // Compute wind ONCE per blade (XZ only)
+    let root = vec3<f32>(root_xz.x, top_y, root_xz.y);
+
+    // wind (XZ only), phase-shifted
     let w_xz = grass_wind_xz(root + vec3<f32>(0.0, ph, 0.0), time_s, strength);
 
-    // Segment loop: only cheap math + sdf_box
+    // per-blade lean direction (adds “messy lush” look even with low wind)
+    let lean_ang = TAU * fract(u0 * 1.73 + v0 * 2.11);
+    let lean_dir = vec2<f32>(cos(lean_ang), sin(lean_ang));
+    let lean_amt = 0.10 + 0.25 * (v0 * v0);   // stable bend
+
+    // radius variance: thicker overall, plus per-blade
+    let r0 = base_r * mix(0.85, 1.35, wR);
+
+    // segment loop: capsules (rounded blades)
     for (var s: u32 = 0u; s < segs; s = s + 1u) {
-      let t01 = (f32(s) + 0.5) * inv_segs;
-      let y   = t01 * blade_len;
+      let t01a = (f32(s)      ) * inv_segs;
+      let t01b = (f32(s) + 1.0) * inv_segs;
 
-      // Same “shape” as before:
-      // - height factor: (0.55 + 0.45*t01)
-      // - then scaled by (blade_len * t01)
-      let height_factor = (0.55 + 0.45 * t01);
-      let bend_mag      = (blade_len * t01) * height_factor;
+      let ya = t01a * blade_len;
+      let yb = t01b * blade_len;
 
-      let off_xz = w_xz * bend_mag;
+      // bending increases with height, with a little extra lean
+      let bend_a = (blade_len * t01a) * (0.55 + 0.45 * t01a);
+      let bend_b = (blade_len * t01b) * (0.55 + 0.45 * t01b);
 
-      let c = root + vec3<f32>(off_xz.x, y, off_xz.y);
+      // wind + stable lean combined
+      let bend_vec = (w_xz + lean_dir * lean_amt);
 
-      let taper = mix(1.0, GRASS_VOXEL_TAPER, t01);
-      let bxz = half_xz * taper;
-      let b = vec3<f32>(bxz, half_y, bxz);
+      let offa = bend_vec * bend_a;
+      let offb = bend_vec * bend_b;
 
-      dmin = min(dmin, sdf_box(p_m, c, b));
+      let pa = root + vec3<f32>(offa.x, ya, offa.y);
+      let pb = root + vec3<f32>(offb.x, yb, offb.y);
+
+      // taper to tip (but keep tips not needle-thin => “thick lush”)
+      let taper = mix(1.0, max(GRASS_VOXEL_TAPER, 0.55), 0.5 * (t01a + t01b));
+      let r = r0 * taper;
+
+      dmin = min(dmin, sdf_capsule(p_m, pa, pb, r));
     }
   }
 
@@ -157,18 +198,21 @@ fn grass_sdf_lod(
 }
 
 
-fn grass_blade_params(cell_id_vox: vec3<f32>, i: u32) -> vec3<f32> {
-  // returns (u, v, phase)
+fn grass_blade_params(cell_id_vox: vec3<f32>, i: u32) -> vec4<f32> {
+  // returns (u, v, phase, w) where w is a width rand
   let fi = f32(i);
 
-  // One hash per blade
-  let h = hash31(cell_id_vox + vec3<f32>(fi * 7.3, 1.1, 2.9));
+  let h0 = hash31(cell_id_vox + vec3<f32>(fi * 7.3, 1.1, 2.9));
+  let h1 = hash31(cell_id_vox + vec3<f32>(fi * 3.7, 8.4, 0.6));
 
-  // Derive 3 decorrelated-ish values from h
-  let u = fract(h * 1.61803398875);  // golden ratio-ish
-  let v = fract(h * 2.41421356237);  // sqrt(2)+1-ish
-  let p = fract(h * 3.14159265359);  // pi-ish
-  return vec3<f32>(u, v, p);
+  let u = fract(h0 * 1.61803398875);
+  let v = fract(h0 * 2.41421356237);
+  let p = fract(h0 * 3.14159265359);
+
+  // width rand (biased towards thicker)
+  let w = 0.35 + 0.65 * (h1 * h1);
+
+  return vec4<f32>(u, v, p, w);
 }
 
 fn grass_sdf_normal_lod(
