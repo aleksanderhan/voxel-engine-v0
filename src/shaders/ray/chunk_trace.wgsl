@@ -602,7 +602,13 @@ fn trace_chunk_interval_stream_macro(
 ) -> ChunkTraceResult {
   let vs = cam.voxel_params.x;
 
-  let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * vs;
+  let origin_vox = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
+  let origin_vox_local = origin_vox - cam.floating_origin_voxel.xyz;
+  let root_bmin = vec3<f32>(
+    f32(origin_vox_local.x),
+    f32(origin_vox_local.y),
+    f32(origin_vox_local.z)
+  ) * vs;
   let root_size = f32(cam.chunk_size) * vs;
 
   let eps_step = 1e-4 * vs;
@@ -679,7 +685,13 @@ fn trace_chunk_rope_interval_nomacro(
 ) -> ChunkTraceResult {
   let vs = cam.voxel_params.x;
 
-  let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
+  let origin_vox = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
+  let origin_vox_local = origin_vox - cam.floating_origin_voxel.xyz;
+  let root_bmin_vox = vec3<f32>(
+    f32(origin_vox_local.x),
+    f32(origin_vox_local.y),
+    f32(origin_vox_local.z)
+  );
   let root_bmin     = root_bmin_vox * vs;
   let root_size     = f32(cam.chunk_size) * vs;
 
@@ -694,7 +706,7 @@ fn trace_chunk_rope_interval_nomacro(
   // Only probe grass when we are in small-enough air leaves
   let grass_probe_max_leaf = vs;
 
-  let origin_vox_i = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
+  let origin_vox_i = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z) - cam.floating_origin_voxel.xyz;
   let time_s       = cam.voxel_params.y;
   let strength     = cam.voxel_params.z;
 
@@ -892,7 +904,7 @@ fn trace_chunk_rope_interval_nomacro(
         let cell = pick_grass_cell_in_chunk(
           hp, rd,
           root_bmin,
-          origin_vox_i,
+          origin_vox_i + cam.floating_origin_voxel.xyz,
           vs,
           i32(cam.chunk_size)
         );
@@ -1018,7 +1030,7 @@ fn tile_append_candidates_for_ray(
   let voxel_size   = cam.voxel_params.x;
   let chunk_size_m = f32(cam.chunk_size) * voxel_size;
 
-  let go = cam.grid_origin_chunk;
+  let go = cam.grid_origin_chunk - cam.floating_origin_chunk;
   let gd = cam.grid_dims;
 
   let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
@@ -1172,7 +1184,7 @@ fn trace_scene_voxels_candidates(
   let voxel_size   = cam.voxel_params.x;
   let chunk_size_m = f32(cam.chunk_size) * voxel_size;
 
-  let go = cam.grid_origin_chunk;
+  let go = cam.grid_origin_chunk - cam.floating_origin_chunk;
   let gd = cam.grid_dims;
 
   let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
@@ -1202,7 +1214,12 @@ fn trace_scene_voxels_candidates(
     let ch = chunks[slot];
     if (ch.macro_empty != 0u) { continue; }
 
-    let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * voxel_size;
+    let origin_vox = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z) - cam.floating_origin_voxel.xyz;
+    let root_bmin = vec3<f32>(
+      f32(origin_vox.x),
+      f32(origin_vox.y),
+      f32(origin_vox.z)
+    ) * voxel_size;
     let root_bmax = root_bmin + vec3<f32>(root_size);
     let rt_chunk = intersect_aabb(ro, rd, root_bmin, root_bmax);
 
@@ -1261,7 +1278,7 @@ fn trace_scene_voxels_interval(
   let voxel_size   = cam.voxel_params.x;
   let chunk_size_m = f32(cam.chunk_size) * voxel_size;
 
-  let go = cam.grid_origin_chunk;
+  let go = cam.grid_origin_chunk - cam.floating_origin_chunk;
   let gd = cam.grid_dims;
 
   // Grid bounds in meters
@@ -1285,7 +1302,7 @@ fn trace_scene_voxels_interval(
   let start_t = t_enter + nudge_p;
   let p0      = ro + start_t * rd;
 
-  // World chunk coords at start
+  // Local chunk coords at start (camera-relative)
   let c = chunk_coord_from_pos(p0, chunk_size_m);
 
   // Local grid coords (0..dims-1) and running linear index
@@ -1316,7 +1333,7 @@ fn trace_scene_voxels_interval(
   let step_y: i32 = select(-1, 1, rd.y > 0.0);
   let step_z: i32 = select(-1, 1, rd.z > 0.0);
 
-  // Next chunk boundary in meters (world chunk coords from c)
+  // Next chunk boundary in meters (local chunk coords from c)
   let bx = select(f32(c.x) * chunk_size_m, f32(c.x + 1) * chunk_size_m, rd.x > 0.0);
   let by = select(f32(c.y) * chunk_size_m, f32(c.y + 1) * chunk_size_m, rd.y > 0.0);
   let bz = select(f32(c.z) * chunk_size_m, f32(c.z + 1) * chunk_size_m, rd.z > 0.0);
@@ -1457,7 +1474,8 @@ fn hitgeom_from_clipmap(ch: ClipHit, ro: vec3<f32>, rd: vec3<f32>) -> HitGeom {
 
 fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>, grass_seed: u32) -> VoxTraceResult {
   // 1) Fast terrain estimate (downward rays only inside clipmap code)
-  let ch = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+  let ro_world = local_to_world(ro);
+  let ch = clip_trace_heightfield(ro_world, rd, 0.0, FOG_MAX_DIST);
 
   // If clipmap says "terrain at t", we can:
   // A) For FAR terrain: accept clipmap hit directly (skip voxel tracing)
@@ -1482,7 +1500,7 @@ fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>, grass_seed: u32) -> Vo
       }
 
       // no near voxel occluder => use cheap clipmap terrain
-      let best = hitgeom_from_clipmap(ch, ro, rd);
+      let best = hitgeom_from_clipmap(ch, ro_world, rd);
       return VoxTraceResult(true, best, min(ch.t, FOG_MAX_DIST), false, INVALID_U32, vec3<i32>(0));
     }
 
@@ -1496,7 +1514,7 @@ fn trace_scene_primary_fast(ro: vec3<f32>, rd: vec3<f32>, grass_seed: u32) -> Vo
     if (v.best.hit != 0u) {
       return v;
     } else {
-      let best = hitgeom_from_clipmap(ch, ro, rd);
+      let best = hitgeom_from_clipmap(ch, ro_world, rd);
       return VoxTraceResult(true, best, min(ch.t, FOG_MAX_DIST), false, INVALID_U32, vec3<i32>(0));
     }
   }
@@ -1557,7 +1575,12 @@ fn chunk_heightfield_early_skip(
   let y1 = ro.y + rd.y * t_exit;
   let seg_y_min = min(y0, y1);
 
-  let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * voxel_size;
+  let origin_vox = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z) - cam.floating_origin_voxel.xyz;
+  let root_bmin = vec3<f32>(
+    f32(origin_vox.x),
+    f32(origin_vox.y),
+    f32(origin_vox.z)
+  ) * voxel_size;
 
   let seg_len = max(t_exit - t_enter, 0.0);
   let dt = seg_len * (1.0 / 3.0);
@@ -1671,12 +1694,16 @@ fn probe_grass_columns_xz_dda(
 
     if (ci.valid && ci.mat == MAT_GRASS) {
       // World voxel coords for the grass cell (at column-top y)
-      let wx: i32 = origin_vox_i.x + lx;
-      let wy: i32 = origin_vox_i.y + i32(ci.y_vox);
-      let wz: i32 = origin_vox_i.z + lz;
+      let wx_local: i32 = origin_vox_i.x + lx;
+      let wy_local: i32 = origin_vox_i.y + i32(ci.y_vox);
+      let wz_local: i32 = origin_vox_i.z + lz;
 
-      let cell_bmin_m = vec3<f32>(f32(wx), f32(wy), f32(wz)) * vs;
-      let id_vox      = vec3<f32>(f32(wx), f32(wy), f32(wz));
+      let wx_global = wx_local + cam.floating_origin_voxel.x;
+      let wy_global = wy_local + cam.floating_origin_voxel.y;
+      let wz_global = wz_local + cam.floating_origin_voxel.z;
+
+      let cell_bmin_m = vec3<f32>(f32(wx_local), f32(wy_local), f32(wz_local)) * vs;
+      let id_vox      = vec3<f32>(f32(wx_global), f32(wy_global), f32(wz_global));
 
       // ------------------------------------------------------------
       // NEW: ultra-cheap vertical overlap test (kills most calls)

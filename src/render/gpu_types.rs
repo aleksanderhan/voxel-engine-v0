@@ -55,6 +55,9 @@ pub struct CameraGpu {
     pub prev_view_proj: [[f32; 4]; 4],
     
     pub cam_pos: [f32; 4],
+    pub floating_origin_world: [f32; 4],
+    pub floating_origin_voxel: [i32; 4],
+    pub floating_origin_chunk: [i32; 4],
     pub ray00: [f32; 4],
     pub ray_dx: [f32; 4],
     pub ray_dy: [f32; 4],

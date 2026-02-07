@@ -10,7 +10,7 @@ fn leaf_cube_offset(bmin: vec3<f32>, size: f32, time_s: f32, strength: f32) -> v
   let fade = smoothstep(LEAF_LOD_DISP_START, LEAF_LOD_DISP_END, d);
   let strength_eff = strength * (1.0 - fade);
 
-  var w = wind_field(center, time_s) * strength_eff;
+  var w = wind_field(local_to_world(center), time_s) * strength_eff;
   w = vec3<f32>(w.x, LEAF_VERTICAL_REDUCE * w.y, w.z);
 
   let amp = LEAF_OFFSET_AMP * size;

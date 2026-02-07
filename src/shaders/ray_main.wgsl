@@ -106,6 +106,7 @@ fn main_primary(
   let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
 
   let ro  = cam.cam_pos.xyz;
+  let ro_world = camera_world_pos();
   let rd  = ray_dir_from_pixel(px);
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
@@ -122,13 +123,13 @@ fn main_primary(
   let shadow_idx = u32(ip.y) * dims.x + u32(ip.x);
 
   if (cam.chunk_count == 0u) {
-    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+    let hf = clip_trace_heightfield(ro_world, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+      let surface = shade_clip_hit(ro_world, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let sky_bg_rd = sky_bg(rd);
-      let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
+      let col = apply_fog(surface, ro_world, rd, t_scene, sky_bg_rd);
 
       t_store = t_scene;
       textureStore(color_img, ip, vec4<f32>(col, 1.0));
@@ -164,7 +165,7 @@ fn main_primary(
     let hist_guess = textureLoad(primary_hist_tex, ip, 0);
     let t_hist_guess = hist_guess.x;
     if (t_hist_guess > 1e-3) {
-      let p_ws = ro + rd * t_hist_guess;
+      let p_ws = local_to_world(ro + rd * t_hist_guess);
       let uv_prev = prev_uv_from_world(p_ws);
 
       if (in_unit_square(uv_prev)) {
@@ -253,13 +254,13 @@ fn main_primary(
 
   // Outside streamed grid => heightfield or sky
   if (!vt.in_grid) {
-    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+    let hf = clip_trace_heightfield(ro_world, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+      let surface = shade_clip_hit(ro_world, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let sky_bg_rd = sky_bg(rd);
-      let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
+      let col = apply_fog(surface, ro_world, rd, t_scene, sky_bg_rd);
 
       t_store = t_scene;
       textureStore(color_img, ip, vec4<f32>(col, 1.0));
@@ -282,12 +283,13 @@ fn main_primary(
   // In grid: voxel hit?
   if (vt.best.hit != 0u) {
     let hp = ro + vt.best.t * rd;
+    let hp_world = local_to_world(hp);
     let hp_shadow = hp + vt.best.n * (0.75 * cam.voxel_params.x);
 
     let shadow_do = (seed & SHADOW_SUBSAMPLE_MASK) == 0u;
     if (shadow_do) {
       var shadow_hist = shadow_hist_in[shadow_idx];
-      let uv_prev = prev_uv_from_world(hp);
+      let uv_prev = prev_uv_from_world(hp_world);
       if (in_unit_square(uv_prev)) {
         let prev_px = vec2<i32>(
           clamp(i32(uv_prev.x * f32(dims.x)), 0, i32(dims.x) - 1),
@@ -310,7 +312,7 @@ fn main_primary(
 
     // Fog only the base surface term (view-space medium)
     let sky_bg_rd = sky_bg(rd);
-    let col_base = apply_fog(sh.base_hdr, ro, rd, t_scene, sky_bg_rd);
+    let col_base = apply_fog(sh.base_hdr, ro_world, rd, t_scene, sky_bg_rd);
 
     // Local is stored UNFOGGED for temporal accumulation
     local_out = sh.local_hdr;
@@ -339,13 +341,13 @@ fn main_primary(
   }
 
   // Voxel miss: try heightfield
-  let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+  let hf = clip_trace_heightfield(ro_world, rd, 0.0, FOG_MAX_DIST);
 
   if (hf.hit) {
-    let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+    let surface = shade_clip_hit(ro_world, rd, hf, sky_up, seed);
     let t_scene = min(hf.t, FOG_MAX_DIST);
     let sky_bg_rd = sky_bg(rd);
-    let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
+    let col = apply_fog(surface, ro_world, rd, t_scene, sky_bg_rd);
 
     t_store = t_scene;
     textureStore(color_img, ip, vec4<f32>(col, 1.0));

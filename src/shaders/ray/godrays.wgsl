@@ -249,7 +249,7 @@ fn compute_godray_pixel(
   }
   let fdims_u = textureDimensions(depth_tex);
   let fdims_i = vec2<i32>(i32(fdims_u.x), i32(fdims_u.y));
-  let ro = cam.cam_pos.xyz;
+  let ro = camera_world_pos();
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
   let qpx = vec2<f32>(f32(gid.x), f32(gid.y));

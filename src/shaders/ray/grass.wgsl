@@ -59,7 +59,7 @@ fn grass_root_uv(cell_id_vox: vec3<f32>, i: u32) -> vec2<f32> {
 
 fn grass_wind_xz(root_m: vec3<f32>, t: f32, strength: f32) -> vec2<f32> {
   // wind_field returns vec3; we only use XZ for bending
-  let w = wind_field(root_m, t) * strength;
+  let w = wind_field(local_to_world(root_m), t) * strength;
   return vec2<f32>(w.x, w.z);
 }
 

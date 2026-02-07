@@ -450,6 +450,18 @@ impl App {
         let ray_dx = ray10 - ray00;
         let ray_dy = ray01 - ray00;
 
+        let chunk_world_size = config::CHUNK_SIZE as f32 * config::VOXEL_SIZE_M_F32;
+        let origin_chunk = Vec3::new(
+            (camera_frame.pos.x / chunk_world_size).floor(),
+            (camera_frame.pos.y / chunk_world_size).floor(),
+            (camera_frame.pos.z / chunk_world_size).floor(),
+        );
+        let origin_chunk_i = origin_chunk.as_ivec3();
+        let origin_world = origin_chunk * chunk_world_size;
+        let origin_voxel = origin_chunk_i * config::CHUNK_SIZE as i32;
+
+        let cam_pos_local = camera_frame.pos - origin_world;
+
         let camera_gpu = CameraGpu {
             view_inv: camera_frame.view_inv.to_cols_array_2d(),
             proj_inv: camera_frame.proj_inv.to_cols_array_2d(),
@@ -457,7 +469,10 @@ impl App {
             view_proj: view_proj.to_cols_array_2d(),
             prev_view_proj: previous_view_proj.to_cols_array_2d(),
 
-            cam_pos: [camera_frame.pos.x, camera_frame.pos.y, camera_frame.pos.z, 1.0],
+            cam_pos: [cam_pos_local.x, cam_pos_local.y, cam_pos_local.z, 1.0],
+            floating_origin_world: [origin_world.x, origin_world.y, origin_world.z, 0.0],
+            floating_origin_voxel: [origin_voxel.x, origin_voxel.y, origin_voxel.z, 0],
+            floating_origin_chunk: [origin_chunk_i.x, origin_chunk_i.y, origin_chunk_i.z, 0],
             ray00: [ray00.x, ray00.y, ray00.z, 0.0],
             ray_dx: [ray_dx.x, ray_dx.y, ray_dx.z, 0.0],
             ray_dy: [ray_dy.x, ray_dy.y, ray_dy.z, 0.0],

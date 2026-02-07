@@ -165,10 +165,11 @@ fn shade_hit_split(
   var local_w   = 0.0;
 
   if (hg.hit != 0u && hg.mat != MAT_LIGHT && hg.t <= LOCAL_LIGHT_MAX_DIST) {
-    let hp = ro + hg.t * rd;
-    let albedo = base_albedo(hg.mat, hp, hg.t);
+    let hp_local = ro + hg.t * rd;
+    let hp_world = local_to_world(hp_local);
+    let albedo = base_albedo(hg.mat, hp_world, hg.t);
     local_hdr = gather_voxel_lights(
-      hp,
+      hp_local,
       hg.n,
       hg.root_bmin,
       hg.root_size,
@@ -190,15 +191,16 @@ fn shade_hit(
   seed: u32,
   sun_shadow: f32
 ) -> vec3<f32> {
-  let hp = ro + hg.t * rd;
+  let hp_local = ro + hg.t * rd;
+  let hp_world = local_to_world(hp_local);
 
-  var base = base_albedo(hg.mat, hp, hg.t);
+  var base = base_albedo(hg.mat, hp_world, hg.t);
 
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
     if (ENABLE_GRASS && grass_allowed_primary(hg.t, hg.n, seed)) {
       let vs  = cam.voxel_params.x;
-      let tip = clamp(fract(hp.y / max(vs, 1e-6)), 0.0, 1.0);
+      let tip = clamp(fract(hp_local.y / max(vs, 1e-6)), 0.0, 1.0);
 
       base = mix(base, base + vec3<f32>(0.10, 0.10, 0.02), 0.35 * tip);
 
@@ -208,11 +210,12 @@ fn shade_hit(
   }
 
   let vs        = cam.voxel_params.x;
-  let hp_shadow = hp + hg.n * (0.75 * vs);
+  let hp_shadow_local = hp_local + hg.n * (0.75 * vs);
+  let hp_shadow_world = local_to_world(hp_shadow_local);
 
   var Tc: f32 = 1.0;
   if (PRIMARY_CLOUD_SHADOWS) {
-    Tc = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
+    Tc = cloud_sun_transmittance_fast(hp_shadow_world, SUN_DIR);
   }
   let sun_vis = Tc * clamp(sun_shadow, 0.0, 1.0);
   let diff = max(dot(hg.n, SUN_DIR), 0.0);
@@ -220,7 +223,7 @@ fn shade_hit(
   // AO for voxels: only when the hit is a real voxel hit (not sky / miss)
   var ao = 1.0;
   if (hg.hit != 0u && hg.t <= VOXEL_AO_MAX_DIST) {
-    ao = voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
+    ao = voxel_ao_local(hp_local, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
   }
 
   let amb_col      = hemi_ambient(hg.n, sky_up);
@@ -236,8 +239,8 @@ fn shade_hit(
   var dapple = 1.0;
   if (hg.mat == MAT_LEAF && hg.t <= FAR_SHADING_DIST) {
     let time_s = cam.voxel_params.y;
-    let d0 = sin(dot(hp.xz, vec2<f32>(3.0, 2.2)) + time_s * 3.5);
-    let d1 = sin(dot(hp.xz, vec2<f32>(6.5, 4.1)) - time_s * 6.0);
+    let d0 = sin(dot(hp_world.xz, vec2<f32>(3.0, 2.2)) + time_s * 3.5);
+    let d1 = sin(dot(hp_world.xz, vec2<f32>(6.5, 4.1)) - time_s * 6.0);
     dapple = 0.90 + 0.10 * (0.6 * d0 + 0.4 * d1);
   }
 

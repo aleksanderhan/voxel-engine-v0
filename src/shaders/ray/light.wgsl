@@ -96,7 +96,7 @@ fn dda_hit_light(p0: vec3<f32>, dir: vec3<f32>, max_steps: u32, vs: f32) -> vec4
 
   for (var s: u32 = 0u; s < max_steps; s = s + 1u) {
     let center_ws = (vec3<f32>(f32(cell.x) + 0.5, f32(cell.y) + 0.5, f32(cell.z) + 0.5)) * vs;
-    let leaf = query_leaf_world(center_ws);
+    let leaf = query_leaf_world(local_to_world(center_ws));
 
     if (leaf.mat == MAT_LIGHT) {
       return vec4<f32>(center_ws, 1.0);

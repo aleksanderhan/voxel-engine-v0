@@ -52,7 +52,7 @@ fn sky_color(rd: vec3<f32>) -> vec3<f32> {
   // Volumetric slab clouds (cheap front-to-back)
   // ------------------------------------------------------------------------
   if (ENABLE_CLOUDS && rd.y > 0.01) {
-    let ro = cam.cam_pos.xyz;
+    let ro = camera_world_pos();
     let time_s = cam.voxel_params.y;
 
     // Intersect view ray with slab [CLOUD_BASE_H .. CLOUD_TOP_H]

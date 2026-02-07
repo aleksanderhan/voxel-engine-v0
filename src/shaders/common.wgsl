@@ -358,6 +358,9 @@ struct Camera {
   prev_view_proj: mat4x4<f32>,
 
   cam_pos     : vec4<f32>,
+  floating_origin_world : vec4<f32>,
+  floating_origin_voxel : vec4<i32>,
+  floating_origin_chunk : vec4<i32>,
   ray00       : vec4<f32>,
   ray_dx      : vec4<f32>,
   ray_dy      : vec4<f32>,
@@ -444,6 +447,17 @@ fn safe_normalize(v: vec3<f32>) -> vec3<f32> {
   return v * inverseSqrt(l2);
 }
 
+fn camera_world_pos() -> vec3<f32> {
+  return cam.cam_pos.xyz + cam.floating_origin_world.xyz;
+}
+
+fn local_to_world(p: vec3<f32>) -> vec3<f32> {
+  return p + cam.floating_origin_world.xyz;
+}
+
+fn world_to_local(p: vec3<f32>) -> vec3<f32> {
+  return p - cam.floating_origin_world.xyz;
+}
 
 fn ray_dir_from_pixel(px: vec2<f32>) -> vec3<f32> {
   let d = cam.ray00.xyz + px.x * cam.ray_dx.xyz + px.y * cam.ray_dy.xyz;
@@ -507,9 +521,9 @@ fn child_rank(mask: u32, ci: u32) -> u32 {
 }
 
 fn grid_lookup_slot(cx: i32, cy: i32, cz: i32) -> u32 {
-  let ox = cam.grid_origin_chunk.x;
-  let oy = cam.grid_origin_chunk.y;
-  let oz = cam.grid_origin_chunk.z;
+  let ox = cam.grid_origin_chunk.x - cam.floating_origin_chunk.x;
+  let oy = cam.grid_origin_chunk.y - cam.floating_origin_chunk.y;
+  let oz = cam.grid_origin_chunk.z - cam.floating_origin_chunk.z;
 
   let ix_i = cx - ox;
   let iy_i = cy - oy;

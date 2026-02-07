@@ -11,7 +11,13 @@ fn trace_chunk_shadow_trans_interval(
   let voxel_size = cam.voxel_params.x;
   let nudge_s = 0.20 * voxel_size;
 
-  let root_bmin_vox = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z));
+  let origin_vox = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
+  let origin_vox_local = origin_vox - cam.floating_origin_voxel.xyz;
+  let root_bmin_vox = vec3<f32>(
+    f32(origin_vox_local.x),
+    f32(origin_vox_local.y),
+    f32(origin_vox_local.z)
+  );
   let root_bmin = root_bmin_vox * voxel_size;
   let root_size = f32(cam.chunk_size) * voxel_size;
 
@@ -87,7 +93,7 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   let nudge_s      = 0.18 * voxel_size;
   let chunk_size_m = f32(cam.chunk_size) * voxel_size;
 
-  let go = cam.grid_origin_chunk;
+  let go = cam.grid_origin_chunk - cam.floating_origin_chunk;
   let gd = cam.grid_dims;
 
   let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
