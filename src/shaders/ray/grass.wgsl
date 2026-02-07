@@ -98,7 +98,7 @@ fn sdf_blade_segment(
     let B = make_orthonormal_basis(T);
     S = B[0]; // X axis
   } else {
-    S = S * inversesqrt(s2);
+    S = S * inverseSqrt(s2);
   }
   let N = cross(T, S); // thin axis (normal to blade face), orthonormal
 
