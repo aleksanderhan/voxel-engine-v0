@@ -244,9 +244,19 @@ fn clip_trace_heightfield(ro: vec3<f32>, rd: vec3<f32>, t_min: f32, t_max: f32) 
 
 
 
-fn material_variation_clip(world_p: vec3<f32>, cell_size_m: f32, strength: f32) -> f32 {
-  let cell = floor(world_p / cell_size_m);
-  return (hash31(cell) - 0.5) * strength;
+// Continuous material variation (no voxel seams).
+// scale_m controls feature size in meters (bigger = smoother/less detailed).
+fn material_variation_clip(world_p: vec3<f32>, scale_m: f32, strength: f32) -> f32 {
+  let inv = 1.0 / max(scale_m, 1e-4);
+
+  // Build a 2D coordinate but still vary with y (prevents planar banding).
+  let q = world_p * inv;
+  let uv = q.xz + vec2<f32>(0.17 * q.y, -0.11 * q.y);
+
+  // fbm returns ~[0..1], center to [-0.5..0.5]
+  let n = fbm(uv) - 0.5;
+
+  return n * strength;
 }
 
 fn apply_material_variation_clip(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f32> {
