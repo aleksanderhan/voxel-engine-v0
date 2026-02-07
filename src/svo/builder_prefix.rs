@@ -5,8 +5,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rayon::prelude::*;
-
 use crate::world::materials::AIR;
 
 #[inline]
@@ -134,6 +132,5 @@ pub fn prefix_pass_z(prefix: &mut [u32], side: usize, cancel: &AtomicBool) {
         }
     }
 }
-
 
 

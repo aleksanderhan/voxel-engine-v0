@@ -240,12 +240,6 @@ pub struct BuildScratch {
 
     svo: svo::SvoScratch,
 
-    hm: Vec<i32>,
-    hm_w: usize,
-    hm_h: usize,
-    hm_xm0: i32,
-    hm_zm0: i32,
-    hm_valid: bool,
 }
 
 impl BuildScratch {
@@ -270,24 +264,8 @@ impl BuildScratch {
             cave_shift: 0,
             cave_dim: 0,
             svo: svo::SvoScratch::new(),
-            hm: Vec::new(),
-            hm_w: 0,
-            hm_h: 0,
-            hm_xm0: 0,
-            hm_zm0: 0,
-            hm_valid: false,
 
         }
-    }
-
-    #[inline]
-    fn ensure_hm(&mut self, w: usize, h: usize) {
-        let need = w * h;
-        if self.hm.len() != need {
-            self.hm.resize(need, 0);
-        }
-        self.hm_w = w;
-        self.hm_h = h;
     }
 
     #[inline]
@@ -548,7 +526,7 @@ fn build_tree_top(
 /// Fill per-voxel material into scratch.material.
 /// Tree overlay is supplied as a closure returning material id at local coords.
 fn fill_material(
-    gen: &WorldGen,
+    _gen: &WorldGen,
     ctx: ChunkCtx,
     scratch: &mut BuildScratch,
     cancel: &AtomicBool,
@@ -761,28 +739,6 @@ fn build_cave_mask_coarse(
 }
 
 
-#[inline(always)]
-fn idx3(dim: usize, x: usize, y: usize, z: usize) -> usize {
-    (y * dim * dim) + (z * dim) + x
-}
-
-#[inline(always)]
-fn cave_mask_at_shifted(
-    cave_mask: &[u8],
-    cave_dim: usize,
-    cave_shift: u32,
-    lx: usize,
-    ly: usize,
-    lz: usize,
-) -> bool {
-    let sx = (lx >> cave_shift).min(cave_dim - 1);
-    let sy = (ly >> cave_shift).min(cave_dim - 1);
-    let sz = (lz >> cave_shift).min(cave_dim - 1);
-    cave_mask[idx3(cave_dim, sx, sy, sz)] != 0
-}
-
-
-
 fn build_colinfo_words(ctx: ChunkCtx, scratch: &BuildScratch) -> Vec<u32> {
     debug_assert_eq!(ctx.side, 64, "colinfo packing assumes chunk_size=64");
 
@@ -934,8 +890,8 @@ pub fn build_chunk_svo_sparse_cancelable_with_scratch(
     });
     cancel_if!(cancel, tim);
 
-    let _tree_mip = time_it!(tim, tree_mip, {
-        build_max_mip_inplace(&scratch.tree_top, ctx.size_u, &mut scratch.tree_levels)
+    time_it!(tim, tree_mip, {
+        build_max_mip_inplace(&scratch.tree_top, ctx.size_u, &mut scratch.tree_levels);
     });
 
     // Material fill

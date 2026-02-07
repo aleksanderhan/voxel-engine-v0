@@ -6,8 +6,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rayon::prelude::*;
-
 use crate::render::gpu_types::NodeGpu;
 use crate::world::materials::{AIR, STONE};
 
@@ -73,7 +71,7 @@ fn build_level_bottom_up(
     chunk_oy: i32,
     parent_size: i32,          // size of parent cell in voxels
     parent_side: usize,        // number of parent cells per axis
-    child_size: i32,           // size of child cell in voxels (= parent_size/2)
+    _child_size: i32,          // size of child cell in voxels (= parent_size/2)
     child_side: usize,         // number of child cells per axis (= parent_side*2)
     child_idx_grid: &[u32],    // dense grid: child cell -> index in child_nodes (or INVALID)
     child_nodes: &[NodeGpu],   // compact list of existing child nodes
@@ -408,9 +406,6 @@ pub fn build_svo_bottom_up(
 
     // ---- Pass 2 (FIXED): fill dense index grid + leaf nodes in parallel
     // Use raw pointers to avoid capturing &mut scratch.* inside Fn closures.
-    let idx_ptr = scratch.child_idx_grid.as_mut_ptr() as usize;
-    let node_ptr = scratch.child_nodes.as_mut_ptr() as usize;
-
     for bi in 0..nb {
         let count = scratch.block_counts[bi];
         if count == 0 { continue; }

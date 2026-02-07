@@ -31,15 +31,6 @@ pub struct TextureSet {
 }
 
 
-pub fn quarter_dim(x: u32) -> u32 {
-    (x + 3) / 4
-}
-
-pub fn half_dim(x: u32) -> u32 {
-    (x + 1) / 2
-}
-
-
 fn make_tex2d(
     device: &wgpu::Device,
     label: &str,

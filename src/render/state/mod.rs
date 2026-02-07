@@ -548,7 +548,7 @@ impl Renderer {
         self.device.poll(wgpu::Maintain::Wait);
 
         // Wait for the mapping callback
-        let map_ok = pollster::block_on(async { rx.receive().await })
+        let _map_ok = pollster::block_on(async { rx.receive().await })
             .expect("map_async dropped")
             .expect("map_async failed");
 

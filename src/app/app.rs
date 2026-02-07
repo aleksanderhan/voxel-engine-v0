@@ -62,9 +62,7 @@ pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
 struct ClipmapCpuUpdate {
     clip_gpu: ClipmapGpu,
     clip_uploads: Vec<crate::clipmap::ClipmapUpload>,
-    upload_bytes: usize,
     time_seconds: f32,
-    camera_position: glam::Vec3,
 }
 
 pub struct App {
@@ -401,9 +399,7 @@ impl App {
         ClipmapCpuUpdate {
             clip_gpu,
             clip_uploads,
-            upload_bytes,
             time_seconds,
-            camera_position,
         }
     }
 
@@ -826,7 +822,6 @@ impl App {
         };
 
         let max_t = max_dist_m;
-        let mut t = 0.0f32;
 
         // Deterministic single-axis stepping:
         // - We step EXACTLY ONE axis per iteration.
@@ -868,8 +863,6 @@ impl App {
                     (0, 0, -step_z)
                 }
             };
-
-            t = t_next;
 
             // Now inside the newly-entered voxel.
             if self.sample_voxel_material(vx, vy, vz) != AIR {
