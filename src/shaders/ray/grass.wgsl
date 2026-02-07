@@ -299,10 +299,11 @@ fn grass_lod_from_t(t: f32) -> u32 {
   return 0u;
 }
 
-fn grass_allowed_primary(t: f32, n: vec3<f32>, seed: u32) -> bool {
+fn grass_allowed_primary(t: f32, n: vec3<f32>, seed: u32, rd: vec3<f32>) -> bool {
   if (!ENABLE_GRASS) { return false; }
   if (t > GRASS_PRIMARY_MAX_DIST) { return false; }
   if (n.y < GRASS_PRIMARY_MIN_NY) { return false; }
+  if (abs(rd.y) < 0.25) { return false; }
 
   // subsample in primary pass (temporal if your seed includes frame index)
   if ((seed & GRASS_PRIMARY_RATE_MASK) != 0u) { return false; }
