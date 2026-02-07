@@ -196,14 +196,32 @@ fn shade_hit(
 
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
-    if (ENABLE_GRASS && grass_allowed_primary(hg.t, hg.n, seed)) {
+    if (ENABLE_GRASS && grass_allowed_primary(hg.t, hg.n, rd, seed)) {
       let vs  = cam.voxel_params.x;
+
+      // 0 at base of the grass slab voxel, 1 near its top
       let tip = clamp(fract(hp.y / max(vs, 1e-6)), 0.0, 1.0);
 
-      base = mix(base, base + vec3<f32>(0.10, 0.10, 0.02), 0.35 * tip);
+      // Darker base, brighter tips (lush depth)
+      base *= mix(0.72, 1.10, smoothstep(0.0, 1.0, tip));
 
-      let back = pow(clamp(dot(-SUN_DIR, hg.n), 0.0, 1.0), 2.0);
-      base += 0.22 * back * vec3<f32>(0.18, 0.35, 0.10);
+      // Slight yellowing at tips (sun-bleached feel)
+      base += 0.06 * smoothstep(0.55, 1.0, tip) * vec3<f32>(0.10, 0.10, 0.02);
+
+      // Wrap diffuse so blades don’t look “flat-lit”
+      let ndl = dot(hg.n, SUN_DIR);
+      let wrap = 0.35; // 0..1 (higher = softer, leafier)
+      let diff_wrap = clamp((ndl + wrap) / (1.0 + wrap), 0.0, 1.0);
+
+      // Strong backscatter / “subsurface-ish” pop when sun is behind grass
+      let back = pow(clamp(dot(-SUN_DIR, hg.n), 0.0, 1.0), 1.6);
+      let view_graze = pow(1.0 - max(dot(normalize(-rd), hg.n), 0.0), 2.0);
+
+      // Add warm-green transmission
+      base += (0.22 * back + 0.10 * view_graze * back) * vec3<f32>(0.18, 0.34, 0.10);
+
+      // Bake wrapped diffuse into albedo a bit (keeps it “full” under sun)
+      base *= (0.90 + 0.10 * diff_wrap);
     }
   }
 
@@ -290,7 +308,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
 
   // AO-lite for terrain: gate hard for grass in primary
   var ao = 1.0;
-  if (ch.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(ch.t, ch.n, seed) && ch.t <= FAR_SHADING_DIST) {
+  if (ch.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(ch.t, ch.n, rd, seed) && ch.t <= FAR_SHADING_DIST) {
     let lvl  = clip_best_level(hp.xz, 2);
     let cell = clip.level[lvl].z;
 

@@ -257,6 +257,42 @@ fn main_primary(
 
   // In grid: voxel hit?
   if (vt.best.hit != 0u) {
+    if (vt.best.mat == MAT_GRASS && ENABLE_GRASS) {
+      if (grass_allowed_primary(vt.best.t, vt.best.n, rd, seed)) {
+        let voxel_size = cam.voxel_params.x;
+        let chunk_size_vox = i32(cam.chunk_size);
+        let ch_origin_vox = vec3<i32>(
+          i32(floor(vt.best.root_bmin.x / voxel_size + 0.5)),
+          i32(floor(vt.best.root_bmin.y / voxel_size + 0.5)),
+          i32(floor(vt.best.root_bmin.z / voxel_size + 0.5))
+        );
+        let hp = ro + rd * vt.best.t;
+        let cell = pick_grass_cell_in_chunk(
+          hp,
+          rd,
+          vt.best.root_bmin,
+          ch_origin_vox,
+          voxel_size,
+          chunk_size_vox
+        );
+        let gh = try_grass_slab_hit(
+          ro,
+          rd,
+          0.0,
+          vt.best.t,
+          cell.bmin_m,
+          cell.id_vox,
+          voxel_size,
+          cam.voxel_params.y,
+          cam.voxel_params.z
+        );
+        if (gh.hit) {
+          vt.best.t = gh.t;
+          vt.best.n = gh.n;
+        }
+      }
+    }
+
     let hp = ro + vt.best.t * rd;
     let hp_shadow = hp + vt.best.n * (0.75 * cam.voxel_params.x);
 

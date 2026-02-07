@@ -744,7 +744,7 @@ fn trace_chunk_rope_interval_nomacro(
       }
 
       if (ENABLE_GRASS && lod_probe != 2u && leaf.size <= grass_leaf_limit) {
-        let grass_ok = grass_allowed_primary(tcur, vec3<f32>(0.0, 1.0, 0.0), grass_seed);
+        let grass_ok = grass_allowed_primary(tcur, vec3<f32>(0.0, 1.0, 0.0), rd, grass_seed);
         if (!grass_ok) {
           // Skip grass entirely in primary pass (subsampled)
         } else {
