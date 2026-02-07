@@ -258,7 +258,7 @@ fn main_primary(
   // In grid: voxel hit?
   if (vt.best.hit != 0u) {
     if (vt.best.mat == MAT_GRASS && ENABLE_GRASS) {
-      if (grass_allowed_primary(vt.best.t, vt.best.n, seed)) {
+      if (grass_allowed_primary(vt.best.t, vt.best.n, rd, seed)) {
         let voxel_size = cam.voxel_params.x;
         let chunk_size_vox = i32(cam.chunk_size);
         let ch_origin_vox = vec3<i32>(
