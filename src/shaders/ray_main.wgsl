@@ -70,7 +70,6 @@ fn main_primary(
   @builtin(workgroup_id) wg_id: vec3<u32>
 ) {
   let dims = textureDimensions(color_img);
-  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
 
   // Compute once per 8x8 workgroup (already cheap: sky_bg only)
   if (lid == 0u) {
@@ -87,17 +86,20 @@ fn main_primary(
         f32(wg_id.y * TILE_SIZE)
       );
       let ro_tile = cam.cam_pos.xyz;
+      let max_px = vec2<f32>(f32(dims.x) - 0.5, f32(dims.y) - 0.5);
+      let min_px = vec2<f32>(0.5, 0.5);
 
-      var px = tile_base + vec2<f32>(4.5, 4.5);
+      let px_center = clamp(tile_base + vec2<f32>(4.5, 4.5), min_px, max_px);
+      var px = px_center;
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
 
-      px = tile_base + vec2<f32>(0.5, 0.5);
+      px = clamp(tile_base + vec2<f32>(0.5, 0.5), min_px, max_px);
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-      px = tile_base + vec2<f32>(7.5, 0.5);
+      px = clamp(tile_base + vec2<f32>(7.5, 0.5), min_px, max_px);
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-      px = tile_base + vec2<f32>(0.5, 7.5);
+      px = clamp(tile_base + vec2<f32>(0.5, 7.5), min_px, max_px);
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-      px = tile_base + vec2<f32>(7.5, 7.5);
+      px = clamp(tile_base + vec2<f32>(7.5, 7.5), min_px, max_px);
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
     }
     let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
@@ -105,6 +107,8 @@ fn main_primary(
     WG_TILE_COUNT_CACHED = min(raw_count, PRIMARY_MAX_TILE_CHUNKS);
   }
   workgroupBarrier();
+
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
 
   let res = vec2<f32>(f32(dims.x), f32(dims.y));
   let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);

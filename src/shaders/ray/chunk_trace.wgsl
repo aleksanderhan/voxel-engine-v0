@@ -605,7 +605,7 @@ fn trace_chunk_interval_stream_macro(
   let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * vs;
   let root_size = f32(cam.chunk_size) * vs;
 
-  let eps_step = 1e-4 * vs;
+  let eps_step = 2e-4 * vs;
 
   var tcur = max(t0_in, 0.0) + eps_step;
   let t_end = t1_in;
@@ -683,7 +683,7 @@ fn trace_chunk_rope_interval_nomacro(
   let root_bmin     = root_bmin_vox * vs;
   let root_size     = f32(cam.chunk_size) * vs;
 
-  let eps_step = 1e-4 * vs;
+  let eps_step = 2e-4 * vs;
   var tcur     = max(t_enter, 0.0) + eps_step;
 
   var anchor_node = AnchorNode(false, 0u, vec3<f32>(0.0), 0.0, INVALID_U32);
@@ -744,7 +744,7 @@ fn trace_chunk_rope_interval_nomacro(
       }
 
       if (ENABLE_GRASS && ch.colinfo_base != INVALID_U32 && lod_probe != 2u && leaf.size <= grass_leaf_limit) {
-        let grass_ok = grass_allowed_primary(tcur, vec3<f32>(0.0, 1.0, 0.0), grass_seed);
+        let grass_ok = grass_allowed_primary(tcur, vec3<f32>(0.0, 1.0, 0.0), grass_seed, rd);
         if (!grass_ok) {
           // Skip grass entirely in primary pass (subsampled)
         } else {
@@ -783,6 +783,7 @@ fn trace_chunk_rope_interval_nomacro(
       let ex = exit_face_from_slab_safe(rd, slab);
 
       tcur = max(t_leave, tcur) + eps_step;
+      tcur = tcur + 0.05 * vs;
       if (tcur > t_exit) { break; }
 
       if (ex.amb != 0u) {
