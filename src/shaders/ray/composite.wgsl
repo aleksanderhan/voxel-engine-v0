@@ -121,7 +121,8 @@ fn composite_pixel_mapped(
   let warm = mix(vec3<f32>(1.0), vec3<f32>(1.08, 1.03, 0.92), god_far); // tweak to taste
   god_lin *= warm;
 
-  var hdr = max(base + god_scale * god_lin, vec3<f32>(0.0));
+  // --- 1) Scene HDR (NO godrays yet) ---
+  var hdr_scene = max(base, vec3<f32>(0.0));
 
   // Bloom (hue-preserving + distance-faded)
   if (ENABLE_BLOOM) {
@@ -129,7 +130,7 @@ fn composite_pixel_mapped(
     let bloom_k      = 0.12;
     let bloom_k_eff  = bloom_k * mix(1.0, 0.0, god_far);
 
-    let b0 = bright_extract_hue(hdr, bloom_thresh);
+    let b0 = bright_extract_hue(hdr_scene, bloom_thresh);
 
     let ipx1 = vec2<i32>(clamp(ip_r.x + 2, 0, rd_i.x - 1), ip_r.y);
     let ipx0 = vec2<i32>(clamp(ip_r.x - 2, 0, rd_i.x - 1), ip_r.y);
@@ -148,12 +149,12 @@ fn composite_pixel_mapped(
       + bright_extract_hue(hy1, bloom_thresh)
       + bright_extract_hue(hy0, bloom_thresh)) / 5.0;
 
-    let bloom_max = 0.35 * max(hdr, vec3<f32>(0.0));
-    hdr += bloom_k_eff * min(bloom, bloom_max);
+    let bloom_max = 0.35 * max(hdr_scene, vec3<f32>(0.0));
+    hdr_scene += bloom_k_eff * min(bloom, bloom_max);
   }
 
   // Distance-safe saturation compensation (HDR)
-  let l_hdr  = max(dot(hdr, lum_w), 1e-6);
+  let l_hdr  = max(dot(hdr_scene, lum_w), 1e-6);
   let gray_h = vec3<f32>(l_hdr);
 
   let t_sat = smoothstep(30.0, 100.0, d0);
@@ -163,30 +164,39 @@ fn composite_pixel_mapped(
   let hi = smoothstep(1.6, 6.0, l_hdr);
   sat_boost = mix(sat_boost, 1.0, 0.55 * hi);
 
-  hdr = mix(gray_h, hdr, sat_boost);
+  hdr_scene = mix(gray_h, hdr_scene, sat_boost);
 
-  // --- Grade knobs (constants or uniforms)
+  // --- 2) Grade/tonemap the scene ---
   let exposure = 1.10;
   let contrast = 1.05;
   let temp     = 0.03; // +warm, -cool
 
-  hdr *= exposure;
+  hdr_scene *= exposure;
 
   // temperature: push R up, B down a bit
-  hdr *= vec3<f32>(1.0 + temp, 1.0, 1.0 - temp);
+  hdr_scene *= vec3<f32>(1.0 + temp, 1.0, 1.0 - temp);
 
   // contrast around mid-gray
   let mid = vec3<f32>(0.18);
-  hdr = (hdr - mid) * contrast + mid;
-  hdr = max(hdr, vec3<f32>(0.0));
-
+  hdr_scene = (hdr_scene - mid) * contrast + mid;
+  hdr_scene = max(hdr_scene, vec3<f32>(0.0));
 
   // --- Filmic tonemap (single global tonemap) ---
   let white_point: f32 = 6.0; // try 4..10 (bigger = brighter highlights)
-  var c = tonemap_filmic_white_scale(hdr * POST_EXPOSURE, white_point);
+  var scene_tm = tonemap_filmic_white_scale(hdr_scene * POST_EXPOSURE, white_point);
 
   // Clamp to display range (still linear at this point)
-  c = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+  scene_tm = clamp(scene_tm, vec3<f32>(0.0), vec3<f32>(1.0));
+
+  // --- 3) Add godrays AFTER tonemap (so they don’t crush scene exposure) ---
+  var god_tm = vec3<f32>(0.0);
+  if (ENABLE_GODRAYS) {
+    let god_add = god_scale * god_lin * 0.35;
+    god_tm = tonemap_filmic_white_scale(god_add * POST_EXPOSURE, white_point);
+  }
+
+  // Final combined (still linear display space)
+  var c = clamp(scene_tm + god_tm, vec3<f32>(0.0), vec3<f32>(1.0));
 
   // Optional tiny "print" bias (keep subtle)
   c = pow(c, vec3<f32>(0.98));
