@@ -57,6 +57,21 @@ fn sdf_capsule(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r: f32) -> f32 {
   return length(pa - ba * h) - r;
 }
 
+fn grass_primary_rate_mask(rd: vec3<f32>) -> u32 {
+  // abs(rd.y) ~ 1 => looking vertical (top-down/up)
+  // abs(rd.y) ~ 0 => looking horizontal (side-on)
+  let ay = abs(rd.y);
+
+  // Side-on: no subsampling (full coverage)
+  if (ay < 0.25) { return 0u; }   // 1/1
+
+  // Oblique: light subsampling
+  if (ay < 0.55) { return 3u; }   // 1/4
+
+  // Mostly vertical: heavier subsampling
+  return GRASS_PRIMARY_RATE_MASK; // e.g. 1/16 if mask=15
+}
+
 fn grass_root_uv(cell_id_vox: vec3<f32>, i: u32) -> vec2<f32> {
   let fi = f32(i);
   let u = hash31(cell_id_vox + vec3<f32>(fi, 0.0, 0.0));
@@ -358,14 +373,8 @@ fn grass_allowed_primary(t: f32, n: vec3<f32>, rd: vec3<f32>, seed: u32) -> bool
   if (t > GRASS_PRIMARY_MAX_DIST) { return false; }
   if (n.y < GRASS_PRIMARY_MIN_NY) { return false; }
 
-  // If we're looking mostly downward, DON'T subsample (top-down needs coverage).
-  // rd.y is negative when looking down.
-  let view_down = (-rd.y) > 0.65;
-
-  if (!view_down) {
-    // subsample in primary pass (temporal if your seed includes frame index)
-    if ((seed & GRASS_PRIMARY_RATE_MASK) != 0u) { return false; }
-  }
+  let mask = grass_primary_rate_mask(rd);
+  if ((seed & mask) != 0u) { return false; }
 
   return true;
 }
