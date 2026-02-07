@@ -223,10 +223,17 @@ fn shade_hit(
     ao = voxel_ao_local(hp, hg.n, hg.root_bmin, hg.root_size, hg.node_base, hg.macro_base);
   }
 
-  let amb_col      = hemi_ambient(hg.n, sky_up);
-  let amb_strength = select(0.03, 0.05, hg.mat == MAT_LEAF);
-  let ao_term      = ao * ao * ao;
-  var ambient      = amb_col * amb_strength * ao_term;
+    let amb_col      = hemi_ambient(hg.n, sky_up);
+
+  // Much stronger baseline; leaves slightly higher.
+  let amb_strength = select(0.10, 0.13, hg.mat == MAT_LEAF);
+
+  // Do NOT square AO (it crushes the shadow side).
+  // If you want a curve, use a gentle power instead.
+  let ao_term = pow(clamp(ao, 0.0, 1.0), 1.0);
+
+  var ambient = amb_col * amb_strength * ao_term;
+
 
   if (hg.mat == MAT_STONE) {
     ambient *= vec3<f32>(0.92, 0.95, 1.05);
@@ -258,7 +265,8 @@ fn shade_hit(
     spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * sun_vis;
   }
 
-  let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * sun_vis * dapple;
+  let direct = SUN_COLOR * SUN_INTENSITY * (0.35 * diff + 0.65 * diff * diff) * sun_vis * dapple;
+
   let emissive = material_emission(hg.mat);
   return base * (ambient + direct) + 0.20 * spec_col + emissive;
 }
