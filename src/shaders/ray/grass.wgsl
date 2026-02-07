@@ -225,7 +225,17 @@ fn grass_sdf_normal_lod(
 ) -> vec3<f32> {
   // Mid/far: cheap approximation is good enough visually
   if (lod != 0u) {
-    return vec3<f32>(0.0, 1.0, 0.0);
+    // Approximate: "up" tilted by local wind direction (stable, cheap)
+    let vs = cam.voxel_params.x;
+    let top_y = cell_bmin_m.y + vs;
+
+    // pick a representative root in this cell (center)
+    let root = vec3<f32>(cell_bmin_m.x + 0.5 * vs, top_y, cell_bmin_m.z + 0.5 * vs);
+    let w = grass_wind_xz(root, time_s, strength);
+
+    // tilt amount tuned small
+    let tilt = 0.35;
+    return normalize(vec3<f32>(-w.x * tilt, 1.0, -w.y * tilt));
   }
 
   let e = 0.02 * cam.voxel_params.x;
