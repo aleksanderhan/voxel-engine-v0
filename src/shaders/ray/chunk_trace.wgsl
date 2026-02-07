@@ -1212,8 +1212,6 @@ fn trace_scene_voxels_candidates(
 
     if (best.hit != 0u && cell_enter >= best.t) { continue; }
 
-    if (chunk_heightfield_early_skip(ro, rd, cell_enter, cell_exit, ch, voxel_size)) { continue; }
-
     let chunk_coord = vec3<i32>(
       ch.origin.x / i32(cam.chunk_size),
       ch.origin.y / i32(cam.chunk_size),
@@ -1488,51 +1486,6 @@ fn colinfo_decode(e16: u32) -> ColInfo {
   }
   return ColInfo(true, y8, mat8);
 }
-
-fn chunk_heightfield_early_skip(
-  ro: vec3<f32>,
-  rd: vec3<f32>,
-  t_enter: f32,
-  t_exit: f32,
-  ch: ChunkMeta,
-  voxel_size: f32
-) -> bool {
-  if (ch.colinfo_base == INVALID_U32) { return false; }
-  if (rd.y >= 0.0) { return false; }
-
-  let y0 = ro.y + rd.y * t_enter;
-  let y1 = ro.y + rd.y * t_exit;
-  let seg_y_min = min(y0, y1);
-
-  let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * voxel_size;
-
-  let seg_len = max(t_exit - t_enter, 0.0);
-  let dt = seg_len * (1.0 / 3.0);
-
-  var found_candidate = false;
-  for (var i: u32 = 0u; i < 4u; i = i + 1u) {
-    let t = t_enter + f32(i) * dt;
-    let p = ro + rd * t;
-
-    let lx_f = (p.x - root_bmin.x) / voxel_size;
-    let lz_f = (p.z - root_bmin.z) / voxel_size;
-    let lx = clamp(i32(floor(lx_f)), 0, 63);
-    let lz = clamp(i32(floor(lz_f)), 0, 63);
-
-    let e16 = colinfo_entry_u16(ch.colinfo_base, u32(lx), u32(lz));
-    let ci = colinfo_decode(e16);
-    if (!ci.valid) { continue; }
-
-    let top_y = root_bmin.y + (f32(ci.y_vox) + 1.0) * voxel_size;
-    if (seg_y_min <= top_y + 1e-3 * voxel_size) {
-      found_candidate = true;
-      break;
-    }
-  }
-
-  return !found_candidate;
-}
-
 
 // Visit each (lx,lz) column crossed by [t0,t1] once (XZ DDA).
 // Calls try_grass_slab_hit at most once per visited column.
