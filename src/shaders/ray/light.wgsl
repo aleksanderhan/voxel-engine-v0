@@ -63,7 +63,8 @@ fn sphere_dir_local(i: u32, count: u32) -> vec3<f32> {
 // hitFlag = 1: hit a light voxel
 // hitFlag = 0: no light (either blocked by solid or ran out of steps)
 fn dda_hit_light(p0: vec3<f32>, dir: vec3<f32>, max_steps: u32, vs: f32) -> vec4<f32> {
-  var gpos = p0 / max(vs, 1e-6);
+  let ro_bias = p0 + dir * 1e-4;
+  var gpos = ro_bias / max(vs, 1e-6);
   var cell = vec3<i32>(floor(gpos));
 
   let d = dir;

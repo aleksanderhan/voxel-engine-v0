@@ -1046,7 +1046,8 @@ fn tile_append_candidates_for_ray(
 
   let nudge_p = PRIMARY_NUDGE_VOXEL_FRAC * voxel_size;
   let start_t = t_enter + nudge_p;
-  let p0      = ro + start_t * rd;
+  let ro_bias = ro + rd * 1e-4;
+  let p0      = ro_bias + start_t * rd;
 
   let c = chunk_coord_from_pos(p0, chunk_size_m);
 
@@ -1121,19 +1122,23 @@ fn tile_append_candidates_for_ray(
     }
 
     let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
-    let epsTie = 1e-6 * max(1.0, abs(tNextLocal));
 
-    if (abs(tMaxX - tNextLocal) <= epsTie) {
-      lcx += step_x; idx_i += didx_x;
-      tMaxX += tDeltaX;
-    }
-    if (abs(tMaxY - tNextLocal) <= epsTie) {
-      lcy += step_y; idx_i += didx_y;
-      tMaxY += tDeltaY;
-    }
-    if (abs(tMaxZ - tNextLocal) <= epsTie) {
-      lcz += step_z; idx_i += didx_z;
-      tMaxZ += tDeltaZ;
+    if (tMaxX < tMaxY) {
+      if (tMaxX < tMaxZ) {
+        lcx += step_x; idx_i += didx_x;
+        tMaxX += tDeltaX;
+      } else {
+        lcz += step_z; idx_i += didx_z;
+        tMaxZ += tDeltaZ;
+      }
+    } else {
+      if (tMaxY < tMaxZ) {
+        lcy += step_y; idx_i += didx_y;
+        tMaxY += tDeltaY;
+      } else {
+        lcz += step_z; idx_i += didx_z;
+        tMaxZ += tDeltaZ;
+      }
     }
 
     t_local = tNextLocal;
@@ -1300,7 +1305,8 @@ fn trace_scene_voxels_interval(
   // Nudge inside
   let nudge_p = PRIMARY_NUDGE_VOXEL_FRAC * voxel_size;
   let start_t = t_enter + nudge_p;
-  let p0      = ro + start_t * rd;
+  let ro_bias = ro + rd * 1e-4;
+  let p0      = ro_bias + start_t * rd;
 
   // Local chunk coords at start (camera-relative)
   let c = chunk_coord_from_pos(p0, chunk_size_m);
@@ -1434,21 +1440,22 @@ fn trace_scene_voxels_interval(
     }
 
 
-    // --- tie-aware DDA advance (prevents skipping on edges/corners) ---
-    let epsTie = 1e-6 * max(1.0, abs(tNextLocal));
-
-    // Step all axes that match tNextLocal
-    if (abs(tMaxX - tNextLocal) <= epsTie) {
-      lcx += step_x; idx_i += didx_x;
-      tMaxX += tDeltaX;
-    }
-    if (abs(tMaxY - tNextLocal) <= epsTie) {
-      lcy += step_y; idx_i += didx_y;
-      tMaxY += tDeltaY;
-    }
-    if (abs(tMaxZ - tNextLocal) <= epsTie) {
-      lcz += step_z; idx_i += didx_z;
-      tMaxZ += tDeltaZ;
+    if (tMaxX < tMaxY) {
+      if (tMaxX < tMaxZ) {
+        lcx += step_x; idx_i += didx_x;
+        tMaxX += tDeltaX;
+      } else {
+        lcz += step_z; idx_i += didx_z;
+        tMaxZ += tDeltaZ;
+      }
+    } else {
+      if (tMaxY < tMaxZ) {
+        lcy += step_y; idx_i += didx_y;
+        tMaxY += tDeltaY;
+      } else {
+        lcz += step_z; idx_i += didx_z;
+        tMaxZ += tDeltaZ;
+      }
     }
 
     t_local = tNextLocal;
@@ -1638,7 +1645,8 @@ fn probe_grass_columns_xz_dda(
   var t = t0 + eps;
   if (t > t1) { t = t0; }
 
-  var p = ro + rd * t;
+  let ro_bias = ro + rd * 1e-4;
+  var p = ro_bias + rd * t;
 
   // Local voxel coords in chunk (floating)
   var lx_f = (p.x - root_bmin.x) / vs;
@@ -1741,13 +1749,11 @@ fn probe_grass_columns_xz_dda(
 
     // Step across whichever boundary is hit first
     let tStep = min(tMaxX, tMaxZ);
-    let epsTie = 1e-6 * max(1.0, abs(tStep));
 
-    if (abs(tMaxX - tStep) <= epsTie) {
+    if (tMaxX < tMaxZ) {
       lx += stepX;
       tMaxX += tDeltaX;
-    }
-    if (abs(tMaxZ - tStep) <= epsTie) {
+    } else {
       lz += stepZ;
       tMaxZ += tDeltaZ;
     }

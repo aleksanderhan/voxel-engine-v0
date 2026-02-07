@@ -109,7 +109,8 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   if (t_exit < t_enter) { return 1.0; }
 
   let start_t = t_enter + nudge_s;
-  let p0 = ro + start_t * rd;
+  let ro_bias = ro + rd * 1e-4;
+  let p0 = ro_bias + start_t * rd;
 
   var t_local: f32 = 0.0;
   let t_exit_local = max(t_exit - start_t, 0.0);
