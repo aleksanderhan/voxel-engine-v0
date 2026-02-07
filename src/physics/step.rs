@@ -1,7 +1,5 @@
 // src/physics/step.rs
 use glam::Vec3;
-use rayon::prelude::*;
-
 use crate::app::InputState;
 
 use super::{
@@ -245,5 +243,4 @@ impl Physics {
     }
 
 }
-
 

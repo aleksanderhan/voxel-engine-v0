@@ -9,27 +9,8 @@ use crate::{
     streaming::types::*,
 };
 
-use super::{ground, keep};
+use super::keep;
 use super::ChunkManager;
-
-#[inline(always)]
-fn y_band_min_dyn(mgr: &ChunkManager) -> i32 {
-    if mgr.build.cam_below_ground { GRID_Y_MIN_DY } else { 0 }
-}
-
-#[inline(always)]
-fn y_band_max_dyn(_mgr: &ChunkManager) -> i32 {
-    GRID_Y_MIN_DY + GRID_Y_COUNT as i32 - 1
-}
-
-#[inline(always)]
-pub fn is_gpu_ready(mgr: &ChunkManager, k: ChunkKey) -> bool {
-    match mgr.build.chunks.get(&k) {
-        Some(ChunkState::Resident(_)) => true,
-        Some(ChunkState::Uploading(up)) => up.uploaded,
-        _ => false,
-    }
-}
 
 #[inline]
 fn cancel_token(mgr: &mut ChunkManager, key: ChunkKey) -> Arc<AtomicBool> {
@@ -637,7 +618,7 @@ pub fn replace_chunk_contents(
     );
 
     // Decide allocation strategy FIRST (so we don't partially mutate state on failure).
-    let (node_base, alloc_cap, pad_to_cap) = if need <= old_cap {
+    let (node_base, alloc_cap, _pad_to_cap) = if need <= old_cap {
         // Reuse old allocation. Keep capacity as old_cap to avoid leaking arena space.
         (old_base, old_cap, true)
     } else {

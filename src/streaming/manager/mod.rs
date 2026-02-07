@@ -209,7 +209,6 @@ impl ChunkManager {
             let cam_vz = (cam_pos_m.z / config::VOXEL_SIZE_M_F32).floor() as i32;
 
             let cs = config::CHUNK_SIZE as i32;
-            let half = cs / 2;
 
             let ccx = cam_vx.div_euclid(cs);
             let ccz = cam_vz.div_euclid(cs);
@@ -301,10 +300,6 @@ impl ChunkManager {
     pub fn grid_origin(&self) -> [i32; 3] { self.grid.grid_origin_chunk }
     pub fn grid_dims(&self) -> [u32; 3] { self.grid.grid_dims }
     pub fn chunk_grid(&self) -> &[u32] { &self.grid.chunk_grid }
-
-    pub fn take_uploads(&mut self) -> Vec<ChunkUpload> {
-        uploads::take_all(self)
-    }
 
     pub fn take_uploads_budgeted(&mut self) -> Vec<ChunkUpload> {
         uploads::take_budgeted(self)
@@ -445,4 +440,3 @@ impl StreamTimingWindow {
         std::mem::take(self)
     }
 }
-

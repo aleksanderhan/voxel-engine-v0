@@ -15,11 +15,9 @@ pub struct WorldGen {
 
     // Caves:
     // - cave_a + cave_b: two independent fields; tunnels are their intersection (AND)
-    // - cave_warp: domain warp for twist
     // - cave_room: low-frequency modulation for chambers
     cave_a: Fbm<Perlin>,
     cave_b: Fbm<Perlin>,
-    cave_warp: Fbm<Perlin>,
 
     // 2.5D tunnel shaping:
     cave_level: Fbm<Perlin>,
@@ -39,9 +37,6 @@ impl WorldGen {
         let cave_a = Fbm::<Perlin>::new(seed ^ 0xB4B4_B4B4).set_octaves(4).set_frequency(0.135);
         let cave_b = Fbm::<Perlin>::new(seed ^ 0xD1D1_D1D1).set_octaves(4).set_frequency(0.148);
 
-        // Warp: keep twist but prevent cavern blow-ups.
-        let cave_warp = Fbm::<Perlin>::new(seed ^ 0xC3C3_C3C3).set_octaves(2).set_frequency(0.030);
-
         // 2.5D tunnel layer controls:
         // Low frequency => long meanders and stable “tunnel layer” depth.
         let cave_level = Fbm::<Perlin>::new(seed ^ 0x9C9C_9C9C).set_octaves(2).set_frequency(0.010);
@@ -56,7 +51,6 @@ impl WorldGen {
             detail,
             cave_a,
             cave_b,
-            cave_warp,
             cave_level,
             cave_warp2,
             voxels_per_meter,
@@ -432,4 +426,3 @@ impl WorldGen {
     }
 
 }
-

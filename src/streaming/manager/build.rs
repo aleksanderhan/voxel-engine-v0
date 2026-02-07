@@ -9,7 +9,7 @@ use std::time::Instant;
 use crossbeam_channel::TrySendError;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use glam::{Vec2, Vec3};
+use glam::Vec3;
 
 use crate::streaming::types::*;
 use crate::{render::gpu_types::{NodeGpu, NodeRopesGpu}};
@@ -103,8 +103,6 @@ pub fn enqueue_active_ring(mgr: &mut ChunkManager, center: ChunkKey) {
         let z = center.z + dz;
 
         // Outside priority radius: only consider columns that are in the 360° PVS.
-        let ddx = x - center.x;
-        let ddz = z - center.z;
         let ar = config::ACTIVE_RADIUS;
         if dx*dx + dz*dz > ar*ar {
             if !super::visibility::column_visible(mgr, x, z) {
@@ -632,4 +630,3 @@ pub fn request_edit_refresh(mgr: &mut ChunkManager, key: ChunkKey) {
         }
     }
 }
-

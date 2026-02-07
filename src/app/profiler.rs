@@ -167,13 +167,6 @@ impl FrameProf {
         }
     }
     #[inline]
-    pub fn poll(&mut self, ms: f64) {
-        if self.enabled {
-            self.t_poll += ms;
-        }
-    }
-
-    #[inline]
     pub fn present(&mut self, ms: f64) {
         if self.enabled {
             self.t_present += ms;
