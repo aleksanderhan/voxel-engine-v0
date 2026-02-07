@@ -244,19 +244,26 @@ fn grass_sdf_lod(
       let pa = root + vec3<f32>(offa.x, ya, offa.y);
       let pb = root + vec3<f32>(offb.x, yb, offb.y);
 
-      // taper to tip (but keep tips not needle-thin => “thick lush”)
-      let taper = mix(1.0, max(GRASS_VOXEL_TAPER, 0.55), 0.5 * (t01a + t01b));
-      let r = r0 * taper;
+      // --- taper to a point ---
+      // t in [0..1], 0=base, 1=tip
+      let tmid = 0.5 * (t01a + t01b);
 
-      // --- flat blade profile ---
-      // half-width (across blade)
+      // Nonlinear taper so most narrowing happens near the top.
+      // k bigger => pointier. Try 2.0..4.0.
+      let k = 3.0;
+      let taper_shape = pow(clamp(1.0 - tmid, 0.0, 1.0), k);
+
+      // Treat GRASS_VOXEL_TAPER as *minimum tip fraction* (set it small, e.g. 0.08..0.20)
+      let taper = mix(GRASS_VOXEL_TAPER, 1.0, taper_shape);
+
+      // --- flat blade profile (width tapers hard, thickness follows) ---
       let half_w = r0 * taper;
 
-      // half-thickness (paper-thin, but not zero)
-      let half_t = max(0.12 * half_w, 0.02 * vs * 0.25);
+      // keep some thickness so it doesn't disappear / alias too hard
+      let half_t = max(0.10 * half_w, 0.01 * vs);
 
-      // subtle rounding on edges (keeps it from aliasing like a perfect plane)
-      let edge_r = 0.20 * half_t;
+      // edge rounding scales down with thickness
+      let edge_r = 0.35 * half_t;
 
       // stable per-blade side axis (twist-ish). Use lean_dir + wind to vary orientation.
       let side_hint = normalize(vec3<f32>(lean_dir.x + 0.35 * w_xz.x, 0.15, lean_dir.y + 0.35 * w_xz.y));

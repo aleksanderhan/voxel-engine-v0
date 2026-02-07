@@ -304,7 +304,7 @@ const GRASS_STEP_MIN_VOX          : f32 = 0.03;
 
 const GRASS_VOXEL_SEGS            : f32 = 3.0;
 const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.08;
-const GRASS_VOXEL_TAPER           : f32 = 0.70;
+const GRASS_VOXEL_TAPER           : f32 = 0.12; // 0.08..0.20 gives a visible point
 const GRASS_OVERHANG_VOX          : f32 = 0.20;
 
 const GRASS_LOD_MID_START : f32 = 15.0;
