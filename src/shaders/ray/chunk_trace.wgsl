@@ -597,7 +597,8 @@ fn trace_chunk_interval_stream_macro(
   t0_in: f32,
   t1_in: f32,
   use_anchor: bool,
-  anchor_key_in: u32
+  anchor_key_in: u32,
+  grass_seed: u32
 ) -> ChunkTraceResult {
   let vs = cam.voxel_params.x;
 
@@ -613,13 +614,13 @@ fn trace_chunk_interval_stream_macro(
   var anchor_valid = use_anchor;
 
   if (ch.macro_base == INVALID_U32) {
-    let h = trace_chunk_rope_interval(ro, rd, inv, ch, tcur, t_end, anchor_valid, anchor_key);
+    let h = trace_chunk_rope_interval(ro, rd, inv, ch, tcur, t_end, anchor_valid, anchor_key, grass_seed);
     return h;
   }
 
   var ms = macro_dda_init(ro, rd, inv, tcur, root_bmin, root_size, ch.macro_base);
   if (!ms.enabled) {
-    let h = trace_chunk_rope_interval(ro, rd, inv, ch, tcur, t_end, anchor_valid, anchor_key);
+    let h = trace_chunk_rope_interval(ro, rd, inv, ch, tcur, t_end, anchor_valid, anchor_key, grass_seed);
     return h;
   }
 
@@ -639,7 +640,17 @@ fn trace_chunk_interval_stream_macro(
       continue;
     }
 
-    let h = trace_chunk_rope_interval_nomacro(ro, rd, inv, ch, tcur, t_cell_exit, anchor_valid, anchor_key);
+    let h = trace_chunk_rope_interval_nomacro(
+      ro,
+      rd,
+      inv,
+      ch,
+      tcur,
+      t_cell_exit,
+      anchor_valid,
+      anchor_key,
+      grass_seed
+    );
 
     if (h.hit.hit != 0u) {
       return h;
@@ -663,7 +674,8 @@ fn trace_chunk_rope_interval_nomacro(
   t_enter: f32,
   t_exit: f32,
   use_anchor: bool,
-  anchor_key: u32
+  anchor_key: u32,
+  grass_seed: u32
 ) -> ChunkTraceResult {
   let vs = cam.voxel_params.x;
 
@@ -731,33 +743,38 @@ fn trace_chunk_rope_interval_nomacro(
         grass_leaf_limit = cam.voxel_params.x;     // mid: only probe 1-voxel leaves
       }
 
-      if (ENABLE_GRASS && lod_probe != 2u && leaf.size <= grass_leaf_limit) {
-        let t0_probe = max(t_enter, tcur - eps_step);
-        let t1_probe = min(t_leave, t_exit);
+      if (ENABLE_GRASS && ch.colinfo_base != INVALID_U32 && lod_probe != 2u && leaf.size <= grass_leaf_limit) {
+        let grass_ok = grass_allowed_primary(tcur, vec3<f32>(0.0, 1.0, 0.0), grass_seed);
+        if (!grass_ok) {
+          // Skip grass entirely in primary pass (subsampled)
+        } else {
+          let t0_probe = max(t_enter, tcur - eps_step);
+          let t1_probe = min(t_leave, t_exit);
 
-        if (t1_probe >= t0_probe) {
-          let gh = probe_grass_columns_xz_dda(
-            ro, rd, inv,
-            t0_probe, t1_probe,
-            root_bmin,
-            origin_vox_i,
-            vs,
-            ch.colinfo_base,
-            time_s,
-            strength
-          );
+          if (t1_probe >= t0_probe) {
+            let gh = probe_grass_columns_xz_dda(
+              ro, rd, inv,
+              t0_probe, t1_probe,
+              root_bmin,
+              origin_vox_i,
+              vs,
+              ch.colinfo_base,
+              time_s,
+              strength
+            );
 
-          if (gh.hit) {
-            var outg = miss_hitgeom();
-            outg.hit = 1u;
-            outg.t   = gh.t;
-            outg.mat = MAT_GRASS;
-            outg.n   = gh.n;
-            outg.root_bmin  = root_bmin;
-            outg.root_size  = root_size;
-            outg.node_base  = ch.node_base;
-            outg.macro_base = ch.macro_base;
-            return ChunkTraceResult(outg, anchor_node.valid, anchor_node.key);
+            if (gh.hit) {
+              var outg = miss_hitgeom();
+              outg.hit = 1u;
+              outg.t   = gh.t;
+              outg.mat = MAT_GRASS;
+              outg.n   = gh.n;
+              outg.root_bmin  = root_bmin;
+              outg.root_size  = root_size;
+              outg.node_base  = ch.node_base;
+              outg.macro_base = ch.macro_base;
+              return ChunkTraceResult(outg, anchor_node.valid, anchor_node.key);
+            }
           }
         }
       }
@@ -931,7 +948,8 @@ fn trace_chunk_rope_interval(
   t_enter: f32,
   t_exit: f32,
   use_anchor: bool,
-  anchor_key: u32
+  anchor_key: u32,
+  grass_seed: u32
 ) -> ChunkTraceResult {
   return trace_chunk_rope_interval_nomacro(
     ro,
@@ -941,7 +959,8 @@ fn trace_chunk_rope_interval(
     t_enter,
     t_exit,
     use_anchor,
-    anchor_key
+    anchor_key,
+    grass_seed
   );
 }
 
@@ -965,10 +984,24 @@ fn chunk_coords_neighbor(a: vec3<i32>, b: vec3<i32>) -> bool {
   return (dx <= 1 && dy <= 1 && dz <= 1);
 }
 
-fn tile_add_candidate(slot: u32) {
+fn tile_add_candidate(slot: u32, cell_enter: f32) {
+  if (slot < cam.chunk_count) {
+    let ch = chunks[slot];
+    if (ch.macro_empty != 0u) { return; }
+  }
+
+  let count = atomicLoad(&WG_TILE_COUNT);
+  for (var i: u32 = 0u; i < count && i < MAX_TILE_CHUNKS; i = i + 1u) {
+    if (WG_TILE_SLOTS[i] == slot) {
+      WG_TILE_ENTER[i] = min(WG_TILE_ENTER[i], cell_enter);
+      return;
+    }
+  }
+
   let idx = atomicAdd(&WG_TILE_COUNT, 1u);
   if (idx < MAX_TILE_CHUNKS) {
     WG_TILE_SLOTS[idx] = slot;
+    WG_TILE_ENTER[idx] = cell_enter;
   }
 }
 
@@ -1072,7 +1105,7 @@ fn tile_append_candidates_for_ray(
 
     let slot = chunk_grid[u32(idx_i)];
     if (slot != INVALID_U32 && slot < cam.chunk_count) {
-      tile_add_candidate(slot);
+      tile_add_candidate(slot, start_t + t_local);
     }
 
     let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
@@ -1097,6 +1130,30 @@ fn tile_append_candidates_for_ray(
   }
 }
 
+fn tile_sort_candidates_by_enter(count: u32) {
+  if (count <= 1u) { return; }
+  let limit = min(count, PRIMARY_MAX_TILE_CHUNKS);
+  if (limit <= 1u) { return; }
+  for (var i: u32 = 0u; i + 1u < limit; i = i + 1u) {
+    var min_idx = i;
+    var min_t = WG_TILE_ENTER[i];
+    for (var j: u32 = i + 1u; j < limit; j = j + 1u) {
+      if (WG_TILE_ENTER[j] < min_t) {
+        min_t = WG_TILE_ENTER[j];
+        min_idx = j;
+      }
+    }
+    if (min_idx != i) {
+      let tmp_slot = WG_TILE_SLOTS[i];
+      let tmp_t = WG_TILE_ENTER[i];
+      WG_TILE_SLOTS[i] = WG_TILE_SLOTS[min_idx];
+      WG_TILE_ENTER[i] = WG_TILE_ENTER[min_idx];
+      WG_TILE_SLOTS[min_idx] = tmp_slot;
+      WG_TILE_ENTER[min_idx] = tmp_t;
+    }
+  }
+}
+
 fn trace_scene_voxels_candidates(
   ro: vec3<f32>,
   rd: vec3<f32>,
@@ -1105,7 +1162,8 @@ fn trace_scene_voxels_candidates(
   anchor_valid_in: bool,
   anchor_chunk_in: vec3<i32>,
   anchor_key_in: u32,
-  candidate_count: u32
+  candidate_count: u32,
+  grass_seed: u32
 ) -> VoxTraceResult {
   if (cam.chunk_count == 0u) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
@@ -1170,7 +1228,8 @@ fn trace_scene_voxels_candidates(
       cell_enter,
       cell_exit,
       use_anchor,
-      anchor_key_use
+      anchor_key_use,
+      grass_seed
     );
     if (h.hit.hit != 0u && h.hit.t < best.t) {
       best = h.hit;
@@ -1190,7 +1249,8 @@ fn trace_scene_voxels_interval(
   t_max: f32,
   anchor_valid_in: bool,
   anchor_chunk_in: vec3<i32>,
-  anchor_key_in: u32
+  anchor_key_in: u32,
+  grass_seed: u32
 ) -> VoxTraceResult {
   if (cam.chunk_count == 0u) {
     return VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
@@ -1333,7 +1393,8 @@ fn trace_scene_voxels_interval(
           cell_enter,
           cell_exit,
           use_anchor,
-          anchor_key_use
+          anchor_key_use,
+          grass_seed
         );
         if (h.hit.hit != 0u && h.hit.t < best.t) {
           best = h.hit;
@@ -1381,7 +1442,16 @@ fn trace_scene_voxels_interval(
 }
 
 fn trace_scene_voxels(ro: vec3<f32>, rd: vec3<f32>) -> VoxTraceResult {
-  return trace_scene_voxels_interval(ro, rd, 0.0, FOG_MAX_DIST, false, vec3<i32>(0), INVALID_U32);
+  return trace_scene_voxels_interval(
+    ro,
+    rd,
+    0.0,
+    FOG_MAX_DIST,
+    false,
+    vec3<i32>(0),
+    INVALID_U32,
+    0u
+  );
 }
 
 // --------------------------------------------------------------------------
@@ -1416,7 +1486,6 @@ fn colinfo_decode(e16: u32) -> ColInfo {
   }
   return ColInfo(true, y8, mat8);
 }
-
 
 // Visit each (lx,lz) column crossed by [t0,t1] once (XZ DDA).
 // Calls try_grass_slab_hit at most once per visited column.

@@ -409,9 +409,11 @@ const MACRO_DIM : u32 = 8u;              // 8x8x8 macro cells per chunk
 const MACRO_WORDS_PER_CHUNK : u32 = 16u; // 512 bits / 32
 const TILE_SIZE: u32 = 8u;
 const MAX_TILE_CHUNKS: u32 = 512u;
+const PRIMARY_MAX_TILE_CHUNKS: u32 = MAX_TILE_CHUNKS;
 
 var<workgroup> WG_TILE_COUNT : atomic<u32>;
 var<workgroup> WG_TILE_SLOTS : array<u32, MAX_TILE_CHUNKS>;
+var<workgroup> WG_TILE_ENTER : array<f32, MAX_TILE_CHUNKS>;
 
 fn macro_cell_size(root_size: f32) -> f32 {
   return root_size / f32(MACRO_DIM);
