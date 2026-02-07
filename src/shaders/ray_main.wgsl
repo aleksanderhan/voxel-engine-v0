@@ -88,24 +88,22 @@ fn main_primary(
       );
       let ro_tile = cam.cam_pos.xyz;
 
+      // Two candidate rays per tile to stabilize distant voxel selection.
       var px = tile_base + vec2<f32>(4.5, 4.5);
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-
-      px = tile_base + vec2<f32>(0.5, 0.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-      px = tile_base + vec2<f32>(7.5, 0.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-      px = tile_base + vec2<f32>(0.5, 7.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-      px = tile_base + vec2<f32>(7.5, 7.5);
+      px = tile_base + vec2<f32>(1.5, 1.5);
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
     }
-    WG_TILE_COUNT_CACHED = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
+    let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
+    tile_sort_candidates_by_enter(raw_count);
+    WG_TILE_COUNT_CACHED = min(raw_count, PRIMARY_MAX_TILE_CHUNKS);
   }
   workgroupBarrier();
 
   let res = vec2<f32>(f32(dims.x), f32(dims.y));
   let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+  let frame = cam.frame_index;
+  let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
 
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px);
@@ -127,8 +125,6 @@ fn main_primary(
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      let frame = cam.frame_index;
-      let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let sky_bg_rd = sky_bg(rd);
@@ -208,7 +204,8 @@ fn main_primary(
         hist_anchor_key != INVALID_U32,
         hist_anchor_coord,
         hist_anchor_key,
-        tile_candidate_count
+        tile_candidate_count,
+        seed
       );
       if (vt_hint.best.hit != 0u) {
         vt = vt_hint;
@@ -224,7 +221,8 @@ fn main_primary(
         false,
         vec3<i32>(0),
         INVALID_U32,
-        tile_candidate_count
+        tile_candidate_count,
+        seed
       );
     }
   }
@@ -234,8 +232,6 @@ fn main_primary(
     let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      let frame = cam.frame_index;
-      let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let sky_bg_rd = sky_bg(rd);
@@ -263,9 +259,6 @@ fn main_primary(
   if (vt.best.hit != 0u) {
     let hp = ro + vt.best.t * rd;
     let hp_shadow = hp + vt.best.n * (0.75 * cam.voxel_params.x);
-
-    let frame = cam.frame_index;
-    let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
 
     let shadow_do = (seed & SHADOW_SUBSAMPLE_MASK) == 0u;
     if (shadow_do) {
@@ -325,8 +318,6 @@ fn main_primary(
   let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
   if (hf.hit) {
-    let frame = cam.frame_index;
-    let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
     let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
     let t_scene = min(hf.t, FOG_MAX_DIST);
     let sky_bg_rd = sky_bg(rd);
