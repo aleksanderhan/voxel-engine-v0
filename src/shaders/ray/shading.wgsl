@@ -116,6 +116,44 @@ fn fresnel_schlick(ndv: f32, f0: f32) -> f32 {
   return f0 + (1.0 - f0) * pow(1.0 - clamp(ndv, 0.0, 1.0), 5.0);
 }
 
+fn wrap_lambert(ndl: f32, wrap: f32) -> f32 {
+  return clamp((ndl + wrap) / (1.0 + wrap), 0.0, 1.0);
+}
+
+fn foliage_direct_sun(
+  mat: u32,
+  n: vec3<f32>,
+  rd: vec3<f32>,
+  shadow: f32
+) -> vec3<f32> {
+  let l = SUN_DIR;
+
+  let ndl_raw = dot(n, l);
+  let ndl = max(ndl_raw, 0.0);
+  let bdl = max(dot(-n, l), 0.0);
+
+  let wrap = 0.35;
+  let trans_strength =
+    select(0.0,
+      select(GRASS_LIGHT_TRANSMIT, LEAF_LIGHT_TRANSMIT, mat == MAT_LEAF),
+      (mat == MAT_LEAF) || (mat == MAT_GRASS)
+    );
+
+  let v_sun = clamp(dot(rd, l), 0.0, 1.0);
+  let trans_view_boost = mix(0.85, 1.25, smoothstep(0.0, 0.6, v_sun));
+
+  let front = wrap_lambert(ndl, wrap);
+
+  let shadow_t = max(shadow, MIN_TRANS);
+
+  let sun = SUN_COLOR * SUN_INTENSITY;
+
+  let direct_front = sun * front * shadow;
+  let direct_back = sun * (trans_strength * trans_view_boost) * bdl * shadow_t;
+
+  return direct_front + direct_back;
+}
+
 fn material_roughness(mat: u32) -> f32 {
   if (mat == MAT_STONE) { return 0.45; }
   if (mat == MAT_WOOD)  { return 0.70; }
@@ -258,7 +296,11 @@ fn shade_hit(
     spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * sun_vis;
   }
 
-  let direct   = SUN_COLOR * SUN_INTENSITY * (diff * diff) * sun_vis * dapple;
+  var direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * sun_vis;
+  if (hg.mat == MAT_LEAF || hg.mat == MAT_GRASS) {
+    direct = foliage_direct_sun(hg.mat, hg.n, rd, sun_vis);
+  }
+  direct *= dapple;
   let emissive = material_emission(hg.mat);
   return base * (ambient + direct) + 0.20 * spec_col + emissive;
 }
@@ -305,7 +347,10 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
   let amb_strength = 0.10;
   let ambient      = amb_col * amb_strength * ao;
 
-  let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis;
+  var direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis;
+  if (ch.mat == MAT_GRASS) {
+    direct = foliage_direct_sun(ch.mat, ch.n, rd, vis);
+  }
 
   var spec_col = vec3<f32>(0.0);
   if (ch.t <= FAR_SHADING_DIST) {
