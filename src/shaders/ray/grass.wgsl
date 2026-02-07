@@ -57,6 +57,64 @@ fn sdf_capsule(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r: f32) -> f32 {
   return length(pa - ba * h) - r;
 }
 
+fn make_orthonormal_basis(n: vec3<f32>) -> mat3x3<f32> {
+  // n becomes Y axis in this basis; returns columns (x,y,z)
+  let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.999);
+  let x = normalize(cross(up, n));
+  let z = cross(n, x);
+  return mat3x3<f32>(x, n, z);
+}
+
+// distance to a "rounded rectangle" in 2D (Inigo Quilez style)
+fn sd_round_rect_2d(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
+  let q = abs(p) - b;
+  return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+// A flat blade segment: closest point on segment, then distance in the segment's local frame
+// width = half-width (flat axis), thick = half-thickness (thin axis), edge_r = rounding
+fn sdf_blade_segment(
+  p: vec3<f32>,
+  a: vec3<f32>,
+  b: vec3<f32>,
+  width: f32,
+  thick: f32,
+  edge_r: f32,
+  // stable per-blade "side" axis orientation control
+  side_hint: vec3<f32>
+) -> f32 {
+  let ab = b - a;
+  let ab2 = max(dot(ab, ab), 1e-6);
+  let t = clamp(dot(p - a, ab) / ab2, 0.0, 1.0);
+  let c = a + ab * t;
+
+  let T = normalize(ab);
+
+  // Build a stable frame: choose side axis from side_hint, made orthogonal to T.
+  var S = side_hint - T * dot(side_hint, T);
+  let s2 = dot(S, S);
+  if (s2 < 1e-6) {
+    // fallback if hint is parallel to tangent
+    let B = make_orthonormal_basis(T);
+    S = B[0]; // X axis
+  } else {
+    S = S * inversesqrt(s2);
+  }
+  let N = cross(T, S); // thin axis (normal to blade face), orthonormal
+
+  let d = p - c;
+
+  // local coords around the segment centerline
+  let x = dot(d, S); // across blade width
+  let y = dot(d, N); // blade thickness direction
+
+  // We want a slab around the segment, so clamp z into segment half-length implicitly
+  // Using closest point already handles along-segment distance -> z ~= 0 at closest.
+  // Now do a rounded-rect in (x,y) and combine with a small rounding.
+  let rr = max(edge_r, 0.0);
+  return sd_round_rect_2d(vec2<f32>(x, y), vec2<f32>(width - rr, thick - rr), rr);
+}
+
 fn grass_primary_rate_mask(rd: vec3<f32>) -> u32 {
   // abs(rd.y) ~ 1 => looking vertical (top-down/up)
   // abs(rd.y) ~ 0 => looking horizontal (side-on)
@@ -205,7 +263,20 @@ fn grass_sdf_lod(
       let taper = mix(1.0, max(GRASS_VOXEL_TAPER, 0.55), 0.5 * (t01a + t01b));
       let r = r0 * taper;
 
-      dmin = min(dmin, sdf_capsule(p_m, pa, pb, r));
+      // --- flat blade profile ---
+      // half-width (across blade)
+      let half_w = r0 * taper;
+
+      // half-thickness (paper-thin, but not zero)
+      let half_t = max(0.12 * half_w, 0.02 * vs * 0.25);
+
+      // subtle rounding on edges (keeps it from aliasing like a perfect plane)
+      let edge_r = 0.20 * half_t;
+
+      // stable per-blade side axis (twist-ish). Use lean_dir + wind to vary orientation.
+      let side_hint = normalize(vec3<f32>(lean_dir.x + 0.35 * w_xz.x, 0.15, lean_dir.y + 0.35 * w_xz.y));
+
+      dmin = min(dmin, sdf_blade_segment(p_m, pa, pb, half_w, half_t, edge_r, side_hint));
     }
   }
 
