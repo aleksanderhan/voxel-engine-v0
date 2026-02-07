@@ -319,12 +319,6 @@ const GRASS_SEGS_FAR : u32 = 1u;
 const GRASS_TRACE_STEPS_MID : u32 = 6u;
 const GRASS_TRACE_STEPS_FAR : u32 = 2u;
 
-// Primary-pass grass gating (tune these)
-const GRASS_PRIMARY_MAX_DIST : f32 = 20.0; // meters-ish
-const GRASS_PRIMARY_MIN_NY   : f32 = 0.60; // only fairly upward normals
-const GRASS_PRIMARY_RATE_MASK: u32 = 0u;  // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
-
-
 // Misc
 const ALBEDO_VAR_GAIN = 3.5;
 

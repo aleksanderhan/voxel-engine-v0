@@ -115,21 +115,6 @@ fn sdf_blade_segment(
   return sd_round_rect_2d(vec2<f32>(x, y), vec2<f32>(width - rr, thick - rr), rr);
 }
 
-fn grass_primary_rate_mask(rd: vec3<f32>) -> u32 {
-  // abs(rd.y) ~ 1 => looking vertical (top-down/up)
-  // abs(rd.y) ~ 0 => looking horizontal (side-on)
-  let ay = abs(rd.y);
-
-  // Side-on: no subsampling (full coverage)
-  if (ay < 0.25) { return 0u; }   // 1/1
-
-  // Oblique: light subsampling
-  if (ay < 0.55) { return 3u; }   // 1/4
-
-  // Mostly vertical: heavier subsampling
-  return GRASS_PRIMARY_RATE_MASK; // e.g. 1/16 if mask=15
-}
-
 fn grass_root_uv(cell_id_vox: vec3<f32>, i: u32) -> vec2<f32> {
   let fi = f32(i);
   let u = hash31(cell_id_vox + vec3<f32>(fi, 0.0, 0.0));
@@ -439,13 +424,6 @@ fn grass_lod_from_t(t: f32) -> u32 {
   return 0u;
 }
 
-fn grass_allowed_primary(t: f32, n: vec3<f32>, rd: vec3<f32>, seed: u32) -> bool {
-  if (!ENABLE_GRASS) { return false; }
-  if (t > GRASS_PRIMARY_MAX_DIST) { return false; }
-  if (n.y < GRASS_PRIMARY_MIN_NY) { return false; }
-
-  let mask = grass_primary_rate_mask(rd);
-  if ((seed & mask) != 0u) { return false; }
-
-  return true;
+fn grass_allowed_primary(_t: f32, _n: vec3<f32>, _rd: vec3<f32>, _seed: u32) -> bool {
+  return ENABLE_GRASS;
 }

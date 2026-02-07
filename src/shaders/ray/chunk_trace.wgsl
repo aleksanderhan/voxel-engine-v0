@@ -744,37 +744,32 @@ fn trace_chunk_rope_interval_nomacro(
       }
 
       if (ENABLE_GRASS && lod_probe != 2u && leaf.size <= grass_leaf_limit) {
-        let grass_ok = grass_allowed_primary(tcur, vec3<f32>(0.0, 1.0, 0.0), rd, grass_seed);
-        if (!grass_ok) {
-          // Skip grass entirely in primary pass (subsampled)
-        } else {
-          let t0_probe = max(t_enter, tcur - eps_step);
-          let t1_probe = min(t_leave, t_exit);
+        let t0_probe = max(t_enter, tcur - eps_step);
+        let t1_probe = min(t_leave, t_exit);
 
-          if (t1_probe >= t0_probe) {
-            let gh = probe_grass_columns_xz_dda(
-              ro, rd, inv,
-              t0_probe, t1_probe,
-              root_bmin,
-              origin_vox_i,
-              vs,
-              ch.colinfo_base,
-              time_s,
-              strength
-            );
+        if (t1_probe >= t0_probe) {
+          let gh = probe_grass_columns_xz_dda(
+            ro, rd, inv,
+            t0_probe, t1_probe,
+            root_bmin,
+            origin_vox_i,
+            vs,
+            ch.colinfo_base,
+            time_s,
+            strength
+          );
 
-            if (gh.hit) {
-              var outg = miss_hitgeom();
-              outg.hit = 1u;
-              outg.t   = gh.t;
-              outg.mat = MAT_GRASS;
-              outg.n   = gh.n;
-              outg.root_bmin  = root_bmin;
-              outg.root_size  = root_size;
-              outg.node_base  = ch.node_base;
-              outg.macro_base = ch.macro_base;
-              return ChunkTraceResult(outg, anchor_node.valid, anchor_node.key);
-            }
+          if (gh.hit) {
+            var outg = miss_hitgeom();
+            outg.hit = 1u;
+            outg.t   = gh.t;
+            outg.mat = MAT_GRASS;
+            outg.n   = gh.n;
+            outg.root_bmin  = root_bmin;
+            outg.root_size  = root_size;
+            outg.node_base  = ch.node_base;
+            outg.macro_base = ch.macro_base;
+            return ChunkTraceResult(outg, anchor_node.valid, anchor_node.key);
           }
         }
       }
