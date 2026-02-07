@@ -196,7 +196,7 @@ fn shade_hit(
 
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
-    if (ENABLE_GRASS && grass_allowed_primary(hg.t, hg.n, seed)) {
+    if (ENABLE_GRASS && grass_allowed_primary(hg.t, hg.n, seed, rd)) {
       let vs  = cam.voxel_params.x;
       let tip = clamp(fract(hp.y / max(vs, 1e-6)), 0.0, 1.0);
 
@@ -282,7 +282,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
 
   // AO-lite for terrain: gate hard for grass in primary
   var ao = 1.0;
-  if (ch.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(ch.t, ch.n, seed) && ch.t <= FAR_SHADING_DIST) {
+  if (ch.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(ch.t, ch.n, seed, rd) && ch.t <= FAR_SHADING_DIST) {
     let lvl  = clip_best_level(hp.xz, 2);
     let cell = clip.level[lvl].z;
 

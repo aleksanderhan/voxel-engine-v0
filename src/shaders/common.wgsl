@@ -81,7 +81,7 @@ const GODRAY_KNEE_COMPOSITE : f32 = 0.25;
 //// --------------------------------------------------------------------------
 
 const FOG_HEIGHT_FALLOFF : f32 = 0.18;
-const FOG_MAX_DIST       : f32 = 120.0;
+const FOG_MAX_DIST       : f32 = 90.0;
 
 const FOG_PRIMARY_SCALE : f32 = 0.02;
 const FOG_GODRAY_SCALE  : f32 = 1.0;
@@ -241,8 +241,8 @@ const POST_EXPOSURE : f32 = 0.15;
 const CLIP_LEVELS_MAX : u32 = 16u;
 
 // March tuning
-const HF_MAX_STEPS : u32 = 96u;
-const HF_BISECT    : u32 = 5u;
+const HF_MAX_STEPS : u32 = 64u;
+const HF_BISECT    : u32 = 4u;
 
 // dt clamp (meters along ray)
 const HF_DT_MAX : f32 = 48.0;
@@ -320,9 +320,9 @@ const GRASS_TRACE_STEPS_MID : u32 = 6u;
 const GRASS_TRACE_STEPS_FAR : u32 = 4u;
 
 // Primary-pass grass gating (tune these)
-const GRASS_PRIMARY_MAX_DIST : f32 = 14.0; // meters-ish
+const GRASS_PRIMARY_MAX_DIST : f32 = 10.0; // meters-ish
 const GRASS_PRIMARY_MIN_NY   : f32 = 0.60; // only fairly upward normals
-const GRASS_PRIMARY_RATE_MASK: u32 = 7u;   // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
+const GRASS_PRIMARY_RATE_MASK: u32 = 15u;  // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8, 15 => 1/16 ...
 
 
 // Misc
@@ -408,8 +408,8 @@ struct ChunkMeta {
 const MACRO_DIM : u32 = 8u;              // 8x8x8 macro cells per chunk
 const MACRO_WORDS_PER_CHUNK : u32 = 16u; // 512 bits / 32
 const TILE_SIZE: u32 = 8u;
-const MAX_TILE_CHUNKS: u32 = 512u;
-const PRIMARY_MAX_TILE_CHUNKS: u32 = MAX_TILE_CHUNKS;
+const MAX_TILE_CHUNKS: u32 = 128u;
+const PRIMARY_MAX_TILE_CHUNKS: u32 = 128u;
 
 var<workgroup> WG_TILE_COUNT : atomic<u32>;
 var<workgroup> WG_TILE_SLOTS : array<u32, MAX_TILE_CHUNKS>;
