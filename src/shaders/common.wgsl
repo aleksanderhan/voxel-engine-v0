@@ -477,6 +477,7 @@ fn in_unit_square(uv: vec2<f32>) -> bool {
 
 fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
   let eps = 1e-8;
+  let inv_dir = sign(rd) / max(abs(rd), vec3<f32>(eps));
 
   var t_enter = -1e30;
   var t_exit  =  1e30;
@@ -484,9 +485,9 @@ fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>
   if (abs(rd.x) < eps) {
     if (ro.x < bmin.x || ro.x > bmax.x) { return vec2<f32>(1.0, 0.0); }
   } else {
-    let inv = 1.0 / rd.x;
-    let t0 = (bmin.x - ro.x) * inv;
-    let t1 = (bmax.x - ro.x) * inv;
+    let t0 = (bmin.x - ro.x) * inv_dir.x;
+    let t1 = (bmax.x - ro.x) * inv_dir.x;
+    if (any(isNan(vec2<f32>(t0, t1)))) { return vec2<f32>(1.0, 0.0); }
     t_enter = max(t_enter, min(t0, t1));
     t_exit  = min(t_exit,  max(t0, t1));
   }
@@ -494,9 +495,9 @@ fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>
   if (abs(rd.y) < eps) {
     if (ro.y < bmin.y || ro.y > bmax.y) { return vec2<f32>(1.0, 0.0); }
   } else {
-    let inv = 1.0 / rd.y;
-    let t0 = (bmin.y - ro.y) * inv;
-    let t1 = (bmax.y - ro.y) * inv;
+    let t0 = (bmin.y - ro.y) * inv_dir.y;
+    let t1 = (bmax.y - ro.y) * inv_dir.y;
+    if (any(isNan(vec2<f32>(t0, t1)))) { return vec2<f32>(1.0, 0.0); }
     t_enter = max(t_enter, min(t0, t1));
     t_exit  = min(t_exit,  max(t0, t1));
   }
@@ -504,9 +505,9 @@ fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>
   if (abs(rd.z) < eps) {
     if (ro.z < bmin.z || ro.z > bmax.z) { return vec2<f32>(1.0, 0.0); }
   } else {
-    let inv = 1.0 / rd.z;
-    let t0 = (bmin.z - ro.z) * inv;
-    let t1 = (bmax.z - ro.z) * inv;
+    let t0 = (bmin.z - ro.z) * inv_dir.z;
+    let t1 = (bmax.z - ro.z) * inv_dir.z;
+    if (any(isNan(vec2<f32>(t0, t1)))) { return vec2<f32>(1.0, 0.0); }
     t_enter = max(t_enter, min(t0, t1));
     t_exit  = min(t_exit,  max(t0, t1));
   }
