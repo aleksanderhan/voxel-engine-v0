@@ -58,6 +58,9 @@ pub struct CameraGpu {
     pub ray00: [f32; 4],
     pub ray_dx: [f32; 4],
     pub ray_dy: [f32; 4],
+    pub ray00_uj: [f32; 4],
+    pub ray_dx_uj: [f32; 4],
+    pub ray_dy_uj: [f32; 4],
 
     pub chunk_size: u32,
     pub chunk_count: u32,

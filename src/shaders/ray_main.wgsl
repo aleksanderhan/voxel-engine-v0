@@ -153,9 +153,9 @@ fn main_primary(
 
       // Two candidate rays per tile to stabilize distant voxel selection.
       var px = tile_base + vec2<f32>(4.5, 4.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel_uj(px), 0.0, FOG_MAX_DIST);
       px = tile_base + vec2<f32>(1.5, 1.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel_uj(px), 0.0, FOG_MAX_DIST);
     }
     let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
     tile_sort_candidates_by_enter(raw_count);

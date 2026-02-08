@@ -452,6 +452,11 @@ impl App {
         let ray01 = ray_dir_at(Vec2::new(0.5, 1.5) + jitter);
         let ray_dx = ray10 - ray00;
         let ray_dy = ray01 - ray00;
+        let ray00_uj = ray_dir_at(Vec2::new(0.5, 0.5));
+        let ray10_uj = ray_dir_at(Vec2::new(1.5, 0.5));
+        let ray01_uj = ray_dir_at(Vec2::new(0.5, 1.5));
+        let ray_dx_uj = ray10_uj - ray00_uj;
+        let ray_dy_uj = ray01_uj - ray00_uj;
 
         let camera_gpu = CameraGpu {
             view_inv: camera_frame.view_inv.to_cols_array_2d(),
@@ -464,6 +469,9 @@ impl App {
             ray00: [ray00.x, ray00.y, ray00.z, 0.0],
             ray_dx: [ray_dx.x, ray_dx.y, ray_dx.z, 0.0],
             ray_dy: [ray_dy.x, ray_dy.y, ray_dy.z, 0.0],
+            ray00_uj: [ray00_uj.x, ray00_uj.y, ray00_uj.z, 0.0],
+            ray_dx_uj: [ray_dx_uj.x, ray_dx_uj.y, ray_dx_uj.z, 0.0],
+            ray_dy_uj: [ray_dy_uj.x, ray_dy_uj.y, ray_dy_uj.z, 0.0],
 
             chunk_size: config::CHUNK_SIZE,
             chunk_count: self.chunks.chunk_count(),
