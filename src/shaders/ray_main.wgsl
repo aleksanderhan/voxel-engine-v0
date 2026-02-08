@@ -39,7 +39,7 @@ struct ProfileCounters {
 };
 
 @group(0) @binding(15) var shadow_hist_in : texture_2d<f32>;
-@group(0) @binding(16) var shadow_hist_out : texture_storage_2d<r32float, write>;
+@group(0) @binding(16) var<storage, read_write> shadow_hist_out : array<f32>;
 @group(0) @binding(17) var<storage, read_write> profile_counts : ProfileCounters;
 
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
@@ -135,6 +135,11 @@ fn main_primary(
   // ------------------------------------------------------------
   // Case 1: no voxel chunks => heightfield or sky
   // ------------------------------------------------------------
+  let bytes_per_row = dims.x * 4u;
+  let padded_bpr = (bytes_per_row + 255u) & ~255u;
+  let shadow_stride = padded_bpr / 4u;
+  let shadow_idx = u32(ip.y) * shadow_stride + u32(ip.x);
+
   if (cam.chunk_count == 0u) {
     var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
@@ -173,7 +178,7 @@ fn main_primary(
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-      textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+      shadow_hist_out[shadow_idx] = shadow_out;
       return;
     }
 
@@ -183,7 +188,7 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+    shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
 
@@ -304,7 +309,7 @@ fn main_primary(
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-      textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+      shadow_hist_out[shadow_idx] = shadow_out;
       return;
     }
 
@@ -313,7 +318,7 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+    shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
 
@@ -411,7 +416,7 @@ fn main_primary(
       ip,
       vec4<f32>(t_store, bitcast<f32>(anchor_key), bitcast<f32>(packed_xy), bitcast<f32>(packed_z))
     );
-    textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+    shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
 
@@ -453,7 +458,7 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+    shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
 
@@ -463,7 +468,7 @@ fn main_primary(
   textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
   textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
   textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-  textureStore(shadow_hist_out, ip, vec4<f32>(shadow_out, 0.0, 0.0, 0.0));
+  shadow_hist_out[shadow_idx] = shadow_out;
 }
 
 

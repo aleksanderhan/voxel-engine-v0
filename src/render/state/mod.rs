@@ -344,6 +344,34 @@ impl Renderer {
         }
 
         {
+            let bytes_per_row = self.internal_w.max(1) * std::mem::size_of::<f32>() as u32;
+            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let padded_bpr = ((bytes_per_row + align - 1) / align) * align;
+
+            encoder.copy_buffer_to_texture(
+                wgpu::ImageCopyBuffer {
+                    buffer: &self.textures.shadow_hist_buf,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bpr),
+                        rows_per_image: Some(self.internal_h.max(1)),
+                    },
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self.textures.shadow_hist.tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.internal_w.max(1),
+                    height: self.internal_h.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("godray_pass"),
                 timestamp_writes: self.ts_pair(2, 3),
