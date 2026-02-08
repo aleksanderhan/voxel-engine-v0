@@ -135,6 +135,10 @@ fn make_grass_bg(
                 resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
             },
             wgpu::BindGroupEntry {
+                binding: 17,
+                resource: buffers.primary_profile.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
                 binding: 18,
                 resource: wgpu::BindingResource::TextureView(&textures.grass.view),
             },

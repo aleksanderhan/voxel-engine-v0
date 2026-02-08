@@ -205,6 +205,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
                 cs_vis,
                 wgpu::TextureSampleType::Float { filterable: false },
             ),
+            bgl_storage_rw(17, cs_vis),
             bgl_storage_tex_wo(18, cs_vis, wgpu::TextureFormat::Rgba32Float),
         ],
     });
