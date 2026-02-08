@@ -1056,7 +1056,7 @@ fn tile_append_candidates_for_ray(
   let start_t = t_enter + nudge_p;
   let p0      = ro + start_t * rd;
 
-  let c = chunk_coord_from_pos(p0, chunk_size_m);
+  let c = chunk_coord_from_pos_dir(p0, rd, chunk_size_m);
 
   let nx: i32 = i32(gd.x);
   let ny: i32 = i32(gd.y);
