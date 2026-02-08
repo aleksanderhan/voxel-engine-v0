@@ -1197,6 +1197,10 @@ fn tile_append_candidates_for_ray(
   if (cam.chunk_count == 0u) {
     return;
   }
+  if (cam.chunk_count <= PRIMARY_MAX_TILE_CHUNKS) {
+    tile_append_candidates_for_ray_fine(ro, rd, t_min, t_max);
+    return;
+  }
 
   let voxel_size   = cam.voxel_params.x;
   let chunk_size_m = f32(cam.chunk_size) * voxel_size;
