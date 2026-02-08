@@ -33,9 +33,10 @@ const PROFILE_VOXEL: u32 = 0u;
 const PROFILE_GRASS: u32 = 1u;
 const PROFILE_HDR: u32 = 2u;
 const PROFILE_FOG: u32 = 3u;
+const PROFILE_SHADOW: u32 = 4u;
 
 struct ProfileCounters {
-  counts: array<atomic<u32>, 4>,
+  counts: array<atomic<u32>, 5>,
 };
 
 @group(0) @binding(15) var shadow_hist_in : texture_2d<f32>;
@@ -66,6 +67,12 @@ fn profile_inc(idx: u32) {
   }
 }
 
+fn profile_add(idx: u32, value: u32) {
+  if ((cam.profile_flags & 1u) != 0u) {
+    atomicAdd(&profile_counts.counts[idx], value);
+  }
+}
+
 fn pack_i16x2(a: i32, b: i32) -> u32 {
   return (u32(a) & 0xFFFFu) | ((u32(b) & 0xFFFFu) << 16u);
 }
@@ -77,6 +84,80 @@ fn unpack_i16(v: u32) -> i32 {
 
 fn unpack_i16x2(v: u32) -> vec2<i32> {
   return vec2<i32>(unpack_i16(v), unpack_i16(v >> 16u));
+}
+
+fn fog_profile_weight(t_scene: f32) -> u32 {
+  if (!ENABLE_FOG) { return 0u; }
+  let fog_norm = clamp(t_scene / FOG_MAX_DIST, 0.0, 1.0);
+  return max(1u, u32(fog_norm * 256.0));
+}
+
+struct HfShadeOut {
+  col: vec3<f32>,
+  t_scene: f32,
+};
+
+fn shade_heightfield(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  hf: ClipHit,
+  sky_up: vec3<f32>,
+  seed: u32
+) -> HfShadeOut {
+  profile_add(PROFILE_HDR, 1u);
+  let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+  let t_scene = min(hf.t, FOG_MAX_DIST);
+  let sky_bg_rd = sky_bg(rd);
+  let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
+  profile_add(PROFILE_FOG, fog_profile_weight(t_scene));
+  return HfShadeOut(col, t_scene);
+}
+
+fn trace_primary_voxels(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_start: f32,
+  t_end: f32,
+  has_tile_candidates: bool,
+  hist_valid: bool,
+  hist_anchor_key: u32,
+  hist_anchor_coord: vec3<i32>,
+  tile_candidate_count: u32,
+  seed: u32
+) -> VoxTraceResult {
+  var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
+  if (has_tile_candidates) {
+    if (hist_valid) {
+      profile_add(PROFILE_VOXEL, max(1u, tile_candidate_count));
+      let vt_hint = trace_scene_voxels_candidates(
+        ro,
+        rd,
+        t_start,
+        t_end,
+        hist_anchor_key != INVALID_U32,
+        hist_anchor_coord,
+        hist_anchor_key,
+        tile_candidate_count,
+        seed
+      );
+      if (vt_hint.best.hit != 0u) {
+        return vt_hint;
+      }
+    }
+    profile_add(PROFILE_VOXEL, max(1u, tile_candidate_count));
+    vt = trace_scene_voxels_candidates(
+      ro,
+      rd,
+      0.0,
+      FOG_MAX_DIST,
+      false,
+      vec3<i32>(0),
+      INVALID_U32,
+      tile_candidate_count,
+      seed
+    );
+  }
+  return vt;
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -167,15 +248,10 @@ fn main_primary(
         }
       }
 
-      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
-      let t_scene = min(hf.t, FOG_MAX_DIST);
-      let sky_bg_rd = sky_bg(rd);
-      let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
-      profile_inc(PROFILE_FOG);
-
-      t_store = t_scene;
-      textureStore(color_img, ip, vec4<f32>(col, 1.0));
-      textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+      let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
+      t_store = shade.t_scene;
+      textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
+      textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
       shadow_hist_out[shadow_idx] = shadow_out;
@@ -233,42 +309,20 @@ fn main_primary(
     }
   }
 
-  var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
-  var used_hint = false;
-  if (has_tile_candidates) {
-    if (hist_valid) {
-      let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
-      let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
-      let vt_hint = trace_scene_voxels_candidates(
-        ro,
-        rd,
-        t_start,
-        t_end,
-        hist_anchor_key != INVALID_U32,
-        hist_anchor_coord,
-        hist_anchor_key,
-        tile_candidate_count,
-        seed
-      );
-      if (vt_hint.best.hit != 0u) {
-        vt = vt_hint;
-        used_hint = true;
-      }
-    }
-    if (!used_hint) {
-      vt = trace_scene_voxels_candidates(
-        ro,
-        rd,
-        0.0,
-        FOG_MAX_DIST,
-        false,
-        vec3<i32>(0),
-        INVALID_U32,
-        tile_candidate_count,
-        seed
-      );
-    }
-  }
+  let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
+  let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
+  var vt = trace_primary_voxels(
+    ro,
+    rd,
+    t_start,
+    t_end,
+    has_tile_candidates,
+    hist_valid,
+    hist_anchor_key,
+    hist_anchor_coord,
+    tile_candidate_count,
+    seed
+  );
 
   // Outside streamed grid => heightfield or sky
   if (!vt.in_grid) {
@@ -298,15 +352,10 @@ fn main_primary(
         }
       }
 
-      let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
-      let t_scene = min(hf.t, FOG_MAX_DIST);
-      let sky_bg_rd = sky_bg(rd);
-      let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
-      profile_inc(PROFILE_FOG);
-
-      t_store = t_scene;
-      textureStore(color_img, ip, vec4<f32>(col, 1.0));
-      textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+      let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
+      t_store = shade.t_scene;
+      textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
+      textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
       shadow_hist_out[shadow_idx] = shadow_out;
@@ -366,6 +415,7 @@ fn main_primary(
 
     let shadow_do = (seed & SHADOW_SUBSAMPLE_MASK) == 0u;
     if (shadow_do) {
+      profile_add(PROFILE_SHADOW, 2u);
       var shadow_hist = textureLoad(shadow_hist_in, ip, 0).x;
       let uv_prev = prev_uv_from_world(hp);
       if (in_unit_square(uv_prev)) {
@@ -379,20 +429,20 @@ fn main_primary(
       let shadow_cur = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
       shadow_out = mix(shadow_hist, shadow_cur, SHADOW_TAA_ALPHA);
     } else {
+      profile_add(PROFILE_SHADOW, 1u);
       shadow_out = clamp(textureLoad(shadow_hist_in, ip, 0).x, 0.0, 1.0);
     }
 
     // Split shading (base + local)
-    profile_inc(PROFILE_VOXEL);
     let sh = shade_hit_split(ro, rd, vt.best, sky_up, seed, shadow_out);
-    profile_inc(PROFILE_HDR);
+    profile_add(PROFILE_HDR, 2u);
 
     let t_scene = min(vt.best.t, FOG_MAX_DIST);
 
     // Fog only the base surface term (view-space medium)
     let sky_bg_rd = sky_bg(rd);
     let col_base = apply_fog(sh.base_hdr, ro, rd, t_scene, sky_bg_rd);
-    profile_inc(PROFILE_FOG);
+    profile_add(PROFILE_FOG, fog_profile_weight(t_scene));
 
     // Local is stored UNFOGGED for temporal accumulation
     local_out = sh.local_hdr;
@@ -447,15 +497,10 @@ fn main_primary(
       }
     }
 
-    let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
-    let t_scene = min(hf.t, FOG_MAX_DIST);
-    let sky_bg_rd = sky_bg(rd);
-    let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
-    profile_inc(PROFILE_FOG);
-
-    t_store = t_scene;
-    textureStore(color_img, ip, vec4<f32>(col, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+    let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
+    t_store = shade.t_scene;
+    textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
+    textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
     shadow_hist_out[shadow_idx] = shadow_out;

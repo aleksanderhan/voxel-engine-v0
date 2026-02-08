@@ -34,7 +34,7 @@ struct Overlay {
   text_p1    : u32, // 4 chars packed
   text_p2    : u32, // 4 chars packed
 
-  // Profiling HUD lines (up to 4)
+  // Profiling HUD lines (up to 5)
   prof0_len  : u32,
   prof0_p0   : u32,
   prof0_p1   : u32,
@@ -54,6 +54,11 @@ struct Overlay {
   prof3_p0   : u32,
   prof3_p1   : u32,
   prof3_p2   : u32,
+
+  prof4_len  : u32,
+  prof4_p0   : u32,
+  prof4_p1   : u32,
+  prof4_p2   : u32,
 
   _pad0      : u32,
 };
@@ -319,7 +324,7 @@ fn fs_main(
   // ---- Profiling overlay lines ----
   let fps_right_i = i32(overlay.origin_x + overlay.total_w);
 
-  for (var line_i: u32 = 0u; line_i < 4u; line_i = line_i + 1u) {
+  for (var line_i: u32 = 0u; line_i < 5u; line_i = line_i + 1u) {
     var line_len: u32 = 0u;
     var p0: u32 = 0u;
     var p1: u32 = 0u;
@@ -340,11 +345,16 @@ fn fs_main(
       p0 = overlay.prof2_p0;
       p1 = overlay.prof2_p1;
       p2 = overlay.prof2_p2;
-    } else {
+    } else if (line_i == 3u) {
       line_len = overlay.prof3_len;
       p0 = overlay.prof3_p0;
       p1 = overlay.prof3_p1;
       p2 = overlay.prof3_p2;
+    } else {
+      line_len = overlay.prof4_len;
+      p0 = overlay.prof4_p0;
+      p1 = overlay.prof4_p1;
+      p2 = overlay.prof4_p2;
     }
 
     let text_len_line = min(line_len, 12u);

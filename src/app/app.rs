@@ -546,11 +546,42 @@ impl App {
     fn build_profile_lines(&self) -> Vec<String> {
         let counts = self.primary_profile_counts;
         vec![
-            format!("VOX {}", counts[0]),
-            format!("GRS {}", counts[1]),
-            format!("HDR {}", counts[2]),
-            format!("FOG {}", counts[3]),
+            Self::format_profile_line("VOX", counts[0]),
+            Self::format_profile_line("GRS", counts[1]),
+            Self::format_profile_line("HDR", counts[2]),
+            Self::format_profile_line("FOG", counts[3]),
+            Self::format_profile_line("SHD", counts[4]),
         ]
+    }
+
+    fn format_profile_line(label: &str, value: u32) -> String {
+        let count = Self::format_profile_count(value);
+        let number_width = 9usize;
+        let trimmed = if count.len() > number_width {
+            count[count.len() - number_width..].to_string()
+        } else {
+            count
+        };
+        let mut padded = String::with_capacity(number_width);
+        if trimmed.len() < number_width {
+            padded.extend(std::iter::repeat(' ').take(number_width - trimmed.len()));
+        }
+        padded.push_str(&trimmed);
+        format!("{label}{padded}")
+    }
+
+    fn format_profile_count(value: u32) -> String {
+        let raw = value.to_string();
+        let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+        let mut count = 0usize;
+        for ch in raw.chars().rev() {
+            if count != 0 && count % 3 == 0 {
+                out.push('.');
+            }
+            out.push(ch);
+            count += 1;
+        }
+        out.chars().rev().collect()
     }
 
 
