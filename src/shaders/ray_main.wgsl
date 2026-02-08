@@ -4,12 +4,12 @@
 // Depends on: common.wgsl + ray_core.wgsl + clipmap.wgsl
 //
 // Changes:
-// - Added local light output target (local_img) for shade_hit_split().local_hdr
+// - Added local light output target (primary_out_img layer 1) for shade_hit_split().local_hdr
 // - main_primary now:
 //     * computes ShadeOut for voxel hits
 //     * fogs ONLY base_hdr (and emissive voxels are already in base_hdr)
-//     * writes local_hdr UNFOGGED into local_img (for later temporal accumulation)
-// - For non-voxel cases (heightfield/sky), local_img is written as 0.
+//     * writes local_hdr UNFOGGED into primary_out_img (layer 1) for later temporal accumulation
+// - For non-voxel cases (heightfield/sky), primary_out_img (layer 1) is written as 0.
 //
 // NOTE: This file assumes you have:
 // - shade_hit_split() in shading.wgsl (and ShadeOut struct)
@@ -17,11 +17,8 @@
 // - apply_fog() unchanged
 // - Your temporal accumulation pass is separate (not shown here).
 
-@group(0) @binding(4) var color_img : texture_storage_2d<rgba32float, write>;
+@group(0) @binding(4) var primary_out_img : texture_storage_2d_array<rgba32float, write>;
 @group(0) @binding(5) var depth_img : texture_storage_2d<r32float, write>;
-
-// local (noisy) voxel-light term output (HDR, NOT fogged)
-@group(0) @binding(6) var local_img : texture_storage_2d<rgba32float, write>;
 
 // primary hit history (temporal reprojection)
 @group(0) @binding(12) var primary_hist_tex  : texture_2d<f32>;
@@ -48,6 +45,9 @@
 
 var<workgroup> WG_SKY_UP : vec3<f32>;
 var<workgroup> WG_TILE_COUNT_CACHED : u32;
+
+const PRIMARY_OUT_COLOR : i32 = 0;
+const PRIMARY_OUT_LOCAL : i32 = 1;
 
 fn pack_i16x2(a: i32, b: i32) -> u32 {
   return (u32(a) & 0xFFFFu) | ((u32(b) & 0xFFFFu) << 16u);
@@ -132,7 +132,7 @@ fn main_primary(
   @builtin(local_invocation_index) lid: u32,
   @builtin(workgroup_id) wg_id: vec3<u32>
 ) {
-  let dims = textureDimensions(color_img);
+  let dims = textureDimensions(primary_out_img);
   if (gid.x >= dims.x || gid.y >= dims.y) { return; }
 
   // Compute once per 8x8 workgroup (already cheap: sky_bg only)
@@ -215,9 +215,9 @@ fn main_primary(
 
       let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
       t_store = shade.t_scene;
-      textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
+      textureStore(primary_out_img, ip, PRIMARY_OUT_COLOR, vec4<f32>(shade.col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
-      textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+      textureStore(primary_out_img, ip, PRIMARY_OUT_LOCAL, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
       shadow_hist_out[shadow_idx] = shadow_out;
       return;
@@ -225,9 +225,9 @@ fn main_primary(
 
     // True sky pixel: now pay for full sky (clouds + sun)
     let sky = sky_color(rd);
-    textureStore(color_img, ip, vec4<f32>(sky, 1.0));
+    textureStore(primary_out_img, ip, PRIMARY_OUT_COLOR, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    textureStore(primary_out_img, ip, PRIMARY_OUT_LOCAL, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
@@ -336,18 +336,18 @@ fn main_primary(
 
       let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
       t_store = shade.t_scene;
-      textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
+      textureStore(primary_out_img, ip, PRIMARY_OUT_COLOR, vec4<f32>(shade.col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
-      textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+      textureStore(primary_out_img, ip, PRIMARY_OUT_LOCAL, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
       shadow_hist_out[shadow_idx] = shadow_out;
       return;
     }
 
     let sky = sky_color(rd);
-    textureStore(color_img, ip, vec4<f32>(sky, 1.0));
+    textureStore(primary_out_img, ip, PRIMARY_OUT_COLOR, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    textureStore(primary_out_img, ip, PRIMARY_OUT_LOCAL, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
@@ -426,9 +426,9 @@ fn main_primary(
     local_w   = sh.local_w;
     t_store   = t_scene;
 
-    textureStore(color_img, ip, vec4<f32>(col_base, 1.0));
+    textureStore(primary_out_img, ip, PRIMARY_OUT_COLOR, vec4<f32>(col_base, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha = validity
+    textureStore(primary_out_img, ip, PRIMARY_OUT_LOCAL, vec4<f32>(local_out, local_w)); // alpha = validity
     var packed_xy: u32 = 0u;
     var packed_z: u32 = 0u;
     var anchor_key: u32 = 0u;
@@ -475,9 +475,9 @@ fn main_primary(
 
     let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
     t_store = shade.t_scene;
-    textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
+    textureStore(primary_out_img, ip, PRIMARY_OUT_COLOR, vec4<f32>(shade.col, 1.0));
     textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    textureStore(primary_out_img, ip, PRIMARY_OUT_LOCAL, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
@@ -485,9 +485,9 @@ fn main_primary(
 
   // True sky pixel: now compute full sky (clouds + sun)
   let sky = sky_color(rd);
-  textureStore(color_img, ip, vec4<f32>(sky, 1.0));
+  textureStore(primary_out_img, ip, PRIMARY_OUT_COLOR, vec4<f32>(sky, 1.0));
   textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
-  textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+  textureStore(primary_out_img, ip, PRIMARY_OUT_LOCAL, vec4<f32>(local_out, local_w)); // alpha=0
   textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
   shadow_hist_out[shadow_idx] = shadow_out;
 }

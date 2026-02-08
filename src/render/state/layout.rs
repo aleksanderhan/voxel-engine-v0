@@ -115,6 +115,23 @@ fn bgl_storage_tex_wo(
     }
 }
 
+fn bgl_storage_tex_array_wo(
+    binding: u32,
+    visibility: wgpu::ShaderStages,
+    format: wgpu::TextureFormat,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format,
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+        },
+        count: None,
+    }
+}
+
 pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     let cs_vis = wgpu::ShaderStages::COMPUTE;
 
@@ -123,9 +140,9 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
         bgl_storage_ro(3, cs_vis),
-        bgl_storage_ro(8, cs_vis),
         bgl_storage_ro(9, cs_vis),
         bgl_storage_ro(10, cs_vis),
+        bgl_storage_ro(11, cs_vis),
     ];
 
     let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -138,9 +155,8 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     // 1 chunks (storage_ro)
     // 2 nodes (storage_ro)
     // 3 chunk_grid (storage_ro)
-    // 4 color (storage write)
+    // 4 primary outputs (storage array, layer 0 = color, layer 1 = local)
     // 5 depth (storage write)
-    // 6 local lighting (storage write)
     // 7 clipmap params (uniform)
     // 8 clipmap height texture array (sampled)
     // 9 macro_occ (storage_ro)
@@ -151,15 +167,14 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     // 14 primary hit history sampler
     // 15 sun-shadow history (sampled)
     // 16 sun-shadow history output (storage buffer write)
-    let primary_entries: [wgpu::BindGroupLayoutEntry; 17] = [
+    let primary_entries: [wgpu::BindGroupLayoutEntry; 15] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
         bgl_storage_ro(3, cs_vis),
 
-        bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba32Float),
+        bgl_storage_tex_array_wo(4, cs_vis, wgpu::TextureFormat::Rgba32Float),
         bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float),
-        bgl_storage_tex_wo(6, cs_vis, wgpu::TextureFormat::Rgba32Float), // local
 
         bgl_uniform(7, cs_vis),
         bgl_tex_sample_2d_array(
