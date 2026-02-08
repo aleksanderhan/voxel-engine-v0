@@ -108,12 +108,12 @@ fn sun_transmittance_geom_only(p: vec3<f32>, sun_dir: vec3<f32>) -> f32 {
   var t_local: f32 = 0.0;
   let t_exit_local = max(t_exit - start_t, 0.0);
 
-  let bias = vec3<f32>(
+  let chunk_bias = vec3<f32>(
     select(-1.0, 1.0, rd.x >= 0.0),
     select(-1.0, 1.0, rd.y >= 0.0),
     select(-1.0, 1.0, rd.z >= 0.0)
   ) * (1e-4 * chunk_size_m);
-  let p_bias = p0 + bias;
+  let p_bias = p0 + chunk_bias;
   let local = (p_bias - grid_bmin) / chunk_size_m;
 
   var cx: i32 = i32(floor(local.x)) + go.x;
