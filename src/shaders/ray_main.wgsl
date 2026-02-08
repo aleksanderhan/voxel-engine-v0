@@ -66,6 +66,12 @@ fn profile_inc(idx: u32) {
   }
 }
 
+fn profile_add(idx: u32, value: u32) {
+  if ((cam.profile_flags & 1u) != 0u) {
+    atomicAdd(&profile_counts.counts[idx], value);
+  }
+}
+
 fn pack_i16x2(a: i32, b: i32) -> u32 {
   return (u32(a) & 0xFFFFu) | ((u32(b) & 0xFFFFu) << 16u);
 }
@@ -77,6 +83,12 @@ fn unpack_i16(v: u32) -> i32 {
 
 fn unpack_i16x2(v: u32) -> vec2<i32> {
   return vec2<i32>(unpack_i16(v), unpack_i16(v >> 16u));
+}
+
+fn fog_profile_weight(t_scene: f32) -> u32 {
+  if (!ENABLE_FOG) { return 0u; }
+  let fog_norm = clamp(t_scene / FOG_MAX_DIST, 0.0, 1.0);
+  return max(1u, u32(fog_norm * 256.0));
 }
 
 struct HfShadeOut {
@@ -91,12 +103,12 @@ fn shade_heightfield(
   sky_up: vec3<f32>,
   seed: u32
 ) -> HfShadeOut {
-  profile_inc(PROFILE_HDR);
+  profile_add(PROFILE_HDR, 1u);
   let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
   let t_scene = min(hf.t, FOG_MAX_DIST);
   let sky_bg_rd = sky_bg(rd);
   let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
-  profile_inc(PROFILE_FOG);
+  profile_add(PROFILE_FOG, fog_profile_weight(t_scene));
   return HfShadeOut(col, t_scene);
 }
 
@@ -115,7 +127,7 @@ fn trace_primary_voxels(
   var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
   if (has_tile_candidates) {
     if (hist_valid) {
-      profile_inc(PROFILE_VOXEL);
+      profile_add(PROFILE_VOXEL, max(1u, tile_candidate_count));
       let vt_hint = trace_scene_voxels_candidates(
         ro,
         rd,
@@ -131,7 +143,7 @@ fn trace_primary_voxels(
         return vt_hint;
       }
     }
-    profile_inc(PROFILE_VOXEL);
+    profile_add(PROFILE_VOXEL, max(1u, tile_candidate_count));
     vt = trace_scene_voxels_candidates(
       ro,
       rd,
@@ -420,14 +432,14 @@ fn main_primary(
 
     // Split shading (base + local)
     let sh = shade_hit_split(ro, rd, vt.best, sky_up, seed, shadow_out);
-    profile_inc(PROFILE_HDR);
+    profile_add(PROFILE_HDR, 2u);
 
     let t_scene = min(vt.best.t, FOG_MAX_DIST);
 
     // Fog only the base surface term (view-space medium)
     let sky_bg_rd = sky_bg(rd);
     let col_base = apply_fog(sh.base_hdr, ro, rd, t_scene, sky_bg_rd);
-    profile_inc(PROFILE_FOG);
+    profile_add(PROFILE_FOG, fog_profile_weight(t_scene));
 
     // Local is stored UNFOGGED for temporal accumulation
     local_out = sh.local_hdr;
