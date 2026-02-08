@@ -1,6 +1,6 @@
 // src/shaders/ray/light.wgsl
-// --------------------------
-// Cheap voxel light gather for MAT_LIGHT voxels.
+// ---------------------------------
+// Cheap voxel light gather for MAT_LIGHT voxels (no DDA).
 //
 // What changed (for TAA-friendly behavior):
 // - Removed "empty air bail" (it caused random hit/miss speckle in open air)
@@ -56,64 +56,26 @@ fn sphere_dir_local(i: u32, count: u32) -> vec3<f32> {
 }
 
 // -----------------------------------------------------------------------------
-// 3D DDA: walk voxels along ray without skipping 1-voxel lights
+// Fixed-step raymarch: walk in voxel-sized steps (no DDA)
 // -----------------------------------------------------------------------------
 
 // Returns vec4(hitPosWS.xyz, hitFlag).
 // hitFlag = 1: hit a light voxel
 // hitFlag = 0: no light (either blocked by solid or ran out of steps)
-fn dda_hit_light(p0: vec3<f32>, dir: vec3<f32>, max_steps: u32, vs: f32) -> vec4<f32> {
-  var gpos = p0 / max(vs, 1e-6);
-  var cell = vec3<i32>(floor(gpos));
-
-  let d = dir;
-
-  let step = vec3<i32>(
-    select(-1, 1, d.x >= 0.0),
-    select(-1, 1, d.y >= 0.0),
-    select(-1, 1, d.z >= 0.0)
-  );
-
-  let next_boundary = vec3<f32>(
-    f32(cell.x + select(0, 1, d.x >= 0.0)),
-    f32(cell.y + select(0, 1, d.y >= 0.0)),
-    f32(cell.z + select(0, 1, d.z >= 0.0))
-  );
-
-  let inv = vec3<f32>(
-    select(1e30, 1.0 / abs(d.x), abs(d.x) > 1e-6),
-    select(1e30, 1.0 / abs(d.y), abs(d.y) > 1e-6),
-    select(1e30, 1.0 / abs(d.z), abs(d.z) > 1e-6)
-  );
-
-  var tMax = vec3<f32>(
-    (next_boundary.x - gpos.x) * inv.x,
-    (next_boundary.y - gpos.y) * inv.y,
-    (next_boundary.z - gpos.z) * inv.z
-  );
-
-  let tDelta = inv;
-
+fn march_hit_light(p0: vec3<f32>, dir: vec3<f32>, max_steps: u32, vs: f32) -> vec4<f32> {
+  let step_len = max(vs, 1e-6);
   for (var s: u32 = 0u; s < max_steps; s = s + 1u) {
-    let center_ws = (vec3<f32>(f32(cell.x) + 0.5, f32(cell.y) + 0.5, f32(cell.z) + 0.5)) * vs;
-    let leaf = query_leaf_world(center_ws);
+    let t = (f32(s) + 0.5) * step_len;
+    let pos = p0 + dir * t;
+    let leaf = query_leaf_world(pos);
 
     if (leaf.mat == MAT_LIGHT) {
-      return vec4<f32>(center_ws, 1.0);
+      return vec4<f32>(pos, 1.0);
     }
 
     if (leaf.mat != MAT_AIR) {
       // SOLID blocks the ray
       return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    }
-
-    // step to next voxel boundary
-    if (tMax.x < tMax.y) {
-      if (tMax.x < tMax.z) { cell.x += step.x; tMax.x += tDelta.x; }
-      else                 { cell.z += step.z; tMax.z += tDelta.z; }
-    } else {
-      if (tMax.y < tMax.z) { cell.y += step.y; tMax.y += tDelta.y; }
-      else                 { cell.z += step.z; tMax.z += tDelta.z; }
     }
   }
 
@@ -168,7 +130,7 @@ fn gather_voxel_lights(
     var ldir = normalize(tbn * normalize(sphere_dir_local(i, LIGHT_RAYS)));
     ldir = normalize(rot_about_axis(ldir, n, rot));
 
-    let hit = dda_hit_light(p0, ldir, LIGHT_MAX_DIST_VOX, vs);
+    let hit = march_hit_light(p0, ldir, LIGHT_MAX_DIST_VOX, vs);
     if (hit.w > 0.5) {
       hits += 1u;
 
