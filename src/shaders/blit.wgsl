@@ -36,43 +36,7 @@ struct Overlay {
   text_p3    : u32, // 4 chars packed
   text_p4    : u32, // 4 chars packed
 
-  // Profiling HUD lines (up to 5)
-  prof0_len  : u32,
-  prof0_p0   : u32,
-  prof0_p1   : u32,
-  prof0_p2   : u32,
-  prof0_p3   : u32,
-  prof0_p4   : u32,
-
-  prof1_len  : u32,
-  prof1_p0   : u32,
-  prof1_p1   : u32,
-  prof1_p2   : u32,
-  prof1_p3   : u32,
-  prof1_p4   : u32,
-
-  prof2_len  : u32,
-  prof2_p0   : u32,
-  prof2_p1   : u32,
-  prof2_p2   : u32,
-  prof2_p3   : u32,
-  prof2_p4   : u32,
-
-  prof3_len  : u32,
-  prof3_p0   : u32,
-  prof3_p1   : u32,
-  prof3_p2   : u32,
-  prof3_p3   : u32,
-  prof3_p4   : u32,
-
-  prof4_len  : u32,
-  prof4_p0   : u32,
-  prof4_p1   : u32,
-  prof4_p2   : u32,
-  prof4_p3   : u32,
-  prof4_p4   : u32,
-
-  _pad0      : u32,
+  _pad0      : vec3<u32>,
 };
 
 @group(0) @binding(2) var<uniform> overlay : Overlay;
@@ -123,15 +87,6 @@ fn unpack_char(i: u32) -> u32 {
   if (i < 12u) { return pack_get_byte(overlay.text_p2, i - 8u); }
   if (i < 16u) { return pack_get_byte(overlay.text_p3, i - 12u); }
   if (i < 20u) { return pack_get_byte(overlay.text_p4, i - 16u); }
-  return 0u;
-}
-
-fn unpack_char_from(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, i: u32) -> u32 {
-  if (i < 4u)  { return pack_get_byte(p0, i); }
-  if (i < 8u)  { return pack_get_byte(p1, i - 4u); }
-  if (i < 12u) { return pack_get_byte(p2, i - 8u); }
-  if (i < 16u) { return pack_get_byte(p3, i - 12u); }
-  if (i < 20u) { return pack_get_byte(p4, i - 16u); }
   return 0u;
 }
 
@@ -298,10 +253,8 @@ fn fs_main(
   let text_len_raw = overlay.text_len;
   let text_len = min(text_len_raw, 20u);
 
-  var profile_base_y = overlay.origin_y + overlay.digit_h + margin;
-
   if (text_len > 0u) {
-    let toy = profile_base_y;
+    let toy = overlay.origin_y + overlay.digit_h + margin;
 
     // total pixel width of the string (don’t count trailing gap)
     let text_w = text_len * stride - text_gap;
@@ -335,92 +288,7 @@ fn fs_main(
       }
     }
 
-    profile_base_y = profile_base_y + char_h + margin;
   }
-
-  // ---- Profiling overlay lines ----
-  let fps_right_i = i32(overlay.origin_x + overlay.total_w);
-
-  for (var line_i: u32 = 0u; line_i < 5u; line_i = line_i + 1u) {
-    var line_len: u32 = 0u;
-    var p0: u32 = 0u;
-    var p1: u32 = 0u;
-    var p2: u32 = 0u;
-    var p3: u32 = 0u;
-    var p4: u32 = 0u;
-
-    if (line_i == 0u) {
-      line_len = overlay.prof0_len;
-      p0 = overlay.prof0_p0;
-      p1 = overlay.prof0_p1;
-      p2 = overlay.prof0_p2;
-      p3 = overlay.prof0_p3;
-      p4 = overlay.prof0_p4;
-    } else if (line_i == 1u) {
-      line_len = overlay.prof1_len;
-      p0 = overlay.prof1_p0;
-      p1 = overlay.prof1_p1;
-      p2 = overlay.prof1_p2;
-      p3 = overlay.prof1_p3;
-      p4 = overlay.prof1_p4;
-    } else if (line_i == 2u) {
-      line_len = overlay.prof2_len;
-      p0 = overlay.prof2_p0;
-      p1 = overlay.prof2_p1;
-      p2 = overlay.prof2_p2;
-      p3 = overlay.prof2_p3;
-      p4 = overlay.prof2_p4;
-    } else if (line_i == 3u) {
-      line_len = overlay.prof3_len;
-      p0 = overlay.prof3_p0;
-      p1 = overlay.prof3_p1;
-      p2 = overlay.prof3_p2;
-      p3 = overlay.prof3_p3;
-      p4 = overlay.prof3_p4;
-    } else {
-      line_len = overlay.prof4_len;
-      p0 = overlay.prof4_p0;
-      p1 = overlay.prof4_p1;
-      p2 = overlay.prof4_p2;
-      p3 = overlay.prof4_p3;
-      p4 = overlay.prof4_p4;
-    }
-
-    let text_len_line = min(line_len, 20u);
-    if (text_len_line == 0u) {
-      continue;
-    }
-
-    let toy = profile_base_y + line_i * (char_h + margin);
-    let text_w = text_len_line * stride - text_gap;
-    let tox_i = max(0, fps_right_i - i32(text_w));
-    let tox = u32(tox_i);
-
-    if (px.x >= tox && px.x < (tox + text_w) &&
-        px.y >= toy && px.y < (toy + char_h)) {
-      let lx = px.x - tox;
-      let ly = px.y - toy;
-
-      let ci   = lx / stride;        // char index
-      let in_x = lx - ci * stride;   // x within char+gap
-
-      if (ci < text_len_line && in_x < char_w) {
-        let cell_x = in_x / scale;   // 0..2
-        let cell_y = ly   / scale;   // 0..4
-
-        if (cell_y < 5u) {
-          let cch = unpack_char_from(p0, p1, p2, p3, p4, ci);
-          let m   = glyph_mask(cch);
-
-          if (glyph_bit(m, cell_x, cell_y)) {
-            rgb = vec3<f32>(1.0, 1.0, 1.0);
-          }
-        }
-      }
-    }
-  }
-
-
 
   // ---- Crosshair (present-space, centered) ----
   // Assumes `img` is the presented/composited output (so its dimensions match screen).
