@@ -448,7 +448,6 @@ impl Renderer {
                 label: Some("composite_taa_pass"),
                 timestamp_writes: self.ts_pair(ts_index, ts_index + 1),
             });
-            ts_index += 2;
 
             cpass.set_pipeline(&self.pipelines.composite_taa);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
@@ -644,7 +643,7 @@ impl Renderer {
 
         // Read 12 u64 timestamps
         let data = slice.get_mapped_range();
-        let words: &[u64] = bytemuck::cast_slice(&data);
+        let words: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
         if words.len() < TS_COUNT as usize {
             drop(data);
             readback.unmap();
