@@ -129,12 +129,13 @@ fn main_primary(
         let voxel_size = cam.voxel_params.x;
         let hp = ro + rd * hf.t;
         let cell = grass_cell_from_world_global(hp, rd, voxel_size);
+        let grass_bmin = vec3<f32>(cell.bmin_m.x, hp.y - voxel_size, cell.bmin_m.z);
         let gh = try_grass_slab_hit(
           ro,
           rd,
           0.0,
           hf.t,
-          cell.bmin_m,
+          grass_bmin,
           cell.id_vox,
           voxel_size,
           cam.voxel_params.y,
@@ -257,12 +258,13 @@ fn main_primary(
         let voxel_size = cam.voxel_params.x;
         let hp = ro + rd * hf.t;
         let cell = grass_cell_from_world_global(hp, rd, voxel_size);
+        let grass_bmin = vec3<f32>(cell.bmin_m.x, hp.y - voxel_size, cell.bmin_m.z);
         let gh = try_grass_slab_hit(
           ro,
           rd,
           0.0,
           hf.t,
-          cell.bmin_m,
+          grass_bmin,
           cell.id_vox,
           voxel_size,
           cam.voxel_params.y,
@@ -400,12 +402,13 @@ fn main_primary(
       let voxel_size = cam.voxel_params.x;
       let hp = ro + rd * hf.t;
       let cell = grass_cell_from_world_global(hp, rd, voxel_size);
+      let grass_bmin = vec3<f32>(cell.bmin_m.x, hp.y - voxel_size, cell.bmin_m.z);
       let gh = try_grass_slab_hit(
         ro,
         rd,
         0.0,
         hf.t,
-        cell.bmin_m,
+        grass_bmin,
         cell.id_vox,
         voxel_size,
         cam.voxel_params.y,
