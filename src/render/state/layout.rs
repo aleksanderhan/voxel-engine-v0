@@ -4,6 +4,7 @@
 
 pub struct Layouts {
     pub primary: wgpu::BindGroupLayout,
+    pub tile_candidates: wgpu::BindGroupLayout,
     pub scene: wgpu::BindGroupLayout,
     pub godray: wgpu::BindGroupLayout,
     pub local_taa: wgpu::BindGroupLayout,
@@ -194,6 +195,11 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         entries: &primary_entries,
     });
 
+    let tile_candidates = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("tile_candidates_bgl"),
+        entries: &[bgl_storage_rw(0, cs_vis)],
+    });
+
 
     let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("godray_bgl"),
@@ -317,6 +323,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
 
     Layouts {
         primary,
+        tile_candidates,
         scene,
         godray,
         local_taa,

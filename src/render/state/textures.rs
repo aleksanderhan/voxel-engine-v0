@@ -30,6 +30,7 @@ pub struct TextureSet {
     pub primary_hit_hist: [Tex2D; 2],
     pub shadow_hist: Tex2D,
     pub shadow_hist_buf: wgpu::Buffer,
+    pub tile_candidates: wgpu::Buffer,
     
     pub godray: [Tex2D; 2],
     pub clip_height: Tex2DArray,
@@ -208,6 +209,15 @@ pub fn create_textures(
     let padded_bpr = ((bytes_per_row + align - 1) / align) * align;
     let shadow_bytes = (padded_bpr as u64) * (internal_h.max(1) as u64);
     let shadow_hist_buf = make_storage_buffer(device, "shadow_hist_buf", shadow_bytes);
+    let tiles_x = (internal_w + 7) / 8;
+    let tiles_y = (internal_h + 7) / 8;
+    let tile_count = tiles_x.max(1) as u64 * tiles_y.max(1) as u64;
+    let bytes_per_tile = 4u64 * (1 + 2 * crate::render::state::PRIMARY_MAX_TILE_CHUNKS as u64);
+    let tile_candidates = make_storage_buffer(
+        device,
+        "tile_candidates_buf",
+        tile_count * bytes_per_tile,
+    );
 
     let godray = [
         make_tex2d(
@@ -279,6 +289,7 @@ pub fn create_textures(
         primary_hit_hist,
         shadow_hist,
         shadow_hist_buf,
+        tile_candidates,
         godray,
         clip_height,
     }

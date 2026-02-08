@@ -23,6 +23,12 @@ struct PrimaryDispatch {
   _pad: vec2<u32>,
 };
 
+struct TileCandidates {
+  count: u32,
+  slots: array<u32, PRIMARY_MAX_TILE_CHUNKS>,
+  enters: array<f32, PRIMARY_MAX_TILE_CHUNKS>,
+};
+
 @group(0) @binding(4) var color_img : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(5) var depth_img : texture_storage_2d<r32float, write>;
 
@@ -74,6 +80,7 @@ struct HfShadeOut {
 };
 
 @group(0) @binding(17) var<uniform> primary_dispatch : PrimaryDispatch;
+@group(3) @binding(0) var<storage, read_write> tile_candidates : array<TileCandidates>;
 
 fn shade_heightfield(
   ro: vec3<f32>,
@@ -134,6 +141,43 @@ fn trace_primary_voxels(
   return vt;
 }
 
+@compute @workgroup_size(1, 1, 1)
+fn main_primary_tiles(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let tiles_x = (cam.render_present_px.x + TILE_SIZE - 1u) / TILE_SIZE;
+  let tiles_y = (cam.render_present_px.y + TILE_SIZE - 1u) / TILE_SIZE;
+  if (gid.x >= tiles_x || gid.y >= tiles_y) { return; }
+
+  atomicStore(&WG_TILE_COUNT, 0u);
+  if (cam.chunk_count != 0u) {
+    let tile_base = vec2<f32>(
+      f32(gid.x * TILE_SIZE),
+      f32(gid.y * TILE_SIZE)
+    );
+    let ro_tile = cam.cam_pos.xyz;
+
+    // Two candidate rays per tile to stabilize distant voxel selection.
+    var px = tile_base + vec2<f32>(4.5, 4.5);
+    tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+    px = tile_base + vec2<f32>(1.5, 1.5);
+    tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+  }
+  let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
+  tile_sort_candidates_by_enter(raw_count);
+  let count = min(raw_count, PRIMARY_MAX_TILE_CHUNKS);
+
+  let tile_index = gid.y * tiles_x + gid.x;
+  tile_candidates[tile_index].count = count;
+  for (var i: u32 = 0u; i < PRIMARY_MAX_TILE_CHUNKS; i = i + 1u) {
+    if (i < count) {
+      tile_candidates[tile_index].slots[i] = WG_TILE_SLOTS[i];
+      tile_candidates[tile_index].enters[i] = WG_TILE_ENTER[i];
+    } else {
+      tile_candidates[tile_index].slots[i] = INVALID_U32;
+      tile_candidates[tile_index].enters[i] = BIG_F32;
+    }
+  }
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main_primary(
   @builtin(global_invocation_id) gid: vec3<u32>,
@@ -152,23 +196,15 @@ fn main_primary(
   let sky_up = WG_SKY_UP;
 
   if (lid == 0u) {
-    atomicStore(&WG_TILE_COUNT, 0u);
-    if (cam.chunk_count != 0u) {
-      let tile_base = vec2<f32>(
-        f32(wg_id.x * TILE_SIZE),
-        f32(wg_id.y * TILE_SIZE) + f32(primary_dispatch.base_y)
-      );
-      let ro_tile = cam.cam_pos.xyz;
-
-      // Two candidate rays per tile to stabilize distant voxel selection.
-      var px = tile_base + vec2<f32>(4.5, 4.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-      px = tile_base + vec2<f32>(1.5, 1.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+    let tiles_x = (u32(dims.x) + TILE_SIZE - 1u) / TILE_SIZE;
+    let base_tile_y = primary_dispatch.base_y / TILE_SIZE;
+    let tile_index = (base_tile_y + wg_id.y) * tiles_x + wg_id.x;
+    let count = min(tile_candidates[tile_index].count, PRIMARY_MAX_TILE_CHUNKS);
+    WG_TILE_COUNT_CACHED = count;
+    for (var i: u32 = 0u; i < count; i = i + 1u) {
+      WG_TILE_SLOTS[i] = tile_candidates[tile_index].slots[i];
+      WG_TILE_ENTER[i] = tile_candidates[tile_index].enters[i];
     }
-    let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
-    tile_sort_candidates_by_enter(raw_count);
-    WG_TILE_COUNT_CACHED = min(raw_count, PRIMARY_MAX_TILE_CHUNKS);
   }
   workgroupBarrier();
 

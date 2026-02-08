@@ -7,6 +7,7 @@ use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
 pub struct BindGroups {
     pub primary: [Vec<wgpu::BindGroup>; 2],
     pub scene: wgpu::BindGroup,
+    pub tile_candidates: wgpu::BindGroup,
     pub godray: [wgpu::BindGroup; 2],
     pub local_taa: [wgpu::BindGroup; 2],
     pub composite: [wgpu::BindGroup; 2],
@@ -340,6 +341,14 @@ pub fn create_bind_groups(
     }
     let primary = [primary_a, primary_b];
     let scene = make_scene_bg(device, &layouts.scene, buffers);
+    let tile_candidates = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tile_candidates_bg"),
+        layout: &layouts.tile_candidates,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: textures.tile_candidates.as_entire_binding(),
+        }],
+    });
 
     let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("empty_bg"),
@@ -453,6 +462,7 @@ pub fn create_bind_groups(
     BindGroups {
         primary,
         scene,
+        tile_candidates,
         godray,
         local_taa,
         composite,

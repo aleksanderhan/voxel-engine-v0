@@ -19,6 +19,8 @@ use super::layout::Layouts;
 pub struct Pipelines {
     /// Compute pipeline for the primary full-resolution pass (writes color/depth).
     pub primary: wgpu::ComputePipeline,
+    /// Compute pipeline for per-tile candidate generation.
+    pub primary_tiles: wgpu::ComputePipeline,
 
     /// Compute pipeline for the quarter-resolution godray pass (ping-pong temporal).
     pub godray: wgpu::ComputePipeline,
@@ -93,7 +95,14 @@ pub fn create_pipelines(
         "primary_pipeline",
         cs_module,
         "main_primary",
-        &[&layouts.primary],
+        &[&layouts.primary, &layouts.empty, &layouts.empty, &layouts.tile_candidates],
+    );
+    let primary_tiles = make_compute_pipeline(
+        device,
+        "primary_tiles_pipeline",
+        cs_module,
+        "main_primary_tiles",
+        &[&layouts.scene, &layouts.empty, &layouts.empty, &layouts.tile_candidates],
     );
 
     // Godray pass:
@@ -188,6 +197,7 @@ pub fn create_pipelines(
 
     Pipelines {
         primary,
+        primary_tiles,
         godray,
         local_taa,
         composite,

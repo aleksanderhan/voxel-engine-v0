@@ -20,8 +20,9 @@ use pipelines::{create_pipelines, Pipelines};
 use textures::{create_textures, TextureSet};
 
 pub(super) const PRIMARY_PASS_SLICES: usize = 2;
+pub(super) const PRIMARY_MAX_TILE_CHUNKS: usize = 24;
 const OTHER_PASSES: u32 = 5;
-const TS_COUNT: u32 = 2 * (PRIMARY_PASS_SLICES as u32 + OTHER_PASSES);
+const TS_COUNT: u32 = 2 * (PRIMARY_PASS_SLICES as u32 + OTHER_PASSES + 1);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuTimingsMs {
@@ -324,6 +325,24 @@ impl Renderer {
         let pong = 1 - ping;
         let mut ts_index = 0u32;
 
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("primary_tiles_pass"),
+                timestamp_writes: self.ts_pair(ts_index, ts_index + 1),
+            });
+            ts_index += 2;
+
+            cpass.set_pipeline(&self.pipelines.primary_tiles);
+            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
+            cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
+            cpass.set_bind_group(2, &self.bind_groups.empty, &[]);
+            cpass.set_bind_group(3, &self.bind_groups.tile_candidates, &[]);
+
+            let gx = (self.internal_w + 7) / 8;
+            let gy = (self.internal_h + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+        }
+
         let slice_h = (self.internal_h + PRIMARY_PASS_SLICES as u32 - 1) / PRIMARY_PASS_SLICES as u32;
         let slice_h = ((slice_h + 7) / 8) * 8;
 
@@ -354,6 +373,9 @@ impl Renderer {
 
             cpass.set_pipeline(&self.pipelines.primary);
             cpass.set_bind_group(0, &self.bind_groups.primary[ping][slice], &[]);
+            cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
+            cpass.set_bind_group(2, &self.bind_groups.empty, &[]);
+            cpass.set_bind_group(3, &self.bind_groups.tile_candidates, &[]);
 
             let gx = (self.internal_w + 7) / 8;
             let gy = (max_y.saturating_sub(base_y) + 7) / 8;
@@ -660,13 +682,13 @@ impl Renderer {
         let ns = self.ts_period_ns;
         let to_ms = |a: u64, b: u64| -> f64 { (b.saturating_sub(a) as f64) * ns * 1e-6 };
 
-        let mut primary = 0.0;
+        let mut primary = to_ms(ts[0], ts[1]);
         for i in 0..PRIMARY_PASS_SLICES {
-            let idx = i * 2;
+            let idx = 2 + i * 2;
             primary += to_ms(ts[idx], ts[idx + 1]);
         }
 
-        let base = PRIMARY_PASS_SLICES * 2;
+        let base = 2 + PRIMARY_PASS_SLICES * 2;
         let local_taa = to_ms(ts[base], ts[base + 1]);
         let godray = to_ms(ts[base + 2], ts[base + 3]);
         let composite = to_ms(ts[base + 4], ts[base + 5]);
