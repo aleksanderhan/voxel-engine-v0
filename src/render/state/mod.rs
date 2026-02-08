@@ -364,43 +364,49 @@ impl Renderer {
 
         if profile_primary_breakdown {
             self.write_profile_mode(PROFILE_TRACE_ONLY);
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("primary_trace_pass"),
-                timestamp_writes: self.ts_pair(12, 13),
-            });
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("primary_trace_pass"),
+                    timestamp_writes: self.ts_pair(12, 13),
+                });
 
-            cpass.set_pipeline(&self.pipelines.primary);
-            cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
+                cpass.set_pipeline(&self.pipelines.primary);
+                cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
 
-            let gx = (self.internal_w + 7) / 8;
-            let gy = (self.internal_h + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
+                let gx = (self.internal_w + 7) / 8;
+                let gy = (self.internal_h + 7) / 8;
+                cpass.dispatch_workgroups(gx, gy, 1);
+            }
 
             self.write_profile_mode(PROFILE_NO_FOG | PROFILE_NO_GRASS);
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("primary_no_fog_no_grass_pass"),
-                timestamp_writes: self.ts_pair(14, 15),
-            });
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("primary_no_fog_no_grass_pass"),
+                    timestamp_writes: self.ts_pair(14, 15),
+                });
 
-            cpass.set_pipeline(&self.pipelines.primary);
-            cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
+                cpass.set_pipeline(&self.pipelines.primary);
+                cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
 
-            let gx = (self.internal_w + 7) / 8;
-            let gy = (self.internal_h + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
+                let gx = (self.internal_w + 7) / 8;
+                let gy = (self.internal_h + 7) / 8;
+                cpass.dispatch_workgroups(gx, gy, 1);
+            }
 
             self.write_profile_mode(PROFILE_NO_FOG);
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("primary_no_fog_pass"),
-                timestamp_writes: self.ts_pair(16, 17),
-            });
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("primary_no_fog_pass"),
+                    timestamp_writes: self.ts_pair(16, 17),
+                });
 
-            cpass.set_pipeline(&self.pipelines.primary);
-            cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
+                cpass.set_pipeline(&self.pipelines.primary);
+                cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
 
-            let gx = (self.internal_w + 7) / 8;
-            let gy = (self.internal_h + 7) / 8;
-            cpass.dispatch_workgroups(gx, gy, 1);
+                let gx = (self.internal_w + 7) / 8;
+                let gy = (self.internal_h + 7) / 8;
+                cpass.dispatch_workgroups(gx, gy, 1);
+            }
 
             self.write_profile_mode(0);
         }
