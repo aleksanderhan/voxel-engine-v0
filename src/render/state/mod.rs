@@ -25,6 +25,7 @@ pub struct GpuTimingsMs {
     pub local_taa: f64,
     pub godray: f64,
     pub composite: f64,
+    pub composite_taa: f64,
     pub blit: f64,
     pub total: f64,
 }
@@ -173,7 +174,7 @@ impl Renderer {
             .await
             .unwrap();
 
-        const TS_COUNT: u32 = 10;
+        const TS_COUNT: u32 = 12;
         let (ts_qs, ts_resolve, ts_readback, ts_period_ns) = if use_ts {
             let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("ts_qs"),
@@ -424,6 +425,23 @@ impl Renderer {
 
         }
 
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("composite_taa_pass"),
+                timestamp_writes: self.ts_pair(8, 9),
+            });
+
+            cpass.set_pipeline(&self.pipelines.composite_taa);
+            cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
+            cpass.set_bind_group(1, &self.bind_groups.empty, &[]);
+            cpass.set_bind_group(2, &self.bind_groups.empty, &[]);
+            cpass.set_bind_group(3, &self.bind_groups.composite_taa[ping], &[]);
+
+            let gx = (width + 7) / 8;
+            let gy = (height + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+        }
+
         self.ping = pong;
     }
 
@@ -484,7 +502,7 @@ impl Renderer {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: self.ts_pair_rp(8, 9),
+            timestamp_writes: self.ts_pair_rp(10, 11),
             occlusion_query_set: None,
         });
 
@@ -650,18 +668,18 @@ impl Renderer {
             .expect("map_async dropped")
             .expect("map_async failed");
 
-        // Read 10 u64 timestamps
+        // Read 12 u64 timestamps
         let data = slice.get_mapped_range();
         let words: &[u64] = bytemuck::cast_slice(&data);
-        if words.len() < 10 {
+        if words.len() < 12 {
             drop(data);
             readback.unmap();
             return None;
         }
 
         let ts = [
-            words[0], words[1], words[2], words[3], words[4],
-            words[5], words[6], words[7], words[8], words[9],
+            words[0], words[1], words[2], words[3], words[4], words[5],
+            words[6], words[7], words[8], words[9], words[10], words[11],
         ];
 
         drop(data);
@@ -676,15 +694,17 @@ impl Renderer {
         let local_taa = to_ms(ts[2], ts[3]);
         let godray    = to_ms(ts[4], ts[5]);
         let composite = to_ms(ts[6], ts[7]);
-        let blit      = to_ms(ts[8], ts[9]);
+        let composite_taa = to_ms(ts[8], ts[9]);
+        let blit      = to_ms(ts[10], ts[11]);
 
         Some(GpuTimingsMs {
             primary,
             local_taa,
             godray,
             composite,
+            composite_taa,
             blit,
-            total: primary + local_taa + godray + composite + blit,
+            total: primary + local_taa + godray + composite + composite_taa + blit,
         })
     }
 

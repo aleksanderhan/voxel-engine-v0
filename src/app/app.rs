@@ -428,6 +428,12 @@ impl App {
         let (internal_width, internal_height) = self.renderer.internal_dims();
         let render_res = Vec2::new(internal_width as f32, internal_height as f32);
 
+        let jitter = {
+            let fx = halton_2d(self.frame_index.wrapping_add(1)).x - 0.5;
+            let fy = halton_2d(self.frame_index.wrapping_add(1)).y - 0.5;
+            Vec2::new(fx, fy)
+        };
+
         let ray_dir_at = |px: Vec2| -> Vec3 {
             let ndc = Vec4::new(
                 2.0 * px.x / render_res.x - 1.0,
@@ -445,9 +451,9 @@ impl App {
             (camera_frame.view_inv * vdir).truncate()
         };
 
-        let ray00 = ray_dir_at(Vec2::new(0.5, 0.5));
-        let ray10 = ray_dir_at(Vec2::new(1.5, 0.5));
-        let ray01 = ray_dir_at(Vec2::new(0.5, 1.5));
+        let ray00 = ray_dir_at(Vec2::new(0.5, 0.5) + jitter);
+        let ray10 = ray_dir_at(Vec2::new(1.5, 0.5) + jitter);
+        let ray01 = ray_dir_at(Vec2::new(0.5, 1.5) + jitter);
         let ray_dx = ray10 - ray00;
         let ray_dy = ray01 - ray00;
 
@@ -976,6 +982,21 @@ impl App {
             .material_at_voxel_with_edits(&self.chunks.edits, wx, wy, wz)
     }
 
+}
+
+fn halton(mut index: u32, base: u32) -> f32 {
+    let mut f = 1.0;
+    let mut r = 0.0;
+    while index > 0 {
+        f /= base as f32;
+        r += f * (index % base) as f32;
+        index /= base;
+    }
+    r
+}
+
+fn halton_2d(index: u32) -> Vec2 {
+    Vec2::new(halton(index, 2), halton(index, 3))
 }
 
 fn choose_present_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::PresentMode {

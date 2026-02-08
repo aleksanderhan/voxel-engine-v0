@@ -10,6 +10,7 @@ pub struct BindGroups {
     pub godray: [wgpu::BindGroup; 2],
     pub local_taa: [wgpu::BindGroup; 2],
     pub composite: [wgpu::BindGroup; 2],
+    pub composite_taa: [wgpu::BindGroup; 2],
     pub empty: wgpu::BindGroup,
     pub blit: wgpu::BindGroup,
 }
@@ -247,6 +248,31 @@ fn make_composite_bg(
     })
 }
 
+fn make_composite_taa_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    composite_in_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
+    hist_in_view: &wgpu::TextureView,
+    hist_sampler: &wgpu::Sampler,
+    output_view: &wgpu::TextureView,
+    hist_out_view: &wgpu::TextureView,
+    label: &str,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(composite_in_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(hist_in_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(hist_sampler) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(output_view) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(hist_out_view) },
+        ],
+    })
+}
+
 
 
 fn make_blit_bg(
@@ -365,7 +391,7 @@ pub fn create_bind_groups(
             &layouts.composite,
             &textures.color.view,
             &textures.godray[0].view,
-            &textures.output.view,
+            &textures.output_pre_taa.view,
             &textures.depth.view,
             sampler,
             &textures.local_hist[0].view,
@@ -377,12 +403,37 @@ pub fn create_bind_groups(
             &layouts.composite,
             &textures.color.view,
             &textures.godray[1].view,
-            &textures.output.view,
+            &textures.output_pre_taa.view,
             &textures.depth.view,
             sampler,
             &textures.local_hist[1].view,
             sampler,
             "composite_bg_read_b",
+        ),
+    ];
+
+    let composite_taa = [
+        make_composite_taa_bg(
+            device,
+            &layouts.composite_taa,
+            &textures.output_pre_taa.view,
+            &textures.depth.view,
+            &textures.output_hist[0].view,
+            sampler,
+            &textures.output.view,
+            &textures.output_hist[1].view,
+            "composite_taa_bg_a_to_b",
+        ),
+        make_composite_taa_bg(
+            device,
+            &layouts.composite_taa,
+            &textures.output_pre_taa.view,
+            &textures.depth.view,
+            &textures.output_hist[1].view,
+            sampler,
+            &textures.output.view,
+            &textures.output_hist[0].view,
+            "composite_taa_bg_b_to_a",
         ),
     ];
 
@@ -401,6 +452,7 @@ pub fn create_bind_groups(
         godray,
         local_taa,
         composite,
+        composite_taa,
         empty,
         blit,
     }

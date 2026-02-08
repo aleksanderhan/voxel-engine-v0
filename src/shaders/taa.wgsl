@@ -1,6 +1,10 @@
-// src/shaders/ray/local_taa.wgsl
-// ------------------------------------
-// Temporal accumulation for local voxel light term.
+// src/shaders/taa.wgsl
+// --------------------
+// Temporal accumulation passes.
+//
+// Passes:
+// - local_taa: accumulates the local voxel light term.
+// - composite_taa: full-frame reprojection + history blend.
 //
 // Input:
 //   local_in_tex  = current frame noisy local term (rgb) + validity (a = local_w)
@@ -62,4 +66,45 @@ fn main_local_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
   let conf1 = select(conf0, min(1.0, conf0 + k), has_sample);
 
   textureStore(local_hist_out, ip, vec4<f32>(out_local, conf1));
+}
+
+// -----------------------------------------------------------------------------
+// Composite TAA (full-frame)
+// -----------------------------------------------------------------------------
+
+@group(3) @binding(0) var composite_in_tex : texture_2d<f32>;
+@group(3) @binding(1) var depth_full_tex   : texture_2d<f32>;
+@group(3) @binding(2) var hist_in_tex      : texture_2d<f32>;
+@group(3) @binding(3) var hist_samp        : sampler;
+@group(3) @binding(4) var output_tex       : texture_storage_2d<rgba32float, write>;
+@group(3) @binding(5) var hist_out_tex     : texture_storage_2d<rgba32float, write>;
+
+@compute @workgroup_size(8, 8, 1)
+fn main_composite_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let dims = textureDimensions(output_tex);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+
+  let ip_out = vec2<i32>(i32(gid.x), i32(gid.y));
+  let px_present = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+
+  let ip_render = ip_render_from_present_px(px_present);
+  let px_render = px_render_from_present_px(px_present);
+
+  let cur = textureLoad(composite_in_tex, ip_out, 0).xyz;
+  var taa_rgb = cur;
+
+  if (COMPOSITE_TAA_ENABLED && cam.frame_index > 1u) {
+    let depth = textureLoad(depth_full_tex, ip_render, 0).x;
+    let rd = ray_dir_from_pixel(px_render);
+    let p_ws = cam.cam_pos.xyz + rd * depth;
+    let uv_prev = prev_uv_from_world(p_ws);
+
+    if (in_unit_square(uv_prev)) {
+      let hist_rgb = textureSampleLevel(hist_in_tex, hist_samp, uv_prev, 0.0).xyz;
+      taa_rgb = mix(hist_rgb, taa_rgb, COMPOSITE_TAA_ALPHA);
+    }
+  }
+
+  textureStore(output_tex, ip_out, vec4<f32>(taa_rgb, 1.0));
+  textureStore(hist_out_tex, ip_out, vec4<f32>(taa_rgb, 1.0));
 }

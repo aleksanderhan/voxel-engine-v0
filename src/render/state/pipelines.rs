@@ -29,6 +29,9 @@ pub struct Pipelines {
     /// Compute pipeline for the full-resolution composite pass (writes final output).
     pub composite: wgpu::ComputePipeline,
 
+    /// Compute pipeline for full-frame temporal accumulation.
+    pub composite_taa: wgpu::ComputePipeline,
+
     /// Render pipeline for the final blit to the swapchain (fullscreen triangle).
     pub blit: wgpu::RenderPipeline,
 }
@@ -126,6 +129,15 @@ pub fn create_pipelines(
         &[&layouts.scene, &layouts.empty, &layouts.composite],
     );
 
+    let composite_taa = make_compute_pipeline(
+        device,
+        "composite_taa_pipeline",
+        cs_module,
+        "main_composite_taa",
+        // group(0)=scene, group(1)=empty, group(2)=empty, group(3)=composite_taa
+        &[&layouts.scene, &layouts.empty, &layouts.empty, &layouts.composite_taa],
+    );
+
     // -------------------------------------------------------------------------
     // Render pipeline: blit
     // -------------------------------------------------------------------------
@@ -179,6 +191,7 @@ pub fn create_pipelines(
         godray,
         local_taa,
         composite,
+        composite_taa,
         blit,
     }
 }
