@@ -71,10 +71,7 @@ pub struct CameraGpu {
 
     pub render_present_px: [u32; 4],
 
-    // Keep the rest 16B-aligned blocks.
-    pub _pad0: [u32; 3],
-    pub _pad1: [u32; 4],
-    pub _pad2: [u32; 4],
+    // No trailing padding needed (struct ends on 16B boundary).
 }
 
 
