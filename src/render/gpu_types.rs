@@ -76,6 +76,7 @@ pub struct CameraGpu {
     pub profile_flags: u32,
     pub _pad0: [u32; 3],
     pub _pad1: [u32; 4],
+    pub _pad2: [u32; 4],
 }
 
 /// Clipmap uniform payload.
