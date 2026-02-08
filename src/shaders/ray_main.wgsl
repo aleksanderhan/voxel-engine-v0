@@ -29,9 +29,8 @@
 @group(0) @binding(14) var primary_hist_samp : sampler;
 
 // Sun-shadow history (geom-only transmittance)
-@group(0) @binding(15) var<storage, read> shadow_hist_in : array<f32>;
-@group(0) @binding(16) var<storage, read_write> shadow_hist_out : array<f32>;
-@group(0) @binding(17) var<storage, read_write> primary_prof : array<atomic<u32>>;
+@group(0) @binding(15) var<storage, read> shadow_hist_in : array<u32>;
+@group(0) @binding(16) var<storage, read_write> shadow_hist_out : array<atomic<u32>>;
 
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
 @group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
@@ -117,6 +116,7 @@ fn main_primary(
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
   let profile_on = cam.profile_enabled != 0u;
+  let profile_base_idx = dims.x * dims.y;
 
   // Local output defaults: invalid (alpha=0) so TAA keeps history instead of blending black.
   var local_out = vec3<f32>(0.0);
@@ -130,7 +130,7 @@ fn main_primary(
   let shadow_idx = u32(ip.y) * dims.x + u32(ip.x);
 
   if (cam.chunk_count == 0u) {
-    if (profile_on) { atomicAdd(&primary_prof[PROF_HEIGHTFIELD], 1u); }
+    if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_HEIGHTFIELD], 1u); }
     var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
@@ -156,11 +156,11 @@ fn main_primary(
         }
       }
 
-      if (profile_on) { atomicAdd(&primary_prof[PROF_SHADE], 1u); }
+      if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_SHADE], 1u); }
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let sky_bg_rd = sky_bg(rd);
-      if (profile_on) { atomicAdd(&primary_prof[PROF_FOG], 1u); }
+      if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_FOG], 1u); }
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
       t_store = t_scene;
@@ -168,18 +168,18 @@ fn main_primary(
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-      shadow_hist_out[shadow_idx] = shadow_out;
+      atomicStore(&shadow_hist_out[shadow_idx], bitcast<u32>(shadow_out));
       return;
     }
 
     // True sky pixel: now pay for full sky (clouds + sun)
-    if (profile_on) { atomicAdd(&primary_prof[PROF_SKY], 1u); }
+    if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_SKY], 1u); }
     let sky = sky_color(rd);
     textureStore(color_img, ip, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    shadow_hist_out[shadow_idx] = shadow_out;
+    atomicStore(&shadow_hist_out[shadow_idx], bitcast<u32>(shadow_out));
     return;
   }
 
@@ -230,7 +230,7 @@ fn main_primary(
     if (hist_valid) {
       let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
       let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
-      if (profile_on) { atomicAdd(&primary_prof[PROF_VOX_TRACE], 1u); }
+      if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_VOX_TRACE], 1u); }
       let vt_hint = trace_scene_voxels_candidates(
         ro,
         rd,
@@ -248,7 +248,7 @@ fn main_primary(
       }
     }
     if (!used_hint) {
-      if (profile_on) { atomicAdd(&primary_prof[PROF_VOX_TRACE], 1u); }
+      if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_VOX_TRACE], 1u); }
       vt = trace_scene_voxels_candidates(
         ro,
         rd,
@@ -265,7 +265,7 @@ fn main_primary(
 
   // Outside streamed grid => heightfield or sky
   if (!vt.in_grid) {
-    if (profile_on) { atomicAdd(&primary_prof[PROF_HEIGHTFIELD], 1u); }
+    if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_HEIGHTFIELD], 1u); }
     var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
@@ -291,11 +291,11 @@ fn main_primary(
         }
       }
 
-      if (profile_on) { atomicAdd(&primary_prof[PROF_SHADE], 1u); }
+      if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_SHADE], 1u); }
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let sky_bg_rd = sky_bg(rd);
-      if (profile_on) { atomicAdd(&primary_prof[PROF_FOG], 1u); }
+      if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_FOG], 1u); }
       let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
       t_store = t_scene;
@@ -303,17 +303,17 @@ fn main_primary(
       textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-      shadow_hist_out[shadow_idx] = shadow_out;
+      atomicStore(&shadow_hist_out[shadow_idx], bitcast<u32>(shadow_out));
       return;
     }
 
-    if (profile_on) { atomicAdd(&primary_prof[PROF_SKY], 1u); }
+    if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_SKY], 1u); }
     let sky = sky_color(rd);
     textureStore(color_img, ip, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    shadow_hist_out[shadow_idx] = shadow_out;
+    atomicStore(&shadow_hist_out[shadow_idx], bitcast<u32>(shadow_out));
     return;
   }
 
@@ -360,7 +360,7 @@ fn main_primary(
 
     let shadow_do = (seed & SHADOW_SUBSAMPLE_MASK) == 0u;
     if (shadow_do) {
-      var shadow_hist = shadow_hist_in[shadow_idx];
+      var shadow_hist = bitcast<f32>(shadow_hist_in[shadow_idx]);
       let uv_prev = prev_uv_from_world(hp);
       if (in_unit_square(uv_prev)) {
         let prev_px = vec2<i32>(
@@ -368,24 +368,24 @@ fn main_primary(
           clamp(i32(uv_prev.y * f32(dims.y)), 0, i32(dims.y) - 1)
         );
         let prev_idx = u32(prev_px.y) * dims.x + u32(prev_px.x);
-        shadow_hist = shadow_hist_in[prev_idx];
+        shadow_hist = bitcast<f32>(shadow_hist_in[prev_idx]);
       }
       shadow_hist = clamp(shadow_hist, 0.0, 1.0);
       let shadow_cur = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
       shadow_out = mix(shadow_hist, shadow_cur, SHADOW_TAA_ALPHA);
     } else {
-      shadow_out = clamp(shadow_hist_in[shadow_idx], 0.0, 1.0);
+      shadow_out = clamp(bitcast<f32>(shadow_hist_in[shadow_idx]), 0.0, 1.0);
     }
 
     // Split shading (base + local)
-    if (profile_on) { atomicAdd(&primary_prof[PROF_SHADE], 1u); }
+    if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_SHADE], 1u); }
     let sh = shade_hit_split(ro, rd, vt.best, sky_up, seed, shadow_out);
 
     let t_scene = min(vt.best.t, FOG_MAX_DIST);
 
     // Fog only the base surface term (view-space medium)
     let sky_bg_rd = sky_bg(rd);
-    if (profile_on) { atomicAdd(&primary_prof[PROF_FOG], 1u); }
+    if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_FOG], 1u); }
     let col_base = apply_fog(sh.base_hdr, ro, rd, t_scene, sky_bg_rd);
 
     // Local is stored UNFOGGED for temporal accumulation
@@ -410,12 +410,12 @@ fn main_primary(
       ip,
       vec4<f32>(t_store, bitcast<f32>(anchor_key), bitcast<f32>(packed_xy), bitcast<f32>(packed_z))
     );
-    shadow_hist_out[shadow_idx] = shadow_out;
+    atomicStore(&shadow_hist_out[shadow_idx], bitcast<u32>(shadow_out));
     return;
   }
 
   // Voxel miss: try heightfield
-  if (profile_on) { atomicAdd(&primary_prof[PROF_HEIGHTFIELD], 1u); }
+  if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_HEIGHTFIELD], 1u); }
   var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
   if (hf.hit) {
@@ -441,11 +441,11 @@ fn main_primary(
       }
     }
 
-    if (profile_on) { atomicAdd(&primary_prof[PROF_SHADE], 1u); }
+    if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_SHADE], 1u); }
     let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
     let t_scene = min(hf.t, FOG_MAX_DIST);
     let sky_bg_rd = sky_bg(rd);
-    if (profile_on) { atomicAdd(&primary_prof[PROF_FOG], 1u); }
+    if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_FOG], 1u); }
     let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
 
     t_store = t_scene;
@@ -453,18 +453,18 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    shadow_hist_out[shadow_idx] = shadow_out;
+    atomicStore(&shadow_hist_out[shadow_idx], bitcast<u32>(shadow_out));
     return;
   }
 
   // True sky pixel: now compute full sky (clouds + sun)
-  if (profile_on) { atomicAdd(&primary_prof[PROF_SKY], 1u); }
+  if (profile_on) { atomicAdd(&shadow_hist_out[profile_base_idx + PROF_SKY], 1u); }
   let sky = sky_color(rd);
   textureStore(color_img, ip, vec4<f32>(sky, 1.0));
   textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
   textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
   textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-  shadow_hist_out[shadow_idx] = shadow_out;
+  atomicStore(&shadow_hist_out[shadow_idx], bitcast<u32>(shadow_out));
 }
 
 

@@ -10,7 +10,7 @@ pub struct BindGroups {
     pub godray: [wgpu::BindGroup; 2],
     pub composite: [wgpu::BindGroup; 2],
     pub empty: wgpu::BindGroup,
-    pub blit: wgpu::BindGroup,
+    pub blit: [wgpu::BindGroup; 2],
 }
 
 fn make_primary_bg(
@@ -101,12 +101,6 @@ fn make_primary_bg(
                 binding: 16,
                 resource: shadow_hist_out.as_entire_binding(),
             },
-            wgpu::BindGroupEntry {
-                binding: 17,
-                resource: buffers.primary_profile.as_entire_binding(),
-            },
-
-
         ],
     })
 }
@@ -222,7 +216,7 @@ fn make_blit_bg(
     output_view: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
     overlay_buf: &wgpu::Buffer,
-    primary_profile: &wgpu::Buffer,
+    shadow_hist: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("blit_bg"),
@@ -242,7 +236,7 @@ fn make_blit_bg(
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: primary_profile.as_entire_binding(),
+                resource: shadow_hist.as_entire_binding(),
             },
         ],
     })
@@ -338,14 +332,24 @@ pub fn create_bind_groups(
     ];
 
 
-    let blit = make_blit_bg(
-        device,
-        &layouts.blit,
-        &textures.output.view,
-        sampler,
-        &buffers.overlay,
-        &buffers.primary_profile,
-    );
+    let blit = [
+        make_blit_bg(
+            device,
+            &layouts.blit,
+            &textures.output.view,
+            sampler,
+            &buffers.overlay,
+            &textures.shadow_hist[0],
+        ),
+        make_blit_bg(
+            device,
+            &layouts.blit,
+            &textures.output.view,
+            sampler,
+            &buffers.overlay,
+            &textures.shadow_hist[1],
+        ),
+    ];
 
     BindGroups {
         primary,

@@ -151,9 +151,10 @@ pub struct OverlayGpu {
     pub text_p2:  u32, // 4 ASCII bytes
 
     pub profile_enabled: u32,
+    pub profile_base_idx: u32,
 
     // pad to 64 bytes (uniform structs are effectively 16-byte aligned)
-    pub _pad0:    [u32; 4],
+    pub _pad0:    [u32; 3],
 }
 
 
@@ -187,6 +188,7 @@ impl OverlayGpu {
         _height: u32,
         scale: u32,
         profile_enabled: bool,
+        profile_base_idx: u32,
     ) -> Self {
         // ---- FPS digits ----
         let mut v = fps.min(9999);
@@ -236,7 +238,8 @@ impl OverlayGpu {
             text_p1,
             text_p2,
             profile_enabled: profile_enabled as u32,
-            _pad0: [0; 4],
+            profile_base_idx,
+            _pad0: [0; 3],
         }
     }
 }

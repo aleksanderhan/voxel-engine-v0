@@ -34,8 +34,6 @@ pub struct Buffers {
     pub colinfo: wgpu::Buffer,
     pub colinfo_capacity_u32: u32,
 
-    pub primary_profile: wgpu::Buffer,
-
 }
 
 fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
@@ -112,13 +110,6 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         (colinfo_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
     );
 
-    let primary_profile = make_storage_buffer(
-        device,
-        "primary_profile_buf",
-        (crate::render::gpu_types::PRIMARY_PROFILE_COUNTERS as u64)
-            * (std::mem::size_of::<u32>() as u64),
-    );
-
     Buffers {
         camera,
         overlay,
@@ -135,6 +126,5 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         rope_capacity,
         colinfo,
         colinfo_capacity_u32,
-        primary_profile,
     }
 }

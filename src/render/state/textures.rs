@@ -3,6 +3,7 @@
 
 use crate::app::config;
 use crate::{
+    render::gpu_types::PRIMARY_PROFILE_COUNTERS,
     render::resources::{create_output_texture, OutputTex},
 };
 
@@ -164,10 +165,13 @@ pub fn create_textures(
 
     let shadow_bytes = (internal_w.max(1) as u64)
         * (internal_h.max(1) as u64)
-        * std::mem::size_of::<f32>() as u64;
+        * std::mem::size_of::<u32>() as u64;
+    let shadow_counter_bytes =
+        (PRIMARY_PROFILE_COUNTERS as u64) * std::mem::size_of::<u32>() as u64;
+    let shadow_total_bytes = shadow_bytes + shadow_counter_bytes;
     let shadow_hist = [
-        make_storage_buffer(device, "shadow_hist_a", shadow_bytes),
-        make_storage_buffer(device, "shadow_hist_b", shadow_bytes),
+        make_storage_buffer(device, "shadow_hist_a", shadow_total_bytes),
+        make_storage_buffer(device, "shadow_hist_b", shadow_total_bytes),
     ];
 
     let godray = [

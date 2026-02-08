@@ -314,11 +314,15 @@ impl Renderer {
             .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
     }
 
-    pub fn clear_primary_profile(&self) {
+    pub fn clear_shadow_profile_counters(&self) {
         let zeros = [0u32; PRIMARY_PROFILE_COUNTERS];
+        let pong = 1 - self.ping;
+        let shadow_bytes = (self.internal_w as u64)
+            * (self.internal_h as u64)
+            * (std::mem::size_of::<u32>() as u64);
         self.queue.write_buffer(
-            &self.buffers.primary_profile,
-            0,
+            &self.textures.shadow_hist[pong],
+            shadow_bytes,
             bytemuck::cast_slice(&zeros),
         );
     }
@@ -400,7 +404,7 @@ impl Renderer {
         });
 
         rpass.set_pipeline(&self.pipelines.blit);
-        rpass.set_bind_group(0, &self.bind_groups.blit, &[]);
+        rpass.set_bind_group(0, &self.bind_groups.blit[self.ping], &[]);
         rpass.draw(0..3, 0..1);
     }
 

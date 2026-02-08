@@ -35,7 +35,8 @@ struct Overlay {
   text_p2    : u32, // 4 chars packed
 
   profile_enabled : u32,
-  _pad0 : vec4<u32>,
+  profile_base_idx : u32,
+  _pad0 : vec3<u32>,
 };
 
 @group(0) @binding(2) var<uniform> overlay : Overlay;
@@ -157,13 +158,13 @@ fn glyph_bit(mask: u32, x: u32, y: u32) -> bool {
   return ((mask >> bit) & 1u) != 0u;
 }
 
-fn profile_value(line: u32) -> u32 {
+fn profile_value(line: u32, base_idx: u32) -> u32 {
   switch (line) {
-    case 0u: { return primary_prof[0]; }
-    case 1u: { return primary_prof[1]; }
-    case 2u: { return primary_prof[2]; }
-    case 3u: { return primary_prof[3]; }
-    default: { return primary_prof[4]; }
+    case 0u: { return primary_prof[base_idx + 0u]; }
+    case 1u: { return primary_prof[base_idx + 1u]; }
+    case 2u: { return primary_prof[base_idx + 2u]; }
+    case 3u: { return primary_prof[base_idx + 3u]; }
+    default: { return primary_prof[base_idx + 4u]; }
   }
 }
 
@@ -221,7 +222,7 @@ fn profile_label(line: u32, ci: u32) -> u32 {
   }
 }
 
-fn profile_char(line: u32, ci: u32) -> u32 {
+fn profile_char(line: u32, ci: u32, base_idx: u32) -> u32 {
   if (ci < 3u) {
     return profile_label(line, ci);
   }
@@ -229,7 +230,7 @@ fn profile_char(line: u32, ci: u32) -> u32 {
     return 32u; // space
   }
   if (ci < 8u) {
-    let count = profile_value(line);
+    let count = profile_value(line, base_idx);
     let val_k = min((count + 500u) / 1000u, 9999u);
     let digit = profile_digit(val_k, ci - 4u);
     return 48u + digit;
@@ -391,6 +392,8 @@ fn fs_main(
     let base_y = overlay.origin_y + overlay.digit_h + margin + text_offset + margin;
     let total_h = PROFILE_LINES * line_stride - line_gap;
 
+    let base_idx = overlay.profile_base_idx;
+
     if (px.x >= tox && px.x < (tox + line_w) &&
         px.y >= base_y && px.y < (base_y + total_h)) {
       let lx = px.x - tox;
@@ -407,7 +410,7 @@ fn fs_main(
           let cell_y = in_y / scale;
 
           if (cell_y < 5u) {
-            let ch = profile_char(line, ci);
+            let ch = profile_char(line, ci, base_idx);
             let m = glyph_mask(ch);
             if (glyph_bit(m, cell_x, cell_y)) {
               rgb = vec3<f32>(1.0, 1.0, 1.0);

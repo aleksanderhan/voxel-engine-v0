@@ -270,7 +270,7 @@ impl App {
         let camera_gpu = self.build_camera_gpu(clipmap_update.time_seconds);
         self.write_overlay_fps();
         if self.show_primary_profile {
-            self.renderer.clear_primary_profile();
+            self.renderer.clear_shadow_profile_counters();
         }
 
         self.apply_chunk_uploads_and_refresh_grid();
@@ -532,6 +532,10 @@ impl App {
             self.surface_config.height,
             8,
             self.show_primary_profile,
+            {
+                let (internal_w, internal_h) = self.renderer.internal_dims();
+                internal_w * internal_h
+            },
         );
         self.renderer.write_overlay(&overlay);
 
