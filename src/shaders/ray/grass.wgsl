@@ -253,12 +253,17 @@ fn grass_sdf_lod(
       let ya = t01a * blade_len;
       let yb = t01b * blade_len;
 
+      // t in [0..1], 0=base, 1=tip
+      let tmid = 0.5 * (t01a + t01b);
+
       // bending increases with height, with a little extra lean
       let bend_a = (blade_len * t01a) * (0.55 + 0.45 * t01a);
       let bend_b = (blade_len * t01b) * (0.55 + 0.45 * t01b);
 
       // wind + stable lean combined
-      let bend_vec = (w_xz + lean_dir * lean_amt);
+      // keep base anchored: fade wind by height (0 at base, 1 at tip)
+      let wind_fade = tmid;
+      let bend_vec = (w_xz * wind_fade + lean_dir * lean_amt);
 
       let offa = bend_vec * bend_a;
       let offb = bend_vec * bend_b;
@@ -267,8 +272,6 @@ fn grass_sdf_lod(
       let pb = root + vec3<f32>(offb.x, yb, offb.y);
 
       // --- taper to a point ---
-      // t in [0..1], 0=base, 1=tip
-      let tmid = 0.5 * (t01a + t01b);
 
       // Nonlinear taper so most narrowing happens near the top.
       // k bigger => pointier. Try 2.0..4.0.
