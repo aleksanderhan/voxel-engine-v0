@@ -58,6 +58,11 @@ struct ProfileCounters {
 @group(2) @binding(5) var local_hist_tex : texture_2d<f32>;
 @group(2) @binding(6) var local_samp     : sampler;
 
+// composite TAA history (LDR, present resolution)
+@group(2) @binding(7) var output_hist_in  : texture_2d<f32>;
+@group(2) @binding(8) var output_hist_samp: sampler;
+@group(2) @binding(9) var output_hist_out : texture_storage_2d<rgba32float, write>;
+
 var<workgroup> WG_SKY_UP : vec3<f32>;
 var<workgroup> WG_TILE_COUNT_CACHED : u32;
 
@@ -568,6 +573,31 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
   let rgb_final = outc.xyz + local_rgb;
   let outc_final = vec4<f32>(rgb_final, outc.w);
 
+  // --- Full-frame TAA in present space (reproject history via depth) ---
+  var taa_rgb = outc_final.xyz;
+  if (COMPOSITE_TAA_ENABLED && cam.frame_index > 1u) {
+    let fd_u = textureDimensions(depth_full);
+    let fd_f = vec2<f32>(f32(fd_u.x), f32(fd_u.y));
+    let rd_u = textureDimensions(color_tex);
+    let rd_f = vec2<f32>(f32(rd_u.x), f32(rd_u.y));
+
+    let px_full = px_render * (fd_f / rd_f);
+    let ip_f = vec2<i32>(
+      clamp(i32(floor(px_full.x)), 0, i32(fd_u.x) - 1),
+      clamp(i32(floor(px_full.y)), 0, i32(fd_u.y) - 1)
+    );
+    let d0 = textureLoad(depth_full, ip_f, 0).x;
+    let rd = ray_dir_from_pixel(px_render);
+    let p_ws = cam.cam_pos.xyz + rd * d0;
+    let uv_prev = prev_uv_from_world(p_ws);
+
+    if (in_unit_square(uv_prev)) {
+      let hist_rgb = textureSampleLevel(output_hist_in, output_hist_samp, uv_prev, 0.0).xyz;
+      taa_rgb = mix(hist_rgb, taa_rgb, COMPOSITE_TAA_ALPHA);
+    }
+  }
+
   let ip_out = vec2<i32>(i32(gid.x), i32(gid.y));
-  textureStore(out_img, ip_out, outc_final);
+  textureStore(out_img, ip_out, vec4<f32>(taa_rgb, outc_final.w));
+  textureStore(output_hist_out, ip_out, vec4<f32>(taa_rgb, outc_final.w));
 }

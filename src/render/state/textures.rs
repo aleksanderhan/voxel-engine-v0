@@ -18,6 +18,7 @@ pub struct Tex2DArray {
 
 pub struct TextureSet {
     pub output: OutputTex,
+    pub output_hist: [Tex2D; 2],
     pub color: Tex2D,
     pub depth: Tex2D,
 
@@ -129,6 +130,24 @@ pub fn create_textures(
         wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
 
     let output = create_output_texture(device, out_w, out_h);
+    let output_hist = [
+        make_tex2d(
+            device,
+            "output_hist_a",
+            out_w,
+            out_h,
+            wgpu::TextureFormat::Rgba32Float,
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        ),
+        make_tex2d(
+            device,
+            "output_hist_b",
+            out_w,
+            out_h,
+            wgpu::TextureFormat::Rgba32Float,
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        ),
+    ];
 
     let color = make_tex2d(
         device,
@@ -242,6 +261,7 @@ pub fn create_textures(
 
     TextureSet {
         output,
+        output_hist,
         color,
         depth,
         local,

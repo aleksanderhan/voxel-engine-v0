@@ -294,6 +294,14 @@ const LOCAL_TAA_ALPHA : f32 = 0.12;
 const LOCAL_TAA_ENABLED : bool = true;
 
 //// --------------------------------------------------------------------------
+//// Composite TAA
+//// --------------------------------------------------------------------------
+
+// Blend factor for full-frame TAA (lower = steadier, higher = faster response).
+const COMPOSITE_TAA_ALPHA : f32 = 0.08;
+const COMPOSITE_TAA_ENABLED : bool = true;
+
+//// --------------------------------------------------------------------------
 //// Grass “hair” (procedural blades)
 //// --------------------------------------------------------------------------
 

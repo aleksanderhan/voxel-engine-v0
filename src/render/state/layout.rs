@@ -264,6 +264,17 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             // binding 6: sampler (can reuse same sampler type)
             bgl_sampler_non_filtering(6, cs_vis),
 
+            // binding 7: output_hist_tex (sampled)
+            bgl_tex_sample_2d(
+                7,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            // binding 8: output_hist sampler
+            bgl_sampler_non_filtering(8, cs_vis),
+            // binding 9: output_hist_out (storage write)
+            bgl_storage_tex_wo(9, cs_vis, wgpu::TextureFormat::Rgba32Float),
+
         ],
     });
 
