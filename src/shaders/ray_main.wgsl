@@ -122,9 +122,30 @@ fn main_primary(
   let shadow_idx = u32(ip.y) * dims.x + u32(ip.x);
 
   if (cam.chunk_count == 0u) {
-    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+    var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
+      if (hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
+        let voxel_size = cam.voxel_params.x;
+        let hp = ro + rd * hf.t;
+        let cell = grass_cell_from_world_global(hp, rd, voxel_size);
+        let gh = try_grass_slab_hit(
+          ro,
+          rd,
+          0.0,
+          hf.t,
+          cell.bmin_m,
+          cell.id_vox,
+          voxel_size,
+          cam.voxel_params.y,
+          cam.voxel_params.z
+        );
+        if (gh.hit) {
+          hf.t = gh.t;
+          hf.n = gh.n;
+        }
+      }
+
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let sky_bg_rd = sky_bg(rd);
@@ -229,9 +250,30 @@ fn main_primary(
 
   // Outside streamed grid => heightfield or sky
   if (!vt.in_grid) {
-    let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+    var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
+      if (hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
+        let voxel_size = cam.voxel_params.x;
+        let hp = ro + rd * hf.t;
+        let cell = grass_cell_from_world_global(hp, rd, voxel_size);
+        let gh = try_grass_slab_hit(
+          ro,
+          rd,
+          0.0,
+          hf.t,
+          cell.bmin_m,
+          cell.id_vox,
+          voxel_size,
+          cam.voxel_params.y,
+          cam.voxel_params.z
+        );
+        if (gh.hit) {
+          hf.t = gh.t;
+          hf.n = gh.n;
+        }
+      }
+
       let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
       let t_scene = min(hf.t, FOG_MAX_DIST);
       let sky_bg_rd = sky_bg(rd);
@@ -351,9 +393,30 @@ fn main_primary(
   }
 
   // Voxel miss: try heightfield
-  let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+  var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
   if (hf.hit) {
+    if (hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
+      let voxel_size = cam.voxel_params.x;
+      let hp = ro + rd * hf.t;
+      let cell = grass_cell_from_world_global(hp, rd, voxel_size);
+      let gh = try_grass_slab_hit(
+        ro,
+        rd,
+        0.0,
+        hf.t,
+        cell.bmin_m,
+        cell.id_vox,
+        voxel_size,
+        cam.voxel_params.y,
+        cam.voxel_params.z
+      );
+      if (gh.hit) {
+        hf.t = gh.t;
+        hf.n = gh.n;
+      }
+    }
+
     let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
     let t_scene = min(hf.t, FOG_MAX_DIST);
     let sky_bg_rd = sky_bg(rd);

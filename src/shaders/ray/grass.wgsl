@@ -83,6 +83,26 @@ fn grass_cell_from_world(
   );
 }
 
+fn grass_cell_from_world_global(
+  hp_m: vec3<f32>,
+  rd: vec3<f32>,
+  voxel_size_m: f32
+) -> GrassCell {
+  let bias = 0.05 * voxel_size_m;
+  let p = hp_m - rd * bias;
+  let pxz = vec2<f32>(p.x, p.z);
+  let py = p.y - 1e-4 * voxel_size_m;
+
+  let ix = i32(floor(pxz.x / voxel_size_m));
+  let iy = i32(floor(py / voxel_size_m));
+  let iz = i32(floor(pxz.y / voxel_size_m));
+
+  let bmin_m = vec3<f32>(f32(ix), f32(iy), f32(iz)) * voxel_size_m;
+  let id_vox = vec3<f32>(f32(ix), f32(iy), f32(iz));
+
+  return GrassCell(bmin_m, id_vox);
+}
+
 fn sdf_box(p: vec3<f32>, c: vec3<f32>, b: vec3<f32>) -> f32 {
   let q = abs(p - c) - b;
   let outside = length(max(q, vec3<f32>(0.0)));
