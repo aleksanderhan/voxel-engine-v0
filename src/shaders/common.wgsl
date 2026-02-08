@@ -255,7 +255,7 @@ const HF_DT_MAX : f32 = 48.0;
 const LIGHT_MAX_DIST_VOX : u32 = 16u;   // try 16..64
 
 // Number of rays
-const LIGHT_RAYS : u32 = 16u;          // try 8..16
+const LIGHT_RAYS : u32 = 64u;          // try 16..64
 
 // Softens inverse-square near the light (in voxels)
 const LIGHT_SOFT_RADIUS_VOX : f32 = 3.0;
@@ -274,7 +274,7 @@ const LIGHT_DIRECT_GAIN   : f32 = 1.00;
 const LIGHT_INDIRECT_GAIN : f32 = 0.65; // cheap “bounce fill”
 
 // Stop after N light hits (perf only; output is normalized with LIGHT_RAYS)
-const LIGHT_EARLY_HITS : u32 = 6u;
+const LIGHT_EARLY_HITS : u32 = 64u;
 
 //// --------------------------------------------------------------------------
 //// Shading gates (world-space distance)
