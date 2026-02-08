@@ -161,7 +161,7 @@ const CLOUD_SILVER_STR : f32       = 0.6;
 
 // How much clouds attenuate SUNLIGHT hitting the world
 const CLOUD_SHADOW_ABSORB   : f32 = 6.0;
-const CLOUD_SHADOW_STRENGTH : f32 = 0.65;
+const CLOUD_SHADOW_STRENGTH : f32 = 0.45;
 
 // Sun-disc dim behavior (keep)
 const CLOUD_DIM_SUN_DISC : bool = true;
