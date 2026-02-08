@@ -23,7 +23,7 @@ const EPS_INV : f32 = 1e-8;
 //// Feature toggles
 //// --------------------------------------------------------------------------
 
-const ENABLE_GRASS   : bool = true;
+const ENABLE_GRASS   : bool = false;
 const ENABLE_CLIPMAP : bool = true;
 const ENABLE_GODRAYS : bool = true;
 const ENABLE_CLOUDS  : bool = true;
