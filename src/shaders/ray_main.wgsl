@@ -170,6 +170,7 @@ fn main_primary(
 
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px);
+  let rd_uj = ray_dir_from_pixel_uj(px);
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
 
@@ -248,7 +249,7 @@ fn main_primary(
     let hist_guess = textureLoad(primary_hist_tex, ip, 0);
     let t_hist_guess = hist_guess.x;
     if (t_hist_guess > 1e-3) {
-      let p_ws = ro + rd * t_hist_guess;
+      let p_ws = ro + rd_uj * t_hist_guess;
       let uv_prev = prev_uv_from_world(p_ws);
 
       if (in_unit_square(uv_prev)) {
