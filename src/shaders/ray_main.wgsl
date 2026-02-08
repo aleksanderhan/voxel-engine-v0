@@ -410,7 +410,16 @@ fn main_primary(
       let shadow_cur = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
       shadow_out = mix(shadow_hist, shadow_cur, SHADOW_TAA_ALPHA);
     } else {
-      shadow_out = clamp(textureLoad(shadow_hist_in, ip, 0).x, 0.0, 1.0);
+      let uv_prev = prev_uv_from_world(hp);
+      var shadow_hist = textureLoad(shadow_hist_in, ip, 0).x;
+      if (in_unit_square(uv_prev)) {
+        let prev_px = vec2<i32>(
+          clamp(i32(uv_prev.x * f32(dims.x)), 0, i32(dims.x) - 1),
+          clamp(i32(uv_prev.y * f32(dims.y)), 0, i32(dims.y) - 1)
+        );
+        shadow_hist = textureLoad(shadow_hist_in, prev_px, 0).x;
+      }
+      shadow_out = clamp(shadow_hist, 0.0, 1.0);
     }
 
     // Split shading (base + local)
