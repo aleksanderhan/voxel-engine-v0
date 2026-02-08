@@ -249,8 +249,8 @@ fn grass_sdf_lod(
 
     let root = vec3<f32>(root_xz.x, top_y, root_xz.y);
 
-    // wind (XZ only), phase-shifted
-    let w_xz = grass_wind_xz(root + vec3<f32>(0.0, ph, 0.0), time_s, strength);
+    // wind (XZ only), phase-shifted (damped so blades just sway)
+    let w_xz = 0.35 * grass_wind_xz(root + vec3<f32>(0.0, ph, 0.0), time_s, strength);
 
     // per-blade lean direction (adds “messy lush” look even with low wind)
     let lean_ang = TAU * fract(u0 * 1.73 + v0 * 2.11);
