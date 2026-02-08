@@ -884,8 +884,8 @@ fn trace_chunk_rope_interval_nomacro(
       if (ENABLE_GRASS && leaf.mat == MAT_GRASS) {
         let hp = ro + bh.t * rd;
 
-        let cell = pick_grass_cell_in_chunk(
-          hp, rd,
+        let cell = pick_grass_cell_in_chunk_with_bias(
+          hp, bh.n,
           root_bmin,
           origin_vox_i,
           vs,
