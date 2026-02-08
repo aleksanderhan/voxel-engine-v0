@@ -370,7 +370,7 @@ fn grass_sdf_normal_lod(
     return normalize(vec3<f32>(-w.x * tilt, 1.0, -w.y * tilt));
   }
 
-  let e = 0.02 * cam.voxel_params.x;
+  let e = 0.01 * cam.voxel_params.x;
 
   let dx =
     grass_sdf_lod(p_m + vec3<f32>(e, 0.0, 0.0), cell_bmin_m, cell_id_vox, time_s, strength, lod) -
