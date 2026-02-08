@@ -93,26 +93,6 @@ fn sd_round_rect_2d(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
   return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
-// Approximate SDF for a thin triangular "card" blade in a local frame.
-// y axis = blade length, x axis = blade width, z axis = thickness.
-fn sd_blade_card(p: vec3<f32>, length: f32, width_base: f32, thickness: f32) -> f32 {
-  let h = max(length, 1e-6);
-  let y = p.y;
-
-  let y_clamped = clamp(y, 0.0, h);
-  let width = width_base * (1.0 - y_clamped / h);
-
-  let dx = abs(p.x) - width;
-  let dy = max(-y, y - h);
-
-  let d2 = length(max(vec2<f32>(dx, dy), vec2<f32>(0.0)));
-  let inside = min(max(dx, dy), 0.0);
-  let d_tri = d2 + inside;
-
-  let dz = abs(p.z) - thickness;
-  return max(d_tri, dz);
-}
-
 // A flat blade segment: closest point on segment, then distance in the segment's local frame
 // width = half-width (flat axis), thick = half-thickness (thin axis), edge_r = rounding
 fn sdf_blade_segment(
@@ -199,11 +179,16 @@ fn grass_sdf_lod(
 
   // LOD selection (as before)
   var blade_count: u32 = GRASS_BLADE_COUNT;
+  var segs: u32 = u32(max(3.0, floor(GRASS_VOXEL_SEGS)));
   if (lod == 1u) {
     blade_count = min(blade_count, GRASS_BLADE_COUNT_MID);
+    segs = min(segs, GRASS_SEGS_MID);
   } else if (lod == 2u) {
     blade_count = min(blade_count, GRASS_BLADE_COUNT_FAR);
+    segs = min(segs, GRASS_SEGS_FAR);
   }
+
+  let inv_segs = 1.0 / max(f32(segs), 1.0);
 
   var dmin = BIG_F32;
 
@@ -260,15 +245,11 @@ fn grass_sdf_lod(
     // radius variance: thicker overall, plus per-blade
     let r0 = base_r * mix(0.85, 1.35, wR);
 
-    // --- single alpha card-style blade ---
+    // --- stacked voxel blade ---
     // wind + stable lean combined (base anchored, tip follows)
     let bend_vec = (w_xz + lean_dir * lean_amt);
-    let tip = root + vec3<f32>(bend_vec.x, blade_len, bend_vec.y);
 
-    // blade frame
-    let T = normalize(tip - root);
-
-    // Keep a stable ribbon orientation per blade so it reads as one thin triangle.
+    // Keep a stable orientation per blade.
     let roll = TAU * (0.15 * ph + 0.10 * wR);
     let roll_dir = vec2<f32>(cos(roll), sin(roll));
     var side_hint = normalize(vec3<f32>(
@@ -277,29 +258,54 @@ fn grass_sdf_lod(
       lean_dir.x * roll_dir.y + lean_dir.y * roll_dir.x
     ));
 
-    // build local frame (S across width, N thickness)
-    var S = side_hint - T * dot(side_hint, T);
-    let s2 = dot(S, S);
-    if (s2 < 1e-6) {
-      let B = make_orthonormal_basis(T);
-      S = B[0];
-    } else {
-      S = S * inverseSqrt(s2);
+    for (var s: u32 = 0u; s < segs; s = s + 1u) {
+      let t01a = (f32(s)      ) * inv_segs;
+      let t01b = (f32(s) + 1.0) * inv_segs;
+
+      let ya = t01a * blade_len;
+      let yb = t01b * blade_len;
+      let seg_h = yb - ya;
+
+      let bend_a = (blade_len * t01a) * (0.55 + 0.45 * t01a);
+      let bend_b = (blade_len * t01b) * (0.55 + 0.45 * t01b);
+
+      let bend_vec_a = (w_xz * t01a + lean_dir * lean_amt);
+      let bend_vec_b = (w_xz * t01b + lean_dir * lean_amt);
+
+      let offa = bend_vec_a * bend_a;
+      let offb = bend_vec_b * bend_b;
+
+      let pa = root + vec3<f32>(offa.x, ya, offa.y);
+      let pb = root + vec3<f32>(offb.x, yb, offb.y);
+
+      let T = normalize(pb - pa);
+
+      var S = side_hint - T * dot(side_hint, T);
+      let s2 = dot(S, S);
+      if (s2 < 1e-6) {
+        let B = make_orthonormal_basis(T);
+        S = B[0];
+      } else {
+        S = S * inverseSqrt(s2);
+      }
+      let N = cross(T, S);
+
+      let mid = 0.5 * (pa + pb);
+      let d = p_m - mid;
+      let local = vec3<f32>(dot(d, S), dot(d, T), dot(d, N));
+
+      // Nonlinear taper so most narrowing happens near the top.
+      let tmid = 0.5 * (t01a + t01b);
+      let k = 3.0;
+      let taper_shape = pow(clamp(1.0 - tmid, 0.0, 1.0), k);
+      let taper = mix(GRASS_VOXEL_TAPER, 1.0, taper_shape);
+
+      let half_w = r0 * taper;
+      let half_t = max(0.03 * half_w, 0.006 * vs);
+
+      let dbox = sdf_box(local, vec3<f32>(0.0), vec3<f32>(half_w, 0.5 * seg_h, half_t));
+      dmin = min(dmin, dbox);
     }
-    let N = cross(T, S);
-
-    let d = p_m - root;
-    let local = vec3<f32>(dot(d, S), dot(d, T), dot(d, N));
-
-    // Nonlinear taper so most narrowing happens near the top.
-    let k = 3.0;
-    let taper_shape = pow(clamp(1.0 - local.y / max(blade_len, 1e-6), 0.0, 1.0), k);
-    let taper = mix(GRASS_VOXEL_TAPER, 1.0, taper_shape);
-
-    let half_w = r0 * taper;
-    let half_t = max(0.03 * half_w, 0.006 * vs);
-
-    dmin = min(dmin, sd_blade_card(local, blade_len, half_w, half_t));
   }
 
   return dmin;
