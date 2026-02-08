@@ -298,7 +298,7 @@ fn main_primary(
 
   let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
   let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
-  let vt = trace_primary_voxels(
+  var vt = trace_primary_voxels(
     ro,
     rd,
     t_start,
