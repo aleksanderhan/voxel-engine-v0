@@ -101,6 +101,10 @@ fn make_primary_bg(
                 binding: 16,
                 resource: shadow_hist_out.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: buffers.primary_profile.as_entire_binding(),
+            },
 
 
         ],

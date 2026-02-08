@@ -368,6 +368,9 @@ struct Camera {
 
   // xy = render size in pixels, zw = present size in pixels
   render_present_px : vec4<u32>,
+
+  profile_flags : u32,
+  _pad0 : vec3<u32>,
 };
 
 struct ChunkMeta {
