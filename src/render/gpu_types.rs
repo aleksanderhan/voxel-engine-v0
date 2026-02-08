@@ -154,6 +154,14 @@ pub struct OverlayGpu {
     pub _pad0: [u32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct PrimaryDispatchGpu {
+    pub base_y: u32,
+    pub max_y: u32,
+    pub _pad0: [u32; 2],
+}
+
 
 fn pack4(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32)

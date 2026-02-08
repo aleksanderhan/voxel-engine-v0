@@ -13,6 +13,9 @@ pub struct Buffers {
     /// Clipmap params (primary compute pass only).
     pub clipmap: wgpu::Buffer,
 
+    /// Primary pass dispatch range (slicing).
+    pub primary_dispatch: wgpu::Buffer,
+
     // --- Storage buffers ---
     pub node: wgpu::Buffer,
     pub chunk: wgpu::Buffer,
@@ -57,6 +60,11 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
     let overlay = make_uniform_buffer::<crate::render::gpu_types::OverlayGpu>(device, "overlay_buf");
 
     let clipmap = make_uniform_buffer::<ClipmapGpu>(device, "clipmap_buf");
+    let primary_dispatch =
+        make_uniform_buffer::<crate::render::gpu_types::PrimaryDispatchGpu>(
+            device,
+            "primary_dispatch_buf",
+        );
 
     let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
 
@@ -112,6 +120,7 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         camera,
         overlay,
         clipmap,
+        primary_dispatch,
         node,
         chunk,
         chunk_grid,

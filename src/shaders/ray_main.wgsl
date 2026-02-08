@@ -17,6 +17,12 @@
 // - apply_fog() unchanged
 // - Your temporal accumulation pass is separate (not shown here).
 
+struct PrimaryDispatch {
+  base_y: u32,
+  max_y: u32,
+  _pad: vec2<u32>,
+};
+
 @group(0) @binding(4) var color_img : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(5) var depth_img : texture_storage_2d<r32float, write>;
 
@@ -66,6 +72,8 @@ struct HfShadeOut {
   col: vec3<f32>,
   t_scene: f32,
 };
+
+@group(0) @binding(17) var<uniform> primary_dispatch : PrimaryDispatch;
 
 fn shade_heightfield(
   ro: vec3<f32>,
@@ -133,7 +141,8 @@ fn main_primary(
   @builtin(workgroup_id) wg_id: vec3<u32>
 ) {
   let dims = textureDimensions(color_img);
-  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+  let global_y = gid.y + primary_dispatch.base_y;
+  if (gid.x >= dims.x || global_y >= primary_dispatch.max_y) { return; }
 
   // Compute once per 8x8 workgroup (already cheap: sky_bg only)
   if (lid == 0u) {
@@ -147,7 +156,7 @@ fn main_primary(
     if (cam.chunk_count != 0u) {
       let tile_base = vec2<f32>(
         f32(wg_id.x * TILE_SIZE),
-        f32(wg_id.y * TILE_SIZE)
+        f32(wg_id.y * TILE_SIZE) + f32(primary_dispatch.base_y)
       );
       let ro_tile = cam.cam_pos.xyz;
 
@@ -164,14 +173,14 @@ fn main_primary(
   workgroupBarrier();
 
   let res = vec2<f32>(f32(dims.x), f32(dims.y));
-  let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+  let px  = vec2<f32>(f32(gid.x) + 0.5, f32(global_y) + 0.5);
   let frame = cam.frame_index;
-  let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
+  let seed  = (u32(gid.x) * 1973u) ^ (u32(global_y) * 9277u) ^ (frame * 26699u);
 
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px);
 
-  let ip = vec2<i32>(i32(gid.x), i32(gid.y));
+  let ip = vec2<i32>(i32(gid.x), i32(global_y));
 
   // Local output defaults: invalid (alpha=0) so TAA keeps history instead of blending black.
   var local_out = vec3<f32>(0.0);

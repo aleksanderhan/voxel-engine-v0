@@ -8,7 +8,7 @@ pub mod textures;
 
 use crate::app::config;
 use crate::{
-    render::gpu_types::{CameraGpu, OverlayGpu},
+    render::gpu_types::{CameraGpu, OverlayGpu, PrimaryDispatchGpu},
     streaming::ChunkUpload,
 };
 use bytemuck::{Pod, cast_slice};
@@ -18,6 +18,10 @@ use buffers::{create_persistent_buffers, Buffers};
 use layout::{create_layouts, Layouts};
 use pipelines::{create_pipelines, Pipelines};
 use textures::{create_textures, TextureSet};
+
+const PRIMARY_PASS_SLICES: u32 = 2;
+const OTHER_PASSES: u32 = 5;
+const TS_COUNT: u32 = 2 * (PRIMARY_PASS_SLICES + OTHER_PASSES);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuTimingsMs {
@@ -172,7 +176,6 @@ impl Renderer {
             .await
             .unwrap();
 
-        const TS_COUNT: u32 = 12;
         let (ts_qs, ts_resolve, ts_readback, ts_period_ns) = if use_ts {
             let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("ts_qs"),
@@ -319,27 +322,50 @@ impl Renderer {
     pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
         let ping = self.ping;
         let pong = 1 - ping;
+        let mut ts_index = 0u32;
 
-        {
+        let slice_h = (self.internal_h + PRIMARY_PASS_SLICES - 1) / PRIMARY_PASS_SLICES;
+        let slice_h = ((slice_h + 7) / 8) * 8;
+
+        for slice in 0..PRIMARY_PASS_SLICES {
+            let base_y = slice * slice_h;
+            if base_y >= self.internal_h {
+                break;
+            }
+            let max_y = (base_y + slice_h).min(self.internal_h);
+
+            let dispatch = PrimaryDispatchGpu {
+                base_y,
+                max_y,
+                _pad0: [0; 2],
+            };
+            self.queue.write_buffer(
+                &self.buffers.primary_dispatch,
+                0,
+                bytemuck::bytes_of(&dispatch),
+            );
+
+            let label = format!("primary_pass_{slice}");
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("primary_pass"),
-                timestamp_writes: self.ts_pair(0, 1),
+                label: Some(&label),
+                timestamp_writes: self.ts_pair(ts_index, ts_index + 1),
             });
+            ts_index += 2;
 
             cpass.set_pipeline(&self.pipelines.primary);
             cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
 
             let gx = (self.internal_w + 7) / 8;
-            let gy = (self.internal_h + 7) / 8;
+            let gy = (max_y.saturating_sub(base_y) + 7) / 8;
             cpass.dispatch_workgroups(gx, gy, 1);
-
         }
 
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("local_taa_pass"),
-                timestamp_writes: self.ts_pair(2, 3),
+                timestamp_writes: self.ts_pair(ts_index, ts_index + 1),
             });
+            ts_index += 2;
 
             cpass.set_pipeline(&self.pipelines.local_taa);
             cpass.set_bind_group(0, &self.bind_groups.local_taa[ping], &[]);
@@ -380,8 +406,9 @@ impl Renderer {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("godray_pass"),
-                timestamp_writes: self.ts_pair(4, 5),
+                timestamp_writes: self.ts_pair(ts_index, ts_index + 1),
             });
+            ts_index += 2;
 
             cpass.set_pipeline(&self.pipelines.godray);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
@@ -395,8 +422,9 @@ impl Renderer {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("composite_pass"),
-                timestamp_writes: self.ts_pair(6, 7),
+                timestamp_writes: self.ts_pair(ts_index, ts_index + 1),
             });
+            ts_index += 2;
 
             cpass.set_pipeline(&self.pipelines.composite);
 
@@ -418,8 +446,9 @@ impl Renderer {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("composite_taa_pass"),
-                timestamp_writes: self.ts_pair(8, 9),
+                timestamp_writes: self.ts_pair(ts_index, ts_index + 1),
             });
+            ts_index += 2;
 
             cpass.set_pipeline(&self.pipelines.composite_taa);
             cpass.set_bind_group(0, &self.bind_groups.scene, &[]);
@@ -447,7 +476,7 @@ impl Renderer {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: self.ts_pair_rp(10, 11),
+            timestamp_writes: self.ts_pair_rp(TS_COUNT - 2, TS_COUNT - 1),
             occlusion_query_set: None,
         });
 
@@ -587,8 +616,8 @@ impl Renderer {
         let qs = self.ts_qs.as_ref().unwrap();
         let resolve = self.ts_resolve.as_ref().unwrap();
         let readback = self.ts_readback.as_ref().unwrap();
-        encoder.resolve_query_set(qs, 0..10, resolve, 0);
-        encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, 10 * 8);
+        encoder.resolve_query_set(qs, 0..TS_COUNT, resolve, 0);
+        encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, (TS_COUNT as u64) * 8);
     }
 
     pub fn read_gpu_timings_ms_blocking(&self) -> Option<GpuTimingsMs> {
@@ -616,16 +645,13 @@ impl Renderer {
         // Read 12 u64 timestamps
         let data = slice.get_mapped_range();
         let words: &[u64] = bytemuck::cast_slice(&data);
-        if words.len() < 12 {
+        if words.len() < TS_COUNT as usize {
             drop(data);
             readback.unmap();
             return None;
         }
 
-        let ts = [
-            words[0], words[1], words[2], words[3], words[4], words[5],
-            words[6], words[7], words[8], words[9], words[10], words[11],
-        ];
+        let ts = &words[..TS_COUNT as usize];
 
         drop(data);
         readback.unmap();
@@ -635,12 +661,18 @@ impl Renderer {
         let ns = self.ts_period_ns;
         let to_ms = |a: u64, b: u64| -> f64 { (b.saturating_sub(a) as f64) * ns * 1e-6 };
 
-        let primary   = to_ms(ts[0], ts[1]);
-        let local_taa = to_ms(ts[2], ts[3]);
-        let godray    = to_ms(ts[4], ts[5]);
-        let composite = to_ms(ts[6], ts[7]);
-        let composite_taa = to_ms(ts[8], ts[9]);
-        let blit      = to_ms(ts[10], ts[11]);
+        let mut primary = 0.0;
+        for i in 0..PRIMARY_PASS_SLICES {
+            let idx = (i * 2) as usize;
+            primary += to_ms(ts[idx], ts[idx + 1]);
+        }
+
+        let base = (PRIMARY_PASS_SLICES * 2) as usize;
+        let local_taa = to_ms(ts[base], ts[base + 1]);
+        let godray = to_ms(ts[base + 2], ts[base + 3]);
+        let composite = to_ms(ts[base + 4], ts[base + 5]);
+        let composite_taa = to_ms(ts[base + 6], ts[base + 7]);
+        let blit = to_ms(ts[base + 8], ts[base + 9]);
 
         Some(GpuTimingsMs {
             primary,
