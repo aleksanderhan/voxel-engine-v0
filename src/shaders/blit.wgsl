@@ -36,7 +36,7 @@ struct Overlay {
   text_p3    : u32, // 4 chars packed
   text_p4    : u32, // 4 chars packed
 
-  _pad0      : vec4<u32>,
+  _pad0      : vec2<u32>,
 };
 
 @group(0) @binding(2) var<uniform> overlay : Overlay;
