@@ -101,6 +101,9 @@ pub struct App {
     last_cam_pos: glam::Vec3,
     last_cam_forward: glam::Vec3,
     last_chunk_count: u32,
+    last_ray00: glam::Vec3,
+    last_ray_dx: glam::Vec3,
+    last_ray_dy: glam::Vec3,
     has_tile_cam_state: bool,
 
     // Streaming update throttle.
@@ -193,6 +196,9 @@ impl App {
         let profiler = profiler::FrameProf::new(prof_enabled, prof_every);
         let camera_pos = camera.position();
         let camera_forward = camera.forward();
+        let camera_ray00 = glam::Vec3::ZERO;
+        let camera_ray_dx = glam::Vec3::ZERO;
+        let camera_ray_dy = glam::Vec3::ZERO;
 
         Self {
             window,
@@ -219,6 +225,9 @@ impl App {
             last_cam_pos: camera_pos,
             last_cam_forward: camera_forward,
             last_chunk_count: 0,
+            last_ray00: camera_ray00,
+            last_ray_dx: camera_ray_dx,
+            last_ray_dy: camera_ray_dy,
             has_tile_cam_state: false,
             last_stream_update: Instant::now(),
             stream_period: Duration::from_millis(33), // 30 Hz
@@ -474,8 +483,15 @@ impl App {
         if self.has_tile_cam_state {
             let pos_delta = camera_frame.pos.distance(self.last_cam_pos);
             let forward_dot = cam_forward.dot(self.last_cam_forward);
-            let stable =
-                pos_delta < 0.02 && forward_dot > 0.9995 && chunk_count == self.last_chunk_count;
+            let ray00_delta = (ray00 - self.last_ray00).length();
+            let ray_dx_delta = (ray_dx - self.last_ray_dx).length();
+            let ray_dy_delta = (ray_dy - self.last_ray_dy).length();
+            let stable = pos_delta < 0.02
+                && forward_dot > 0.9995
+                && ray00_delta < 1e-4
+                && ray_dx_delta < 1e-4
+                && ray_dy_delta < 1e-4
+                && chunk_count == self.last_chunk_count;
             if stable {
                 tile_rebuild = 0u32;
                 tile_ray_count = 1u32;
@@ -485,6 +501,9 @@ impl App {
         self.last_cam_pos = camera_frame.pos;
         self.last_cam_forward = cam_forward;
         self.last_chunk_count = chunk_count;
+        self.last_ray00 = ray00;
+        self.last_ray_dx = ray_dx;
+        self.last_ray_dy = ray_dy;
         self.has_tile_cam_state = true;
 
         let camera_gpu = CameraGpu {
