@@ -314,7 +314,7 @@ fn grass_sdf_lod(
 
       // Nonlinear taper so most narrowing happens near the top.
       let tmid = 0.5 * (t01a + t01b);
-      let k = 4.0;
+      let k = 3.0;
       let taper_shape = pow(clamp(1.0 - tmid, 0.0, 1.0), k);
       let taper = mix(GRASS_VOXEL_TAPER, 1.0, taper_shape);
 

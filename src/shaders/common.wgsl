@@ -296,15 +296,15 @@ const LOCAL_TAA_ALPHA : f32 = 0.12;
 //// Grass “hair” (procedural blades)
 //// --------------------------------------------------------------------------
 
-const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.75;
+const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.55;
 const GRASS_BLADE_COUNT           : u32 = 3u;
 const GRASS_TRACE_STEPS           : u32 = 7u;
 const GRASS_HIT_EPS_VOX           : f32 = 0.015;
 const GRASS_STEP_MIN_VOX          : f32 = 0.02;
 
 const GRASS_VOXEL_SEGS            : f32 = 6.0;
-const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.115;
-const GRASS_VOXEL_TAPER           : f32 = 0.045; // 0.04..0.20 gives a visible point
+const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.15;
+const GRASS_VOXEL_TAPER           : f32 = 0.10; // 0.04..0.20 gives a visible point
 const GRASS_OVERHANG_VOX          : f32 = 0.6;
 
 const GRASS_LOD_MID_START : f32 = 18.0;
