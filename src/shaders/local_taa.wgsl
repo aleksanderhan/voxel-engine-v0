@@ -13,7 +13,7 @@
 //   When local_w == 0, do NOT decay/overwrite history. Keep history as-is.
 
 @group(0) @binding(0) var local_in_tex   : texture_2d<f32>;
-@group(0) @binding(1) var local_hist_tex : texture_2d<f32>;
+@group(0) @binding(1) var local_hist_in_tex : texture_2d<f32>;
 @group(0) @binding(2) var local_hist_out : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(3) var local_samp     : sampler;
 
@@ -28,7 +28,7 @@ fn main_local_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
   let uv = (vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5)) / vec2<f32>(f32(dims.x), f32(dims.y));
 
   let cur4  = textureSampleLevel(local_in_tex,   local_samp, uv, 0.0);
-  let hist4 = textureSampleLevel(local_hist_tex, local_samp, uv, 0.0);
+  let hist4 = textureSampleLevel(local_hist_in_tex, local_samp, uv, 0.0);
 
   let cur   = cur4.xyz;
   let w_in  = cur4.w;          // local_w in [0,1] meaning “valid this frame”
