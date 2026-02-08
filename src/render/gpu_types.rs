@@ -8,8 +8,6 @@
 use bytemuck::{Pod, Zeroable};
 use crate::app::config;
 
-pub const PRIMARY_PROFILE_COUNT: usize = 5;
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct NodeGpu {

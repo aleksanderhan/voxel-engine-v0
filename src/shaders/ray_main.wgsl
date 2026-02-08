@@ -28,20 +28,8 @@
 @group(0) @binding(13) var primary_hist_out  : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(14) var primary_hist_samp : sampler;
 
-// Sun-shadow history (geom-only transmittance)
-const PROFILE_VOXEL: u32 = 0u;
-const PROFILE_GRASS: u32 = 1u;
-const PROFILE_HDR: u32 = 2u;
-const PROFILE_FOG: u32 = 3u;
-const PROFILE_SHADOW: u32 = 4u;
-
-struct ProfileCounters {
-  counts: array<atomic<u32>, 5>,
-};
-
 @group(0) @binding(15) var shadow_hist_in : texture_2d<f32>;
 @group(0) @binding(16) var<storage, read_write> shadow_hist_out : array<f32>;
-@group(0) @binding(17) var<storage, read_write> profile_counts : ProfileCounters;
 
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
 @group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
@@ -61,18 +49,6 @@ struct ProfileCounters {
 var<workgroup> WG_SKY_UP : vec3<f32>;
 var<workgroup> WG_TILE_COUNT_CACHED : u32;
 
-fn profile_inc(idx: u32) {
-  if ((cam.profile_flags & 1u) != 0u) {
-    atomicAdd(&profile_counts.counts[idx], 1u);
-  }
-}
-
-fn profile_add(idx: u32, value: u32) {
-  if ((cam.profile_flags & 1u) != 0u) {
-    atomicAdd(&profile_counts.counts[idx], value);
-  }
-}
-
 fn pack_i16x2(a: i32, b: i32) -> u32 {
   return (u32(a) & 0xFFFFu) | ((u32(b) & 0xFFFFu) << 16u);
 }
@@ -84,12 +60,6 @@ fn unpack_i16(v: u32) -> i32 {
 
 fn unpack_i16x2(v: u32) -> vec2<i32> {
   return vec2<i32>(unpack_i16(v), unpack_i16(v >> 16u));
-}
-
-fn fog_profile_weight(t_scene: f32) -> u32 {
-  if (!ENABLE_FOG) { return 0u; }
-  let fog_norm = clamp(t_scene / FOG_MAX_DIST, 0.0, 1.0);
-  return max(1u, u32(fog_norm * 256.0));
 }
 
 struct HfShadeOut {
@@ -104,12 +74,10 @@ fn shade_heightfield(
   sky_up: vec3<f32>,
   seed: u32
 ) -> HfShadeOut {
-  profile_add(PROFILE_HDR, 1u);
   let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
   let t_scene = min(hf.t, FOG_MAX_DIST);
   let sky_bg_rd = sky_bg(rd);
   let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
-  profile_add(PROFILE_FOG, fog_profile_weight(t_scene));
   return HfShadeOut(col, t_scene);
 }
 
@@ -128,7 +96,6 @@ fn trace_primary_voxels(
   var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
   if (has_tile_candidates) {
     if (hist_valid) {
-      profile_add(PROFILE_VOXEL, max(1u, tile_candidate_count));
       let vt_hint = trace_scene_voxels_candidates(
         ro,
         rd,
@@ -144,7 +111,6 @@ fn trace_primary_voxels(
         return vt_hint;
       }
     }
-    profile_add(PROFILE_VOXEL, max(1u, tile_candidate_count));
     vt = trace_scene_voxels_candidates(
       ro,
       rd,
@@ -244,7 +210,6 @@ fn main_primary(
         if (gh.hit) {
           hf.t = gh.t;
           hf.n = gh.n;
-          profile_inc(PROFILE_GRASS);
         }
       }
 
@@ -348,7 +313,6 @@ fn main_primary(
         if (gh.hit) {
           hf.t = gh.t;
           hf.n = gh.n;
-          profile_inc(PROFILE_GRASS);
         }
       }
 
@@ -405,7 +369,6 @@ fn main_primary(
         if (gh.hit) {
           vt.best.t = gh.t;
           vt.best.n = gh.n;
-          profile_inc(PROFILE_GRASS);
         }
       }
     }
@@ -415,7 +378,6 @@ fn main_primary(
 
     let shadow_do = (seed & SHADOW_SUBSAMPLE_MASK) == 0u;
     if (shadow_do) {
-      profile_add(PROFILE_SHADOW, 2u);
       var shadow_hist = textureLoad(shadow_hist_in, ip, 0).x;
       let uv_prev = prev_uv_from_world(hp);
       if (in_unit_square(uv_prev)) {
@@ -429,20 +391,17 @@ fn main_primary(
       let shadow_cur = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
       shadow_out = mix(shadow_hist, shadow_cur, SHADOW_TAA_ALPHA);
     } else {
-      profile_add(PROFILE_SHADOW, 1u);
       shadow_out = clamp(textureLoad(shadow_hist_in, ip, 0).x, 0.0, 1.0);
     }
 
     // Split shading (base + local)
     let sh = shade_hit_split(ro, rd, vt.best, sky_up, seed, shadow_out);
-    profile_add(PROFILE_HDR, 2u);
 
     let t_scene = min(vt.best.t, FOG_MAX_DIST);
 
     // Fog only the base surface term (view-space medium)
     let sky_bg_rd = sky_bg(rd);
     let col_base = apply_fog(sh.base_hdr, ro, rd, t_scene, sky_bg_rd);
-    profile_add(PROFILE_FOG, fog_profile_weight(t_scene));
 
     // Local is stored UNFOGGED for temporal accumulation
     local_out = sh.local_hdr;
@@ -493,7 +452,6 @@ fn main_primary(
       if (gh.hit) {
         hf.t = gh.t;
         hf.n = gh.n;
-        profile_inc(PROFILE_GRASS);
       }
     }
 

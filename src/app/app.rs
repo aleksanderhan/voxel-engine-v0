@@ -23,9 +23,10 @@ use super::profiler;
 use crate::app::camera::Camera;
 use crate::app::config;
 use crate::app::input::InputState;
+use crate::render::state::GpuTimingsMs;
 use crate::{
     clipmap::Clipmap,
-    render::{gpu_types::PRIMARY_PROFILE_COUNT, CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
+    render::{CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
     streaming::ChunkManager,
     world::WorldGen,
 };
@@ -110,7 +111,7 @@ pub struct App {
     edit_modes: Vec<EditMode>,
 
     show_profile_hud: bool,
-    primary_profile_counts: [u32; PRIMARY_PROFILE_COUNT],
+    gpu_timings_ms: Option<GpuTimingsMs>,
 }
 
 #[derive(Clone, Copy)]
@@ -216,7 +217,7 @@ impl App {
             edit_mode: 0,
             edit_modes,
             show_profile_hud: false,
-            primary_profile_counts: [0; PRIMARY_PROFILE_COUNT],
+            gpu_timings_ms: None,
         }
     }
 
@@ -550,44 +551,20 @@ impl App {
     }
 
     fn build_profile_lines(&self) -> Vec<String> {
-        let counts = self.primary_profile_counts;
-        vec![
-            Self::format_profile_line("VOX", counts[0]),
-            Self::format_profile_line("GRS", counts[1]),
-            Self::format_profile_line("HDR", counts[2]),
-            Self::format_profile_line("FOG", counts[3]),
-            Self::format_profile_line("SHD", counts[4]),
-        ]
+        match self.gpu_timings_ms {
+            Some(timings) => vec![
+                Self::format_profile_ms("PRI", timings.primary),
+                Self::format_profile_ms("LTA", timings.local_taa),
+                Self::format_profile_ms("GOD", timings.godray),
+                Self::format_profile_ms("CMP", timings.composite),
+                Self::format_profile_ms("CTA", timings.composite_taa),
+            ],
+            None => vec!["GPU TS OFF".to_string()],
+        }
     }
 
-    fn format_profile_line(label: &str, value: u32) -> String {
-        let count = Self::format_profile_count(value);
-        let number_width = 13usize;
-        let trimmed = if count.len() > number_width {
-            count[count.len() - number_width..].to_string()
-        } else {
-            count
-        };
-        let mut padded = String::with_capacity(number_width);
-        if trimmed.len() < number_width {
-            padded.extend(std::iter::repeat(' ').take(number_width - trimmed.len()));
-        }
-        padded.push_str(&trimmed);
-        format!("{label} {padded}")
-    }
-
-    fn format_profile_count(value: u32) -> String {
-        let raw = value.to_string();
-        let mut out = String::with_capacity(raw.len() + raw.len() / 3);
-        let mut count = 0usize;
-        for ch in raw.chars().rev() {
-            if count != 0 && count % 3 == 0 {
-                out.push('.');
-            }
-            out.push(ch);
-            count += 1;
-        }
-        out.chars().rev().collect()
+    fn format_profile_ms(label: &str, value: f64) -> String {
+        format!("{label} {:>7.2}ms", value)
     }
 
 
@@ -636,19 +613,11 @@ impl App {
     fn encode_compute_pass(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let t0 = self.profiler.start();
 
-        if self.show_profile_hud {
-            self.renderer.reset_primary_profile_counts();
-        }
-
         self.renderer.encode_compute(
             encoder,
             self.surface_config.width,
             self.surface_config.height,
         );
-
-        if self.show_profile_hud {
-            self.renderer.encode_primary_profile_readback(encoder);
-        }
 
         self.profiler.enc_comp(profiler::FrameProf::end_ms(t0));
     }
@@ -715,10 +684,18 @@ impl App {
     }
 
     fn finish_frame_profiling(&mut self, render_ms: f64) {
-        if self.show_profile_hud {
-            if let Some(counts) = self.renderer.read_primary_profile_counts_blocking() {
-                self.primary_profile_counts = counts;
-            }
+        let want_hud = self.show_profile_hud;
+        let want_print = self.profiler.should_print();
+        let gpu_timings_ms = if want_hud || want_print {
+            self.renderer.read_gpu_timings_ms_blocking()
+        } else {
+            None
+        };
+
+        if want_hud {
+            self.gpu_timings_ms = gpu_timings_ms;
+        } else {
+            self.gpu_timings_ms = None;
         }
 
         if !self.profiler.enabled() {
@@ -727,11 +704,7 @@ impl App {
 
         let prof_start = Instant::now();
 
-        let gpu_timings_ms = if self.profiler.should_print() {
-            self.renderer.read_gpu_timings_ms_blocking()
-        } else {
-            None
-        };
+        let gpu_timings_ms = if want_print { gpu_timings_ms } else { None };
 
         let streaming_stats = if self.profiler.should_print() {
             self.chunks.stats()
