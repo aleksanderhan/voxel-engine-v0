@@ -884,13 +884,33 @@ fn trace_chunk_rope_interval_nomacro(
       if (ENABLE_GRASS && leaf.mat == MAT_GRASS) {
         let hp = ro + bh.t * rd;
 
-        let cell = pick_grass_cell_in_chunk_with_bias(
+        var cell = pick_grass_cell_in_chunk_with_bias(
           hp, bh.n,
           root_bmin,
           origin_vox_i,
           vs,
           i32(cam.chunk_size)
         );
+
+        if (ch.colinfo_base != INVALID_U32) {
+          var lx = i32(floor((hp.x - root_bmin.x) / vs));
+          var lz = i32(floor((hp.z - root_bmin.z) / vs));
+          lx = clamp(lx, 0, 63);
+          lz = clamp(lz, 0, 63);
+
+          let e16 = colinfo_entry_u16(ch.colinfo_base, u32(lx), u32(lz));
+          let ci  = colinfo_decode(e16);
+          if (ci.valid && ci.mat == MAT_GRASS) {
+            let wx: i32 = origin_vox_i.x + lx;
+            let wy: i32 = origin_vox_i.y + i32(ci.y_vox);
+            let wz: i32 = origin_vox_i.z + lz;
+
+            cell = GrassCell(
+              vec3<f32>(f32(wx), f32(wy), f32(wz)) * vs,
+              vec3<f32>(f32(wx), f32(wy), f32(wz))
+            );
+          }
+        }
 
         let probe_pad = (GRASS_LAYER_HEIGHT_VOX + 1.0) * vs;
         let tmin_probe = max(t_enter, bh.t - 0.01 * vs);
