@@ -224,6 +224,51 @@ fn rope_next_local(node_base: u32, local_idx: u32, face: u32) -> u32 {
   return r.nz;
 }
 
+fn safe_normalize_local(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
+  let len2 = dot(v, v);
+  if (len2 <= 1e-8) { return fallback; }
+  return v * inverseSqrt(len2);
+}
+
+fn voxel_occ_at_ws(
+  p_ws: vec3<f32>,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  node_base: u32
+) -> f32 {
+  let lp = p_ws - root_bmin;
+  if (lp.x < 0.0 || lp.y < 0.0 || lp.z < 0.0 ||
+      lp.x >= root_size || lp.y >= root_size || lp.z >= root_size) {
+    return 0.0;
+  }
+
+  let leaf = descend_leaf_sparse(p_ws, node_base, 0u, root_bmin, root_size);
+  return select(0.0, 1.0, leaf.mat != MAT_AIR);
+}
+
+fn voxel_normal_at_ws(
+  p_ws: vec3<f32>,
+  fallback_n: vec3<f32>,
+  root_bmin: vec3<f32>,
+  root_size: f32,
+  node_base: u32,
+  voxel_size: f32
+) -> vec3<f32> {
+  let v = (p_ws - root_bmin) / voxel_size;
+  let vc = floor(v);
+  let center = root_bmin + (vc + vec3<f32>(0.5)) * voxel_size;
+
+  let dx = voxel_occ_at_ws(center - vec3<f32>(voxel_size, 0.0, 0.0), root_bmin, root_size, node_base) -
+           voxel_occ_at_ws(center + vec3<f32>(voxel_size, 0.0, 0.0), root_bmin, root_size, node_base);
+  let dy = voxel_occ_at_ws(center - vec3<f32>(0.0, voxel_size, 0.0), root_bmin, root_size, node_base) -
+           voxel_occ_at_ws(center + vec3<f32>(0.0, voxel_size, 0.0), root_bmin, root_size, node_base);
+  let dz = voxel_occ_at_ws(center - vec3<f32>(0.0, 0.0, voxel_size), root_bmin, root_size, node_base) -
+           voxel_occ_at_ws(center + vec3<f32>(0.0, 0.0, voxel_size), root_bmin, root_size, node_base);
+
+  let n = vec3<f32>(dx, dy, dz);
+  return safe_normalize_local(n, fallback_n);
+}
+
 // Add this near exit_face_from_slab
 struct ExitFaceRes {
   face : u32,   // 0..5
@@ -940,11 +985,14 @@ fn trace_chunk_rope_interval_nomacro(
         }
       }
 
+      let hp = ro + bh.t * rd;
+      let smooth_n = voxel_normal_at_ws(hp, bh.n, root_bmin, root_size, ch.node_base, vs);
+
       var out = miss_hitgeom();
       out.hit = 1u;
       out.t   = bh.t;
       out.mat = leaf.mat;
-      out.n   = bh.n;
+      out.n   = smooth_n;
       out.root_bmin  = root_bmin;
       out.root_size  = root_size;
       out.node_base  = ch.node_base;
