@@ -155,9 +155,10 @@ pub struct OverlayGpu {
     pub profile_enabled: u32,
     pub profile_base_idx: u32,
 
-    // pad to 80 bytes (uniform structs are effectively 16-byte aligned)
+    // pad to 96 bytes (uniform structs are effectively 16-byte aligned)
     pub _pad0:    [u32; 3],
     pub _pad1:    [u32; 4],
+    pub _pad2:    [u32; 4],
 }
 
 
@@ -244,6 +245,7 @@ impl OverlayGpu {
             profile_base_idx,
             _pad0: [0; 3],
             _pad1: [0; 4],
+            _pad2: [0; 4],
         }
     }
 }
