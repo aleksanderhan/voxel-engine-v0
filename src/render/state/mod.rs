@@ -105,12 +105,17 @@ fn batch_write_meta(
     meta_stride: u64,
     uploads: &[crate::streaming::ChunkUpload],
     chunk_capacity: u32,
+    colinfo_offset_u32: u32,
 ) {
     // Collect (slot, meta)
     let mut items: Vec<(u32, crate::render::gpu_types::ChunkMetaGpu)> = Vec::with_capacity(uploads.len());
     for u in uploads {
         if u.slot < chunk_capacity {
-            items.push((u.slot, u.meta));
+            let mut meta = u.meta;
+            if meta.colinfo_base != crate::streaming::types::INVALID_U32 {
+                meta.colinfo_base = meta.colinfo_base.saturating_add(colinfo_offset_u32);
+            }
+            items.push((u.slot, meta));
         }
     }
     if items.is_empty() { return; }
@@ -469,6 +474,7 @@ impl Renderer {
             meta_stride,
             uploads,
             self.buffers.chunk_capacity,
+            self.buffers.colinfo_offset_u32,
         );
 
         // 2) Nodes / macro / ropes / colinfo as merged byte regions
@@ -506,7 +512,8 @@ impl Renderer {
             if !u.colinfo_words.is_empty() {
                 let needed = u.colinfo_words.len() as u32;
                 if u.meta.colinfo_base + needed <= self.buffers.colinfo_capacity_u32 {
-                    push_typed_region(&mut colinfo_regions, u.meta.colinfo_base, u32_stride, u.colinfo_words.as_ref());
+                    let colinfo_base = self.buffers.colinfo_offset_u32 + u.meta.colinfo_base;
+                    push_typed_region(&mut colinfo_regions, colinfo_base, u32_stride, u.colinfo_words.as_ref());
                 }
             }
         }
@@ -516,13 +523,13 @@ impl Renderer {
             self.queue.write_buffer(&self.buffers.node, r.off, &r.data);
         }
         for r in merge_adjacent(macro_regions) {
-            self.queue.write_buffer(&self.buffers.macro_occ, r.off, &r.data);
+            self.queue.write_buffer(&self.buffers.chunk_aux, r.off, &r.data);
         }
         for r in merge_adjacent(rope_regions) {
             self.queue.write_buffer(&self.buffers.node_ropes, r.off, &r.data);
         }
         for r in merge_adjacent(colinfo_regions) {
-            self.queue.write_buffer(&self.buffers.colinfo, r.off, &r.data);
+            self.queue.write_buffer(&self.buffers.chunk_aux, r.off, &r.data);
         }
     }
 

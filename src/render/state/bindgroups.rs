@@ -2,7 +2,11 @@
 //
 // Bind group creation.
 
-use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
+use super::{
+    buffers::Buffers,
+    layout::Layouts,
+    textures::{TextureSet, PRIMARY_OUT_COLOR, PRIMARY_OUT_LOCAL},
+};
 
 pub struct BindGroups {
     pub primary: [wgpu::BindGroup; 2],
@@ -49,16 +53,11 @@ fn make_primary_bg(
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: wgpu::BindingResource::TextureView(&textures.color.view),
+                resource: wgpu::BindingResource::TextureView(&textures.primary_outputs.view),
             },
             wgpu::BindGroupEntry {
                 binding: 5,
                 resource: wgpu::BindingResource::TextureView(&textures.depth.view),
-            },
-            // NEW: local lighting output
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: wgpu::BindingResource::TextureView(&textures.local.view),
             },
             // shifted clipmap params uniform
             wgpu::BindGroupEntry {
@@ -73,15 +72,11 @@ fn make_primary_bg(
             // shifted storage buffers
             wgpu::BindGroupEntry {
                 binding: 9,
-                resource: buffers.macro_occ.as_entire_binding(),
+                resource: buffers.chunk_aux.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 10,
                 resource: buffers.node_ropes.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 11,
-                resource: buffers.colinfo.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 12,
@@ -133,16 +128,12 @@ fn make_scene_bg(
                 resource: buffers.chunk_grid.as_entire_binding(),
             },
             wgpu::BindGroupEntry { 
-                binding: 8, 
-                resource: buffers.macro_occ.as_entire_binding() 
-            },
-            wgpu::BindGroupEntry {
-                binding: 9,
-                resource: buffers.node_ropes.as_entire_binding(),
+                binding: 9, 
+                resource: buffers.chunk_aux.as_entire_binding() 
             },
             wgpu::BindGroupEntry {
                 binding: 10,
-                resource: buffers.colinfo.as_entire_binding(),
+                resource: buffers.node_ropes.as_entire_binding(),
             },
 
         ],
@@ -362,7 +353,7 @@ pub fn create_bind_groups(
         make_local_taa_bg(
             device,
             &layouts.local_taa,
-            &textures.local.view,
+            &textures.primary_outputs.layers[PRIMARY_OUT_LOCAL],
             &textures.local_hist[0].view,
             &textures.local_hist[1].view,
             sampler,
@@ -371,7 +362,7 @@ pub fn create_bind_groups(
         make_local_taa_bg(
             device,
             &layouts.local_taa,
-            &textures.local.view,
+            &textures.primary_outputs.layers[PRIMARY_OUT_LOCAL],
             &textures.local_hist[1].view,
             &textures.local_hist[0].view,
             sampler,
@@ -383,7 +374,7 @@ pub fn create_bind_groups(
         make_composite_bg(
             device,
             &layouts.composite,
-            &textures.color.view,
+            &textures.primary_outputs.layers[PRIMARY_OUT_COLOR],
             &textures.godray[0].view,
             &textures.output_pre_taa.view,
             &textures.depth.view,
@@ -395,7 +386,7 @@ pub fn create_bind_groups(
         make_composite_bg(
             device,
             &layouts.composite,
-            &textures.color.view,
+            &textures.primary_outputs.layers[PRIMARY_OUT_COLOR],
             &textures.godray[1].view,
             &textures.output_pre_taa.view,
             &textures.depth.view,
