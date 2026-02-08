@@ -61,6 +61,7 @@ fn query_leaf_at(
   var p = p_in;
 
   for (var d: u32 = 0u; d < 32u; d = d + 1u) {
+    profile_add(PROFILE_VOXEL, 1u);
     let n = nodes[idx];
 
     if (n.child_base == LEAF_U32) {

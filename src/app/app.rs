@@ -25,7 +25,14 @@ use crate::app::config;
 use crate::app::input::InputState;
 use crate::{
     clipmap::Clipmap,
-    render::{gpu_types::PRIMARY_PROFILE_COUNT, CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
+    render::{
+        gpu_types::PRIMARY_PROFILE_COUNT,
+        state::GpuTimingsMs,
+        CameraGpu,
+        ClipmapGpu,
+        OverlayGpu,
+        Renderer,
+    },
     streaming::ChunkManager,
     world::WorldGen,
 };
@@ -111,6 +118,7 @@ pub struct App {
 
     show_profile_hud: bool,
     primary_profile_counts: [u32; PRIMARY_PROFILE_COUNT],
+    last_gpu_timings_ms: Option<GpuTimingsMs>,
 }
 
 #[derive(Clone, Copy)]
@@ -217,6 +225,7 @@ impl App {
             edit_modes,
             show_profile_hud: false,
             primary_profile_counts: [0; PRIMARY_PROFILE_COUNT],
+            last_gpu_timings_ms: None,
         }
     }
 
@@ -545,11 +554,22 @@ impl App {
 
     fn build_profile_lines(&self) -> Vec<String> {
         let counts = self.primary_profile_counts;
+        let primary_ms = self.last_gpu_timings_ms.map(|timings| timings.primary);
+        let total_cost = counts.iter().map(|&v| v as u64).sum::<u64>().max(1);
+        let per_count_ms = primary_ms
+            .map(|ms| ms / (total_cost as f64))
+            .unwrap_or(0.0);
+        let fmt = |label: &str, count: u32| -> String {
+            match primary_ms {
+                Some(_) => format!("{label} {:.2}ms", (count as f64) * per_count_ms),
+                None => format!("{label} n/a"),
+            }
+        };
         vec![
-            format!("VOX {}", counts[0]),
-            format!("GRS {}", counts[1]),
-            format!("HDR {}", counts[2]),
-            format!("FOG {}", counts[3]),
+            fmt("VOX", counts[0]),
+            fmt("GRS", counts[1]),
+            fmt("HDR", counts[2]),
+            fmt("FOG", counts[3]),
         ]
     }
 
@@ -682,6 +702,7 @@ impl App {
             if let Some(counts) = self.renderer.read_primary_profile_counts_blocking() {
                 self.primary_profile_counts = counts;
             }
+            self.last_gpu_timings_ms = self.renderer.read_gpu_timings_ms_blocking();
         }
 
         if !self.profiler.enabled() {

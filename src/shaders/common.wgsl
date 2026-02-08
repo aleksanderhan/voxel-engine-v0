@@ -375,6 +375,15 @@ struct Camera {
   _pad2 : vec4<u32>,
 };
 
+const PROFILE_VOXEL: u32 = 0u;
+const PROFILE_GRASS: u32 = 1u;
+const PROFILE_HDR: u32 = 2u;
+const PROFILE_FOG: u32 = 3u;
+
+struct ProfileCounters {
+  counts: array<atomic<u32>, 4>,
+};
+
 struct ChunkMeta {
   origin       : vec4<i32>,
   node_base    : u32,
@@ -398,6 +407,7 @@ struct ChunkMeta {
 @group(0) @binding(9)  var<storage, read> macro_occ : array<u32>;
 @group(0) @binding(10) var<storage, read> node_ropes: array<NodeRopes>;
 @group(0) @binding(11) var<storage, read> chunk_colinfo : array<u32>;
+@group(0) @binding(17) var<storage, read_write> profile_counts : ProfileCounters;
 
 
 //// --------------------------------------------------------------------------
@@ -413,6 +423,12 @@ const PRIMARY_MAX_TILE_CHUNKS: u32 = 24u;
 var<workgroup> WG_TILE_COUNT : atomic<u32>;
 var<workgroup> WG_TILE_SLOTS : array<u32, MAX_TILE_CHUNKS>;
 var<workgroup> WG_TILE_ENTER : array<f32, MAX_TILE_CHUNKS>;
+
+fn profile_add(idx: u32, amount: u32) {
+  if ((cam.profile_flags & 1u) != 0u) {
+    atomicAdd(&profile_counts.counts[idx], amount);
+  }
+}
 
 fn macro_cell_size(root_size: f32) -> f32 {
   return root_size / f32(MACRO_DIM);

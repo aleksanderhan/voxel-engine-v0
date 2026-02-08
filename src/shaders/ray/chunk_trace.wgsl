@@ -1121,6 +1121,7 @@ fn tile_append_candidates_for_ray(
   let max_chunk_steps = min(u32(rem_x + rem_y + rem_z) + 1u, 512u);
 
   for (var s: u32 = 0u; s < max_chunk_steps; s = s + 1u) {
+    profile_add(PROFILE_VOXEL, 1u);
     if (t_local > t_exit_local) { break; }
 
     let slot = chunk_grid[u32(idx_i)];
