@@ -123,7 +123,7 @@ fn grass_top_albedo(base: vec3<f32>, hp: vec3<f32>, t: f32) -> vec3<f32> {
 
 fn base_albedo(mat: u32, hp: vec3<f32>, t: f32) -> vec3<f32> {
   var base = color_for_material(mat);
-  if (t <= FAR_SHADING_DIST) {
+  if (t <= PRIMARY_LOD_DETAIL_DIST) {
     base = apply_material_variation(base, mat, hp);
   }
   return base;
@@ -268,7 +268,7 @@ fn shade_hit(
 
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
-    if (ENABLE_GRASS && grass_allowed_primary(hg.t, hg.n, rd, seed)) {
+    if (ENABLE_GRASS && grass_allowed_primary(hg.t, hg.n, rd, seed) && hg.t <= PRIMARY_LOD_DETAIL_DIST) {
       base = grass_top_albedo(base, hp, hg.t);
 
       // Wrap diffuse so blades don’t look “flat-lit”
@@ -292,7 +292,7 @@ fn shade_hit(
   let hp_shadow = hp + hg.n * (0.75 * vs);
 
   var Tc: f32 = 1.0;
-  if (PRIMARY_CLOUD_SHADOWS) {
+  if (PRIMARY_CLOUD_SHADOWS && hg.t <= PRIMARY_LOD_SHADOW_DIST) {
     Tc = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
   }
   let sun_vis = Tc * clamp(sun_shadow, 0.0, 1.0);
@@ -322,7 +322,7 @@ fn shade_hit(
 
   // Leaf dapple (cheap) - keep as-is
   var dapple = 1.0;
-  if (hg.mat == MAT_LEAF && hg.t <= FAR_SHADING_DIST) {
+  if (hg.mat == MAT_LEAF && hg.t <= PRIMARY_LOD_DETAIL_DIST) {
     let time_s = cam.voxel_params.y;
     let d0 = sin(dot(hp.xz, vec2<f32>(3.0, 2.2)) + time_s * 3.5);
     let d1 = sin(dot(hp.xz, vec2<f32>(6.5, 4.1)) - time_s * 6.0);
@@ -330,7 +330,7 @@ fn shade_hit(
   }
 
   var spec_col = vec3<f32>(0.0);
-  if (hg.t <= FAR_SHADING_DIST) {
+  if (hg.t <= PRIMARY_LOD_DETAIL_DIST) {
     let v = normalize(-rd);
     let h = normalize(v + SUN_DIR);
 
@@ -347,7 +347,7 @@ fn shade_hit(
   }
 
   var grass_ts: f32 = 1.0;
-  if (hg.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hg.t, hg.n, rd, seed)) {
+  if (hg.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hg.t, hg.n, rd, seed) && hg.t <= PRIMARY_LOD_DETAIL_DIST) {
     let time_s = cam.voxel_params.y;
     let strength = cam.voxel_params.z;
     let cell = grass_cell_from_world(hp, rd, hg.root_bmin, vs, i32(cam.chunk_size));
@@ -365,10 +365,10 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
   let hp = ro + ch.t * rd;
 
   var base = color_for_material(ch.mat);
-  if (ch.t <= FAR_SHADING_DIST) {
+  if (ch.t <= PRIMARY_LOD_DETAIL_DIST) {
     base = apply_material_variation_clip(base, ch.mat, hp);
   }
-  if (ch.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(ch.t, ch.n, rd, seed)) {
+  if (ch.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(ch.t, ch.n, rd, seed) && ch.t <= PRIMARY_LOD_DETAIL_DIST) {
     base = grass_top_albedo(base, hp, ch.t);
   }
 
@@ -376,7 +376,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
   let hp_shadow  = hp + ch.n * (0.75 * voxel_size);
 
   var vis = 1.0;
-  if (PRIMARY_CLOUD_SHADOWS) {
+  if (PRIMARY_CLOUD_SHADOWS && ch.t <= PRIMARY_LOD_SHADOW_DIST) {
     vis = cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
   }
   let diff = max(dot(ch.n, SUN_DIR), 0.0);
@@ -409,7 +409,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
   let direct = SUN_COLOR * SUN_INTENSITY * (diff * diff) * vis;
 
   var spec_col = vec3<f32>(0.0);
-  if (ch.t <= FAR_SHADING_DIST) {
+  if (ch.t <= PRIMARY_LOD_DETAIL_DIST) {
     let vdir = normalize(-rd);
     let hdir = normalize(vdir + SUN_DIR);
     let ndv  = max(dot(ch.n, vdir), 0.0);

@@ -60,6 +60,11 @@ struct ProfileCounters {
 
 var<workgroup> WG_SKY_UP : vec3<f32>;
 var<workgroup> WG_TILE_COUNT_CACHED : u32;
+var<workgroup> WG_COARSE_COLOR : array<vec4<f32>, 16>;
+var<workgroup> WG_COARSE_LOCAL : array<vec4<f32>, 16>;
+var<workgroup> WG_COARSE_DEPTH : array<f32, 16>;
+var<workgroup> WG_COARSE_HIST : array<vec4<f32>, 16>;
+var<workgroup> WG_COARSE_SHADOW : array<f32, 16>;
 
 fn profile_inc(idx: u32) {
   if ((cam.profile_flags & 1u) != 0u) {
@@ -95,6 +100,15 @@ fn fog_profile_weight(t_scene: f32) -> u32 {
 struct HfShadeOut {
   col: vec3<f32>,
   t_scene: f32,
+};
+
+struct PrimaryOut {
+  color: vec3<f32>,
+  depth: f32,
+  local: vec3<f32>,
+  local_w: f32,
+  hist: vec4<f32>,
+  shadow: f32,
 };
 
 fn shade_heightfield(
@@ -160,52 +174,17 @@ fn trace_primary_voxels(
   return vt;
 }
 
-@compute @workgroup_size(8, 8, 1)
-fn main_primary(
-  @builtin(global_invocation_id) gid: vec3<u32>,
-  @builtin(local_invocation_index) lid: u32,
-  @builtin(workgroup_id) wg_id: vec3<u32>
-) {
+fn compute_primary_pixel(
+  px: vec2<f32>,
+  ip: vec2<i32>,
+  seed: u32,
+  sky_up: vec3<f32>
+) -> PrimaryOut {
   let dims = textureDimensions(color_img);
-  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
-
-  // Compute once per 8x8 workgroup (already cheap: sky_bg only)
-  if (lid == 0u) {
-    WG_SKY_UP = sky_bg(vec3<f32>(0.0, 1.0, 0.0));
-  }
-  workgroupBarrier();
-  let sky_up = WG_SKY_UP;
-
-  if (lid == 0u) {
-    atomicStore(&WG_TILE_COUNT, 0u);
-    if (cam.chunk_count != 0u) {
-      let tile_base = vec2<f32>(
-        f32(wg_id.x * TILE_SIZE),
-        f32(wg_id.y * TILE_SIZE)
-      );
-      let ro_tile = cam.cam_pos.xyz;
-
-      // Two candidate rays per tile to stabilize distant voxel selection.
-      var px = tile_base + vec2<f32>(4.5, 4.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-      px = tile_base + vec2<f32>(1.5, 1.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-    }
-    let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
-    tile_sort_candidates_by_enter(raw_count);
-    WG_TILE_COUNT_CACHED = min(raw_count, PRIMARY_MAX_TILE_CHUNKS);
-  }
-  workgroupBarrier();
-
   let res = vec2<f32>(f32(dims.x), f32(dims.y));
-  let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
-  let frame = cam.frame_index;
-  let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
 
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px);
-
-  let ip = vec2<i32>(i32(gid.x), i32(gid.y));
 
   // Local output defaults: invalid (alpha=0) so TAA keeps history instead of blending black.
   var local_out = vec3<f32>(0.0);
@@ -216,16 +195,12 @@ fn main_primary(
   // ------------------------------------------------------------
   // Case 1: no voxel chunks => heightfield or sky
   // ------------------------------------------------------------
-  let bytes_per_row = dims.x * 4u;
-  let padded_bpr = (bytes_per_row + 255u) & ~255u;
-  let shadow_stride = padded_bpr / 4u;
-  let shadow_idx = u32(ip.y) * shadow_stride + u32(ip.x);
-
   if (cam.chunk_count == 0u) {
     var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      if (hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
+      if (hf.mat == MAT_GRASS && ENABLE_GRASS && hf.t <= PRIMARY_GRASS_TRACE_DIST &&
+          grass_allowed_primary(hf.t, hf.n, rd, seed)) {
         let voxel_size = cam.voxel_params.x;
         let hp = ro + rd * hf.t;
         let cell = grass_cell_from_world_global(hp, rd, voxel_size);
@@ -250,22 +225,14 @@ fn main_primary(
 
       let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
       t_store = shade.t_scene;
-      textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
-      textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
-      textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-      textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-      shadow_hist_out[shadow_idx] = shadow_out;
-      return;
+      let out_hist = vec4<f32>(t_store, 0.0, 0.0, 0.0);
+      return PrimaryOut(shade.col, shade.t_scene, local_out, local_w, out_hist, shadow_out);
     }
 
     // True sky pixel: now pay for full sky (clouds + sun)
     let sky = sky_color(rd);
-    textureStore(color_img, ip, vec4<f32>(sky, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    shadow_hist_out[shadow_idx] = shadow_out;
-    return;
+    let out_hist = vec4<f32>(t_store, 0.0, 0.0, 0.0);
+    return PrimaryOut(sky, FOG_MAX_DIST, local_out, local_w, out_hist, shadow_out);
   }
 
   // ------------------------------------------------------------
@@ -347,7 +314,8 @@ fn main_primary(
     var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      if (hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
+      if (hf.mat == MAT_GRASS && ENABLE_GRASS && hf.t <= PRIMARY_GRASS_TRACE_DIST &&
+          grass_allowed_primary(hf.t, hf.n, rd, seed)) {
         let voxel_size = cam.voxel_params.x;
         let hp = ro + rd * hf.t;
         let cell = grass_cell_from_world_global(hp, rd, voxel_size);
@@ -372,26 +340,18 @@ fn main_primary(
 
       let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
       t_store = shade.t_scene;
-      textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
-      textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
-      textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-      textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-      shadow_hist_out[shadow_idx] = shadow_out;
-      return;
+      let out_hist = vec4<f32>(t_store, 0.0, 0.0, 0.0);
+      return PrimaryOut(shade.col, shade.t_scene, local_out, local_w, out_hist, shadow_out);
     }
 
     let sky = sky_color(rd);
-    textureStore(color_img, ip, vec4<f32>(sky, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    shadow_hist_out[shadow_idx] = shadow_out;
-    return;
+    let out_hist = vec4<f32>(t_store, 0.0, 0.0, 0.0);
+    return PrimaryOut(sky, FOG_MAX_DIST, local_out, local_w, out_hist, shadow_out);
   }
 
   // In grid: voxel hit?
   if (vt.best.hit != 0u) {
-    if (vt.best.mat == MAT_GRASS && ENABLE_GRASS) {
+    if (vt.best.mat == MAT_GRASS && ENABLE_GRASS && vt.best.t <= PRIMARY_GRASS_TRACE_DIST) {
       if (grass_allowed_primary(vt.best.t, vt.best.n, rd, seed)) {
         let voxel_size = cam.voxel_params.x;
         let chunk_size_vox = i32(cam.chunk_size);
@@ -431,24 +391,26 @@ fn main_primary(
     let hp = ro + vt.best.t * rd;
     let hp_shadow = hp + vt.best.n * (0.75 * cam.voxel_params.x);
 
-    let shadow_do = (seed & SHADOW_SUBSAMPLE_MASK) == 0u;
-    if (shadow_do) {
-      profile_add(PROFILE_SHADOW, 2u);
-      var shadow_hist = textureLoad(shadow_hist_in, ip, 0).x;
-      let uv_prev = prev_uv_from_world(hp);
-      if (in_unit_square(uv_prev)) {
-        let prev_px = vec2<i32>(
-          clamp(i32(uv_prev.x * f32(dims.x)), 0, i32(dims.x) - 1),
-          clamp(i32(uv_prev.y * f32(dims.y)), 0, i32(dims.y) - 1)
-        );
-        shadow_hist = textureLoad(shadow_hist_in, prev_px, 0).x;
+    if (vt.best.t <= PRIMARY_LOD_SHADOW_DIST) {
+      let shadow_do = (seed & SHADOW_SUBSAMPLE_MASK) == 0u;
+      if (shadow_do) {
+        profile_add(PROFILE_SHADOW, 2u);
+        var shadow_hist = textureLoad(shadow_hist_in, ip, 0).x;
+        let uv_prev = prev_uv_from_world(hp);
+        if (in_unit_square(uv_prev)) {
+          let prev_px = vec2<i32>(
+            clamp(i32(uv_prev.x * f32(dims.x)), 0, i32(dims.x) - 1),
+            clamp(i32(uv_prev.y * f32(dims.y)), 0, i32(dims.y) - 1)
+          );
+          shadow_hist = textureLoad(shadow_hist_in, prev_px, 0).x;
+        }
+        shadow_hist = clamp(shadow_hist, 0.0, 1.0);
+        let shadow_cur = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
+        shadow_out = mix(shadow_hist, shadow_cur, SHADOW_TAA_ALPHA);
+      } else {
+        profile_add(PROFILE_SHADOW, 1u);
+        shadow_out = clamp(textureLoad(shadow_hist_in, ip, 0).x, 0.0, 1.0);
       }
-      shadow_hist = clamp(shadow_hist, 0.0, 1.0);
-      let shadow_cur = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
-      shadow_out = mix(shadow_hist, shadow_cur, SHADOW_TAA_ALPHA);
-    } else {
-      profile_add(PROFILE_SHADOW, 1u);
-      shadow_out = clamp(textureLoad(shadow_hist_in, ip, 0).x, 0.0, 1.0);
     }
 
     // Split shading (base + local)
@@ -467,9 +429,6 @@ fn main_primary(
     local_w   = sh.local_w;
     t_store   = t_scene;
 
-    textureStore(color_img, ip, vec4<f32>(col_base, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha = validity
     var packed_xy: u32 = 0u;
     var packed_z: u32 = 0u;
     var anchor_key: u32 = 0u;
@@ -479,20 +438,16 @@ fn main_primary(
       packed_z |= 0x80000000u;
       anchor_key = vt.anchor_key;
     }
-    textureStore(
-      primary_hist_out,
-      ip,
-      vec4<f32>(t_store, bitcast<f32>(anchor_key), bitcast<f32>(packed_xy), bitcast<f32>(packed_z))
-    );
-    shadow_hist_out[shadow_idx] = shadow_out;
-    return;
+    let out_hist = vec4<f32>(t_store, bitcast<f32>(anchor_key), bitcast<f32>(packed_xy), bitcast<f32>(packed_z));
+    return PrimaryOut(col_base, t_scene, local_out, local_w, out_hist, shadow_out);
   }
 
   // Voxel miss: try heightfield
   var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
   if (hf.hit) {
-    if (hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
+    if (hf.mat == MAT_GRASS && ENABLE_GRASS && hf.t <= PRIMARY_GRASS_TRACE_DIST &&
+        grass_allowed_primary(hf.t, hf.n, rd, seed)) {
       let voxel_size = cam.voxel_params.x;
       let hp = ro + rd * hf.t;
       let cell = grass_cell_from_world_global(hp, rd, voxel_size);
@@ -517,21 +472,102 @@ fn main_primary(
 
     let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
     t_store = shade.t_scene;
-    textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
-    textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
-    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-    shadow_hist_out[shadow_idx] = shadow_out;
-    return;
+    let out_hist = vec4<f32>(t_store, 0.0, 0.0, 0.0);
+    return PrimaryOut(shade.col, shade.t_scene, local_out, local_w, out_hist, shadow_out);
   }
 
   // True sky pixel: now compute full sky (clouds + sun)
   let sky = sky_color(rd);
-  textureStore(color_img, ip, vec4<f32>(sky, 1.0));
-  textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
-  textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-  textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
-  shadow_hist_out[shadow_idx] = shadow_out;
+  let out_hist = vec4<f32>(t_store, 0.0, 0.0, 0.0);
+  return PrimaryOut(sky, FOG_MAX_DIST, local_out, local_w, out_hist, shadow_out);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main_primary(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(local_invocation_index) lid: u32,
+  @builtin(workgroup_id) wg_id: vec3<u32>
+) {
+  let dims = textureDimensions(color_img);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+
+  // Compute once per 8x8 workgroup (already cheap: sky_bg only)
+  if (lid == 0u) {
+    WG_SKY_UP = sky_bg(vec3<f32>(0.0, 1.0, 0.0));
+  }
+  workgroupBarrier();
+  let sky_up = WG_SKY_UP;
+
+  if (lid == 0u) {
+    atomicStore(&WG_TILE_COUNT, 0u);
+    if (cam.chunk_count != 0u) {
+      let tile_base = vec2<f32>(
+        f32(wg_id.x * TILE_SIZE),
+        f32(wg_id.y * TILE_SIZE)
+      );
+      let ro_tile = cam.cam_pos.xyz;
+
+      // Two candidate rays per tile to stabilize distant voxel selection.
+      var px = tile_base + vec2<f32>(4.5, 4.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      px = tile_base + vec2<f32>(1.5, 1.5);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+    }
+    let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
+    tile_sort_candidates_by_enter(raw_count);
+    WG_TILE_COUNT_CACHED = min(raw_count, PRIMARY_MAX_TILE_CHUNKS);
+  }
+  workgroupBarrier();
+
+  let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+  let frame = cam.frame_index;
+  let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
+
+  let ip = vec2<i32>(i32(gid.x), i32(gid.y));
+
+  let local_xy = vec2<u32>(gid.x - wg_id.x * 8u, gid.y - wg_id.y * 8u);
+  let coarse_x = min(gid.x & ~1u, dims.x - 1u);
+  let coarse_y = min(gid.y & ~1u, dims.y - 1u);
+  let coarse_ip = vec2<i32>(i32(coarse_x), i32(coarse_y));
+  let coarse_px = vec2<f32>(
+    min(f32(coarse_x) + 1.0, f32(dims.x) - 0.5),
+    min(f32(coarse_y) + 1.0, f32(dims.y) - 0.5)
+  );
+  let coarse_idx = (local_xy.y >> 1u) * 4u + (local_xy.x >> 1u);
+  let coarse_hist = textureLoad(primary_hist_tex, coarse_ip, 0).x;
+  let use_coarse = cam.chunk_count != 0u && coarse_hist > PRIMARY_LOD_CHECKERBOARD_DIST;
+  let is_leader = use_coarse && gid.x == coarse_x && gid.y == coarse_y;
+
+  if (is_leader) {
+    let seed_coarse = (coarse_x * 1973u) ^ (coarse_y * 9277u) ^ (frame * 26699u);
+    let out = compute_primary_pixel(coarse_px, coarse_ip, seed_coarse, sky_up);
+    WG_COARSE_COLOR[coarse_idx] = vec4<f32>(out.color, 1.0);
+    WG_COARSE_LOCAL[coarse_idx] = vec4<f32>(out.local, out.local_w);
+    WG_COARSE_DEPTH[coarse_idx] = out.depth;
+    WG_COARSE_HIST[coarse_idx] = out.hist;
+    WG_COARSE_SHADOW[coarse_idx] = out.shadow;
+  }
+  workgroupBarrier();
+
+  var out = PrimaryOut(vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, vec4<f32>(0.0), 1.0);
+  if (use_coarse) {
+    let c = WG_COARSE_COLOR[coarse_idx];
+    let l = WG_COARSE_LOCAL[coarse_idx];
+    out = PrimaryOut(c.xyz, WG_COARSE_DEPTH[coarse_idx], l.xyz, l.w, WG_COARSE_HIST[coarse_idx], WG_COARSE_SHADOW[coarse_idx]);
+  } else {
+    out = compute_primary_pixel(px, ip, seed, sky_up);
+  }
+
+  let bytes_per_row = dims.x * 4u;
+  let padded_bpr = (bytes_per_row + 255u) & ~255u;
+  let shadow_stride = padded_bpr / 4u;
+  let shadow_idx = u32(ip.y) * shadow_stride + u32(ip.x);
+
+  textureStore(color_img, ip, vec4<f32>(out.color, 1.0));
+  textureStore(depth_img, ip, vec4<f32>(out.depth, 0.0, 0.0, 0.0));
+  textureStore(local_img, ip, vec4<f32>(out.local, out.local_w));
+  textureStore(primary_hist_out, ip, out.hist);
+  shadow_hist_out[shadow_idx] = out.shadow;
 }
 
 
