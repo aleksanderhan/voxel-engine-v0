@@ -692,7 +692,8 @@ fn trace_chunk_rope_interval_nomacro(
   }
 
   // Only probe grass when we are in small-enough air leaves
-  let grass_probe_max_leaf = vs;
+  // (allow a few-voxel leaves so grass isn't skipped in coarse air nodes)
+  let grass_probe_max_leaf = 4.0 * vs;
 
   let origin_vox_i = vec3<i32>(ch.origin.x, ch.origin.y, ch.origin.z);
   let time_s       = cam.voxel_params.y;
@@ -740,7 +741,7 @@ fn trace_chunk_rope_interval_nomacro(
 
       var grass_leaf_limit = grass_probe_max_leaf; // default near
       if (lod_probe == 1u) {
-        grass_leaf_limit = cam.voxel_params.x;     // mid: only probe 1-voxel leaves
+        grass_leaf_limit = 2.0 * cam.voxel_params.x; // mid: only probe small leaves
       }
 
       if (ENABLE_GRASS && lod_probe != 2u && leaf.size <= grass_leaf_limit) {
