@@ -28,7 +28,7 @@ pub struct TextureSet {
     pub local_hist: [Tex2D; 2],
 
     pub primary_hit_hist: [Tex2D; 2],
-    pub primary_hit_payload: [Tex2D; 2],
+    pub primary_hit_payload: [wgpu::Buffer; 2],
     pub shadow_hist: Tex2D,
     pub shadow_hist_buf: wgpu::Buffer,
     
@@ -68,6 +68,15 @@ fn make_tex2d(
 }
 
 fn make_storage_buffer(device: &wgpu::Device, label: &str, size_bytes: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size_bytes.max(4),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn make_storage_buffer_copy(device: &wgpu::Device, label: &str, size_bytes: u64) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: size_bytes.max(4),
@@ -196,23 +205,12 @@ pub fn create_textures(
         ),
     ];
 
+    let payload_bytes = (internal_w.max(1) as u64)
+        * (internal_h.max(1) as u64)
+        * std::mem::size_of::<[f32; 4]>() as u64;
     let primary_hit_payload = [
-        make_tex2d(
-            device,
-            "primary_hit_payload_a",
-            internal_w,
-            internal_h,
-            wgpu::TextureFormat::Rgba16Float,
-            rw_tex_usage,
-        ),
-        make_tex2d(
-            device,
-            "primary_hit_payload_b",
-            internal_w,
-            internal_h,
-            wgpu::TextureFormat::Rgba16Float,
-            rw_tex_usage,
-        ),
+        make_storage_buffer(device, "primary_hit_payload_a", payload_bytes),
+        make_storage_buffer(device, "primary_hit_payload_b", payload_bytes),
     ];
 
     let shadow_hist = make_tex2d(
@@ -227,7 +225,7 @@ pub fn create_textures(
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded_bpr = ((bytes_per_row + align - 1) / align) * align;
     let shadow_bytes = (padded_bpr as u64) * (internal_h.max(1) as u64);
-    let shadow_hist_buf = make_storage_buffer(device, "shadow_hist_buf", shadow_bytes);
+    let shadow_hist_buf = make_storage_buffer_copy(device, "shadow_hist_buf", shadow_bytes);
 
     let godray = [
         make_tex2d(
