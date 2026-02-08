@@ -513,16 +513,16 @@ fn try_grass_slab_hit(
   var t0 = max(rt_slab.x, t_min);
   var t1 = min(rt_slab.y, t_max);
 
-  // clip by true solid voxel cube (avoid "inside voxel" artifacts)
+  // If we start inside the solid voxel, skip ahead to the exit to avoid
+  // "inside voxel" grass artifacts without slicing the visible blades.
   let vox_bmin = cell_bmin;
   let vox_bmax = cell_bmin + vec3<f32>(vs);
   let rt_vox   = intersect_aabb(ro, rd, vox_bmin, vox_bmax);
 
   let clip_eps = 0.01 * vs;
   if (rt_vox.y > rt_vox.x) {
-    let t_enter_vox = rt_vox.x;
-    if (t_enter_vox > t0) {
-      t1 = min(t1, t_enter_vox - clip_eps);
+    if (rt_vox.x < 0.0 && rt_vox.y > 0.0) {
+      t0 = max(t0, rt_vox.y + clip_eps);
     }
   }
 
