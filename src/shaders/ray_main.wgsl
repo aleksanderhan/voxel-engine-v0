@@ -372,16 +372,18 @@ fn main_primary(
         let depth_ok = 1.0 - smoothstep(PRIMARY_HIT_DEPTH_REL0, PRIMARY_HIT_DEPTH_REL1, rel);
         let vel_px = length((uv_prev - uv) * res);
         let motion_ok = 1.0 - smoothstep(PRIMARY_HIT_MOTION_PX0, PRIMARY_HIT_MOTION_PX1, vel_px);
-        let window_ok = abs(t_prev - t_hist_guess) <= PRIMARY_HIT_WINDOW;
-        hist_reproj_ok = t_prev > 1e-3 && depth_ok > 0.5 && motion_ok > 0.5 && window_ok;
+        let window_ok = abs(t_prev - t_hist_guess) <= PRIMARY_HIT_MARGIN;
+        hist_reproj_ok = t_prev > 1e-3 && depth_ok > 0.8 && motion_ok > 0.8 && window_ok;
         if (hist_reproj_ok) {
           t_hist = t_prev;
           hist_prev_n = hist_prev_extra.xyz;
           hist_prev_mat = bitcast<u32>(hist_prev_extra.w);
           let mat_guess = bitcast<u32>(hist_guess_extra.w);
-          let mat_match = hist_prev_mat == mat_guess && hist_prev_mat != MAT_AIR;
-          let normal_ok = length(hist_prev_n) > 0.5;
-          hist_valid = mat_match && normal_ok;
+          let mat_match = hist_prev_mat == mat_guess && hist_prev_mat != MAT_AIR && mat_guess != MAT_AIR;
+          let normal_len = length(hist_prev_n);
+          let normal_ok = normal_len > 0.8;
+          let normal_facing = dot(normalize(hist_prev_n), rd) < -0.1;
+          hist_valid = mat_match && normal_ok && normal_facing;
           let packed_z = bitcast<u32>(hist_prev.w);
           hist_anchor_valid = hist_valid && ((packed_z & 0x80000000u) != 0u);
           if (hist_anchor_valid) {
