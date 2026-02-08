@@ -150,8 +150,8 @@ pub struct OverlayGpu {
     pub text_p3:  u32, // 4 ASCII bytes
     pub text_p4:  u32, // 4 ASCII bytes
 
-    // pad to 16-byte boundary
-    pub _pad0: [u32; 4],
+    // pad to 80 bytes (WGSL uniform structs round to 16-byte alignment)
+    pub _pad0: [u32; 7],
 }
 
 
