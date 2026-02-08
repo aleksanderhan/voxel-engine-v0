@@ -319,7 +319,7 @@ fn grass_sdf_lod(
       let taper = mix(GRASS_VOXEL_TAPER, 1.0, taper_shape);
 
       let half_w = r0 * taper;
-      let half_t = max(0.03 * half_w, 0.006 * vs);
+      let half_t = half_w;
 
       let dbox = sdf_box(local, vec3<f32>(0.0), vec3<f32>(half_w, 0.5 * seg_h, half_t));
       dmin = min(dmin, dbox);
