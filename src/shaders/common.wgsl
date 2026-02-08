@@ -400,9 +400,8 @@ struct ChunkMeta {
 @group(0) @binding(1) var<storage, read> chunks     : array<ChunkMeta>;
 @group(0) @binding(2) var<storage, read> nodes      : array<Node>;
 @group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
-@group(0) @binding(9)  var<storage, read> macro_occ : array<u32>;
+@group(0) @binding(9)  var<storage, read> chunk_aux : array<u32>;
 @group(0) @binding(10) var<storage, read> node_ropes: array<NodeRopes>;
-@group(0) @binding(11) var<storage, read> chunk_colinfo : array<u32>;
 
 
 //// --------------------------------------------------------------------------
@@ -431,7 +430,7 @@ fn macro_bit_index(mx: u32, my: u32, mz: u32) -> u32 {
 fn macro_test(macro_base: u32, bit: u32) -> bool {
   let w = bit >> 5u;
   let b = bit & 31u;
-  let word = macro_occ[macro_base + w];
+  let word = chunk_aux[macro_base + w];
   return (word & (1u << b)) != 0u;
 }
 
@@ -576,7 +575,7 @@ fn col_idx_64(ix: u32, iz: u32) -> u32 {
 // returns (y8, mat8). y8==255 => empty column.
 fn colinfo_load(ch: ChunkMeta, ix: u32, iz: u32) -> vec2<u32> {
   let idx  = col_idx_64(ix, iz);
-  let word = chunk_colinfo[ch.colinfo_base + (idx >> 1u)];
+  let word = chunk_aux[ch.colinfo_base + (idx >> 1u)];
   let half = select(word & 0xFFFFu, (word >> 16u) & 0xFFFFu, (idx & 1u) != 0u);
 
   let y8   = half & 0xFFu;
