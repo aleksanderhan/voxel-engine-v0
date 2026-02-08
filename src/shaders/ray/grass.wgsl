@@ -232,13 +232,30 @@ fn grass_sdf_lod(
 
   // --- CLUMPING: a few tuft centers per cell ---
   // (small number keeps it cheap; makes “lush tufts” instead of uniform lawn)
-  let CLUMPS: u32 = 5u;
+  const CLUMPS: u32 = 5u;
 
   // tuft radius in-cell (in meters)
   let clump_r = 0.18 * vs;
 
   // base thickness in meters (this is your “lushness” knob)
   let base_r = (GRASS_VOXEL_THICKNESS_VOX * vs) * 0.85;
+
+  var clump_centers: array<vec2<f32>, CLUMPS>;
+  for (var c: u32 = 0u; c < CLUMPS; c = c + 1u) {
+    let cfi = f32(c);
+    let cu = hash31(cell_id_vox + vec3<f32>(13.7 + cfi, 2.1, 9.9));
+    let cv = hash31(cell_id_vox + vec3<f32>( 4.2 + cfi, 7.3, 1.4));
+
+    // clump center in [inset..1-inset]
+    let inset = 0.10;
+    let cux = mix(inset, 1.0 - inset, cu);
+    let cvz = mix(inset, 1.0 - inset, cv);
+
+    clump_centers[c] = vec2<f32>(
+      cell_bmin_m.x + cux * vs,
+      cell_bmin_m.z + cvz * vs
+    );
+  }
 
   for (var i: u32 = 0u; i < blade_count; i = i + 1u) {
     // (u,v,phase,widthRand)
@@ -250,19 +267,7 @@ fn grass_sdf_lod(
 
     // pick clump index and its center (stable per cell)
     let ci = i % CLUMPS;
-    let cfi = f32(ci);
-    let cu = hash31(cell_id_vox + vec3<f32>(13.7 + cfi, 2.1, 9.9));
-    let cv = hash31(cell_id_vox + vec3<f32>( 4.2 + cfi, 7.3, 1.4));
-
-    // clump center in [inset..1-inset]
-    let inset = 0.10;
-    let cux = mix(inset, 1.0 - inset, cu);
-    let cvz = mix(inset, 1.0 - inset, cv);
-
-    let clump_center = vec2<f32>(
-      cell_bmin_m.x + cux * vs,
-      cell_bmin_m.z + cvz * vs
-    );
+    let clump_center = clump_centers[ci];
 
     // blade root starts near the clump center, but jittered inside a tuft radius
     // (pulls blades into thick patches)
@@ -335,7 +340,8 @@ fn grass_sdf_lod(
       // Nonlinear taper so most narrowing happens near the top.
       let tmid = 0.5 * (t01a + t01b);
       let k = 3.0;
-      let taper_shape = pow(clamp(1.0 - tmid, 0.0, 1.0), k);
+      let taper_base = clamp(1.0 - tmid, 0.0, 1.0);
+      let taper_shape = taper_base * taper_base * taper_base;
       let taper = mix(GRASS_VOXEL_TAPER, 1.0, taper_shape);
 
       let half_w = r0 * taper * 0.7;
