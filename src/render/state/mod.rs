@@ -344,6 +344,20 @@ impl Renderer {
         }
 
         {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("local_taa_pass"),
+                timestamp_writes: None,
+            });
+
+            cpass.set_pipeline(&self.pipelines.local_taa);
+            cpass.set_bind_group(0, &self.bind_groups.local_taa[ping], &[]);
+
+            let gx = (self.internal_w + 7) / 8;
+            let gy = (self.internal_h + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+        }
+
+        {
             let bytes_per_row = self.internal_w.max(1) * std::mem::size_of::<f32>() as u32;
             let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
             let padded_bpr = ((bytes_per_row + align - 1) / align) * align;

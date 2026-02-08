@@ -12,8 +12,10 @@
 // KEY FIX:
 //   When local_w == 0, do NOT decay/overwrite history. Keep history as-is.
 
-@group(1) @binding(0) var local_in_tex   : texture_2d<f32>;
-@group(1) @binding(2) var local_hist_out : texture_storage_2d<rgba32float, write>;
+@group(0) @binding(0) var local_in_tex   : texture_2d<f32>;
+@group(0) @binding(1) var local_hist_tex : texture_2d<f32>;
+@group(0) @binding(2) var local_hist_out : texture_storage_2d<rgba32float, write>;
+@group(0) @binding(3) var local_samp     : sampler;
 
 // Tunables live in common.wgsl.
 
