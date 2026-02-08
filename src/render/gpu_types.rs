@@ -151,7 +151,7 @@ pub struct OverlayGpu {
     pub text_p4:  u32, // 4 ASCII bytes
 
     // pad to 16-byte boundary
-    pub _pad0: [u32; 3],
+    pub _pad0: [u32; 4],
 }
 
 
@@ -236,7 +236,7 @@ impl OverlayGpu {
             text_p2,
             text_p3,
             text_p4,
-            _pad0: [0; 3],
+            _pad0: [0; 4],
         }
     }
 }
