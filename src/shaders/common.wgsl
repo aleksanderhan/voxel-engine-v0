@@ -283,7 +283,7 @@ const LIGHT_EARLY_HITS : u32 = 4u;
 const VOXEL_AO_MAX_DIST     : f32 = 40.0;
 const LOCAL_LIGHT_MAX_DIST  : f32 = 50.0;
 const FAR_SHADING_DIST      : f32 = 64.0;
-const PRIMARY_CLOUD_SHADOWS : bool = false;
+const PRIMARY_CLOUD_SHADOWS : bool = true;
 
 //// --------------------------------------------------------------------------
 //// Local TAA
