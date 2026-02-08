@@ -29,36 +29,48 @@ struct Overlay {
   stride   : u32,
 
   // --- NEW: mode label ("DIG", "PLACE DIRT", ...)
-  text_len   : u32, // number of chars (<= 12)
+  text_len   : u32, // number of chars (<= 20)
   text_p0    : u32, // 4 chars packed (ASCII)
   text_p1    : u32, // 4 chars packed
   text_p2    : u32, // 4 chars packed
+  text_p3    : u32, // 4 chars packed
+  text_p4    : u32, // 4 chars packed
 
   // Profiling HUD lines (up to 5)
   prof0_len  : u32,
   prof0_p0   : u32,
   prof0_p1   : u32,
   prof0_p2   : u32,
+  prof0_p3   : u32,
+  prof0_p4   : u32,
 
   prof1_len  : u32,
   prof1_p0   : u32,
   prof1_p1   : u32,
   prof1_p2   : u32,
+  prof1_p3   : u32,
+  prof1_p4   : u32,
 
   prof2_len  : u32,
   prof2_p0   : u32,
   prof2_p1   : u32,
   prof2_p2   : u32,
+  prof2_p3   : u32,
+  prof2_p4   : u32,
 
   prof3_len  : u32,
   prof3_p0   : u32,
   prof3_p1   : u32,
   prof3_p2   : u32,
+  prof3_p3   : u32,
+  prof3_p4   : u32,
 
   prof4_len  : u32,
   prof4_p0   : u32,
   prof4_p1   : u32,
   prof4_p2   : u32,
+  prof4_p3   : u32,
+  prof4_p4   : u32,
 
   _pad0      : u32,
 };
@@ -105,17 +117,21 @@ fn pack_get_byte(p: u32, i: u32) -> u32 {
 }
 
 fn unpack_char(i: u32) -> u32 {
-  // up to 12 chars from text_p0..p2
+  // up to 20 chars from text_p0..p4
   if (i < 4u)  { return pack_get_byte(overlay.text_p0, i); }
   if (i < 8u)  { return pack_get_byte(overlay.text_p1, i - 4u); }
   if (i < 12u) { return pack_get_byte(overlay.text_p2, i - 8u); }
+  if (i < 16u) { return pack_get_byte(overlay.text_p3, i - 12u); }
+  if (i < 20u) { return pack_get_byte(overlay.text_p4, i - 16u); }
   return 0u;
 }
 
-fn unpack_char_from(p0: u32, p1: u32, p2: u32, i: u32) -> u32 {
+fn unpack_char_from(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, i: u32) -> u32 {
   if (i < 4u)  { return pack_get_byte(p0, i); }
   if (i < 8u)  { return pack_get_byte(p1, i - 4u); }
   if (i < 12u) { return pack_get_byte(p2, i - 8u); }
+  if (i < 16u) { return pack_get_byte(p3, i - 12u); }
+  if (i < 20u) { return pack_get_byte(p4, i - 16u); }
   return 0u;
 }
 
@@ -280,7 +296,7 @@ fn fs_main(
 
   // ---- Edit mode overlay text (under FPS) ----
   let text_len_raw = overlay.text_len;
-  let text_len = min(text_len_raw, 12u);
+  let text_len = min(text_len_raw, 20u);
 
   var profile_base_y = overlay.origin_y + overlay.digit_h + margin;
 
@@ -330,35 +346,47 @@ fn fs_main(
     var p0: u32 = 0u;
     var p1: u32 = 0u;
     var p2: u32 = 0u;
+    var p3: u32 = 0u;
+    var p4: u32 = 0u;
 
     if (line_i == 0u) {
       line_len = overlay.prof0_len;
       p0 = overlay.prof0_p0;
       p1 = overlay.prof0_p1;
       p2 = overlay.prof0_p2;
+      p3 = overlay.prof0_p3;
+      p4 = overlay.prof0_p4;
     } else if (line_i == 1u) {
       line_len = overlay.prof1_len;
       p0 = overlay.prof1_p0;
       p1 = overlay.prof1_p1;
       p2 = overlay.prof1_p2;
+      p3 = overlay.prof1_p3;
+      p4 = overlay.prof1_p4;
     } else if (line_i == 2u) {
       line_len = overlay.prof2_len;
       p0 = overlay.prof2_p0;
       p1 = overlay.prof2_p1;
       p2 = overlay.prof2_p2;
+      p3 = overlay.prof2_p3;
+      p4 = overlay.prof2_p4;
     } else if (line_i == 3u) {
       line_len = overlay.prof3_len;
       p0 = overlay.prof3_p0;
       p1 = overlay.prof3_p1;
       p2 = overlay.prof3_p2;
+      p3 = overlay.prof3_p3;
+      p4 = overlay.prof3_p4;
     } else {
       line_len = overlay.prof4_len;
       p0 = overlay.prof4_p0;
       p1 = overlay.prof4_p1;
       p2 = overlay.prof4_p2;
+      p3 = overlay.prof4_p3;
+      p4 = overlay.prof4_p4;
     }
 
-    let text_len_line = min(line_len, 12u);
+    let text_len_line = min(line_len, 20u);
     if (text_len_line == 0u) {
       continue;
     }
@@ -381,7 +409,7 @@ fn fs_main(
         let cell_y = ly   / scale;   // 0..4
 
         if (cell_y < 5u) {
-          let cch = unpack_char_from(p0, p1, p2, ci);
+          let cch = unpack_char_from(p0, p1, p2, p3, p4, ci);
           let m   = glyph_mask(cch);
 
           if (glyph_bit(m, cell_x, cell_y)) {
