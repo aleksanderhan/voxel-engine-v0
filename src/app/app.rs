@@ -556,16 +556,22 @@ impl App {
             return vec!["GPU TS OFF".to_string()];
         };
 
-        let Some(breakdown) = timings.primary_breakdown else {
-            return vec!["GPU TS OFF".to_string()];
-        };
+        if let Some(breakdown) = timings.primary_breakdown {
+            return vec![
+                Self::format_profile_ms("VOX", breakdown.voxels),
+                Self::format_profile_ms("HDR", breakdown.hdr),
+                Self::format_profile_ms("GRS", breakdown.grass),
+                Self::format_profile_ms("FOG", breakdown.fog),
+                Self::format_profile_ms("PRI", timings.primary),
+            ];
+        }
 
         vec![
-            Self::format_profile_ms("VOX", breakdown.voxels),
-            Self::format_profile_ms("HDR", breakdown.hdr),
-            Self::format_profile_ms("GRS", breakdown.grass),
-            Self::format_profile_ms("FOG", breakdown.fog),
             Self::format_profile_ms("PRI", timings.primary),
+            Self::format_profile_ms("LTA", timings.local_taa),
+            Self::format_profile_ms("GOD", timings.godray),
+            Self::format_profile_ms("CMP", timings.composite),
+            Self::format_profile_ms("CTA", timings.composite_taa),
         ]
     }
 
