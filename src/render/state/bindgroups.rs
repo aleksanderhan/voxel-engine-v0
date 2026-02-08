@@ -107,6 +107,10 @@ fn make_primary_bg(
                 binding: 17,
                 resource: buffers.primary_profile.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 18,
+                resource: wgpu::BindingResource::TextureView(&textures.grass.view),
+            },
 
 
         ],
@@ -231,6 +235,8 @@ fn make_composite_bg(
     godray_sampler: &wgpu::Sampler,
     local_hist_view: &wgpu::TextureView,
     local_sampler: &wgpu::Sampler,
+    grass_view: &wgpu::TextureView,
+    grass_sampler: &wgpu::Sampler,
     label: &str,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -244,6 +250,8 @@ fn make_composite_bg(
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(godray_sampler) },
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(local_hist_view) },
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(local_sampler) },
+            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(grass_view) },
+            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(grass_sampler) },
         ],
     })
 }
@@ -396,6 +404,8 @@ pub fn create_bind_groups(
             sampler,
             &textures.local_hist[0].view,
             sampler,
+            &textures.grass.view,
+            sampler,
             "composite_bg_read_a",
         ),
         make_composite_bg(
@@ -407,6 +417,8 @@ pub fn create_bind_groups(
             &textures.depth.view,
             sampler,
             &textures.local_hist[1].view,
+            sampler,
+            &textures.grass.view,
             sampler,
             "composite_bg_read_b",
         ),

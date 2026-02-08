@@ -20,6 +20,9 @@ pub struct Pipelines {
     /// Compute pipeline for the primary full-resolution pass (writes color/depth).
     pub primary: wgpu::ComputePipeline,
 
+    /// Compute pipeline for the lower-resolution grass pass.
+    pub grass: wgpu::ComputePipeline,
+
     /// Compute pipeline for the quarter-resolution godray pass (ping-pong temporal).
     pub godray: wgpu::ComputePipeline,
 
@@ -93,6 +96,14 @@ pub fn create_pipelines(
         "primary_pipeline",
         cs_module,
         "main_primary",
+        &[&layouts.primary],
+    );
+
+    let grass = make_compute_pipeline(
+        device,
+        "grass_pipeline",
+        cs_module,
+        "main_grass",
         &[&layouts.primary],
     );
 
@@ -188,6 +199,7 @@ pub fn create_pipelines(
 
     Pipelines {
         primary,
+        grass,
         godray,
         local_taa,
         composite,

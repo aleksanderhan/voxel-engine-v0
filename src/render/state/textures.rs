@@ -26,6 +26,7 @@ pub struct TextureSet {
     // per-pixel local lighting term (unfogged), written by primary
     pub local: Tex2D,
     pub local_hist: [Tex2D; 2],
+    pub grass: Tex2D,
 
     pub primary_hit_hist: [Tex2D; 2],
     pub shadow_hist: Tex2D,
@@ -267,6 +268,16 @@ pub fn create_textures(
         ),
     ];
 
+    let grass_w = (internal_w + config::GRASS_DOWNSCALE - 1) / config::GRASS_DOWNSCALE;
+    let grass_h = (internal_h + config::GRASS_DOWNSCALE - 1) / config::GRASS_DOWNSCALE;
+    let grass = make_tex2d(
+        device,
+        "grass_tex",
+        grass_w,
+        grass_h,
+        wgpu::TextureFormat::Rgba32Float,
+        rw_tex_usage,
+    );
 
     TextureSet {
         output,
@@ -276,6 +287,7 @@ pub fn create_textures(
         depth,
         local,
         local_hist,
+        grass,
         primary_hit_hist,
         shadow_hist,
         shadow_hist_buf,

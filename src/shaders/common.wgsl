@@ -24,6 +24,7 @@ const EPS_INV : f32 = 1e-8;
 //// --------------------------------------------------------------------------
 
 const ENABLE_GRASS   : bool = true;
+const PRIMARY_HEIGHTFIELD_GRASS : bool = false;
 const ENABLE_CLIPMAP : bool = true;
 const ENABLE_GODRAYS : bool = true;
 const ENABLE_CLOUDS  : bool = true;

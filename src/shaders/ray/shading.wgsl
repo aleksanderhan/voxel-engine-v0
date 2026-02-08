@@ -361,14 +361,21 @@ fn shade_hit(
   return base * (ambient + direct) + 0.20 * spec_col + emissive;
 }
 
-fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, seed: u32) -> vec3<f32> {
+fn shade_clip_hit(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  ch: ClipHit,
+  sky_up: vec3<f32>,
+  seed: u32,
+  allow_grass: bool
+) -> vec3<f32> {
   let hp = ro + ch.t * rd;
 
   var base = color_for_material(ch.mat);
   if (ch.t <= FAR_SHADING_DIST) {
     base = apply_material_variation_clip(base, ch.mat, hp);
   }
-  if (ch.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(ch.t, ch.n, rd, seed)) {
+  if (allow_grass && ch.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(ch.t, ch.n, rd, seed)) {
     base = grass_top_albedo(base, hp, ch.t);
   }
 
@@ -383,7 +390,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
 
   // AO-lite for terrain: gate hard for grass in primary
   var ao = 1.0;
-  if (ch.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(ch.t, ch.n, rd, seed) && ch.t <= FAR_SHADING_DIST) {
+  if (allow_grass && ch.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(ch.t, ch.n, rd, seed) && ch.t <= FAR_SHADING_DIST) {
     let lvl  = clip_best_level(hp.xz, 2);
     let cell = clip.level[lvl].z;
 

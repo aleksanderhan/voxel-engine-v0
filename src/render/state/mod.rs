@@ -48,6 +48,8 @@ pub struct Renderer {
     render_scale: f32,
     internal_w: u32,
     internal_h: u32,
+    grass_w: u32,
+    grass_h: u32,
 
     clip_scratch: Vec<u8>,
 
@@ -239,6 +241,8 @@ impl Renderer {
         let render_scale = config::RENDER_SCALE;
         let internal_w = ((width as f32) * render_scale).round().max(1.0) as u32;
         let internal_h = ((height as f32) * render_scale).round().max(1.0) as u32;
+        let grass_w = (internal_w + config::GRASS_DOWNSCALE - 1) / config::GRASS_DOWNSCALE;
+        let grass_h = (internal_h + config::GRASS_DOWNSCALE - 1) / config::GRASS_DOWNSCALE;
         
         let textures = create_textures(&device, width, height, internal_w, internal_h);
         let bind_groups = create_bind_groups(&device, &layouts, &buffers, &textures, &sampler);
@@ -256,6 +260,8 @@ impl Renderer {
             render_scale,
             internal_w,
             internal_h,
+            grass_w,
+            grass_h,
             clip_scratch: Vec::new(),
             ts_enabled: use_ts,
             ts_period_ns,
@@ -297,6 +303,8 @@ impl Renderer {
     pub fn resize_output(&mut self, width: u32, height: u32) {
         self.internal_w = ((width as f32) * self.render_scale).round().max(1.0) as u32;
         self.internal_h = ((height as f32) * self.render_scale).round().max(1.0) as u32;
+        self.grass_w = (self.internal_w + config::GRASS_DOWNSCALE - 1) / config::GRASS_DOWNSCALE;
+        self.grass_h = (self.internal_h + config::GRASS_DOWNSCALE - 1) / config::GRASS_DOWNSCALE;
 
         self.textures = create_textures(&self.device, width, height, self.internal_w, self.internal_h);
 
@@ -343,6 +351,20 @@ impl Renderer {
             let gy = (self.internal_h + 7) / 8;
             cpass.dispatch_workgroups(gx, gy, 1);
 
+        }
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("grass_pass"),
+                timestamp_writes: None,
+            });
+
+            cpass.set_pipeline(&self.pipelines.grass);
+            cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
+
+            let gx = (self.grass_w + 7) / 8;
+            let gy = (self.grass_h + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
         }
 
         {

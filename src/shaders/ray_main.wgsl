@@ -27,6 +27,7 @@
 @group(0) @binding(12) var primary_hist_tex  : texture_2d<f32>;
 @group(0) @binding(13) var primary_hist_out  : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(14) var primary_hist_samp : sampler;
+@group(0) @binding(18) var grass_img : texture_storage_2d<rgba32float, write>;
 
 // Sun-shadow history (geom-only transmittance)
 const PROFILE_VOXEL: u32 = 0u;
@@ -57,6 +58,8 @@ struct ProfileCounters {
 // accumulated local lighting (HDR, same res as internal render)
 @group(2) @binding(5) var local_hist_tex : texture_2d<f32>;
 @group(2) @binding(6) var local_samp     : sampler;
+@group(2) @binding(7) var grass_tex      : texture_2d<f32>;
+@group(2) @binding(8) var grass_samp     : sampler;
 
 var<workgroup> WG_SKY_UP : vec3<f32>;
 var<workgroup> WG_TILE_COUNT_CACHED : u32;
@@ -102,10 +105,11 @@ fn shade_heightfield(
   rd: vec3<f32>,
   hf: ClipHit,
   sky_up: vec3<f32>,
-  seed: u32
+  seed: u32,
+  allow_grass: bool
 ) -> HfShadeOut {
   profile_add(PROFILE_HDR, 1u);
-  let surface = shade_clip_hit(ro, rd, hf, sky_up, seed);
+  let surface = shade_clip_hit(ro, rd, hf, sky_up, seed, allow_grass);
   let t_scene = min(hf.t, FOG_MAX_DIST);
   let sky_bg_rd = sky_bg(rd);
   let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
@@ -225,7 +229,7 @@ fn main_primary(
     var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      if (hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
+      if (PRIMARY_HEIGHTFIELD_GRASS && hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
         let voxel_size = cam.voxel_params.x;
         let hp = ro + rd * hf.t;
         let cell = grass_cell_from_world_global(hp, rd, voxel_size);
@@ -248,7 +252,7 @@ fn main_primary(
         }
       }
 
-      let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
+      let shade = shade_heightfield(ro, rd, hf, sky_up, seed, false);
       t_store = shade.t_scene;
       textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
@@ -347,7 +351,7 @@ fn main_primary(
     var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
     if (hf.hit) {
-      if (hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
+      if (PRIMARY_HEIGHTFIELD_GRASS && hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
         let voxel_size = cam.voxel_params.x;
         let hp = ro + rd * hf.t;
         let cell = grass_cell_from_world_global(hp, rd, voxel_size);
@@ -370,7 +374,7 @@ fn main_primary(
         }
       }
 
-      let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
+      let shade = shade_heightfield(ro, rd, hf, sky_up, seed, false);
       t_store = shade.t_scene;
       textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
@@ -492,7 +496,7 @@ fn main_primary(
   var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
 
   if (hf.hit) {
-    if (hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
+    if (PRIMARY_HEIGHTFIELD_GRASS && hf.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
       let voxel_size = cam.voxel_params.x;
       let hp = ro + rd * hf.t;
       let cell = grass_cell_from_world_global(hp, rd, voxel_size);
@@ -515,7 +519,7 @@ fn main_primary(
       }
     }
 
-    let shade = shade_heightfield(ro, rd, hf, sky_up, seed);
+    let shade = shade_heightfield(ro, rd, hf, sky_up, seed, false);
     t_store = shade.t_scene;
     textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
     textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
@@ -553,6 +557,37 @@ fn main_godray(@builtin(global_invocation_id) gid3: vec3<u32>) {
 }
 
 @compute @workgroup_size(8, 8, 1)
+fn main_grass(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let dims = textureDimensions(grass_img);
+  if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+
+  let ip = vec2<i32>(i32(gid.x), i32(gid.y));
+  var outc = vec4<f32>(0.0);
+
+  if (!ENABLE_GRASS) {
+    textureStore(grass_img, ip, outc);
+    return;
+  }
+
+  let grass_dims = vec2<f32>(f32(dims.x), f32(dims.y));
+  let render_dims = render_dims_f();
+  let px = (vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5)) * (render_dims / grass_dims);
+
+  let ro = cam.cam_pos.xyz;
+  let rd = ray_dir_from_pixel(px);
+  let seed = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (cam.frame_index * 26699u);
+
+  let hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
+  if (hf.hit && hf.mat == MAT_GRASS && grass_allowed_primary(hf.t, hf.n, rd, seed)) {
+    let sky_up = sky_bg(vec3<f32>(0.0, 1.0, 0.0));
+    let shade = shade_heightfield(ro, rd, hf, sky_up, seed, true);
+    outc = vec4<f32>(shade.col, 1.0);
+  }
+
+  textureStore(grass_img, ip, outc);
+}
+
+@compute @workgroup_size(8, 8, 1)
 fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
   let out_dims = textureDimensions(out_img);
   if (gid.x >= out_dims.x || gid.y >= out_dims.y) { return; }
@@ -582,8 +617,11 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
   // local_hist holds HDR RGB (alpha ignored here, or you can use it as confidence later)
   let local_rgb = textureSampleLevel(local_hist_tex, local_samp, uv_r, 0.0).xyz;
 
+  let grass_rgba = textureSampleLevel(grass_tex, grass_samp, uv_r, 0.0);
+
   // WGSL can't assign to swizzles, so rebuild the vec4
-  let rgb_final = outc.xyz + local_rgb;
+  let rgb_lit = outc.xyz + local_rgb;
+  let rgb_final = mix(rgb_lit, grass_rgba.xyz, grass_rgba.w);
   let outc_final = vec4<f32>(rgb_final, outc.w);
 
   let ip_out = vec2<i32>(i32(gid.x), i32(gid.y));

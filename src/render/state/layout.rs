@@ -6,6 +6,7 @@ pub struct Layouts {
     pub primary: wgpu::BindGroupLayout,
     pub scene: wgpu::BindGroupLayout,
     pub godray: wgpu::BindGroupLayout,
+    pub grass: wgpu::BindGroupLayout,
     pub local_taa: wgpu::BindGroupLayout,
     pub composite: wgpu::BindGroupLayout,
     pub composite_taa: wgpu::BindGroupLayout,
@@ -152,7 +153,8 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     // 15 sun-shadow history (sampled)
     // 16 sun-shadow history output (storage buffer write)
     // 17 primary pass profiling counters (storage read-write)
-    let primary_entries: [wgpu::BindGroupLayoutEntry; 18] = [
+    // 18 grass pass output (storage write)
+    let primary_entries: [wgpu::BindGroupLayoutEntry; 19] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
@@ -187,6 +189,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         ),
         bgl_storage_rw(16, cs_vis),
         bgl_storage_rw(17, cs_vis),
+        bgl_storage_tex_wo(18, cs_vis, wgpu::TextureFormat::Rgba32Float),
     ];
 
     let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -194,6 +197,10 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         entries: &primary_entries,
     });
 
+    let grass = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("grass_bgl"),
+        entries: &primary_entries,
+    });
 
     let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("godray_bgl"),
@@ -264,6 +271,12 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             ),
             // binding 6: sampler (can reuse same sampler type)
             bgl_sampler_non_filtering(6, cs_vis),
+            bgl_tex_sample_2d(
+                7,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_sampler_non_filtering(8, cs_vis),
 
         ],
     });
@@ -319,6 +332,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         primary,
         scene,
         godray,
+        grass,
         local_taa,
         composite,
         composite_taa,
