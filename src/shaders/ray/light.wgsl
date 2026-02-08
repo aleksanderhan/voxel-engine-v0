@@ -1,13 +1,10 @@
 // src/shaders/ray/light.wgsl
 // --------------------------
-// Cheap voxel light gather for MAT_LIGHT voxels.
+// Deterministic voxel light gather for MAT_LIGHT voxels.
 //
-// What changed (for TAA-friendly behavior):
-// - Removed "empty air bail" (it caused random hit/miss speckle in open air)
-// - Normalization uses a CONSTANT denom (LIGHT_RAYS), so early-exit doesn’t boost brightness
-//
-// NOTE: Temporal accumulation is done in a separate pass; this file just produces
-// a noisy but unbiased estimate (local radiance) suitable for accumulation.
+// Goals:
+// - Uniform, stable lighting before TAA (no per-frame or per-surface jitter).
+// - Low-discrepancy hemisphere sampling for smooth distribution.
 
 // Tunables live in common.wgsl.
 
@@ -22,23 +19,34 @@ fn make_tbn(n: vec3<f32>) -> mat3x3<f32> {
   return mat3x3<f32>(t, b, n);
 }
 
+// Van der Corput radical inverse (base 2).
+fn radical_inverse_vdc(bits: u32) -> f32 {
+  var b = bits;
+  b = (b << 16u) | (b >> 16u);
+  b = ((b & 0x55555555u) << 1u) | ((b & 0xAAAAAAAAu) >> 1u);
+  b = ((b & 0x33333333u) << 2u) | ((b & 0xCCCCCCCCu) >> 2u);
+  b = ((b & 0x0F0F0F0Fu) << 4u) | ((b & 0xF0F0F0F0u) >> 4u);
+  b = ((b & 0x00FF00FFu) << 8u) | ((b & 0xFF00FF00u) >> 8u);
+  return f32(b) * 2.3283064365386963e-10; // 1/2^32
+}
+
+fn hammersley(i: u32, n: u32) -> vec2<f32> {
+  let fi = f32(i);
+  let fn = max(1.0, f32(n));
+  return vec2<f32>(fi / fn, radical_inverse_vdc(i));
+}
+
+// Cosine-weighted hemisphere sample oriented around +Z.
+fn hemisphere_cosine(u: vec2<f32>) -> vec3<f32> {
+  let phi = 6.28318530718 * u.x;
+  let cos_theta = sqrt(1.0 - u.y);
+  let sin_theta = sqrt(u.y);
+  return vec3<f32>(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
+}
+
 // Use your real HDR emission for lighting too.
 fn light_emission_radiance() -> vec3<f32> {
   return material_emission(MAT_LIGHT);
-}
-
-// -----------------------------------------------------------------------------
-// Direction set
-// -----------------------------------------------------------------------------
-
-fn sphere_dir_local(i: u32, count: u32) -> vec3<f32> {
-  let fi = f32(i);
-  let count_f = max(1.0, f32(count));
-  let golden = 2.399963229728653; // golden angle in radians
-  let y = 1.0 - 2.0 * ((fi + 0.5) / count_f);
-  let r = sqrt(max(0.0, 1.0 - y * y));
-  let phi = golden * fi;
-  return vec3<f32>(cos(phi) * r, sin(phi) * r, y);
 }
 
 // -----------------------------------------------------------------------------
@@ -128,8 +136,6 @@ fn gather_voxel_lights(
   // basis for orienting directions
   let tbn = make_tbn(n);
 
-  // Deterministic, normal-oriented sampling to avoid speckle jitter.
-
   // attenuation helpers
   let soft_r  = LIGHT_SOFT_RADIUS_VOX * vs;
   let soft_r2 = soft_r * soft_r;
@@ -145,10 +151,8 @@ fn gather_voxel_lights(
   var sum = vec3<f32>(0.0);
 
   for (var i: u32 = 0u; i < LIGHT_RAYS; i = i + 1u) {
-    var ldir = normalize(tbn * normalize(sphere_dir_local(i, LIGHT_RAYS)));
-    if (dot(ldir, n) < 0.0) {
-      ldir = -ldir;
-    }
+    let u = hammersley(i, LIGHT_RAYS);
+    let ldir = normalize(tbn * hemisphere_cosine(u));
 
     let hit = dda_hit_light(p0, ldir, LIGHT_MAX_DIST_VOX, vs);
     if (hit.w > 0.5) {
