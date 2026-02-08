@@ -15,25 +15,11 @@
 // Helpers
 // -----------------------------------------------------------------------------
 
-fn hash3_i32(p: vec3<i32>) -> u32 {
-  let ux = u32(p.x) * 73856093u;
-  let uy = u32(p.y) * 19349663u;
-  let uz = u32(p.z) * 83492791u;
-  return hash_u32(ux ^ uy ^ uz);
-}
-
 fn make_tbn(n: vec3<f32>) -> mat3x3<f32> {
   let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
   let t = normalize(cross(up_ref, n));
   let b = normalize(cross(n, t));
   return mat3x3<f32>(t, b, n);
-}
-
-fn rot_about_axis(v: vec3<f32>, axis: vec3<f32>, ang: f32) -> vec3<f32> {
-  let a = normalize(axis);
-  let s = sin(ang);
-  let c = cos(ang);
-  return v * c + cross(a, v) * s + a * dot(a, v) * (1.0 - c);
 }
 
 // Use your real HDR emission for lighting too.
@@ -142,12 +128,7 @@ fn gather_voxel_lights(
   // basis for orienting directions
   let tbn = make_tbn(n);
 
-  // de-pattern rotation: stable per surface cell to avoid visible light jitter.
-  let surf_v = vec3<i32>(floor((hp - root_bmin) / max(vs, 1e-6)));
-  let h0 = hash3_i32(surf_v);
-  let h1 = hash_u32(h0);
-  let h2 = hash_u32(h1);
-  let rot = 6.28318530718 * (f32(h2 & 1023u) / 1024.0);
+  // Deterministic, normal-oriented sampling to avoid speckle jitter.
 
   // attenuation helpers
   let soft_r  = LIGHT_SOFT_RADIUS_VOX * vs;
@@ -165,7 +146,9 @@ fn gather_voxel_lights(
 
   for (var i: u32 = 0u; i < LIGHT_RAYS; i = i + 1u) {
     var ldir = normalize(tbn * normalize(sphere_dir_local(i, LIGHT_RAYS)));
-    ldir = normalize(rot_about_axis(ldir, n, rot));
+    if (dot(ldir, n) < 0.0) {
+      ldir = -ldir;
+    }
 
     let hit = dda_hit_light(p0, ldir, LIGHT_MAX_DIST_VOX, vs);
     if (hit.w > 0.5) {
