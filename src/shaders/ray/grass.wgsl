@@ -291,9 +291,8 @@ fn grass_sdf_lod(
       // edge rounding scales down with thickness
       let edge_r = 0.35 * half_t;
 
-      // Roll/twist changes the ribbon orientation along the blade, giving richer silhouettes.
-      // (tmid is 0..1 along blade)
-      let roll = TAU * (0.15 * ph + 0.35 * tmid + 0.10 * wR);
+      // Keep a stable ribbon orientation per blade so it reads as one thin triangle.
+      let roll = TAU * (0.15 * ph + 0.10 * wR);
       let roll_dir = vec2<f32>(cos(roll), sin(roll));
 
       let side_hint = normalize(vec3<f32>(
