@@ -22,6 +22,7 @@ use textures::{create_textures, TextureSet};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuTimingsMs {
     pub primary: f64,
+    pub local_taa: f64,
     pub godray: f64,
     pub composite: f64,
     pub blit: f64,
@@ -172,7 +173,7 @@ impl Renderer {
             .await
             .unwrap();
 
-        const TS_COUNT: u32 = 8;
+        const TS_COUNT: u32 = 10;
         let (ts_qs, ts_resolve, ts_readback, ts_period_ns) = if use_ts {
             let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("ts_qs"),
@@ -346,7 +347,7 @@ impl Renderer {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("local_taa_pass"),
-                timestamp_writes: None,
+                timestamp_writes: self.ts_pair(2, 3),
             });
 
             cpass.set_pipeline(&self.pipelines.local_taa);
@@ -388,7 +389,7 @@ impl Renderer {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("godray_pass"),
-                timestamp_writes: self.ts_pair(2, 3),
+                timestamp_writes: self.ts_pair(4, 5),
             });
 
             cpass.set_pipeline(&self.pipelines.godray);
@@ -403,7 +404,7 @@ impl Renderer {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("composite_pass"),
-                timestamp_writes: self.ts_pair(4, 5),
+                timestamp_writes: self.ts_pair(6, 7),
             });
 
             cpass.set_pipeline(&self.pipelines.composite);
@@ -483,7 +484,7 @@ impl Renderer {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: self.ts_pair_rp(6, 7),
+            timestamp_writes: self.ts_pair_rp(8, 9),
             occlusion_query_set: None,
         });
 
@@ -623,8 +624,8 @@ impl Renderer {
         let qs = self.ts_qs.as_ref().unwrap();
         let resolve = self.ts_resolve.as_ref().unwrap();
         let readback = self.ts_readback.as_ref().unwrap();
-        encoder.resolve_query_set(qs, 0..8, resolve, 0);
-        encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, 8 * 8);
+        encoder.resolve_query_set(qs, 0..10, resolve, 0);
+        encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, 10 * 8);
     }
 
     pub fn read_gpu_timings_ms_blocking(&self) -> Option<GpuTimingsMs> {
@@ -649,16 +650,19 @@ impl Renderer {
             .expect("map_async dropped")
             .expect("map_async failed");
 
-        // Read 8 u64 timestamps
+        // Read 10 u64 timestamps
         let data = slice.get_mapped_range();
         let words: &[u64] = bytemuck::cast_slice(&data);
-        if words.len() < 8 {
+        if words.len() < 10 {
             drop(data);
             readback.unmap();
             return None;
         }
 
-        let ts = [words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]];
+        let ts = [
+            words[0], words[1], words[2], words[3], words[4],
+            words[5], words[6], words[7], words[8], words[9],
+        ];
 
         drop(data);
         readback.unmap();
@@ -669,16 +673,18 @@ impl Renderer {
         let to_ms = |a: u64, b: u64| -> f64 { (b.saturating_sub(a) as f64) * ns * 1e-6 };
 
         let primary   = to_ms(ts[0], ts[1]);
-        let godray    = to_ms(ts[2], ts[3]);
-        let composite = to_ms(ts[4], ts[5]);
-        let blit      = to_ms(ts[6], ts[7]);
+        let local_taa = to_ms(ts[2], ts[3]);
+        let godray    = to_ms(ts[4], ts[5]);
+        let composite = to_ms(ts[6], ts[7]);
+        let blit      = to_ms(ts[8], ts[9]);
 
         Some(GpuTimingsMs {
             primary,
+            local_taa,
             godray,
             composite,
             blit,
-            total: primary + godray + composite + blit,
+            total: primary + local_taa + godray + composite + blit,
         })
     }
 
