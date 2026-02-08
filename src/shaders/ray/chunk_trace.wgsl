@@ -1158,12 +1158,34 @@ fn coarse_grid_dims() -> vec3<i32> {
   );
 }
 
-fn coarse_grid_index(lcx: i32, lcy: i32, lcz: i32) -> u32 {
-  let cgd = coarse_grid_dims();
-  let ccx = lcx / 2;
-  let ccy = lcy / 2;
-  let ccz = lcz / 2;
-  return u32((ccz * cgd.y + ccy) * cgd.x + ccx);
+fn coarse_cell_occupied(ccx: i32, ccy: i32, ccz: i32) -> bool {
+  let gd = cam.grid_dims;
+  let nx: i32 = i32(gd.x);
+  let ny: i32 = i32(gd.y);
+  let nz: i32 = i32(gd.z);
+  let lcx0 = ccx * 2;
+  let lcy0 = ccy * 2;
+  let lcz0 = ccz * 2;
+  for (var dz: i32 = 0; dz < 2; dz = dz + 1) {
+    let lcz = lcz0 + dz;
+    if (lcz < 0 || lcz >= nz) { continue; }
+    for (var dy: i32 = 0; dy < 2; dy = dy + 1) {
+      let lcy = lcy0 + dy;
+      if (lcy < 0 || lcy >= ny) { continue; }
+      for (var dx: i32 = 0; dx < 2; dx = dx + 1) {
+        let lcx = lcx0 + dx;
+        if (lcx < 0 || lcx >= nx) { continue; }
+        let idx = (lcz * ny + lcy) * nx + lcx;
+        let slot = chunk_grid[u32(idx)];
+        if (slot == INVALID_U32 || slot >= cam.chunk_count) { continue; }
+        let ch = chunks[slot];
+        if (ch.macro_empty == 0u) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 fn tile_append_candidates_for_ray(
@@ -1275,16 +1297,15 @@ fn tile_append_candidates_for_ray(
   for (var s: u32 = 0u; s < max_steps; s = s + 1u) {
     if (t_local > t_exit_local) { break; }
 
+    let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
     if (idx_i >= 0 && idx_i < i32(cgd.x * cgd.y * cgd.z)) {
-      if (chunk_grid_coarse[u32(idx_i)] != 0u) {
-        let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
+      if (coarse_cell_occupied(ccx, ccy, ccz)) {
         let t_cell_enter = start_t + t_local;
         let t_cell_exit = start_t + min(tNextLocal, t_exit_local);
         tile_append_candidates_for_ray_fine(ro, rd, t_cell_enter, t_cell_exit);
       }
     }
 
-    let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
     let epsTie = 1e-6 * max(1.0, abs(tNextLocal));
 
     if (abs(tMaxX - tNextLocal) <= epsTie) {

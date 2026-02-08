@@ -107,10 +107,6 @@ fn make_primary_bg(
                 binding: 17,
                 resource: buffers.primary_profile.as_entire_binding(),
             },
-            wgpu::BindGroupEntry {
-                binding: 18,
-                resource: buffers.chunk_grid_coarse.as_entire_binding(),
-            },
 
 
         ],
@@ -153,10 +149,6 @@ fn make_scene_bg(
             wgpu::BindGroupEntry {
                 binding: 10,
                 resource: buffers.colinfo.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 18,
-                resource: buffers.chunk_grid_coarse.as_entire_binding(),
             },
 
         ],

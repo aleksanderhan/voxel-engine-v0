@@ -3,7 +3,6 @@
 // Persistent GPU buffers and capacities.
 
 use crate::app::config;
-use crate::streaming::types::GRID_Y_COUNT;
 use crate::{
     render::gpu_types::{ChunkMetaGpu, ClipmapGpu, NodeGpu, NodeRopesGpu, PRIMARY_PROFILE_COUNT},
 };
@@ -20,13 +19,11 @@ pub struct Buffers {
     pub node: wgpu::Buffer,
     pub chunk: wgpu::Buffer,
     pub chunk_grid: wgpu::Buffer,
-    pub chunk_grid_coarse: wgpu::Buffer,
 
     // --- Capacities ---
     pub node_capacity: u32,
     pub chunk_capacity: u32,
     pub grid_capacity: u32,
-    pub grid_coarse_capacity: u32,
 
     pub macro_occ: wgpu::Buffer,
     pub macro_capacity_u32: u32,
@@ -97,25 +94,11 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
     );
 
     let grid_capacity = chunk_capacity;
-    let coarse_capacity = {
-        let nx = (2 * config::KEEP_RADIUS + 1) as u32;
-        let ny = GRID_Y_COUNT;
-        let nz = nx;
-        let cnx = (nx + 1) / 2;
-        let cny = (ny + 1) / 2;
-        let cnz = (nz + 1) / 2;
-        cnx * cny * cnz
-    };
 
     let chunk_grid = make_storage_buffer(
         device,
         "chunk_grid_buf",
         (grid_capacity as u64) * (std::mem::size_of::<u32>() as u64),
-    );
-    let chunk_grid_coarse = make_storage_buffer(
-        device,
-        "chunk_grid_coarse_buf",
-        (coarse_capacity as u64) * (std::mem::size_of::<u32>() as u64),
     );
 
     // ---- macro occupancy: 8^3 bits = 512 bits = 16 u32 words per chunk ----
@@ -157,11 +140,9 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         node,
         chunk,
         chunk_grid,
-        chunk_grid_coarse,
         node_capacity,
         chunk_capacity,
         grid_capacity,
-        grid_coarse_capacity: coarse_capacity,
         macro_occ,
         macro_capacity_u32,
         node_ropes,

@@ -404,7 +404,6 @@ struct ChunkMeta {
 @group(0) @binding(1) var<storage, read> chunks     : array<ChunkMeta>;
 @group(0) @binding(2) var<storage, read> nodes      : array<Node>;
 @group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
-@group(0) @binding(18) var<storage, read> chunk_grid_coarse : array<u32>;
 @group(0) @binding(9)  var<storage, read> macro_occ : array<u32>;
 @group(0) @binding(10) var<storage, read> node_ropes: array<NodeRopes>;
 @group(0) @binding(11) var<storage, read> chunk_colinfo : array<u32>;
