@@ -27,11 +27,10 @@
 @group(0) @binding(12) var primary_hist_tex  : texture_2d<f32>;
 @group(0) @binding(13) var primary_hist_out  : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(14) var primary_hist_samp : sampler;
-@group(0) @binding(15) var<storage, read> primary_payload_hist : array<vec4<f32>>;
-@group(0) @binding(16) var<storage, read_write> primary_payload_out : array<vec4<f32>>;
+@group(0) @binding(15) var<storage, read_write> primary_payload : array<vec4<f32>>;
 
-@group(0) @binding(17) var shadow_hist_in : texture_2d<f32>;
-@group(0) @binding(18) var<storage, read_write> shadow_hist_out : array<f32>;
+@group(0) @binding(16) var shadow_hist_in : texture_2d<f32>;
+@group(0) @binding(17) var<storage, read_write> shadow_hist_out : array<f32>;
 
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
 @group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
@@ -201,7 +200,10 @@ fn main_primary(
   let padded_bpr = (bytes_per_row + 255u) & ~255u;
   let shadow_stride = padded_bpr / 4u;
   let shadow_idx = u32(ip.y) * shadow_stride + u32(ip.x);
+  let pixel_count = u32(dims.x) * u32(dims.y);
   let payload_idx = u32(ip.y) * u32(dims.x) + u32(ip.x);
+  let payload_write_base = (cam.frame_index & 1u) * pixel_count;
+  let payload_read_base = (1u - (cam.frame_index & 1u)) * pixel_count;
 
   if (cam.chunk_count == 0u) {
     var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
@@ -236,7 +238,7 @@ fn main_primary(
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
       hist_payload = vec4<f32>(hf.n, encode_hist_mat(hf.mat, false));
-      primary_payload_out[payload_idx] = hist_payload;
+      primary_payload[payload_write_base + payload_idx] = hist_payload;
       shadow_hist_out[shadow_idx] = shadow_out;
       return;
     }
@@ -248,7 +250,7 @@ fn main_primary(
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
     hist_payload = vec4<f32>(vec3<f32>(0.0, 1.0, 0.0), encode_hist_mat(0u, false));
-    primary_payload_out[payload_idx] = hist_payload;
+    primary_payload[payload_write_base + payload_idx] = hist_payload;
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
@@ -268,7 +270,7 @@ fn main_primary(
 
   if (has_tile_candidates) {
     let hist_guess = textureLoad(primary_hist_tex, ip, 0);
-    let payload_guess = primary_payload_hist[payload_idx];
+    let payload_guess = primary_payload[payload_read_base + payload_idx];
     let t_hist_guess = hist_guess.x;
     if (t_hist_guess > 1e-3) {
       let p_ws = ro + rd * t_hist_guess;
@@ -281,7 +283,7 @@ fn main_primary(
           clamp(i32(uv_prev.y * f32(dims.y)), 0, i32(dims.y) - 1)
         );
         let prev_idx = u32(prev_px.y) * u32(dims.x) + u32(prev_px.x);
-        payload_prev = primary_payload_hist[prev_idx];
+        payload_prev = primary_payload[payload_read_base + prev_idx];
         let t_prev = hist_prev.x;
         let rel = abs(t_prev - t_hist_guess) / max(t_hist_guess, 1e-3);
         let depth_ok = 1.0 - smoothstep(PRIMARY_HIT_DEPTH_REL0, PRIMARY_HIT_DEPTH_REL1, rel);
@@ -345,7 +347,7 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, hist_prev.y, hist_prev.z, hist_prev.w));
-    primary_payload_out[payload_idx] = payload_prev;
+    primary_payload[payload_write_base + payload_idx] = payload_prev;
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
@@ -417,7 +419,7 @@ fn main_primary(
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
       hist_payload = vec4<f32>(hf.n, encode_hist_mat(hf.mat, false));
-      primary_payload_out[payload_idx] = hist_payload;
+      primary_payload[payload_write_base + payload_idx] = hist_payload;
       shadow_hist_out[shadow_idx] = shadow_out;
       return;
     }
@@ -428,7 +430,7 @@ fn main_primary(
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
     hist_payload = vec4<f32>(vec3<f32>(0.0, 1.0, 0.0), encode_hist_mat(0u, false));
-    primary_payload_out[payload_idx] = hist_payload;
+    primary_payload[payload_write_base + payload_idx] = hist_payload;
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
@@ -524,7 +526,7 @@ fn main_primary(
       vec4<f32>(t_store, bitcast<f32>(anchor_key), bitcast<f32>(packed_xy), bitcast<f32>(packed_z))
     );
     hist_payload = vec4<f32>(vt.best.n, encode_hist_mat(vt.best.mat, true));
-    primary_payload_out[payload_idx] = hist_payload;
+    primary_payload[payload_write_base + payload_idx] = hist_payload;
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
@@ -562,7 +564,7 @@ fn main_primary(
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
     hist_payload = vec4<f32>(hf.n, encode_hist_mat(hf.mat, false));
-    primary_payload_out[payload_idx] = hist_payload;
+    primary_payload[payload_write_base + payload_idx] = hist_payload;
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
@@ -574,7 +576,7 @@ fn main_primary(
   textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
   textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
   hist_payload = vec4<f32>(vec3<f32>(0.0, 1.0, 0.0), encode_hist_mat(0u, false));
-  primary_payload_out[payload_idx] = hist_payload;
+  primary_payload[payload_write_base + payload_idx] = hist_payload;
   shadow_hist_out[shadow_idx] = shadow_out;
 }
 

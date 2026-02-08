@@ -149,11 +149,10 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     // 12 primary hit history (sampled)
     // 13 primary hit history output (storage write)
     // 14 primary hit history sampler
-    // 15 primary hit payload history (storage read)
-    // 16 primary hit payload output (storage write)
-    // 17 sun-shadow history (sampled)
-    // 18 sun-shadow history output (storage buffer write)
-    let primary_entries: [wgpu::BindGroupLayoutEntry; 19] = [
+    // 15 primary hit payload history (storage read/write)
+    // 16 sun-shadow history (sampled)
+    // 17 sun-shadow history output (storage buffer write)
+    let primary_entries: [wgpu::BindGroupLayoutEntry; 18] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
@@ -181,14 +180,13 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         ),
         bgl_storage_tex_wo(13, cs_vis, wgpu::TextureFormat::Rgba32Float),
         bgl_sampler_non_filtering(14, cs_vis),
-        bgl_storage_ro(15, cs_vis),
-        bgl_storage_rw(16, cs_vis),
+        bgl_storage_rw(15, cs_vis),
         bgl_tex_sample_2d(
-            17,
+            16,
             cs_vis,
             wgpu::TextureSampleType::Float { filterable: false },
         ),
-        bgl_storage_rw(18, cs_vis),
+        bgl_storage_rw(17, cs_vis),
     ];
 
     let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
