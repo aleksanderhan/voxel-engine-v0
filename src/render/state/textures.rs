@@ -28,7 +28,7 @@ pub struct TextureSet {
     pub local_hist: [Tex2D; 2],
 
     pub primary_hit_hist: [Tex2D; 2],
-    pub primary_hit_hist_extra: [Tex2D; 2],
+    pub primary_hit_hist_extra: [wgpu::Buffer; 2],
     pub shadow_hist: Tex2D,
     pub shadow_hist_buf: wgpu::Buffer,
     
@@ -77,6 +77,7 @@ fn make_storage_buffer(device: &wgpu::Device, label: &str, size_bytes: u64) -> w
         mapped_at_creation: false,
     })
 }
+
 
 fn make_tex2d_array(
     device: &wgpu::Device,
@@ -196,23 +197,12 @@ pub fn create_textures(
         ),
     ];
 
+    let hist_extra_bytes = (internal_w.max(1) as u64)
+        * (internal_h.max(1) as u64)
+        * std::mem::size_of::<[f32; 4]>() as u64;
     let primary_hit_hist_extra = [
-        make_tex2d(
-            device,
-            "primary_hit_hist_extra_a",
-            internal_w,
-            internal_h,
-            wgpu::TextureFormat::Rgba32Float,
-            rw_tex_usage,
-        ),
-        make_tex2d(
-            device,
-            "primary_hit_hist_extra_b",
-            internal_w,
-            internal_h,
-            wgpu::TextureFormat::Rgba32Float,
-            rw_tex_usage,
-        ),
+        make_storage_buffer(device, "primary_hit_hist_extra_a", hist_extra_bytes),
+        make_storage_buffer(device, "primary_hit_hist_extra_b", hist_extra_bytes),
     ];
 
     let shadow_hist = make_tex2d(
