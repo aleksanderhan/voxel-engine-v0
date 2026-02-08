@@ -142,11 +142,13 @@ fn gather_voxel_lights(
   // basis for orienting directions
   let tbn = make_tbn(n);
 
-  // de-pattern rotation: stable per surface cell (no per-frame noise)
+  // de-pattern rotation: stable per surface cell with a per-frame phase shift
+  // so temporal accumulation can converge noisy samples.
   let surf_v = vec3<i32>(floor((hp - root_bmin) / max(vs, 1e-6)));
   let h0 = hash3_i32(surf_v);
   let h1 = hash_u32(h0);
-  let rot = 6.28318530718 * (f32(h1 & 1023u) / 1024.0);
+  let h2 = hash_u32(h1 ^ (cam.frame_index * 747796405u));
+  let rot = 6.28318530718 * (f32(h2 & 1023u) / 1024.0);
 
   // attenuation helpers
   let soft_r  = LIGHT_SOFT_RADIUS_VOX * vs;
