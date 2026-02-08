@@ -182,7 +182,9 @@ fn main_primary(
   let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
 
   let ro  = cam.cam_pos.xyz;
+  let ro_prev = cam.prev_cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px);
+  let rd_prev = ray_dir_from_pixel_prev(px);
 
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
 
@@ -274,7 +276,7 @@ fn main_primary(
     let payload_guess = primary_payload[payload_read_base + payload_idx];
     let t_hist_guess = hist_guess.x;
     if (t_hist_guess > 1e-3) {
-      let p_ws = ro + rd * t_hist_guess;
+      let p_ws = ro_prev + rd_prev * t_hist_guess;
       let uv_prev = prev_uv_from_world(p_ws);
 
       if (in_unit_square(uv_prev)) {
@@ -311,8 +313,10 @@ fn main_primary(
   }
 
   if (hist_valid) {
-    let t_scene = min(t_hist, FOG_MAX_DIST);
-    let hp = ro + rd * t_hist;
+    let hp_prev = ro_prev + rd_prev * t_hist;
+    let t_cur = max(dot(hp_prev - ro, rd), 0.0);
+    let t_scene = min(t_cur, FOG_MAX_DIST);
+    let hp = ro + rd * t_cur;
     let hist_n = safe_normalize(payload_prev.xyz);
     let hist_mat = decode_hist_mat(payload_prev.w);
 
@@ -336,7 +340,7 @@ fn main_primary(
 
     var hg = miss_hitgeom();
     hg.hit = 1u;
-    hg.t = t_hist;
+    hg.t = t_cur;
     hg.n = hist_n;
     hg.mat = hist_mat;
 

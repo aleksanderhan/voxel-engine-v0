@@ -361,9 +361,13 @@ struct Camera {
   prev_view_proj: mat4x4<f32>,
 
   cam_pos     : vec4<f32>,
+  prev_cam_pos: vec4<f32>,
   ray00       : vec4<f32>,
   ray_dx      : vec4<f32>,
   ray_dy      : vec4<f32>,
+  prev_ray00  : vec4<f32>,
+  prev_ray_dx : vec4<f32>,
+  prev_ray_dy : vec4<f32>,
 
   chunk_size  : u32,
   chunk_count : u32,
@@ -451,6 +455,11 @@ fn safe_normalize(v: vec3<f32>) -> vec3<f32> {
 
 fn ray_dir_from_pixel(px: vec2<f32>) -> vec3<f32> {
   let d = cam.ray00.xyz + px.x * cam.ray_dx.xyz + px.y * cam.ray_dy.xyz;
+  return normalize(d);
+}
+
+fn ray_dir_from_pixel_prev(px: vec2<f32>) -> vec3<f32> {
+  let d = cam.prev_ray00.xyz + px.x * cam.prev_ray_dx.xyz + px.y * cam.prev_ray_dy.xyz;
   return normalize(d);
 }
 

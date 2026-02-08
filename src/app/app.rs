@@ -98,6 +98,10 @@ pub struct App {
     // Motion vectors / temporal reprojection needs last frame's VP.
     prev_view_proj: glam::Mat4,
     has_prev_view_proj: bool,
+    prev_cam_pos: glam::Vec3,
+    prev_ray00: glam::Vec3,
+    prev_ray_dx: glam::Vec3,
+    prev_ray_dy: glam::Vec3,
 
     // Streaming update throttle.
     last_stream_update: Instant,
@@ -207,6 +211,10 @@ impl App {
             last_frame_time: Instant::now(),
             prev_view_proj: glam::Mat4::IDENTITY,
             has_prev_view_proj: false,
+            prev_cam_pos: glam::Vec3::ZERO,
+            prev_ray00: glam::Vec3::ZERO,
+            prev_ray_dx: glam::Vec3::ZERO,
+            prev_ray_dy: glam::Vec3::ZERO,
             last_stream_update: Instant::now(),
             stream_period: Duration::from_millis(33), // 30 Hz
             physics,
@@ -453,6 +461,13 @@ impl App {
         let ray_dx = ray10 - ray00;
         let ray_dy = ray01 - ray00;
 
+        if !self.has_prev_view_proj {
+            self.prev_cam_pos = camera_frame.pos;
+            self.prev_ray00 = ray00;
+            self.prev_ray_dx = ray_dx;
+            self.prev_ray_dy = ray_dy;
+        }
+
         let camera_gpu = CameraGpu {
             view_inv: camera_frame.view_inv.to_cols_array_2d(),
             proj_inv: camera_frame.proj_inv.to_cols_array_2d(),
@@ -461,9 +476,18 @@ impl App {
             prev_view_proj: previous_view_proj.to_cols_array_2d(),
 
             cam_pos: [camera_frame.pos.x, camera_frame.pos.y, camera_frame.pos.z, 1.0],
+            prev_cam_pos: [
+                self.prev_cam_pos.x,
+                self.prev_cam_pos.y,
+                self.prev_cam_pos.z,
+                1.0,
+            ],
             ray00: [ray00.x, ray00.y, ray00.z, 0.0],
             ray_dx: [ray_dx.x, ray_dx.y, ray_dx.z, 0.0],
             ray_dy: [ray_dy.x, ray_dy.y, ray_dy.z, 0.0],
+            prev_ray00: [self.prev_ray00.x, self.prev_ray00.y, self.prev_ray00.z, 0.0],
+            prev_ray_dx: [self.prev_ray_dx.x, self.prev_ray_dx.y, self.prev_ray_dx.z, 0.0],
+            prev_ray_dy: [self.prev_ray_dy.x, self.prev_ray_dy.y, self.prev_ray_dy.z, 0.0],
 
             chunk_size: config::CHUNK_SIZE,
             chunk_count: self.chunks.chunk_count(),
@@ -496,6 +520,11 @@ impl App {
 
         self.renderer.write_camera(&camera_gpu);
         self.profiler.cam_write(profiler::FrameProf::end_ms(t0));
+
+        self.prev_cam_pos = camera_frame.pos;
+        self.prev_ray00 = ray00;
+        self.prev_ray_dx = ray_dx;
+        self.prev_ray_dy = ray_dy;
 
         camera_gpu
     }
