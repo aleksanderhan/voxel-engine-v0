@@ -379,10 +379,11 @@ fn main_primary(
           hist_prev_n = hist_prev_extra.xyz;
           hist_prev_mat = bitcast<u32>(hist_prev_extra.w);
           let mat_guess = bitcast<u32>(hist_guess_extra.w);
-          let mat_match = hist_prev_mat == mat_guess;
-          hist_valid = mat_match;
+          let mat_match = hist_prev_mat == mat_guess && hist_prev_mat != MAT_AIR;
+          let normal_ok = length(hist_prev_n) > 0.5;
+          hist_valid = mat_match && normal_ok;
           let packed_z = bitcast<u32>(hist_prev.w);
-          hist_anchor_valid = mat_match && ((packed_z & 0x80000000u) != 0u);
+          hist_anchor_valid = hist_valid && ((packed_z & 0x80000000u) != 0u);
           if (hist_anchor_valid) {
             hist_anchor_key = bitcast<u32>(hist_prev.y);
             let packed_xy = bitcast<u32>(hist_prev.z);
