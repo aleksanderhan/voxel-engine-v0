@@ -7,9 +7,9 @@ struct GrassCell {
   id_vox : vec3<f32>,
 };
 
-fn pick_grass_cell_in_chunk(
+fn pick_grass_cell_in_chunk_with_bias(
   hp_m: vec3<f32>,
-  rd: vec3<f32>,
+  bias_dir: vec3<f32>,
   root_bmin_m: vec3<f32>,
   ch_origin_vox: vec3<i32>,
   voxel_size_m: f32,
@@ -18,11 +18,11 @@ fn pick_grass_cell_in_chunk(
   let root_size_m = f32(chunk_size_vox) * voxel_size_m;
 
   let bias = 0.05 * voxel_size_m;
-  var local_xz = (hp_m - root_bmin_m) - rd * bias;
+  var local_xz = (hp_m - root_bmin_m) - bias_dir * bias;
   local_xz.x = clamp(local_xz.x, 0.0, root_size_m - 1e-6);
   local_xz.z = clamp(local_xz.z, 0.0, root_size_m - 1e-6);
 
-  let y_in = hp_m.y - 1e-4 * voxel_size_m;
+  let y_in = (hp_m - bias_dir * bias).y - 1e-4 * voxel_size_m;
   var local_y = clamp(y_in - root_bmin_m.y, 0.0, root_size_m - 1e-6);
 
   var ix = i32(floor(local_xz.x / voxel_size_m));
@@ -41,6 +41,24 @@ fn pick_grass_cell_in_chunk(
   );
 
   return GrassCell(bmin_m, id_vox);
+}
+
+fn pick_grass_cell_in_chunk(
+  hp_m: vec3<f32>,
+  rd: vec3<f32>,
+  root_bmin_m: vec3<f32>,
+  ch_origin_vox: vec3<i32>,
+  voxel_size_m: f32,
+  chunk_size_vox: i32
+) -> GrassCell {
+  return pick_grass_cell_in_chunk_with_bias(
+    hp_m,
+    rd,
+    root_bmin_m,
+    ch_origin_vox,
+    voxel_size_m,
+    chunk_size_vox
+  );
 }
 
 fn grass_cell_from_world(
@@ -296,7 +314,7 @@ fn grass_sdf_lod(
 
       // Nonlinear taper so most narrowing happens near the top.
       let tmid = 0.5 * (t01a + t01b);
-      let k = 3.0;
+      let k = 4.0;
       let taper_shape = pow(clamp(1.0 - tmid, 0.0, 1.0), k);
       let taper = mix(GRASS_VOXEL_TAPER, 1.0, taper_shape);
 

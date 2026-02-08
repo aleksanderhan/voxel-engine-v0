@@ -297,20 +297,20 @@ const LOCAL_TAA_ALPHA : f32 = 0.12;
 //// --------------------------------------------------------------------------
 
 const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.75;
-const GRASS_BLADE_COUNT           : u32 = 2u;
+const GRASS_BLADE_COUNT           : u32 = 3u;
 const GRASS_TRACE_STEPS           : u32 = 7u;
 const GRASS_HIT_EPS_VOX           : f32 = 0.015;
 const GRASS_STEP_MIN_VOX          : f32 = 0.02;
 
 const GRASS_VOXEL_SEGS            : f32 = 6.0;
-const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.045;
-const GRASS_VOXEL_TAPER           : f32 = 0.06; // 0.04..0.20 gives a visible point
-const GRASS_OVERHANG_VOX          : f32 = 0.35;
+const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.115;
+const GRASS_VOXEL_TAPER           : f32 = 0.045; // 0.04..0.20 gives a visible point
+const GRASS_OVERHANG_VOX          : f32 = 0.6;
 
 const GRASS_LOD_MID_START : f32 = 18.0;
 const GRASS_LOD_FAR_START : f32 = 45.0;
 
-const GRASS_BLADE_COUNT_MID : u32 = 1u;
+const GRASS_BLADE_COUNT_MID : u32 = 2u;
 const GRASS_BLADE_COUNT_FAR : u32 = 1u;
 
 const GRASS_SEGS_MID : u32 = 4u;
