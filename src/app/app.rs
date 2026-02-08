@@ -556,13 +556,18 @@ impl App {
 
     fn format_profile_line(label: &str, value: u32) -> String {
         let count = Self::format_profile_count(value);
-        let number_width = 8usize;
-        let mut padded = String::with_capacity(number_width.max(count.len()));
-        if count.len() < number_width {
-            padded.extend(std::iter::repeat('.').take(number_width - count.len()));
+        let number_width = 9usize;
+        let trimmed = if count.len() > number_width {
+            count[count.len() - number_width..].to_string()
+        } else {
+            count
+        };
+        let mut padded = String::with_capacity(number_width);
+        if trimmed.len() < number_width {
+            padded.extend(std::iter::repeat(' ').take(number_width - trimmed.len()));
         }
-        padded.push_str(&count);
-        format!("{label}.{padded}")
+        padded.push_str(&trimmed);
+        format!("{label}{padded}")
     }
 
     fn format_profile_count(value: u32) -> String {
