@@ -32,8 +32,8 @@ fn radical_inverse_vdc(bits: u32) -> f32 {
 
 fn hammersley(i: u32, n: u32) -> vec2<f32> {
   let fi = f32(i);
-  let fn = max(1.0, f32(n));
-  return vec2<f32>(fi / fn, radical_inverse_vdc(i));
+  let n_f = max(1.0, f32(n));
+  return vec2<f32>(fi / n_f, radical_inverse_vdc(i));
 }
 
 // Cosine-weighted hemisphere sample oriented around +Z.
