@@ -167,6 +167,7 @@ fn main_primary(
   let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
   let frame = cam.frame_index;
   let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
+  let shadow_seed = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u);
 
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px);
@@ -394,7 +395,7 @@ fn main_primary(
     let hp = ro + vt.best.t * rd;
     let hp_shadow = hp + vt.best.n * (0.75 * cam.voxel_params.x);
 
-    let shadow_do = (seed & SHADOW_SUBSAMPLE_MASK) == 0u;
+    let shadow_do = (shadow_seed & SHADOW_SUBSAMPLE_MASK) == 0u;
     if (shadow_do) {
       var shadow_hist = textureLoad(shadow_hist_in, ip, 0).x;
       let uv_prev = prev_uv_from_world(hp);
