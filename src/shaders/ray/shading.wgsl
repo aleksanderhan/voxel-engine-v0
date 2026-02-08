@@ -346,7 +346,16 @@ fn shade_hit(
     spec_col = SUN_COLOR * SUN_INTENSITY * spec * fres * sun_vis;
   }
 
-  let direct = SUN_COLOR * SUN_INTENSITY * (0.35 * diff + 0.65 * diff * diff) * sun_vis * dapple;
+  var grass_ts: f32 = 1.0;
+  if (hg.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(hg.t, hg.n, rd, seed)) {
+    let time_s = cam.voxel_params.y;
+    let strength = cam.voxel_params.z;
+    let cell = grass_cell_from_world(hp, rd, hg.root_bmin, vs, i32(cam.chunk_size));
+    let lod = grass_lod_from_t(hg.t);
+    grass_ts = grass_self_shadow(hp, cell.bmin_m, cell.id_vox, time_s, strength, lod);
+  }
+
+  let direct = SUN_COLOR * SUN_INTENSITY * (0.35 * diff + 0.65 * diff * diff) * sun_vis * dapple * grass_ts;
 
   let emissive = material_emission(hg.mat);
   return base * (ambient + direct) + 0.20 * spec_col + emissive;

@@ -43,6 +43,28 @@ fn pick_grass_cell_in_chunk(
   return GrassCell(bmin_m, id_vox);
 }
 
+fn grass_cell_from_world(
+  hp_m: vec3<f32>,
+  rd: vec3<f32>,
+  root_bmin_m: vec3<f32>,
+  voxel_size_m: f32,
+  chunk_size_vox: i32
+) -> GrassCell {
+  let ch_origin_vox = vec3<i32>(
+    i32(floor(root_bmin_m.x / voxel_size_m)),
+    i32(floor(root_bmin_m.y / voxel_size_m)),
+    i32(floor(root_bmin_m.z / voxel_size_m))
+  );
+  return pick_grass_cell_in_chunk(
+    hp_m,
+    rd,
+    root_bmin_m,
+    ch_origin_vox,
+    voxel_size_m,
+    chunk_size_vox
+  );
+}
+
 fn sdf_box(p: vec3<f32>, c: vec3<f32>, b: vec3<f32>) -> f32 {
   let q = abs(p - c) - b;
   let outside = length(max(q, vec3<f32>(0.0)));
@@ -172,10 +194,10 @@ fn grass_sdf_lod(
 
   // --- CLUMPING: a few tuft centers per cell ---
   // (small number keeps it cheap; makes “lush tufts” instead of uniform lawn)
-  let CLUMPS: u32 = 3u;
+  let CLUMPS: u32 = 5u;
 
   // tuft radius in-cell (in meters)
-  let clump_r = 0.22 * vs;
+  let clump_r = 0.18 * vs;
 
   // base thickness in meters (this is your “lushness” knob)
   let base_r = (GRASS_VOXEL_THICKNESS_VOX * vs) * 0.85;
@@ -259,14 +281,23 @@ fn grass_sdf_lod(
       // --- flat blade profile (width tapers hard, thickness follows) ---
       let half_w = r0 * taper;
 
-      // keep some thickness so it doesn't disappear / alias too hard
-      let half_t = max(0.10 * half_w, 0.01 * vs);
+      // thickness: much smaller than width (ribbon-like blade)
+      // keep a tiny floor to avoid shimmering / disappearing
+      let half_t = max(0.03 * half_w, 0.006 * vs);
 
       // edge rounding scales down with thickness
       let edge_r = 0.35 * half_t;
 
-      // stable per-blade side axis (twist-ish). Use lean_dir + wind to vary orientation.
-      let side_hint = normalize(vec3<f32>(lean_dir.x + 0.35 * w_xz.x, 0.15, lean_dir.y + 0.35 * w_xz.y));
+      // Roll/twist changes the ribbon orientation along the blade, giving richer silhouettes.
+      // (tmid is 0..1 along blade)
+      let roll = TAU * (0.15 * ph + 0.35 * tmid + 0.10 * wR);
+      let roll_dir = vec2<f32>(cos(roll), sin(roll));
+
+      let side_hint = normalize(vec3<f32>(
+        (lean_dir.x + 0.35 * w_xz.x) * roll_dir.x - (lean_dir.y + 0.35 * w_xz.y) * roll_dir.y,
+        0.12,
+        (lean_dir.x + 0.35 * w_xz.x) * roll_dir.y + (lean_dir.y + 0.35 * w_xz.y) * roll_dir.x
+      ));
 
       dmin = min(dmin, sdf_blade_segment(p_m, pa, pb, half_w, half_t, edge_r, side_hint));
     }
@@ -331,6 +362,45 @@ fn grass_sdf_normal_lod(
     grass_sdf_lod(p_m - vec3<f32>(0.0, 0.0, e), cell_bmin_m, cell_id_vox, time_s, strength, lod);
 
   return normalize(vec3<f32>(dx, dy, dz));
+}
+
+fn grass_self_shadow(
+  hp: vec3<f32>,
+  cell_bmin_m: vec3<f32>,
+  cell_id_vox: vec3<f32>,
+  time_s: f32,
+  strength: f32,
+  lod: u32
+) -> f32 {
+  // March a few short steps toward the sun through the grass volume.
+  // Returns transmittance in [0..1].
+  let vs = cam.voxel_params.x;
+
+  // start a bit off the surface
+  var p = hp + SUN_DIR * (0.02 * vs);
+
+  // tune distance: longer = more shadowing
+  let max_dist = (0.55 + 0.35 * f32(lod)) * vs;
+  let steps: u32 = select(6u, 4u, lod != 0u);
+
+  let dt = max_dist / f32(steps);
+
+  var occ: f32 = 0.0;
+  for (var i: u32 = 0u; i < steps; i = i + 1u) {
+    let d = grass_sdf_lod(p, cell_bmin_m, cell_id_vox, time_s, strength, lod);
+
+    // Convert SDF “inside/near” into occlusion
+    // (soft ramp, not binary)
+    let x = clamp(1.0 - d / (0.05 * vs), 0.0, 1.0);
+    occ += x;
+
+    p += SUN_DIR * dt;
+  }
+
+  // Map accumulated occlusion to transmittance
+  // stronger exponent = darker cores, nicer depth
+  let k = 0.35;
+  return exp(-k * occ);
 }
 
 
