@@ -559,7 +559,7 @@ fn main_composite(@builtin(global_invocation_id) gid: vec3<u32>) {
   // local_hist_tex is expected to be internal render resolution (same as color_tex/depth_full).
   let dims_r = textureDimensions(color_tex);
   let inv_r  = vec2<f32>(1.0 / f32(dims_r.x), 1.0 / f32(dims_r.y));
-  let uv_r   = vec2<f32>(px_render.x * inv_r.x, 1.0 - px_render.y * inv_r.y);
+  let uv_r   = px_render * inv_r;
 
   // local_hist holds HDR RGB (alpha ignored here, or you can use it as confidence later)
   let local_rgb = textureSampleLevel(local_hist_tex, local_samp, uv_r, 0.0).xyz;

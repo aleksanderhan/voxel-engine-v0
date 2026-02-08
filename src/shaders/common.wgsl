@@ -161,7 +161,7 @@ const CLOUD_SILVER_STR : f32       = 0.6;
 
 // How much clouds attenuate SUNLIGHT hitting the world
 const CLOUD_SHADOW_ABSORB   : f32 = 6.0;
-const CLOUD_SHADOW_STRENGTH : f32 = 0.8;
+const CLOUD_SHADOW_STRENGTH : f32 = 0.65;
 
 // Sun-disc dim behavior (keep)
 const CLOUD_DIM_SUN_DISC : bool = true;
@@ -290,7 +290,7 @@ const PRIMARY_CLOUD_SHADOWS : bool = true;
 //// --------------------------------------------------------------------------
 
 // Tune this: lower = steadier but slower response
-const LOCAL_TAA_ALPHA : f32 = 0.30;
+const LOCAL_TAA_ALPHA : f32 = 0.80;
 const LOCAL_TAA_ENABLED : bool = true;
 
 //// --------------------------------------------------------------------------
@@ -298,7 +298,7 @@ const LOCAL_TAA_ENABLED : bool = true;
 //// --------------------------------------------------------------------------
 
 // Blend factor for full-frame TAA (lower = steadier, higher = faster response).
-const COMPOSITE_TAA_ALPHA : f32 = 0.35;
+const COMPOSITE_TAA_ALPHA : f32 = 0.45;
 const COMPOSITE_TAA_ENABLED : bool = true;
 
 //// --------------------------------------------------------------------------
