@@ -32,6 +32,8 @@ pub struct Buffers {
     pub colinfo: wgpu::Buffer,
     pub colinfo_capacity_u32: u32,
 
+    pub profile_modes: wgpu::Buffer,
+
 }
 
 fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
@@ -108,6 +110,13 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         (colinfo_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
     );
 
+    let profile_modes = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("profile_modes_buf"),
+        size: (std::mem::size_of::<u32>() * 4) as u64,
+        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     Buffers {
         camera,
         overlay,
@@ -124,5 +133,6 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         rope_capacity,
         colinfo,
         colinfo_capacity_u32,
+        profile_modes,
     }
 }

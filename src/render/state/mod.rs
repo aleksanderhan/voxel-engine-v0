@@ -320,12 +320,6 @@ impl Renderer {
             .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
     }
 
-    pub fn write_profile_mode(&self, mode: u32) {
-        let offset = std::mem::offset_of!(CameraGpu, profile_mode) as u64;
-        self.queue
-            .write_buffer(&self.buffers.camera, offset, bytemuck::bytes_of(&mode));
-    }
-
     pub fn write_overlay(&self, ov: &OverlayGpu) {
         self.queue
             .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
@@ -343,9 +337,9 @@ impl Renderer {
         const PROFILE_TRACE_ONLY: u32 = 1;
         const PROFILE_NO_GRASS: u32 = 2;
         const PROFILE_NO_FOG: u32 = 4;
+        let profile_mode_offset = std::mem::offset_of!(CameraGpu, profile_mode) as u64;
 
         self.primary_breakdown_enabled = profile_primary_breakdown;
-        self.write_profile_mode(0);
 
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -363,7 +357,24 @@ impl Renderer {
         }
 
         if profile_primary_breakdown {
-            self.write_profile_mode(PROFILE_TRACE_ONLY);
+            let profile_modes = [
+                PROFILE_TRACE_ONLY,
+                PROFILE_NO_FOG | PROFILE_NO_GRASS,
+                PROFILE_NO_FOG,
+                0,
+            ];
+            self.queue.write_buffer(
+                &self.buffers.profile_modes,
+                0,
+                bytemuck::cast_slice(&profile_modes),
+            );
+            encoder.copy_buffer_to_buffer(
+                &self.buffers.profile_modes,
+                0,
+                &self.buffers.camera,
+                profile_mode_offset,
+                std::mem::size_of::<u32>() as u64,
+            );
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("primary_trace_pass"),
@@ -378,7 +389,13 @@ impl Renderer {
                 cpass.dispatch_workgroups(gx, gy, 1);
             }
 
-            self.write_profile_mode(PROFILE_NO_FOG | PROFILE_NO_GRASS);
+            encoder.copy_buffer_to_buffer(
+                &self.buffers.profile_modes,
+                std::mem::size_of::<u32>() as u64,
+                &self.buffers.camera,
+                profile_mode_offset,
+                std::mem::size_of::<u32>() as u64,
+            );
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("primary_no_fog_no_grass_pass"),
@@ -393,7 +410,13 @@ impl Renderer {
                 cpass.dispatch_workgroups(gx, gy, 1);
             }
 
-            self.write_profile_mode(PROFILE_NO_FOG);
+            encoder.copy_buffer_to_buffer(
+                &self.buffers.profile_modes,
+                (std::mem::size_of::<u32>() * 2) as u64,
+                &self.buffers.camera,
+                profile_mode_offset,
+                std::mem::size_of::<u32>() as u64,
+            );
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("primary_no_fog_pass"),
@@ -408,7 +431,13 @@ impl Renderer {
                 cpass.dispatch_workgroups(gx, gy, 1);
             }
 
-            self.write_profile_mode(0);
+            encoder.copy_buffer_to_buffer(
+                &self.buffers.profile_modes,
+                (std::mem::size_of::<u32>() * 3) as u64,
+                &self.buffers.camera,
+                profile_mode_offset,
+                std::mem::size_of::<u32>() as u64,
+            );
         }
 
         {
