@@ -44,14 +44,6 @@ struct Overlay {
 const PROFILE_LINES: u32 = 5u;
 const PROFILE_LINE_CHARS: u32 = 9u; // "VOX 1234K"
 
-const PROFILE_LABELS: array<u32, 15> = array<u32, 15>(
-  86u, 79u, 88u, // VOX
-  72u, 70u, 84u, // HFT
-  83u, 72u, 68u, // SHD
-  70u, 79u, 71u, // FOG
-  83u, 75u, 89u  // SKY
-);
-
 // -----------------------------------------------------------------------------
 // 3x5 digit font helpers (LUT)
 // -----------------------------------------------------------------------------
@@ -188,9 +180,50 @@ fn profile_digit(val: u32, pos: u32) -> u32 {
   }
 }
 
+fn profile_label(line: u32, ci: u32) -> u32 {
+  // 0: VOX, 1: HFT, 2: SHD, 3: FOG, 4: SKY
+  switch (line) {
+    case 0u: { // VOX
+      switch (ci) {
+        case 0u: { return 86u; }
+        case 1u: { return 79u; }
+        default: { return 88u; }
+      }
+    }
+    case 1u: { // HFT
+      switch (ci) {
+        case 0u: { return 72u; }
+        case 1u: { return 70u; }
+        default: { return 84u; }
+      }
+    }
+    case 2u: { // SHD
+      switch (ci) {
+        case 0u: { return 83u; }
+        case 1u: { return 72u; }
+        default: { return 68u; }
+      }
+    }
+    case 3u: { // FOG
+      switch (ci) {
+        case 0u: { return 70u; }
+        case 1u: { return 79u; }
+        default: { return 71u; }
+      }
+    }
+    default: { // SKY
+      switch (ci) {
+        case 0u: { return 83u; }
+        case 1u: { return 75u; }
+        default: { return 89u; }
+      }
+    }
+  }
+}
+
 fn profile_char(line: u32, ci: u32) -> u32 {
   if (ci < 3u) {
-    return PROFILE_LABELS[line * 3u + ci];
+    return profile_label(line, ci);
   }
   if (ci == 3u) {
     return 32u; // space
