@@ -332,7 +332,7 @@ fn shade_hit(
   var spec_col = vec3<f32>(0.0);
   if (hg.t <= FAR_SHADING_DIST) {
     let v = normalize(-rd);
-    let h = normalize(v + SUN_DIR);
+    let h = safe_normalize(v + SUN_DIR);
 
     let ndv = max(dot(hg.n, v), 0.0);
     let ndh = max(dot(hg.n, h), 0.0);
@@ -411,7 +411,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
   var spec_col = vec3<f32>(0.0);
   if (ch.t <= FAR_SHADING_DIST) {
     let vdir = normalize(-rd);
-    let hdir = normalize(vdir + SUN_DIR);
+    let hdir = safe_normalize(vdir + SUN_DIR);
     let ndv  = max(dot(ch.n, vdir), 0.0);
     let ndh  = max(dot(ch.n, hdir), 0.0);
 

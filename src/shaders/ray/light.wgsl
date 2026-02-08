@@ -24,13 +24,13 @@ fn hash3_i32(p: vec3<i32>) -> u32 {
 
 fn make_tbn(n: vec3<f32>) -> mat3x3<f32> {
   let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
-  let t = normalize(cross(up_ref, n));
-  let b = normalize(cross(n, t));
+  let t = safe_normalize(cross(up_ref, n));
+  let b = safe_normalize(cross(n, t));
   return mat3x3<f32>(t, b, n);
 }
 
 fn rot_about_axis(v: vec3<f32>, axis: vec3<f32>, ang: f32) -> vec3<f32> {
-  let a = normalize(axis);
+  let a = safe_normalize(axis);
   let s = sin(ang);
   let c = cos(ang);
   return v * c + cross(a, v) * s + a * dot(a, v) * (1.0 - c);
