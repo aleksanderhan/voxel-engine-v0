@@ -116,14 +116,15 @@ fn bgl_storage_tex_wo(
 pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     let cs_vis = wgpu::ShaderStages::COMPUTE;
 
-    let scene_entries: [wgpu::BindGroupLayoutEntry; 7] = [
+    let scene_entries: [wgpu::BindGroupLayoutEntry; 8] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
         bgl_storage_ro(3, cs_vis),
-        bgl_storage_ro(8, cs_vis),
         bgl_storage_ro(9, cs_vis),
         bgl_storage_ro(10, cs_vis),
+        bgl_storage_ro(11, cs_vis),
+        bgl_storage_rw(17, cs_vis),
     ];
 
     let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

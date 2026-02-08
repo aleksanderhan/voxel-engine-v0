@@ -136,19 +136,22 @@ fn make_scene_bg(
                 binding: 3,
                 resource: buffers.chunk_grid.as_entire_binding(),
             },
-            wgpu::BindGroupEntry { 
-                binding: 8, 
-                resource: buffers.macro_occ.as_entire_binding() 
-            },
             wgpu::BindGroupEntry {
                 binding: 9,
-                resource: buffers.node_ropes.as_entire_binding(),
+                resource: buffers.macro_occ.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 10,
+                resource: buffers.node_ropes.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
                 resource: buffers.colinfo.as_entire_binding(),
             },
-
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: buffers.primary_profile.as_entire_binding(),
+            },
         ],
     })
 }
