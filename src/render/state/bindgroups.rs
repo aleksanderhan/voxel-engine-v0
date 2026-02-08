@@ -5,7 +5,7 @@
 use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
 
 pub struct BindGroups {
-    pub primary: [wgpu::BindGroup; 2],
+    pub primary: [Vec<wgpu::BindGroup>; 2],
     pub scene: wgpu::BindGroup,
     pub godray: [wgpu::BindGroup; 2],
     pub local_taa: [wgpu::BindGroup; 2],
@@ -19,6 +19,7 @@ fn make_primary_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     buffers: &Buffers,
+    primary_dispatch: &wgpu::Buffer,
     textures: &TextureSet,
     hist_in: &wgpu::TextureView,
     hist_out: &wgpu::TextureView,
@@ -105,7 +106,7 @@ fn make_primary_bg(
             },
             wgpu::BindGroupEntry {
                 binding: 17,
-                resource: buffers.primary_dispatch.as_entire_binding(),
+                resource: primary_dispatch.as_entire_binding(),
             },
         ],
     })
@@ -307,32 +308,37 @@ pub fn create_bind_groups(
     textures: &TextureSet,
     sampler: &wgpu::Sampler,
 ) -> BindGroups {
-    let primary = [
-        make_primary_bg(
+    let mut primary_a = Vec::with_capacity(super::PRIMARY_PASS_SLICES);
+    let mut primary_b = Vec::with_capacity(super::PRIMARY_PASS_SLICES);
+    for (slice, dispatch_buf) in buffers.primary_dispatch.iter().enumerate() {
+        primary_a.push(make_primary_bg(
             device,
             &layouts.primary,
             buffers,
+            dispatch_buf,
             textures,
             &textures.primary_hit_hist[0].view,
             &textures.primary_hit_hist[1].view,
             &textures.shadow_hist.view,
             &textures.shadow_hist_buf,
             sampler,
-            "primary_bg_hist_a_to_b",
-        ),
-        make_primary_bg(
+            &format!("primary_bg_hist_a_to_b_slice_{slice}"),
+        ));
+        primary_b.push(make_primary_bg(
             device,
             &layouts.primary,
             buffers,
+            dispatch_buf,
             textures,
             &textures.primary_hit_hist[1].view,
             &textures.primary_hit_hist[0].view,
             &textures.shadow_hist.view,
             &textures.shadow_hist_buf,
             sampler,
-            "primary_bg_hist_b_to_a",
-        ),
-    ];
+            &format!("primary_bg_hist_b_to_a_slice_{slice}"),
+        ));
+    }
+    let primary = [primary_a, primary_b];
     let scene = make_scene_bg(device, &layouts.scene, buffers);
 
     let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {

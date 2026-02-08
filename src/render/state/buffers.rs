@@ -14,7 +14,7 @@ pub struct Buffers {
     pub clipmap: wgpu::Buffer,
 
     /// Primary pass dispatch range (slicing).
-    pub primary_dispatch: wgpu::Buffer,
+    pub primary_dispatch: Vec<wgpu::Buffer>,
 
     // --- Storage buffers ---
     pub node: wgpu::Buffer,
@@ -60,11 +60,14 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
     let overlay = make_uniform_buffer::<crate::render::gpu_types::OverlayGpu>(device, "overlay_buf");
 
     let clipmap = make_uniform_buffer::<ClipmapGpu>(device, "clipmap_buf");
-    let primary_dispatch =
-        make_uniform_buffer::<crate::render::gpu_types::PrimaryDispatchGpu>(
-            device,
-            "primary_dispatch_buf",
-        );
+    let primary_dispatch = (0..super::PRIMARY_PASS_SLICES)
+        .map(|i| {
+            make_uniform_buffer::<crate::render::gpu_types::PrimaryDispatchGpu>(
+                device,
+                &format!("primary_dispatch_buf_{i}"),
+            )
+        })
+        .collect();
 
     let node_capacity = (config::NODE_BUDGET_BYTES / std::mem::size_of::<NodeGpu>()) as u32;
 
