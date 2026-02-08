@@ -2,6 +2,8 @@
 //// Grass: SDF blades + tracing
 //// --------------------------------------------------------------------------
 
+const GRASS_CLUMPS: u32 = 5u;
+
 struct GrassCell {
   bmin_m : vec3<f32>,
   id_vox : vec3<f32>,
@@ -232,7 +234,7 @@ fn grass_sdf_lod(
 
   // --- CLUMPING: a few tuft centers per cell ---
   // (small number keeps it cheap; makes “lush tufts” instead of uniform lawn)
-  const CLUMPS: u32 = 5u;
+  let clumps = GRASS_CLUMPS;
 
   // tuft radius in-cell (in meters)
   let clump_r = 0.18 * vs;
@@ -240,8 +242,8 @@ fn grass_sdf_lod(
   // base thickness in meters (this is your “lushness” knob)
   let base_r = (GRASS_VOXEL_THICKNESS_VOX * vs) * 0.85;
 
-  var clump_centers: array<vec2<f32>, CLUMPS>;
-  for (var c: u32 = 0u; c < CLUMPS; c = c + 1u) {
+  var clump_centers: array<vec2<f32>, GRASS_CLUMPS>;
+  for (var c: u32 = 0u; c < clumps; c = c + 1u) {
     let cfi = f32(c);
     let cu = hash31(cell_id_vox + vec3<f32>(13.7 + cfi, 2.1, 9.9));
     let cv = hash31(cell_id_vox + vec3<f32>( 4.2 + cfi, 7.3, 1.4));
@@ -266,7 +268,7 @@ fn grass_sdf_lod(
     let wR = uvpw.w;
 
     // pick clump index and its center (stable per cell)
-    let ci = i % CLUMPS;
+    let ci = i % clumps;
     let clump_center = clump_centers[ci];
 
     // blade root starts near the clump center, but jittered inside a tuft radius
