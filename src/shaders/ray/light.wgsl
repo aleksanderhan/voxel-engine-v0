@@ -142,9 +142,10 @@ fn gather_voxel_lights(
   // basis for orienting directions
   let tbn = make_tbn(n);
 
-  // de-pattern rotation: stable per surface cell (no per-frame phase shift)
+  // de-pattern rotation: stable per surface sample (no per-frame phase shift)
   // with extra per-ray jitter to reduce discrete/speckled illumination.
-  let surf_v = vec3<i32>(floor((hp - root_bmin) / max(vs, 1e-6)));
+  let micro_vs = max(vs * 0.25, 1e-6);
+  let surf_v = vec3<i32>(floor((hp - root_bmin) / micro_vs));
   let h0 = hash3_i32(surf_v);
   let h1 = hash_u32(h0);
   let h2 = hash_u32(h1);
