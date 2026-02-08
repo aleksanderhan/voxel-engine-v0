@@ -40,6 +40,7 @@ struct Overlay {
   _pad1 : vec4<u32>,
   _pad2 : vec4<u32>,
   _pad3 : vec4<u32>,
+  _pad4 : vec4<u32>,
 };
 
 @group(0) @binding(2) var<uniform> overlay : Overlay;
