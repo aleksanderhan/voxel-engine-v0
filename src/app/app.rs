@@ -556,7 +556,7 @@ impl App {
 
     fn format_profile_line(label: &str, value: u32) -> String {
         let count = Self::format_profile_count(value);
-        let number_width = 9usize;
+        let number_width = 8usize;
         let trimmed = if count.len() > number_width {
             count[count.len() - number_width..].to_string()
         } else {
@@ -567,7 +567,7 @@ impl App {
             padded.extend(std::iter::repeat(' ').take(number_width - trimmed.len()));
         }
         padded.push_str(&trimmed);
-        format!("{label}{padded}")
+        format!("{label} {padded}")
     }
 
     fn format_profile_count(value: u32) -> String {

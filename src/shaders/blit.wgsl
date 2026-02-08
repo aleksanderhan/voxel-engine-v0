@@ -139,6 +139,7 @@ fn glyph_mask(code: u32) -> u32 {
     // space / punctuation
     case 32u: { return pack3x5(0u,0u,0u,0u,0u); }                // ' '
     case 45u: { return pack3x5(0u,0u,7u,0u,0u); }                // '-'
+    case 46u: { return pack3x5(0u,0u,0u,0u,2u); }                // '.'
     case 58u: { return pack3x5(0u,2u,0u,2u,0u); }                // ':'
 
     // digits (optional; you already draw FPS with digit_mask)
