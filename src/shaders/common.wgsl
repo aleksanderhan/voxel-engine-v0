@@ -23,10 +23,10 @@ const EPS_INV : f32 = 1e-8;
 //// Feature toggles
 //// --------------------------------------------------------------------------
 
-const ENABLE_GRASS   : bool = true;
+const ENABLE_GRASS   : bool = false;
 const ENABLE_CLIPMAP : bool = true;
 const ENABLE_GODRAYS : bool = true;
-const ENABLE_CLOUDS  : bool = true;
+const ENABLE_CLOUDS  : bool = false;
 const ENABLE_FOG     : bool = true;
 const ENABLE_BLOOM   : bool = true;
 
@@ -291,7 +291,7 @@ const PRIMARY_CLOUD_SHADOWS : bool = true;
 
 // Tune this: lower = steadier but slower response
 const LOCAL_TAA_ALPHA : f32 = 0.80;
-const LOCAL_TAA_ENABLED : bool = true;
+const LOCAL_TAA_ENABLED : bool = false;
 
 //// --------------------------------------------------------------------------
 //// Composite TAA
@@ -299,7 +299,7 @@ const LOCAL_TAA_ENABLED : bool = true;
 
 // Blend factor for full-frame TAA (lower = steadier, higher = faster response).
 const COMPOSITE_TAA_ALPHA : f32 = 0.45;
-const COMPOSITE_TAA_ENABLED : bool = true;
+const COMPOSITE_TAA_ENABLED : bool = false;
 
 //// --------------------------------------------------------------------------
 //// Grass “hair” (procedural blades)
