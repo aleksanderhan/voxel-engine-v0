@@ -290,7 +290,7 @@ const PRIMARY_CLOUD_SHADOWS : bool = true;
 //// --------------------------------------------------------------------------
 
 // Tune this: lower = steadier but slower response
-const LOCAL_TAA_ALPHA : f32 = 0.80;
+const LOCAL_TAA_ALPHA : f32 = 0.35;
 const LOCAL_TAA_ENABLED : bool = true;
 
 //// --------------------------------------------------------------------------

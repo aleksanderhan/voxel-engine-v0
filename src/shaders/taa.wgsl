@@ -31,11 +31,22 @@ fn main_local_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
   let uv = (vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5)) / vec2<f32>(f32(dims.x), f32(dims.y));
 
-  let cur4  = textureSampleLevel(local_in_tex,      local_taa_samp, uv, 0.0);
-  let hist4 = textureSampleLevel(local_hist_in_tex, local_taa_samp, uv, 0.0);
+  let texel = 1.0 / vec2<f32>(f32(dims.x), f32(dims.y));
+  var cur_sum = vec3<f32>(0.0);
+  var w_sum = 0.0;
+  for (var oy: i32 = -1; oy <= 1; oy = oy + 1) {
+    for (var ox: i32 = -1; ox <= 1; ox = ox + 1) {
+      let offs = vec2<f32>(f32(ox), f32(oy)) * texel;
+      let s = textureSampleLevel(local_in_tex, local_taa_samp, uv + offs, 0.0);
+      cur_sum += s.xyz;
+      w_sum += s.w;
+    }
+  }
+  let inv_samples = 1.0 / 9.0;
+  let cur = cur_sum * inv_samples;
+  let w_in = w_sum * inv_samples; // local_w in [0,1] meaning “valid this frame”
 
-  let cur   = cur4.xyz;
-  let w_in  = cur4.w;          // local_w in [0,1] meaning “valid this frame”
+  let hist4 = textureSampleLevel(local_hist_in_tex, local_taa_samp, uv, 0.0);
   let hist_ok = !(is_bad_vec3(hist4.xyz));
   let hist  = select(vec3<f32>(0.0), hist4.xyz, hist_ok);
   let conf0 = select(0.0, hist4.w, hist_ok); // history confidence in [0,1]
