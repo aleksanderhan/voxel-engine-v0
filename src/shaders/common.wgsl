@@ -47,8 +47,8 @@ const MAT_LIGHT : u32 = 6u;
 //// --------------------------------------------------------------------------
 
 const SUN_DIR       : vec3<f32> = vec3<f32>(0.61237244, 0.5, 0.61237244);
-const SUN_COLOR     : vec3<f32> = vec3<f32>(1.0, 0.94, 0.72);
-const SUN_INTENSITY : f32       = 5.0;
+const SUN_COLOR     : vec3<f32> = vec3<f32>(1.0, 0.96, 0.88);
+const SUN_INTENSITY : f32       = 4.2;
 
 //// --------------------------------------------------------------------------
 //// Shadows / volumetric shadowing
@@ -67,9 +67,9 @@ const MIN_TRANS            : f32 = 0.03;
 //// Godrays (tuning knobs)
 //// --------------------------------------------------------------------------
 
-const GODRAY_ENERGY_BOOST    : f32 = 8.0;
+const GODRAY_ENERGY_BOOST    : f32 = 6.0;
 const GODRAY_KNEE_INTEGRATE  : f32 = 0.35;
-const GODRAY_COMPOSITE_SCALE : f32 = 6.5;
+const GODRAY_COMPOSITE_SCALE : f32 = 5.2;
 
 const GODRAY_FADE_NEAR : f32 = 40.0;
 const GODRAY_FADE_FAR  : f32 = 80.0;
@@ -83,11 +83,11 @@ const GODRAY_KNEE_COMPOSITE : f32 = 0.25;
 const FOG_HEIGHT_FALLOFF : f32 = 0.18;
 const FOG_MAX_DIST       : f32 = 120.0;
 
-const FOG_PRIMARY_SCALE : f32 = 0.02;
+const FOG_PRIMARY_SCALE : f32 = 0.028;
 const FOG_GODRAY_SCALE  : f32 = 1.0;
 
-const FOG_COLOR_GROUND    : vec3<f32> = vec3<f32>(0.40, 0.42, 0.45);
-const FOG_COLOR_SKY_BLEND : f32       = 0.10;
+const FOG_COLOR_GROUND    : vec3<f32> = vec3<f32>(0.48, 0.52, 0.56);
+const FOG_COLOR_SKY_BLEND : f32       = 0.16;
 
 const GODRAY_MAX_DIST : f32 = 100.0;
 
@@ -113,7 +113,7 @@ const GODRAY_STEPS_PER_METER = 1.25;
 const GODRAY_MIN_STEPS: u32 = 8u;        // keep some detail near silhouettes
 const GODRAY_STEP_Q:   u32 = 4u;         // quantize step count to reduce temporal shimmer
 
-const GODRAY_SHAFT_GAIN: f32 = 3.0;
+const GODRAY_SHAFT_GAIN: f32 = 2.4;
 
 const GODRAY_EDGE_ENERGY_BOOST: f32 = 2.5; // try 1.0 .. 4.0
 
@@ -155,13 +155,13 @@ const CLOUD_HORIZON_Y0 : f32 = 0.02;
 const CLOUD_HORIZON_Y1 : f32 = 0.25;
 
 // Appearance knobs
-const CLOUD_BASE_COL   : vec3<f32> = vec3<f32>(0.72, 0.74, 0.76);
+const CLOUD_BASE_COL   : vec3<f32> = vec3<f32>(0.76, 0.78, 0.80);
 const CLOUD_SILVER_POW : f32       = 8.0;
 const CLOUD_SILVER_STR : f32       = 0.6;
 
 // How much clouds attenuate SUNLIGHT hitting the world
 const CLOUD_SHADOW_ABSORB   : f32 = 6.0;
-const CLOUD_SHADOW_STRENGTH : f32 = 0.45;
+const CLOUD_SHADOW_STRENGTH : f32 = 0.38;
 
 // Sun-disc dim behavior (keep)
 const CLOUD_DIM_SUN_DISC : bool = true;
@@ -174,7 +174,7 @@ const CLOUD_SUN_DISC_DIM_FLOOR : f32 = 0.0;  // set ~0.01 if you want “always 
 // Godray coupling (keep)
 const CLOUD_GODRAY_W : f32 = 0.50;
 
-const SKY_EXPOSURE : f32 = 0.40;
+const SKY_EXPOSURE : f32 = 0.55;
 
 //// --------------------------------------------------------------------------
 //// Leaf wind (displaced cubes)
