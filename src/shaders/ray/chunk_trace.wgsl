@@ -1215,11 +1215,10 @@ fn trace_scene_voxels_candidates(
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
   let root_size = f32(cam.chunk_size) * voxel_size;
   let max_candidates = min(candidate_count, PRIMARY_MAX_TILE_CHUNKS);
-  let tile_list = tile_candidates[tile_index];
 
   for (var i: u32 = 0u; i < max_candidates; i = i + 1u) {
-    if (best.hit != 0u && tile_list.enters[i] >= best.t) { break; }
-    let slot = tile_list.slots[i];
+    if (best.hit != 0u && tile_candidates[tile_index].enters[i] >= best.t) { break; }
+    let slot = tile_candidates[tile_index].slots[i];
     if (slot == INVALID_U32 || slot >= cam.chunk_count) { continue; }
 
     let ch = chunks[slot];
