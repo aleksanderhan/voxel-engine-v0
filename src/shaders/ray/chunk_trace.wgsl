@@ -1054,17 +1054,25 @@ fn tile_append_candidates_for_ray(
 
   let nudge_p = PRIMARY_NUDGE_VOXEL_FRAC * voxel_size;
   let start_t = t_enter + nudge_p;
-  let p0      = ro + start_t * rd;
+  let p0 = ro + start_t * rd;
 
-  let c = chunk_coord_from_pos_dir(p0, rd, chunk_size_m);
+  // Compute local chunk coords relative to the grid origin to keep precision
+  // stable at large world positions (helps avoid distant seam flicker).
+  let bias = vec3<f32>(
+    select(-1.0, 1.0, rd.x >= 0.0),
+    select(-1.0, 1.0, rd.y >= 0.0),
+    select(-1.0, 1.0, rd.z >= 0.0)
+  ) * (1e-4 * chunk_size_m);
+  let p_bias = p0 + bias;
+  let local = (p_bias - grid_bmin) / chunk_size_m;
 
   let nx: i32 = i32(gd.x);
   let ny: i32 = i32(gd.y);
   let nz: i32 = i32(gd.z);
 
-  var lcx: i32 = c.x - go.x;
-  var lcy: i32 = c.y - go.y;
-  var lcz: i32 = c.z - go.z;
+  var lcx: i32 = i32(floor(local.x));
+  var lcy: i32 = i32(floor(local.y));
+  var lcz: i32 = i32(floor(local.z));
 
   if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) {
     return;
@@ -1084,9 +1092,13 @@ fn tile_append_candidates_for_ray(
   let step_y: i32 = select(-1, 1, rd.y > 0.0);
   let step_z: i32 = select(-1, 1, rd.z > 0.0);
 
-  let bx = select(f32(c.x) * chunk_size_m, f32(c.x + 1) * chunk_size_m, rd.x > 0.0);
-  let by = select(f32(c.y) * chunk_size_m, f32(c.y + 1) * chunk_size_m, rd.y > 0.0);
-  let bz = select(f32(c.z) * chunk_size_m, f32(c.z + 1) * chunk_size_m, rd.z > 0.0);
+  let wx = go.x + lcx;
+  let wy = go.y + lcy;
+  let wz = go.z + lcz;
+
+  let bx = select(f32(wx) * chunk_size_m, f32(wx + 1) * chunk_size_m, rd.x > 0.0);
+  let by = select(f32(wy) * chunk_size_m, f32(wy + 1) * chunk_size_m, rd.y > 0.0);
+  let bz = select(f32(wz) * chunk_size_m, f32(wz + 1) * chunk_size_m, rd.z > 0.0);
 
   var tMaxX: f32 = (bx - p0.x) * inv.x;
   var tMaxY: f32 = (by - p0.y) * inv.y;
