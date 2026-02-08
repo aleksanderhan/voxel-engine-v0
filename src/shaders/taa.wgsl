@@ -95,11 +95,18 @@ fn main_composite_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   if (COMPOSITE_TAA_ENABLED && cam.frame_index > 1u) {
     let depth = textureLoad(depth_full_tex, ip_render, 0).x;
+    let depth_ok = depth > 1e-3 && depth < (FOG_MAX_DIST - 1e-3);
+
     let rd = ray_dir_from_pixel(px_render);
     let p_ws = cam.cam_pos.xyz + rd * depth;
     let uv_prev = prev_uv_from_world(p_ws);
 
-    if (in_unit_square(uv_prev)) {
+    let dims_r = render_dims_f();
+    let uv_cur = px_render / dims_r;
+    let motion_px = max(abs(uv_prev.x - uv_cur.x) * dims_r.x, abs(uv_prev.y - uv_cur.y) * dims_r.y);
+    let motion_ok = motion_px <= 1.5;
+
+    if (depth_ok && motion_ok && in_unit_square(uv_prev)) {
       let hist_rgb = textureSampleLevel(hist_in_tex, hist_samp, uv_prev, 0.0).xyz;
       taa_rgb = mix(hist_rgb, taa_rgb, COMPOSITE_TAA_ALPHA);
     }
