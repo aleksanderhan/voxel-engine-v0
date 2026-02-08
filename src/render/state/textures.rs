@@ -28,6 +28,7 @@ pub struct TextureSet {
     pub local_hist: [Tex2D; 2],
 
     pub primary_hit_hist: [Tex2D; 2],
+    pub primary_hit_hist_extra: [Tex2D; 2],
     pub shadow_hist: Tex2D,
     pub shadow_hist_buf: wgpu::Buffer,
     
@@ -195,6 +196,25 @@ pub fn create_textures(
         ),
     ];
 
+    let primary_hit_hist_extra = [
+        make_tex2d(
+            device,
+            "primary_hit_hist_extra_a",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::Rgba32Float,
+            rw_tex_usage,
+        ),
+        make_tex2d(
+            device,
+            "primary_hit_hist_extra_b",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::Rgba32Float,
+            rw_tex_usage,
+        ),
+    ];
+
     let shadow_hist = make_tex2d(
         device,
         "shadow_hist",
@@ -277,6 +297,7 @@ pub fn create_textures(
         local,
         local_hist,
         primary_hit_hist,
+        primary_hit_hist_extra,
         shadow_hist,
         shadow_hist_buf,
         godray,

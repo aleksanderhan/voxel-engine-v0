@@ -27,6 +27,8 @@
 @group(0) @binding(12) var primary_hist_tex  : texture_2d<f32>;
 @group(0) @binding(13) var primary_hist_out  : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(14) var primary_hist_samp : sampler;
+@group(0) @binding(17) var primary_hist_extra_tex  : texture_2d<f32>;
+@group(0) @binding(18) var primary_hist_extra_out  : texture_storage_2d<rgba32float, write>;
 
 @group(0) @binding(15) var shadow_hist_in : texture_2d<f32>;
 @group(0) @binding(16) var<storage, read_write> shadow_hist_out : array<f32>;
@@ -48,6 +50,10 @@
 
 var<workgroup> WG_SKY_UP : vec3<f32>;
 var<workgroup> WG_TILE_COUNT_CACHED : u32;
+var<workgroup> WG_TILE_CENTER_RD : vec3<f32>;
+var<workgroup> WG_ANCHOR_VALID : atomic<u32>;
+var<workgroup> WG_ANCHOR_KEY : u32;
+var<workgroup> WG_ANCHOR_CHUNK : vec3<i32>;
 
 fn pack_i16x2(a: i32, b: i32) -> u32 {
   return (u32(a) & 0xFFFFu) | ((u32(b) & 0xFFFFu) << 16u);
@@ -79,6 +85,63 @@ fn shade_heightfield(
   let sky_bg_rd = sky_bg(rd);
   let col = apply_fog(surface, ro, rd, t_scene, sky_bg_rd);
   return HfShadeOut(col, t_scene);
+}
+
+fn shade_history_hit(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_scene: f32,
+  n: vec3<f32>,
+  mat: u32,
+  sky_up: vec3<f32>,
+  sun_shadow: f32
+) -> vec3<f32> {
+  let hp = ro + rd * t_scene;
+  let base = base_albedo(mat, hp, t_scene);
+
+  let voxel_size = cam.voxel_params.x;
+  let hp_shadow = hp + n * (0.75 * voxel_size);
+
+  var vis = clamp(sun_shadow, 0.0, 1.0);
+  if (PRIMARY_CLOUD_SHADOWS) {
+    vis *= cloud_sun_transmittance_fast(hp_shadow, SUN_DIR);
+  }
+
+  let diff = max(dot(n, SUN_DIR), 0.0);
+  let direct = SUN_COLOR * SUN_INTENSITY * (0.35 * diff + 0.65 * diff * diff) * vis;
+
+  let amb_col = hemi_ambient(n, sky_up);
+  let amb_strength = select(0.10, 0.13, mat == MAT_LEAF);
+  let ambient = amb_col * amb_strength;
+
+  let emissive = material_emission(mat);
+  return base * (ambient + direct) + emissive;
+}
+
+fn store_primary_history(
+  ip: vec2<i32>,
+  t_scene: f32,
+  n: vec3<f32>,
+  mat: u32,
+  anchor_key: u32,
+  anchor_chunk: vec3<i32>,
+  anchor_valid: bool
+) {
+  var packed_xy: u32 = 0u;
+  var packed_z: u32 = 0u;
+  var out_anchor_key: u32 = 0u;
+  if (anchor_valid) {
+    packed_xy = pack_i16x2(anchor_chunk.x, anchor_chunk.y);
+    packed_z = pack_i16x2(anchor_chunk.z, 0);
+    packed_z |= 0x80000000u;
+    out_anchor_key = anchor_key;
+  }
+  textureStore(
+    primary_hist_out,
+    ip,
+    vec4<f32>(t_scene, bitcast<f32>(out_anchor_key), bitcast<f32>(packed_xy), bitcast<f32>(packed_z))
+  );
+  textureStore(primary_hist_extra_out, ip, vec4<f32>(n, bitcast<f32>(mat)));
 }
 
 fn trace_primary_voxels(
@@ -144,6 +207,9 @@ fn main_primary(
 
   if (lid == 0u) {
     atomicStore(&WG_TILE_COUNT, 0u);
+    atomicStore(&WG_ANCHOR_VALID, 0u);
+    WG_ANCHOR_KEY = INVALID_U32;
+    WG_ANCHOR_CHUNK = vec3<i32>(0);
     if (cam.chunk_count != 0u) {
       let tile_base = vec2<f32>(
         f32(wg_id.x * TILE_SIZE),
@@ -153,6 +219,7 @@ fn main_primary(
 
       // Two candidate rays per tile to stabilize distant voxel selection.
       var px = tile_base + vec2<f32>(4.5, 4.5);
+      WG_TILE_CENTER_RD = ray_dir_from_pixel(px);
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
       px = tile_base + vec2<f32>(1.5, 1.5);
       tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
@@ -218,7 +285,7 @@ fn main_primary(
       textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-      textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+      store_primary_history(ip, t_store, hf.n, hf.mat, INVALID_U32, vec3<i32>(0), false);
       shadow_hist_out[shadow_idx] = shadow_out;
       return;
     }
@@ -228,7 +295,7 @@ fn main_primary(
     textureStore(color_img, ip, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+    store_primary_history(ip, t_store, vec3<f32>(0.0), MAT_AIR, INVALID_U32, vec3<i32>(0), false);
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
@@ -238,31 +305,48 @@ fn main_primary(
   // ------------------------------------------------------------
   var t_hist     : f32 = 0.0;
   var hist_valid : bool = false;
+  var hist_reproj_ok: bool = false;
+  var hist_anchor_valid: bool = false;
   var hist_anchor_key  : u32 = INVALID_U32;
   var hist_anchor_coord: vec3<i32> = vec3<i32>(0);
+  var hist_prev_n : vec3<f32> = vec3<f32>(0.0);
+  var hist_prev_mat : u32 = MAT_AIR;
+  var hist_prev_uv : vec2<f32> = vec2<f32>(0.0);
+  var hist_has_prev_uv : bool = false;
   let tile_candidate_count = WG_TILE_COUNT_CACHED;
   let has_tile_candidates = tile_candidate_count != 0u;
   let uv  = px / res;
 
   if (has_tile_candidates) {
     let hist_guess = textureLoad(primary_hist_tex, ip, 0);
+    let hist_guess_extra = textureLoad(primary_hist_extra_tex, ip, 0);
     let t_hist_guess = hist_guess.x;
     if (t_hist_guess > 1e-3) {
       let p_ws = ro + rd * t_hist_guess;
       let uv_prev = prev_uv_from_world(p_ws);
 
       if (in_unit_square(uv_prev)) {
+        hist_prev_uv = uv_prev;
+        hist_has_prev_uv = true;
         let hist_prev = textureSampleLevel(primary_hist_tex, primary_hist_samp, uv_prev, 0.0);
+        let hist_prev_extra = textureSampleLevel(primary_hist_extra_tex, primary_hist_samp, uv_prev, 0.0);
         let t_prev = hist_prev.x;
         let rel = abs(t_prev - t_hist_guess) / max(t_hist_guess, 1e-3);
         let depth_ok = 1.0 - smoothstep(PRIMARY_HIT_DEPTH_REL0, PRIMARY_HIT_DEPTH_REL1, rel);
         let vel_px = length((uv_prev - uv) * res);
         let motion_ok = 1.0 - smoothstep(PRIMARY_HIT_MOTION_PX0, PRIMARY_HIT_MOTION_PX1, vel_px);
-        if (t_prev > 1e-3 && depth_ok > 0.5 && motion_ok > 0.5) {
+        let window_ok = abs(t_prev - t_hist_guess) <= PRIMARY_HIT_WINDOW;
+        hist_reproj_ok = t_prev > 1e-3 && depth_ok > 0.5 && motion_ok > 0.5 && window_ok;
+        if (hist_reproj_ok) {
           t_hist = t_prev;
-          hist_valid = true;
+          hist_prev_n = hist_prev_extra.xyz;
+          hist_prev_mat = bitcast<u32>(hist_prev_extra.w);
+          let mat_guess = bitcast<u32>(hist_guess_extra.w);
+          let mat_match = hist_prev_mat == mat_guess;
+          hist_valid = mat_match;
           let packed_z = bitcast<u32>(hist_prev.w);
-          if ((packed_z & 0x80000000u) != 0u) {
+          hist_anchor_valid = mat_match && ((packed_z & 0x80000000u) != 0u);
+          if (hist_anchor_valid) {
             hist_anchor_key = bitcast<u32>(hist_prev.y);
             let packed_xy = bitcast<u32>(hist_prev.z);
             let xy = unpack_i16x2(packed_xy);
@@ -274,10 +358,57 @@ fn main_primary(
     }
   }
 
-  let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
-  let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
-  var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
   if (hist_valid) {
+    let hist_n = normalize(hist_prev_n);
+    if (hist_has_prev_uv) {
+      let prev_px = vec2<i32>(
+        clamp(i32(hist_prev_uv.x * f32(dims.x)), 0, i32(dims.x) - 1),
+        clamp(i32(hist_prev_uv.y * f32(dims.y)), 0, i32(dims.y) - 1)
+      );
+      shadow_out = clamp(textureLoad(shadow_hist_in, prev_px, 0).x, 0.0, 1.0);
+    } else {
+      shadow_out = clamp(textureLoad(shadow_hist_in, ip, 0).x, 0.0, 1.0);
+    }
+
+    let t_scene = min(t_hist, FOG_MAX_DIST);
+    let col_hist = shade_history_hit(ro, rd, t_scene, hist_n, hist_prev_mat, sky_up, shadow_out);
+    let sky_bg_rd = sky_bg(rd);
+    let col_base = apply_fog(col_hist, ro, rd, t_scene, sky_bg_rd);
+
+    textureStore(color_img, ip, vec4<f32>(col_base, 1.0));
+    textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    store_primary_history(ip, t_scene, hist_n, hist_prev_mat, hist_anchor_key, hist_anchor_coord, hist_anchor_valid);
+    shadow_hist_out[shadow_idx] = shadow_out;
+    return;
+  }
+
+  var t_start = 0.0;
+  var t_end = FOG_MAX_DIST;
+  if (hist_reproj_ok) {
+    t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
+    t_end = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
+  }
+
+  var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
+  if (!hist_valid && hist_reproj_ok) {
+    if (atomicLoad(&WG_ANCHOR_VALID) == 1u && dot(rd, WG_TILE_CENTER_RD) > 0.999) {
+      let vt_anchor = trace_scene_voxels_anchor(
+        ro,
+        rd,
+        t_start,
+        t_end,
+        WG_ANCHOR_CHUNK,
+        WG_ANCHOR_KEY,
+        seed
+      );
+      if (vt_anchor.best.hit != 0u) {
+        vt = vt_anchor;
+      }
+    }
+  }
+
+  if (vt.best.hit == 0u && hist_anchor_valid) {
     let vt_anchor = trace_scene_voxels_anchor(
       ro,
       rd,
@@ -299,7 +430,7 @@ fn main_primary(
       t_start,
       t_end,
       has_tile_candidates,
-      hist_valid,
+      hist_anchor_valid,
       hist_anchor_key,
       hist_anchor_coord,
       tile_candidate_count,
@@ -339,7 +470,7 @@ fn main_primary(
       textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
       textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-      textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+      store_primary_history(ip, t_store, hf.n, hf.mat, INVALID_U32, vec3<i32>(0), false);
       shadow_hist_out[shadow_idx] = shadow_out;
       return;
     }
@@ -348,13 +479,18 @@ fn main_primary(
     textureStore(color_img, ip, vec4<f32>(sky, 1.0));
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+    store_primary_history(ip, t_store, vec3<f32>(0.0), MAT_AIR, INVALID_U32, vec3<i32>(0), false);
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
 
   // In grid: voxel hit?
   if (vt.best.hit != 0u) {
+    if (vt.anchor_valid && atomicLoad(&WG_ANCHOR_VALID) == 0u) {
+      WG_ANCHOR_KEY = vt.anchor_key;
+      WG_ANCHOR_CHUNK = vt.anchor_chunk;
+      atomicStore(&WG_ANCHOR_VALID, 1u);
+    }
     if (vt.best.mat == MAT_GRASS && ENABLE_GRASS) {
       if (grass_allowed_primary(vt.best.t, vt.best.n, rd, seed)) {
         let voxel_size = cam.voxel_params.x;
@@ -429,19 +565,14 @@ fn main_primary(
     textureStore(color_img, ip, vec4<f32>(col_base, 1.0));
     textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha = validity
-    var packed_xy: u32 = 0u;
-    var packed_z: u32 = 0u;
-    var anchor_key: u32 = 0u;
-    if (vt.anchor_valid) {
-      packed_xy = pack_i16x2(vt.anchor_chunk.x, vt.anchor_chunk.y);
-      packed_z = pack_i16x2(vt.anchor_chunk.z, 0);
-      packed_z |= 0x80000000u;
-      anchor_key = vt.anchor_key;
-    }
-    textureStore(
-      primary_hist_out,
+    store_primary_history(
       ip,
-      vec4<f32>(t_store, bitcast<f32>(anchor_key), bitcast<f32>(packed_xy), bitcast<f32>(packed_z))
+      t_store,
+      vt.best.n,
+      vt.best.mat,
+      vt.anchor_key,
+      vt.anchor_chunk,
+      vt.anchor_valid
     );
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
@@ -478,7 +609,7 @@ fn main_primary(
     textureStore(color_img, ip, vec4<f32>(shade.col, 1.0));
     textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-    textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+    store_primary_history(ip, t_store, hf.n, hf.mat, INVALID_U32, vec3<i32>(0), false);
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
@@ -488,7 +619,7 @@ fn main_primary(
   textureStore(color_img, ip, vec4<f32>(sky, 1.0));
   textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
   textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
-  textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+  store_primary_history(ip, t_store, vec3<f32>(0.0), MAT_AIR, INVALID_U32, vec3<i32>(0), false);
   shadow_hist_out[shadow_idx] = shadow_out;
 }
 
