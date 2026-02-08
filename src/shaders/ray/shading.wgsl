@@ -49,6 +49,78 @@ fn apply_material_variation(base: vec3<f32>, mat: u32, hp: vec3<f32>) -> vec3<f3
   return clamp(c, vec3<f32>(0.0), vec3<f32>(1.5));
 }
 
+fn grass_wind_dir_xz(p_ws: vec3<f32>, time_s: f32) -> vec2<f32> {
+  let w = wind_field(p_ws, time_s).xz;
+  var dir = w + vec2<f32>(0.6, 0.2);
+  if (dot(dir, dir) < 1e-4) {
+    dir = vec2<f32>(0.7, 0.25);
+  }
+  return normalize(dir);
+}
+
+fn grass_blade_slivers(p_ws: vec3<f32>, time_s: f32, freq: f32, detail: f32) -> f32 {
+  let dir = grass_wind_dir_xz(p_ws, time_s);
+  let perp = vec2<f32>(-dir.y, dir.x);
+  let p = vec2<f32>(dot(p_ws.xz, dir), dot(p_ws.xz, perp)) * freq;
+
+  let cell = floor(p);
+  let f = fract(p);
+
+  let h0 = hash31(vec3<f32>(cell.x, cell.y, 11.3));
+  let h1 = hash31(vec3<f32>(cell.x + 3.7, cell.y + 7.1, 5.9));
+
+  let angle = (h0 - 0.5) * 0.35;
+  let ca = cos(angle);
+  let sa = sin(angle);
+  let pr = vec2<f32>(f.x * ca - f.y * sa, f.x * sa + f.y * ca);
+
+  let center = 0.5 + (h1 - 0.5) * 0.6;
+  let u = clamp(pr.x, 0.0, 1.0);
+
+  let taper = mix(0.065, 0.012, pow(u, 1.8));
+  let width = taper * mix(0.75, 1.25, h0);
+  let aa = mix(1.6, 0.6, detail) / freq;
+
+  let dist = abs(pr.y - center);
+  let sliver = smoothstep(width + aa, width - aa, dist);
+  let length_mask = smoothstep(0.0, 0.15, u) * smoothstep(1.0, 0.75, u);
+  return sliver * length_mask;
+}
+
+fn grass_blade_field(p_ws: vec3<f32>, time_s: f32, t: f32) -> f32 {
+  let detail = 1.0 - smoothstep(18.0, 55.0, t);
+
+  let low = grass_blade_slivers(p_ws, time_s, 9.0, detail * 0.6);
+  let high = grass_blade_slivers(p_ws + vec3<f32>(1.7, 0.0, 2.3), time_s, 18.0, detail);
+
+  let blend = mix(0.15, 1.0, detail);
+  return mix(low, 0.5 * (low + high), blend);
+}
+
+fn grass_top_albedo(base: vec3<f32>, hp: vec3<f32>, t: f32) -> vec3<f32> {
+  let vs = cam.voxel_params.x;
+  let tip = clamp(fract(hp.y / max(vs, 1e-6)), 0.0, 1.0);
+
+  let time_s = cam.voxel_params.y;
+  let blade = grass_blade_field(hp, time_s, t);
+
+  let patches = fbm(hp.xz * 0.08);
+  let clumps = fbm(hp.xz * 0.35 + vec2<f32>(12.3, 7.1));
+  let density = smoothstep(0.25, 0.75, patches) * smoothstep(0.20, 0.80, clumps);
+
+  let coverage = blade * density;
+
+  let cool_base = base * vec3<f32>(0.78, 0.90, 0.82);
+  let warm_tip = base * vec3<f32>(1.08, 1.16, 0.92) + vec3<f32>(0.02, 0.04, 0.01);
+  let grad = smoothstep(0.0, 1.0, tip);
+  let blade_col = mix(cool_base, warm_tip, grad);
+
+  var out = mix(base * 0.85, blade_col, coverage);
+  let base_shadow = mix(0.68, 1.0, grad + 0.25 * coverage);
+  out *= base_shadow;
+  return max(out, vec3<f32>(0.02));
+}
+
 fn base_albedo(mat: u32, hp: vec3<f32>, t: f32) -> vec3<f32> {
   var base = color_for_material(mat);
   if (t <= FAR_SHADING_DIST) {
@@ -197,16 +269,7 @@ fn shade_hit(
   // Gate extra grass work harder in primary
   if (hg.mat == MAT_GRASS) {
     if (ENABLE_GRASS && grass_allowed_primary(hg.t, hg.n, rd, seed)) {
-      let vs  = cam.voxel_params.x;
-
-      // 0 at base of the grass slab voxel, 1 near its top
-      let tip = clamp(fract(hp.y / max(vs, 1e-6)), 0.0, 1.0);
-
-      // Darker base, brighter tips (lush depth)
-      base *= mix(0.72, 1.10, smoothstep(0.0, 1.0, tip));
-
-      // Slight yellowing at tips (sun-bleached feel)
-      base += 0.06 * smoothstep(0.55, 1.0, tip) * vec3<f32>(0.10, 0.10, 0.02);
+      base = grass_top_albedo(base, hp, hg.t);
 
       // Wrap diffuse so blades don’t look “flat-lit”
       let ndl = dot(hg.n, SUN_DIR);
@@ -295,6 +358,9 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
   var base = color_for_material(ch.mat);
   if (ch.t <= FAR_SHADING_DIST) {
     base = apply_material_variation_clip(base, ch.mat, hp);
+  }
+  if (ch.mat == MAT_GRASS && ENABLE_GRASS && grass_allowed_primary(ch.t, ch.n, rd, seed)) {
+    base = grass_top_albedo(base, hp, ch.t);
   }
 
   let voxel_size = cam.voxel_params.x;
