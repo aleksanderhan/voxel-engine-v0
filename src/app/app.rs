@@ -546,17 +546,17 @@ impl App {
     fn build_profile_lines(&self) -> Vec<String> {
         let counts = self.primary_profile_counts;
         vec![
-            Self::format_profile_line("VOX", counts[0]),
-            Self::format_profile_line("GRS", counts[1]),
-            Self::format_profile_line("HDR", counts[2]),
-            Self::format_profile_line("FOG", counts[3]),
-            Self::format_profile_line("SHD", counts[4]),
+            Self::format_profile_line("VX", counts[0]),
+            Self::format_profile_line("GR", counts[1]),
+            Self::format_profile_line("HD", counts[2]),
+            Self::format_profile_line("FG", counts[3]),
+            Self::format_profile_line("SH", counts[4]),
         ]
     }
 
     fn format_profile_line(label: &str, value: u32) -> String {
         let count = Self::format_profile_count(value);
-        let number_width = 8usize;
+        let number_width = 9usize;
         let trimmed = if count.len() > number_width {
             count[count.len() - number_width..].to_string()
         } else {
