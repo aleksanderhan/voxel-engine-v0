@@ -1216,6 +1216,7 @@ fn trace_scene_voxels_candidates(
   let max_candidates = min(candidate_count, MAX_TILE_CHUNKS);
 
   for (var i: u32 = 0u; i < max_candidates; i = i + 1u) {
+    if (best.hit != 0u && WG_TILE_ENTER[i] >= best.t) { break; }
     let slot = WG_TILE_SLOTS[i];
     if (slot == INVALID_U32 || slot >= cam.chunk_count) { continue; }
 
@@ -1262,6 +1263,85 @@ fn trace_scene_voxels_candidates(
   }
 
   return VoxTraceResult(true, best, t_exit, best_anchor_valid, best_anchor_key, best_anchor_chunk);
+}
+
+fn chunk_slot_from_coord(coord: vec3<i32>) -> u32 {
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+  let lx = coord.x - go.x;
+  let ly = coord.y - go.y;
+  let lz = coord.z - go.z;
+  if (lx < 0 || ly < 0 || lz < 0) { return INVALID_U32; }
+  if (lx >= i32(gd.x) || ly >= i32(gd.y) || lz >= i32(gd.z)) { return INVALID_U32; }
+  let idx = (u32(lz) * gd.y + u32(ly)) * gd.x + u32(lx);
+  return chunk_grid[idx];
+}
+
+fn trace_scene_voxels_anchor(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_min: f32,
+  t_max: f32,
+  anchor_chunk_in: vec3<i32>,
+  anchor_key_in: u32,
+  grass_seed: u32
+) -> VoxTraceResult {
+  if (cam.chunk_count == 0u) {
+    return VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
+  }
+
+  let voxel_size   = cam.voxel_params.x;
+  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
+
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+
+  let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
+  let grid_bmax = grid_bmin + vec3<f32>(f32(gd.x), f32(gd.y), f32(gd.z)) * chunk_size_m;
+
+  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  var t_enter = max(max(rtg.x, 0.0), t_min);
+  let t_exit  = min(min(rtg.y, FOG_MAX_DIST), t_max);
+
+  if (t_exit < t_enter) {
+    return VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
+  }
+
+  let slot = chunk_slot_from_coord(anchor_chunk_in);
+  if (slot == INVALID_U32 || slot >= cam.chunk_count) {
+    return VoxTraceResult(true, miss_hitgeom(), t_exit, false, INVALID_U32, vec3<i32>(0));
+  }
+
+  let ch = chunks[slot];
+  if (ch.macro_empty != 0u) {
+    return VoxTraceResult(true, miss_hitgeom(), t_exit, false, INVALID_U32, vec3<i32>(0));
+  }
+
+  let root_size = f32(cam.chunk_size) * voxel_size;
+  let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * voxel_size;
+  let root_bmax = root_bmin + vec3<f32>(root_size);
+  let rt_chunk = intersect_aabb(ro, rd, root_bmin, root_bmax);
+
+  let cell_enter = max(rt_chunk.x, t_enter);
+  let cell_exit  = min(rt_chunk.y, t_exit);
+  if (cell_exit < cell_enter) {
+    return VoxTraceResult(true, miss_hitgeom(), t_exit, false, INVALID_U32, vec3<i32>(0));
+  }
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let h = trace_chunk_interval_stream_macro(
+    ro,
+    rd,
+    inv,
+    ch,
+    cell_enter,
+    cell_exit,
+    true,
+    anchor_key_in,
+    grass_seed
+  );
+
+  return VoxTraceResult(true, h.hit, t_exit, h.anchor_valid, h.anchor_key, anchor_chunk_in);
 }
 
 fn hitgeom_from_clipmap(ch: ClipHit, ro: vec3<f32>, rd: vec3<f32>) -> HitGeom {

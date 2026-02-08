@@ -311,18 +311,36 @@ fn main_primary(
 
   let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
   let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
-  var vt = trace_primary_voxels(
-    ro,
-    rd,
-    t_start,
-    t_end,
-    has_tile_candidates,
-    hist_valid,
-    hist_anchor_key,
-    hist_anchor_coord,
-    tile_candidate_count,
-    seed
-  );
+  var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
+  if (hist_valid) {
+    let vt_anchor = trace_scene_voxels_anchor(
+      ro,
+      rd,
+      t_start,
+      t_end,
+      hist_anchor_coord,
+      hist_anchor_key,
+      seed
+    );
+    if (vt_anchor.best.hit != 0u) {
+      vt = vt_anchor;
+    }
+  }
+
+  if (vt.best.hit == 0u) {
+    vt = trace_primary_voxels(
+      ro,
+      rd,
+      t_start,
+      t_end,
+      has_tile_candidates,
+      hist_valid,
+      hist_anchor_key,
+      hist_anchor_coord,
+      tile_candidate_count,
+      seed
+    );
+  }
 
   // Outside streamed grid => heightfield or sky
   if (!vt.in_grid) {
