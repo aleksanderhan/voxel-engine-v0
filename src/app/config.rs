@@ -4,7 +4,7 @@
 
 pub const CHUNK_SIZE: u32 = 64;
 
-pub const ACTIVE_RADIUS: i32 = 14;
+pub const ACTIVE_RADIUS: i32 = 7;
 pub const KEEP_RADIUS: i32 = ACTIVE_RADIUS * 2;
 
 pub const VOXEL_SIZE_M_F32: f32 = 0.10;
