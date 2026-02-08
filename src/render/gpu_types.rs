@@ -74,8 +74,9 @@ pub struct CameraGpu {
     pub profile_flags: u32,
 
     // IMPORTANT: WGSL uniform layout aligns the next vec3<u32> to 16 bytes.
-    // So we must add 12 bytes here to reach offset 416.
-    pub _pad_profile: [u32; 3],
+    // So we must add 8 bytes here to reach offset 416.
+    pub profile_mode: u32,
+    pub _pad_profile: [u32; 2],
 
     // Now keep the rest 16B-aligned blocks.
     pub _pad0: [u32; 4],

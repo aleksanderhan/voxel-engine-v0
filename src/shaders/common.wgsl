@@ -379,7 +379,8 @@ struct Camera {
   render_present_px : vec4<u32>,
 
   profile_flags : u32,
-  _pad0 : vec3<u32>,
+  profile_mode : u32,
+  _pad0 : vec2<u32>,
   _pad1 : vec4<u32>,
   _pad2 : vec4<u32>,
 };

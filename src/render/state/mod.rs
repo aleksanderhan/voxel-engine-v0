@@ -17,6 +17,14 @@ use pipelines::{create_pipelines, Pipelines};
 use textures::{create_textures, TextureSet};
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct PrimaryBreakdownMs {
+    pub voxels: f64,
+    pub hdr: f64,
+    pub grass: f64,
+    pub fog: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct GpuTimingsMs {
     pub primary: f64,
     pub local_taa: f64,
@@ -25,6 +33,7 @@ pub struct GpuTimingsMs {
     pub composite_taa: f64,
     pub blit: f64,
     pub total: f64,
+    pub primary_breakdown: Option<PrimaryBreakdownMs>,
 }
 
 
@@ -54,6 +63,8 @@ pub struct Renderer {
     ts_qs: Option<wgpu::QuerySet>,
     ts_resolve: Option<wgpu::Buffer>,   // QUERY_RESOLVE | COPY_SRC
     ts_readback: Option<wgpu::Buffer>,  // COPY_DST | MAP_READ
+
+    primary_breakdown_enabled: bool,
 
 }
 
@@ -169,7 +180,7 @@ impl Renderer {
             .await
             .unwrap();
 
-        const TS_COUNT: u32 = 12;
+        const TS_COUNT: u32 = 18;
         let (ts_qs, ts_resolve, ts_readback, ts_period_ns) = if use_ts {
             let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("ts_qs"),
@@ -250,6 +261,7 @@ impl Renderer {
             ts_qs,
             ts_resolve,
             ts_readback,
+            primary_breakdown_enabled: false,
         }
     }
 
@@ -308,14 +320,32 @@ impl Renderer {
             .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));
     }
 
+    pub fn write_profile_mode(&self, mode: u32) {
+        let offset = std::mem::offset_of!(CameraGpu, profile_mode) as u64;
+        self.queue
+            .write_buffer(&self.buffers.camera, offset, bytemuck::bytes_of(&mode));
+    }
+
     pub fn write_overlay(&self, ov: &OverlayGpu) {
         self.queue
             .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
     }
 
-    pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
+    pub fn encode_compute(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        width: u32,
+        height: u32,
+        profile_primary_breakdown: bool,
+    ) {
         let ping = self.ping;
         let pong = 1 - ping;
+        const PROFILE_TRACE_ONLY: u32 = 1;
+        const PROFILE_NO_GRASS: u32 = 2;
+        const PROFILE_NO_FOG: u32 = 4;
+
+        self.primary_breakdown_enabled = profile_primary_breakdown;
+        self.write_profile_mode(0);
 
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -330,6 +360,49 @@ impl Renderer {
             let gy = (self.internal_h + 7) / 8;
             cpass.dispatch_workgroups(gx, gy, 1);
 
+        }
+
+        if profile_primary_breakdown {
+            self.write_profile_mode(PROFILE_TRACE_ONLY);
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("primary_trace_pass"),
+                timestamp_writes: self.ts_pair(12, 13),
+            });
+
+            cpass.set_pipeline(&self.pipelines.primary);
+            cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
+
+            let gx = (self.internal_w + 7) / 8;
+            let gy = (self.internal_h + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+
+            self.write_profile_mode(PROFILE_NO_FOG | PROFILE_NO_GRASS);
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("primary_no_fog_no_grass_pass"),
+                timestamp_writes: self.ts_pair(14, 15),
+            });
+
+            cpass.set_pipeline(&self.pipelines.primary);
+            cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
+
+            let gx = (self.internal_w + 7) / 8;
+            let gy = (self.internal_h + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+
+            self.write_profile_mode(PROFILE_NO_FOG);
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("primary_no_fog_pass"),
+                timestamp_writes: self.ts_pair(16, 17),
+            });
+
+            cpass.set_pipeline(&self.pipelines.primary);
+            cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
+
+            let gx = (self.internal_w + 7) / 8;
+            let gy = (self.internal_h + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+
+            self.write_profile_mode(0);
         }
 
         {
@@ -584,8 +657,8 @@ impl Renderer {
         let qs = self.ts_qs.as_ref().unwrap();
         let resolve = self.ts_resolve.as_ref().unwrap();
         let readback = self.ts_readback.as_ref().unwrap();
-        encoder.resolve_query_set(qs, 0..12, resolve, 0);
-        encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, 12 * 8);
+        encoder.resolve_query_set(qs, 0..18, resolve, 0);
+        encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, 18 * 8);
     }
 
     pub fn read_gpu_timings_ms_blocking(&self) -> Option<GpuTimingsMs> {
@@ -610,10 +683,10 @@ impl Renderer {
             .expect("map_async dropped")
             .expect("map_async failed");
 
-        // Read 12 u64 timestamps
+        // Read 18 u64 timestamps
         let data = slice.get_mapped_range();
         let words: &[u64] = bytemuck::cast_slice(&data);
-        if words.len() < 12 {
+        if words.len() < 18 {
             drop(data);
             readback.unmap();
             return None;
@@ -622,6 +695,7 @@ impl Renderer {
         let ts = [
             words[0], words[1], words[2], words[3], words[4], words[5],
             words[6], words[7], words[8], words[9], words[10], words[11],
+            words[12], words[13], words[14], words[15], words[16], words[17],
         ];
 
         drop(data);
@@ -639,6 +713,20 @@ impl Renderer {
         let composite_taa = to_ms(ts[8], ts[9]);
         let blit      = to_ms(ts[10], ts[11]);
 
+        let primary_trace = to_ms(ts[12], ts[13]);
+        let primary_no_fog_no_grass = to_ms(ts[14], ts[15]);
+        let primary_no_fog = to_ms(ts[16], ts[17]);
+
+        let primary_breakdown = if self.primary_breakdown_enabled {
+            let voxels = primary_trace;
+            let hdr = (primary_no_fog_no_grass - primary_trace).max(0.0);
+            let grass = (primary_no_fog - primary_no_fog_no_grass).max(0.0);
+            let fog = (primary - primary_no_fog).max(0.0);
+            Some(PrimaryBreakdownMs { voxels, hdr, grass, fog })
+        } else {
+            None
+        };
+
         Some(GpuTimingsMs {
             primary,
             local_taa,
@@ -647,6 +735,7 @@ impl Renderer {
             composite_taa,
             blit,
             total: primary + local_taa + godray + composite + composite_taa + blit,
+            primary_breakdown,
         })
     }
 

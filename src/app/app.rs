@@ -498,7 +498,8 @@ impl App {
                 self.surface_config.height,
             ],
             profile_flags: if self.show_profile_hud { 1 } else { 0 },
-            _pad_profile: [0; 3],
+            profile_mode: 0,
+            _pad_profile: [0; 2],
             _pad0: [0; 4],
             _pad1: [0; 4],
             _pad2: [0; 4],
@@ -551,16 +552,21 @@ impl App {
     }
 
     fn build_profile_lines(&self) -> Vec<String> {
-        match self.gpu_timings_ms {
-            Some(timings) => vec![
-                Self::format_profile_ms("PRI", timings.primary),
-                Self::format_profile_ms("LTA", timings.local_taa),
-                Self::format_profile_ms("GOD", timings.godray),
-                Self::format_profile_ms("CMP", timings.composite),
-                Self::format_profile_ms("CTA", timings.composite_taa),
-            ],
-            None => vec!["GPU TS OFF".to_string()],
-        }
+        let Some(timings) = self.gpu_timings_ms else {
+            return vec!["GPU TS OFF".to_string()];
+        };
+
+        let Some(breakdown) = timings.primary_breakdown else {
+            return vec!["GPU TS OFF".to_string()];
+        };
+
+        vec![
+            Self::format_profile_ms("VOX", breakdown.voxels),
+            Self::format_profile_ms("HDR", breakdown.hdr),
+            Self::format_profile_ms("GRS", breakdown.grass),
+            Self::format_profile_ms("FOG", breakdown.fog),
+            Self::format_profile_ms("PRI", timings.primary),
+        ]
     }
 
     fn format_profile_ms(label: &str, value: f64) -> String {
@@ -617,6 +623,7 @@ impl App {
             encoder,
             self.surface_config.width,
             self.surface_config.height,
+            self.show_profile_hud,
         );
 
         self.profiler.enc_comp(profiler::FrameProf::end_ms(t0));
