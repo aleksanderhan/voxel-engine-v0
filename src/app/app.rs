@@ -546,12 +546,23 @@ impl App {
     fn build_profile_lines(&self) -> Vec<String> {
         let counts = self.primary_profile_counts;
         vec![
-            format!("VOX {}", Self::format_profile_count(counts[0])),
-            format!("GRS {}", Self::format_profile_count(counts[1])),
-            format!("HDR {}", Self::format_profile_count(counts[2])),
-            format!("FOG {}", Self::format_profile_count(counts[3])),
-            format!("SHD {}", Self::format_profile_count(counts[4])),
+            Self::format_profile_line("VOX", counts[0]),
+            Self::format_profile_line("GRS", counts[1]),
+            Self::format_profile_line("HDR", counts[2]),
+            Self::format_profile_line("FOG", counts[3]),
+            Self::format_profile_line("SHD", counts[4]),
         ]
+    }
+
+    fn format_profile_line(label: &str, value: u32) -> String {
+        let count = Self::format_profile_count(value);
+        let number_width = 8usize;
+        let mut padded = String::with_capacity(number_width.max(count.len()));
+        if count.len() < number_width {
+            padded.extend(std::iter::repeat('.').take(number_width - count.len()));
+        }
+        padded.push_str(&count);
+        format!("{label}.{padded}")
     }
 
     fn format_profile_count(value: u32) -> String {
