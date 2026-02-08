@@ -1025,7 +1025,7 @@ fn tile_add_candidate(slot: u32, cell_enter: f32) {
   }
 }
 
-fn tile_append_candidates_for_ray(
+fn tile_append_candidates_for_ray_fine(
   ro: vec3<f32>,
   rd: vec3<f32>,
   t_min: f32,
@@ -1150,6 +1150,162 @@ fn tile_append_candidates_for_ray(
   }
 }
 
+fn coarse_grid_dims() -> vec3<i32> {
+  return vec3<i32>(
+    (i32(cam.grid_dims.x) + 1) / 2,
+    (i32(cam.grid_dims.y) + 1) / 2,
+    (i32(cam.grid_dims.z) + 1) / 2
+  );
+}
+
+fn coarse_grid_index(lcx: i32, lcy: i32, lcz: i32) -> u32 {
+  let cgd = coarse_grid_dims();
+  let ccx = lcx / 2;
+  let ccy = lcy / 2;
+  let ccz = lcz / 2;
+  return u32((ccz * cgd.y + ccy) * cgd.x + ccx);
+}
+
+fn tile_append_candidates_for_ray(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_min: f32,
+  t_max: f32
+) {
+  if (cam.chunk_count == 0u) {
+    return;
+  }
+
+  let voxel_size   = cam.voxel_params.x;
+  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
+  let coarse_size_m = chunk_size_m * 2.0;
+
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+  let cgd = coarse_grid_dims();
+
+  let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
+  let grid_bmax = grid_bmin + vec3<f32>(f32(gd.x), f32(gd.y), f32(gd.z)) * chunk_size_m;
+
+  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  var t_enter = max(max(rtg.x, 0.0), t_min);
+  let t_exit  = min(min(rtg.y, FOG_MAX_DIST), t_max);
+
+  if (t_exit < t_enter) {
+    return;
+  }
+
+  let nudge_p = PRIMARY_NUDGE_VOXEL_FRAC * voxel_size;
+  let start_t = t_enter + nudge_p;
+  let p0      = ro + start_t * rd;
+
+  let c = chunk_coord_from_pos(p0, chunk_size_m);
+
+  let nx: i32 = i32(gd.x);
+  let ny: i32 = i32(gd.y);
+  let nz: i32 = i32(gd.z);
+
+  var lcx: i32 = c.x - go.x;
+  var lcy: i32 = c.y - go.y;
+  var lcz: i32 = c.z - go.z;
+
+  if (lcx < 0 || lcy < 0 || lcz < 0 || lcx >= nx || lcy >= ny || lcz >= nz) {
+    return;
+  }
+
+  var ccx: i32 = lcx / 2;
+  var ccy: i32 = lcy / 2;
+  var ccz: i32 = lcz / 2;
+
+  if (ccx < 0 || ccy < 0 || ccz < 0 || ccx >= cgd.x || ccy >= cgd.y || ccz >= cgd.z) {
+    return;
+  }
+
+  var idx_i: i32 = (ccz * cgd.y + ccy) * cgd.x + ccx;
+
+  var t_local: f32 = 0.0;
+  let t_exit_local = max(t_exit - start_t, 0.0);
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+
+  let step_x: i32 = select(-1, 1, rd.x > 0.0);
+  let step_y: i32 = select(-1, 1, rd.y > 0.0);
+  let step_z: i32 = select(-1, 1, rd.z > 0.0);
+
+  let coarse_origin_x = go.x + ccx * 2;
+  let coarse_origin_y = go.y + ccy * 2;
+  let coarse_origin_z = go.z + ccz * 2;
+
+  let bx = select(f32(coarse_origin_x) * chunk_size_m, f32(coarse_origin_x + 2) * chunk_size_m, rd.x > 0.0);
+  let by = select(f32(coarse_origin_y) * chunk_size_m, f32(coarse_origin_y + 2) * chunk_size_m, rd.y > 0.0);
+  let bz = select(f32(coarse_origin_z) * chunk_size_m, f32(coarse_origin_z + 2) * chunk_size_m, rd.z > 0.0);
+
+  var tMaxX: f32 = (bx - p0.x) * inv.x;
+  var tMaxY: f32 = (by - p0.y) * inv.y;
+  var tMaxZ: f32 = (bz - p0.z) * inv.z;
+
+  let tDeltaX: f32 = abs(coarse_size_m * inv.x);
+  let tDeltaY: f32 = abs(coarse_size_m * inv.y);
+  let tDeltaZ: f32 = abs(coarse_size_m * inv.z);
+
+  if (abs(rd.x) < EPS_INV) { tMaxX = BIG_F32; }
+  if (abs(rd.y) < EPS_INV) { tMaxY = BIG_F32; }
+  if (abs(rd.z) < EPS_INV) { tMaxZ = BIG_F32; }
+
+  let didx_x: i32 = select(-1, 1, rd.x > 0.0);
+  let didx_y: i32 = select(-cgd.x, cgd.x, rd.y > 0.0);
+  let didx_z: i32 = select(-cgd.x * cgd.y, cgd.x * cgd.y, rd.z > 0.0);
+
+  var rem_x: i32 = 0;
+  var rem_y: i32 = 0;
+  var rem_z: i32 = 0;
+
+  if (abs(rd.x) >= EPS_INV) {
+    rem_x = select(ccx, (cgd.x - 1 - ccx), step_x > 0);
+  }
+  if (abs(rd.y) >= EPS_INV) {
+    rem_y = select(ccy, (cgd.y - 1 - ccy), step_y > 0);
+  }
+  if (abs(rd.z) >= EPS_INV) {
+    rem_z = select(ccz, (cgd.z - 1 - ccz), step_z > 0);
+  }
+
+  let max_steps = min(u32(rem_x + rem_y + rem_z) + 1u, 256u);
+
+  for (var s: u32 = 0u; s < max_steps; s = s + 1u) {
+    if (t_local > t_exit_local) { break; }
+
+    if (idx_i >= 0 && idx_i < i32(cgd.x * cgd.y * cgd.z)) {
+      if (chunk_grid_coarse[u32(idx_i)] != 0u) {
+        let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
+        let t_cell_enter = start_t + t_local;
+        let t_cell_exit = start_t + min(tNextLocal, t_exit_local);
+        tile_append_candidates_for_ray_fine(ro, rd, t_cell_enter, t_cell_exit);
+      }
+    }
+
+    let tNextLocal = min(tMaxX, min(tMaxY, tMaxZ));
+    let epsTie = 1e-6 * max(1.0, abs(tNextLocal));
+
+    if (abs(tMaxX - tNextLocal) <= epsTie) {
+      ccx += step_x; idx_i += didx_x;
+      tMaxX += tDeltaX;
+    }
+    if (abs(tMaxY - tNextLocal) <= epsTie) {
+      ccy += step_y; idx_i += didx_y;
+      tMaxY += tDeltaY;
+    }
+    if (abs(tMaxZ - tNextLocal) <= epsTie) {
+      ccz += step_z; idx_i += didx_z;
+      tMaxZ += tDeltaZ;
+    }
+
+    t_local = tNextLocal;
+
+    if (ccx < 0 || ccy < 0 || ccz < 0 || ccx >= cgd.x || ccy >= cgd.y || ccz >= cgd.z) { break; }
+  }
+}
+
 fn tile_sort_candidates_by_enter(count: u32) {
   if (count <= 1u) { return; }
   let limit = min(count, PRIMARY_MAX_TILE_CHUNKS);
@@ -1179,6 +1335,7 @@ fn trace_scene_voxels_candidates(
   rd: vec3<f32>,
   t_min: f32,
   t_max: f32,
+  t_max_hint: f32,
   anchor_valid_in: bool,
   anchor_chunk_in: vec3<i32>,
   anchor_key_in: u32,
@@ -1216,6 +1373,8 @@ fn trace_scene_voxels_candidates(
   let max_candidates = min(candidate_count, MAX_TILE_CHUNKS);
 
   for (var i: u32 = 0u; i < max_candidates; i = i + 1u) {
+    if (t_max_hint > 0.0 && WG_TILE_ENTER[i] > t_max_hint) { break; }
+    if (best.hit != 0u && WG_TILE_ENTER[i] >= best.t) { break; }
     let slot = WG_TILE_SLOTS[i];
     if (slot == INVALID_U32 || slot >= cam.chunk_count) { continue; }
 
@@ -1262,6 +1421,85 @@ fn trace_scene_voxels_candidates(
   }
 
   return VoxTraceResult(true, best, t_exit, best_anchor_valid, best_anchor_key, best_anchor_chunk);
+}
+
+fn chunk_slot_from_coord(coord: vec3<i32>) -> u32 {
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+  let lx = coord.x - go.x;
+  let ly = coord.y - go.y;
+  let lz = coord.z - go.z;
+  if (lx < 0 || ly < 0 || lz < 0) { return INVALID_U32; }
+  if (lx >= i32(gd.x) || ly >= i32(gd.y) || lz >= i32(gd.z)) { return INVALID_U32; }
+  let idx = (u32(lz) * gd.y + u32(ly)) * gd.x + u32(lx);
+  return chunk_grid[idx];
+}
+
+fn trace_scene_voxels_anchor(
+  ro: vec3<f32>,
+  rd: vec3<f32>,
+  t_min: f32,
+  t_max: f32,
+  anchor_chunk_in: vec3<i32>,
+  anchor_key_in: u32,
+  grass_seed: u32
+) -> VoxTraceResult {
+  if (cam.chunk_count == 0u) {
+    return VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
+  }
+
+  let voxel_size   = cam.voxel_params.x;
+  let chunk_size_m = f32(cam.chunk_size) * voxel_size;
+
+  let go = cam.grid_origin_chunk;
+  let gd = cam.grid_dims;
+
+  let grid_bmin = vec3<f32>(f32(go.x), f32(go.y), f32(go.z)) * chunk_size_m;
+  let grid_bmax = grid_bmin + vec3<f32>(f32(gd.x), f32(gd.y), f32(gd.z)) * chunk_size_m;
+
+  let rtg = intersect_aabb(ro, rd, grid_bmin, grid_bmax);
+  var t_enter = max(max(rtg.x, 0.0), t_min);
+  let t_exit  = min(min(rtg.y, FOG_MAX_DIST), t_max);
+
+  if (t_exit < t_enter) {
+    return VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
+  }
+
+  let slot = chunk_slot_from_coord(anchor_chunk_in);
+  if (slot == INVALID_U32 || slot >= cam.chunk_count) {
+    return VoxTraceResult(true, miss_hitgeom(), t_exit, false, INVALID_U32, vec3<i32>(0));
+  }
+
+  let ch = chunks[slot];
+  if (ch.macro_empty != 0u) {
+    return VoxTraceResult(true, miss_hitgeom(), t_exit, false, INVALID_U32, vec3<i32>(0));
+  }
+
+  let root_size = f32(cam.chunk_size) * voxel_size;
+  let root_bmin = vec3<f32>(f32(ch.origin.x), f32(ch.origin.y), f32(ch.origin.z)) * voxel_size;
+  let root_bmax = root_bmin + vec3<f32>(root_size);
+  let rt_chunk = intersect_aabb(ro, rd, root_bmin, root_bmax);
+
+  let cell_enter = max(rt_chunk.x, t_enter);
+  let cell_exit  = min(rt_chunk.y, t_exit);
+  if (cell_exit < cell_enter) {
+    return VoxTraceResult(true, miss_hitgeom(), t_exit, false, INVALID_U32, vec3<i32>(0));
+  }
+
+  let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
+  let h = trace_chunk_interval_stream_macro(
+    ro,
+    rd,
+    inv,
+    ch,
+    cell_enter,
+    cell_exit,
+    true,
+    anchor_key_in,
+    grass_seed
+  );
+
+  return VoxTraceResult(true, h.hit, t_exit, h.anchor_valid, h.anchor_key, anchor_chunk_in);
 }
 
 fn hitgeom_from_clipmap(ch: ClipHit, ro: vec3<f32>, rd: vec3<f32>) -> HitGeom {

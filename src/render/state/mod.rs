@@ -316,6 +316,15 @@ impl Renderer {
         );
     }
 
+    pub fn write_chunk_grid_coarse(&self, grid: &[u32]) {
+        let n = grid.len().min(self.buffers.grid_coarse_capacity as usize);
+        self.queue.write_buffer(
+            &self.buffers.chunk_grid_coarse,
+            0,
+            bytemuck::cast_slice(&grid[..n]),
+        );
+    }
+
     pub fn write_camera(&self, cam: &CameraGpu) {
         self.queue
             .write_buffer(&self.buffers.camera, 0, bytemuck::bytes_of(cam));

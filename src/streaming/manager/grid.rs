@@ -19,6 +19,11 @@ pub fn rebuild_grid(mgr: &mut ChunkManager, center: ChunkKey) {
 
     mgr.grid.grid_dims = [nx, ny, nz];
     mgr.grid.grid_origin_chunk = super::keep::keep_origin_for(center);
+    mgr.grid.grid_dims_coarse = [
+        (nx + 1) / 2,
+        (ny + 1) / 2,
+        (nz + 1) / 2,
+    ];
 
     let needed = (nx * ny * nz) as usize;
     if mgr.grid.chunk_grid.len() != needed {
@@ -42,6 +47,47 @@ pub fn rebuild_grid(mgr: &mut ChunkManager, center: ChunkKey) {
 
         if let Some(idx) = grid_index_for_chunk(mgr, k) {
             mgr.grid.chunk_grid[idx] = slot as u32;
+        }
+    }
+
+    let [cnx, cny, cnz] = mgr.grid.grid_dims_coarse;
+    let coarse_needed = (cnx * cny * cnz) as usize;
+    if mgr.grid.chunk_grid_coarse.len() != coarse_needed {
+        mgr.grid.chunk_grid_coarse.resize(coarse_needed, 0);
+    }
+    mgr.grid.chunk_grid_coarse.fill(0);
+
+    for cz in 0..cnz {
+        for cy in 0..cny {
+            for cx in 0..cnx {
+                let mut occupied = false;
+                for dz in 0..2 {
+                    let z = cz * 2 + dz;
+                    if z >= nz { continue; }
+                    for dy in 0..2 {
+                        let y = cy * 2 + dy;
+                        if y >= ny { continue; }
+                        for dx in 0..2 {
+                            let x = cx * 2 + dx;
+                            if x >= nx { continue; }
+                            let idx = (z * ny * nx) + (y * nx) + x;
+                            let slot = mgr.grid.chunk_grid[idx as usize];
+                            if slot == INVALID_U32 { continue; }
+                            let slot = slot as usize;
+                            if slot >= mgr.slots.chunk_meta.len() { continue; }
+                            if mgr.slots.chunk_meta[slot].macro_empty != 0 {
+                                continue;
+                            }
+                            occupied = true;
+                            break;
+                        }
+                        if occupied { break; }
+                    }
+                    if occupied { break; }
+                }
+                let cidx = (cz * cny * cnx) + (cy * cnx) + cx;
+                mgr.grid.chunk_grid_coarse[cidx as usize] = u32::from(occupied);
+            }
         }
     }
 }

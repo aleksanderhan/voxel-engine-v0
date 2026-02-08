@@ -404,6 +404,7 @@ struct ChunkMeta {
 @group(0) @binding(1) var<storage, read> chunks     : array<ChunkMeta>;
 @group(0) @binding(2) var<storage, read> nodes      : array<Node>;
 @group(0) @binding(3) var<storage, read> chunk_grid : array<u32>;
+@group(0) @binding(18) var<storage, read> chunk_grid_coarse : array<u32>;
 @group(0) @binding(9)  var<storage, read> macro_occ : array<u32>;
 @group(0) @binding(10) var<storage, read> node_ropes: array<NodeRopes>;
 @group(0) @binding(11) var<storage, read> chunk_colinfo : array<u32>;
@@ -422,6 +423,8 @@ const PRIMARY_MAX_TILE_CHUNKS: u32 = 24u;
 var<workgroup> WG_TILE_COUNT : atomic<u32>;
 var<workgroup> WG_TILE_SLOTS : array<u32, MAX_TILE_CHUNKS>;
 var<workgroup> WG_TILE_ENTER : array<f32, MAX_TILE_CHUNKS>;
+var<workgroup> WG_TILE_TMAX_HINT : f32;
+var<workgroup> WG_TILE_ANCHOR_SLOT : u32;
 
 fn macro_cell_size(root_size: f32) -> f32 {
   return root_size / f32(MACRO_DIM);

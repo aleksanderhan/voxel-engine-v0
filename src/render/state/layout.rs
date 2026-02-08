@@ -118,7 +118,7 @@ fn bgl_storage_tex_wo(
 pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     let cs_vis = wgpu::ShaderStages::COMPUTE;
 
-    let scene_entries: [wgpu::BindGroupLayoutEntry; 7] = [
+    let scene_entries: [wgpu::BindGroupLayoutEntry; 8] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
@@ -126,6 +126,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         bgl_storage_ro(8, cs_vis),
         bgl_storage_ro(9, cs_vis),
         bgl_storage_ro(10, cs_vis),
+        bgl_storage_ro(18, cs_vis),
     ];
 
     let scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -152,7 +153,8 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     // 15 sun-shadow history (sampled)
     // 16 sun-shadow history output (storage buffer write)
     // 17 primary pass profiling counters (storage read-write)
-    let primary_entries: [wgpu::BindGroupLayoutEntry; 18] = [
+    // 18 coarse chunk grid (storage_ro)
+    let primary_entries: [wgpu::BindGroupLayoutEntry; 19] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
@@ -187,6 +189,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         ),
         bgl_storage_rw(16, cs_vis),
         bgl_storage_rw(17, cs_vis),
+        bgl_storage_ro(18, cs_vis),
     ];
 
     let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

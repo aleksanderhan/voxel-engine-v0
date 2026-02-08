@@ -96,6 +96,8 @@ pub(crate) struct GridState {
     pub grid_origin_chunk: [i32; 3],
     pub grid_dims: [u32; 3],
     pub chunk_grid: Vec<u32>,
+    pub chunk_grid_coarse: Vec<u32>,
+    pub grid_dims_coarse: [u32; 3],
 }
 
 /// Column ground cache bucket.
@@ -185,6 +187,8 @@ impl ChunkManager {
                 grid_origin_chunk: [0, 0, 0],
                 grid_dims: [nx, ny, nz],
                 chunk_grid: vec![INVALID_U32; grid_len],
+                chunk_grid_coarse: Vec::new(),
+                grid_dims_coarse: [0, 0, 0],
             },
             ground: GroundState { col_ground_y_vox: Vec::new() },
             offsets: Offsets { active_offsets },
@@ -300,6 +304,7 @@ impl ChunkManager {
     pub fn grid_origin(&self) -> [i32; 3] { self.grid.grid_origin_chunk }
     pub fn grid_dims(&self) -> [u32; 3] { self.grid.grid_dims }
     pub fn chunk_grid(&self) -> &[u32] { &self.grid.chunk_grid }
+    pub fn chunk_grid_coarse(&self) -> &[u32] { &self.grid.chunk_grid_coarse }
 
     pub fn take_uploads_budgeted(&mut self) -> Vec<ChunkUpload> {
         uploads::take_budgeted(self)

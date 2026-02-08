@@ -375,6 +375,7 @@ impl App {
 
         if grid_changed {
             self.renderer.write_chunk_grid(self.chunks.chunk_grid());
+            self.renderer.write_chunk_grid_coarse(self.chunks.chunk_grid_coarse());
         }
 
         self.profiler.stream(profiler::FrameProf::end_ms(t0));
@@ -603,6 +604,7 @@ impl App {
         let grid_changed = self.chunks.commit_uploads_applied(&chunk_uploads);
         if grid_changed {
             self.renderer.write_chunk_grid(self.chunks.chunk_grid());
+            self.renderer.write_chunk_grid_coarse(self.chunks.chunk_grid_coarse());
         }
 
         self.profiler.chunk_up(profiler::FrameProf::end_ms(t0));

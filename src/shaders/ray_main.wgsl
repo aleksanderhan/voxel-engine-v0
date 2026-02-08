@@ -118,6 +118,7 @@ fn trace_primary_voxels(
   rd: vec3<f32>,
   t_start: f32,
   t_end: f32,
+  t_max_hint: f32,
   has_tile_candidates: bool,
   hist_valid: bool,
   hist_anchor_key: u32,
@@ -134,6 +135,7 @@ fn trace_primary_voxels(
         rd,
         t_start,
         t_end,
+        t_max_hint,
         hist_anchor_key != INVALID_U32,
         hist_anchor_coord,
         hist_anchor_key,
@@ -150,6 +152,7 @@ fn trace_primary_voxels(
       rd,
       0.0,
       FOG_MAX_DIST,
+      t_max_hint,
       false,
       vec3<i32>(0),
       INVALID_U32,
@@ -178,6 +181,8 @@ fn main_primary(
 
   if (lid == 0u) {
     atomicStore(&WG_TILE_COUNT, 0u);
+    WG_TILE_TMAX_HINT = 0.0;
+    WG_TILE_ANCHOR_SLOT = INVALID_U32;
     if (cam.chunk_count != 0u) {
       let tile_base = vec2<f32>(
         f32(wg_id.x * TILE_SIZE),
@@ -194,6 +199,65 @@ fn main_primary(
     let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
     tile_sort_candidates_by_enter(raw_count);
     WG_TILE_COUNT_CACHED = min(raw_count, PRIMARY_MAX_TILE_CHUNKS);
+
+    let tile_base_i = vec2<i32>(
+      i32(wg_id.x * TILE_SIZE),
+      i32(wg_id.y * TILE_SIZE)
+    );
+    let sample0 = vec2<i32>(
+      clamp(tile_base_i.x + 4, 0, i32(dims.x) - 1),
+      clamp(tile_base_i.y + 4, 0, i32(dims.y) - 1)
+    );
+    let sample1 = vec2<i32>(
+      clamp(tile_base_i.x + 1, 0, i32(dims.x) - 1),
+      clamp(tile_base_i.y + 1, 0, i32(dims.y) - 1)
+    );
+    let hist0 = textureLoad(primary_hist_tex, sample0, 0);
+    let hist1 = textureLoad(primary_hist_tex, sample1, 0);
+    let t0 = hist0.x;
+    let t1 = hist1.x;
+    var t_hist_tile = t0;
+    if (t0 <= 1e-3) {
+      t_hist_tile = t1;
+    } else if (t1 > 1e-3) {
+      t_hist_tile = min(t0, t1);
+    }
+    if (t_hist_tile <= 1e-3) {
+      t_hist_tile = 0.0;
+    }
+    if (t_hist_tile > 1e-3) {
+      WG_TILE_TMAX_HINT = min(t_hist_tile + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
+    }
+
+    var anchor_hist = hist0;
+    let packed_z0 = bitcast<u32>(hist0.w);
+    let packed_z1 = bitcast<u32>(hist1.w);
+    if ((packed_z0 & 0x80000000u) == 0u && (packed_z1 & 0x80000000u) != 0u) {
+      anchor_hist = hist1;
+    }
+    let packed_z = bitcast<u32>(anchor_hist.w);
+    if ((packed_z & 0x80000000u) != 0u) {
+      let anchor_key = bitcast<u32>(anchor_hist.y);
+      let packed_xy = bitcast<u32>(anchor_hist.z);
+      let xy = unpack_i16x2(packed_xy);
+      let z = unpack_i16(packed_z);
+      let anchor_coord = vec3<i32>(xy.x, xy.y, z);
+      WG_TILE_ANCHOR_SLOT = chunk_slot_from_coord(anchor_coord);
+    }
+
+    if (WG_TILE_ANCHOR_SLOT != INVALID_U32 && WG_TILE_COUNT_CACHED > 1u) {
+      for (var i: u32 = 0u; i < WG_TILE_COUNT_CACHED; i = i + 1u) {
+        if (WG_TILE_SLOTS[i] == WG_TILE_ANCHOR_SLOT) {
+          let tmp_slot = WG_TILE_SLOTS[0];
+          let tmp_t = WG_TILE_ENTER[0];
+          WG_TILE_SLOTS[0] = WG_TILE_SLOTS[i];
+          WG_TILE_ENTER[0] = WG_TILE_ENTER[i];
+          WG_TILE_SLOTS[i] = tmp_slot;
+          WG_TILE_ENTER[i] = tmp_t;
+          break;
+        }
+      }
+    }
   }
   workgroupBarrier();
 
@@ -311,18 +375,37 @@ fn main_primary(
 
   let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
   let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
-  var vt = trace_primary_voxels(
-    ro,
-    rd,
-    t_start,
-    t_end,
-    has_tile_candidates,
-    hist_valid,
-    hist_anchor_key,
-    hist_anchor_coord,
-    tile_candidate_count,
-    seed
-  );
+  var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
+  if (hist_valid) {
+    let vt_anchor = trace_scene_voxels_anchor(
+      ro,
+      rd,
+      t_start,
+      t_end,
+      hist_anchor_coord,
+      hist_anchor_key,
+      seed
+    );
+    if (vt_anchor.best.hit != 0u) {
+      vt = vt_anchor;
+    }
+  }
+
+  if (vt.best.hit == 0u) {
+    vt = trace_primary_voxels(
+      ro,
+      rd,
+      t_start,
+      t_end,
+      WG_TILE_TMAX_HINT,
+      has_tile_candidates,
+      hist_valid,
+      hist_anchor_key,
+      hist_anchor_coord,
+      tile_candidate_count,
+      seed
+    );
+  }
 
   // Outside streamed grid => heightfield or sky
   if (!vt.in_grid) {
