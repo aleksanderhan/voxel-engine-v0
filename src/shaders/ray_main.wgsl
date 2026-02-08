@@ -27,9 +27,11 @@
 @group(0) @binding(12) var primary_hist_tex  : texture_2d<f32>;
 @group(0) @binding(13) var primary_hist_out  : texture_storage_2d<rgba32float, write>;
 @group(0) @binding(14) var primary_hist_samp : sampler;
+@group(0) @binding(15) var primary_payload_tex : texture_2d<f32>;
+@group(0) @binding(16) var primary_payload_out : texture_storage_2d<rgba16float, write>;
 
-@group(0) @binding(15) var shadow_hist_in : texture_2d<f32>;
-@group(0) @binding(16) var<storage, read_write> shadow_hist_out : array<f32>;
+@group(0) @binding(17) var shadow_hist_in : texture_2d<f32>;
+@group(0) @binding(18) var<storage, read_write> shadow_hist_out : array<f32>;
 
 @group(1) @binding(0) var depth_tex       : texture_2d<f32>;
 @group(1) @binding(1) var godray_hist_tex : texture_2d<f32>;
@@ -60,6 +62,18 @@ fn unpack_i16(v: u32) -> i32 {
 
 fn unpack_i16x2(v: u32) -> vec2<i32> {
   return vec2<i32>(unpack_i16(v), unpack_i16(v >> 16u));
+}
+
+fn encode_hist_mat(mat: u32, is_voxel: bool) -> f32 {
+  return select(-(f32(mat) + 1.0), f32(mat), is_voxel);
+}
+
+fn hist_is_voxel(v: f32) -> bool {
+  return v >= 0.0;
+}
+
+fn decode_hist_mat(v: f32) -> u32 {
+  return u32(round(select(-v - 1.0, v, v >= 0.0)));
 }
 
 struct HfShadeOut {
@@ -177,6 +191,7 @@ fn main_primary(
   var local_out = vec3<f32>(0.0);
   var local_w   : f32 = 0.0;
   var t_store   : f32 = 0.0;
+  var hist_payload = vec4<f32>(0.0);
   var shadow_out: f32 = 1.0;
 
   // ------------------------------------------------------------
@@ -219,6 +234,8 @@ fn main_primary(
       textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+      hist_payload = vec4<f32>(hf.n, encode_hist_mat(hf.mat, false));
+      textureStore(primary_payload_out, ip, hist_payload);
       shadow_hist_out[shadow_idx] = shadow_out;
       return;
     }
@@ -229,6 +246,8 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+    hist_payload = vec4<f32>(vec3<f32>(0.0, 1.0, 0.0), encode_hist_mat(0u, false));
+    textureStore(primary_payload_out, ip, hist_payload);
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
@@ -240,25 +259,33 @@ fn main_primary(
   var hist_valid : bool = false;
   var hist_anchor_key  : u32 = INVALID_U32;
   var hist_anchor_coord: vec3<i32> = vec3<i32>(0);
+  var hist_prev = vec4<f32>(0.0);
+  var payload_prev = vec4<f32>(0.0);
   let tile_candidate_count = WG_TILE_COUNT_CACHED;
   let has_tile_candidates = tile_candidate_count != 0u;
   let uv  = px / res;
 
   if (has_tile_candidates) {
     let hist_guess = textureLoad(primary_hist_tex, ip, 0);
+    let payload_guess = textureLoad(primary_payload_tex, ip, 0);
     let t_hist_guess = hist_guess.x;
     if (t_hist_guess > 1e-3) {
       let p_ws = ro + rd * t_hist_guess;
       let uv_prev = prev_uv_from_world(p_ws);
 
       if (in_unit_square(uv_prev)) {
-        let hist_prev = textureSampleLevel(primary_hist_tex, primary_hist_samp, uv_prev, 0.0);
+        hist_prev = textureSampleLevel(primary_hist_tex, primary_hist_samp, uv_prev, 0.0);
+        payload_prev = textureSampleLevel(primary_payload_tex, primary_hist_samp, uv_prev, 0.0);
         let t_prev = hist_prev.x;
         let rel = abs(t_prev - t_hist_guess) / max(t_hist_guess, 1e-3);
         let depth_ok = 1.0 - smoothstep(PRIMARY_HIT_DEPTH_REL0, PRIMARY_HIT_DEPTH_REL1, rel);
         let vel_px = length((uv_prev - uv) * res);
         let motion_ok = 1.0 - smoothstep(PRIMARY_HIT_MOTION_PX0, PRIMARY_HIT_MOTION_PX1, vel_px);
-        if (t_prev > 1e-3 && depth_ok > 0.5 && motion_ok > 0.5) {
+        let window_ok = abs(t_prev - t_hist_guess) <= PRIMARY_HIT_WINDOW;
+        let mat_guess = decode_hist_mat(payload_guess.w);
+        let mat_prev = decode_hist_mat(payload_prev.w);
+        let mat_ok = (mat_guess == mat_prev) && hist_is_voxel(payload_guess.w) && hist_is_voxel(payload_prev.w);
+        if (t_prev > 1e-3 && depth_ok > 0.5 && motion_ok > 0.5 && window_ok && mat_ok) {
           t_hist = t_prev;
           hist_valid = true;
           let packed_z = bitcast<u32>(hist_prev.w);
@@ -272,6 +299,49 @@ fn main_primary(
         }
       }
     }
+  }
+
+  if (hist_valid) {
+    let t_scene = min(t_hist, FOG_MAX_DIST);
+    let hp = ro + rd * t_hist;
+    let hist_n = safe_normalize(payload_prev.xyz);
+    let hist_mat = decode_hist_mat(payload_prev.w);
+
+    let shadow_do = (seed & SHADOW_SUBSAMPLE_MASK) == 0u;
+    if (shadow_do) {
+      var shadow_hist = textureLoad(shadow_hist_in, ip, 0).x;
+      let uv_prev = prev_uv_from_world(hp);
+      if (in_unit_square(uv_prev)) {
+        let prev_px = vec2<i32>(
+          clamp(i32(uv_prev.x * f32(dims.x)), 0, i32(dims.x) - 1),
+          clamp(i32(uv_prev.y * f32(dims.y)), 0, i32(dims.y) - 1)
+        );
+        shadow_hist = textureLoad(shadow_hist_in, prev_px, 0).x;
+      }
+      shadow_hist = clamp(shadow_hist, 0.0, 1.0);
+      let shadow_cur = sun_transmittance_geom_only(hp + hist_n * (0.75 * cam.voxel_params.x), SUN_DIR);
+      shadow_out = mix(shadow_hist, shadow_cur, SHADOW_TAA_ALPHA);
+    } else {
+      shadow_out = clamp(textureLoad(shadow_hist_in, ip, 0).x, 0.0, 1.0);
+    }
+
+    var hg = miss_hitgeom();
+    hg.hit = 1u;
+    hg.t = t_hist;
+    hg.n = hist_n;
+    hg.mat = hist_mat;
+
+    let sky_bg_rd = sky_bg(rd);
+    let col_base = apply_fog(shade_hit(ro, rd, hg, sky_up, seed, shadow_out), ro, rd, t_scene, sky_bg_rd);
+
+    t_store = t_scene;
+    textureStore(color_img, ip, vec4<f32>(col_base, 1.0));
+    textureStore(depth_img, ip, vec4<f32>(t_scene, 0.0, 0.0, 0.0));
+    textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
+    textureStore(primary_hist_out, ip, vec4<f32>(t_store, hist_prev.y, hist_prev.z, hist_prev.w));
+    textureStore(primary_payload_out, ip, payload_prev);
+    shadow_hist_out[shadow_idx] = shadow_out;
+    return;
   }
 
   let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
@@ -340,6 +410,8 @@ fn main_primary(
       textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
       textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
       textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+      hist_payload = vec4<f32>(hf.n, encode_hist_mat(hf.mat, false));
+      textureStore(primary_payload_out, ip, hist_payload);
       shadow_hist_out[shadow_idx] = shadow_out;
       return;
     }
@@ -349,6 +421,8 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+    hist_payload = vec4<f32>(vec3<f32>(0.0, 1.0, 0.0), encode_hist_mat(0u, false));
+    textureStore(primary_payload_out, ip, hist_payload);
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
@@ -443,6 +517,8 @@ fn main_primary(
       ip,
       vec4<f32>(t_store, bitcast<f32>(anchor_key), bitcast<f32>(packed_xy), bitcast<f32>(packed_z))
     );
+    hist_payload = vec4<f32>(vt.best.n, encode_hist_mat(vt.best.mat, true));
+    textureStore(primary_payload_out, ip, hist_payload);
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
@@ -479,6 +555,8 @@ fn main_primary(
     textureStore(depth_img, ip, vec4<f32>(shade.t_scene, 0.0, 0.0, 0.0));
     textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
     textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+    hist_payload = vec4<f32>(hf.n, encode_hist_mat(hf.mat, false));
+    textureStore(primary_payload_out, ip, hist_payload);
     shadow_hist_out[shadow_idx] = shadow_out;
     return;
   }
@@ -489,6 +567,8 @@ fn main_primary(
   textureStore(depth_img, ip, vec4<f32>(FOG_MAX_DIST, 0.0, 0.0, 0.0));
   textureStore(local_img, ip, vec4<f32>(local_out, local_w)); // alpha=0
   textureStore(primary_hist_out, ip, vec4<f32>(t_store, 0.0, 0.0, 0.0));
+  hist_payload = vec4<f32>(vec3<f32>(0.0, 1.0, 0.0), encode_hist_mat(0u, false));
+  textureStore(primary_payload_out, ip, hist_payload);
   shadow_hist_out[shadow_idx] = shadow_out;
 }
 
