@@ -142,13 +142,24 @@ fn gather_voxel_lights(
   // basis for orienting directions
   let tbn = make_tbn(n);
 
-  // de-pattern rotation: stable per surface cell with a per-frame phase shift
-  // so temporal accumulation can converge noisy samples.
+  // de-pattern rotation: stable per surface cell (no per-frame phase shift)
+  // so the sampling pattern stays fixed and avoids per-frame jitter.
   let surf_v = vec3<i32>(floor((hp - root_bmin) / max(vs, 1e-6)));
   let h0 = hash3_i32(surf_v);
   let h1 = hash_u32(h0);
-  let h2 = hash_u32(h1 ^ (cam.frame_index * 747796405u));
-  let rot = 6.28318530718 * (f32(h2 & 1023u) / 1024.0);
+  let h2 = hash_u32(h1);
+  let h3 = hash_u32(h2);
+  let hash_scale = 1.0 / 4294967296.0;
+  var rot_axis = vec3<f32>(
+    f32(h1) * hash_scale * 2.0 - 1.0,
+    f32(h2) * hash_scale * 2.0 - 1.0,
+    f32(h3) * hash_scale * 2.0 - 1.0
+  );
+  if (dot(rot_axis, rot_axis) < 1e-4) {
+    rot_axis = vec3<f32>(0.0, 0.0, 1.0);
+  }
+  rot_axis = normalize(rot_axis);
+  let rot = 6.28318530718 * (f32(hash_u32(h3)) * hash_scale);
 
   // attenuation helpers
   let soft_r  = LIGHT_SOFT_RADIUS_VOX * vs;
@@ -165,8 +176,9 @@ fn gather_voxel_lights(
   var sum = vec3<f32>(0.0);
 
   for (var i: u32 = 0u; i < LIGHT_RAYS; i = i + 1u) {
-    var ldir = normalize(tbn * normalize(sphere_dir_local(i, LIGHT_RAYS)));
-    ldir = normalize(rot_about_axis(ldir, n, rot));
+    var ldir = normalize(sphere_dir_local(i, LIGHT_RAYS));
+    ldir = normalize(rot_about_axis(ldir, rot_axis, rot));
+    ldir = normalize(tbn * ldir);
 
     let hit = dda_hit_light(p0, ldir, LIGHT_MAX_DIST_VOX, vs);
     if (hit.w > 0.5) {
