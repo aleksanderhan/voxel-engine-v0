@@ -498,6 +498,7 @@ impl App {
                 self.surface_config.width,
                 self.surface_config.height,
             ],
+            _pad1: [0; 4],
         };
 
         self.renderer.write_camera(&camera_gpu);

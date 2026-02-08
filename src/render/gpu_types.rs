@@ -75,6 +75,8 @@ pub struct CameraGpu {
     pub grid_dims: [u32; 4],
 
     pub render_present_px: [u32; 4],
+
+    pub _pad1: [u32; 4],
 }
 
 /// Clipmap uniform payload.
