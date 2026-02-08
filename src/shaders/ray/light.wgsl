@@ -143,7 +143,7 @@ fn gather_voxel_lights(
   let tbn = make_tbn(n);
 
   // de-pattern rotation: stable per surface cell (no per-frame phase shift)
-  // so the sampling pattern stays fixed and avoids per-frame jitter.
+  // with extra per-ray jitter to reduce discrete/speckled illumination.
   let surf_v = vec3<i32>(floor((hp - root_bmin) / max(vs, 1e-6)));
   let h0 = hash3_i32(surf_v);
   let h1 = hash_u32(h0);
@@ -178,6 +178,20 @@ fn gather_voxel_lights(
   for (var i: u32 = 0u; i < LIGHT_RAYS; i = i + 1u) {
     var ldir = normalize(sphere_dir_local(i, LIGHT_RAYS));
     ldir = normalize(rot_about_axis(ldir, rot_axis, rot));
+    let hi = hash_u32(h1 ^ (i * 1664525u));
+    let hj = hash_u32(hi);
+    let hk = hash_u32(hj);
+    var jitter_axis = vec3<f32>(
+      f32(hi) * hash_scale * 2.0 - 1.0,
+      f32(hj) * hash_scale * 2.0 - 1.0,
+      f32(hk) * hash_scale * 2.0 - 1.0
+    );
+    if (dot(jitter_axis, jitter_axis) < 1e-4) {
+      jitter_axis = vec3<f32>(0.0, 1.0, 0.0);
+    }
+    jitter_axis = normalize(jitter_axis);
+    let jitter_ang = 0.35 * (f32(hash_u32(hk)) * hash_scale);
+    ldir = normalize(rot_about_axis(ldir, jitter_axis, jitter_ang));
     ldir = normalize(tbn * ldir);
 
     let hit = dda_hit_light(p0, ldir, LIGHT_MAX_DIST_VOX, vs);
