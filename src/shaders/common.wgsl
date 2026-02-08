@@ -361,6 +361,9 @@ struct Camera {
   max_steps   : u32,
   frame_index : u32,
 
+  profile_enabled : u32,
+  _pad_profile    : vec3<u32>,
+
   voxel_params : vec4<f32>,
 
   grid_origin_chunk : vec4<i32>,

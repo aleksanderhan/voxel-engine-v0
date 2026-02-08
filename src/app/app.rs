@@ -108,6 +108,8 @@ pub struct App {
 
     edit_mode: usize,
     edit_modes: Vec<EditMode>,
+
+    show_primary_profile: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -212,6 +214,7 @@ impl App {
             free_cam: false,
             edit_mode: 0,
             edit_modes,
+            show_primary_profile: false,
         }
     }
 
@@ -266,6 +269,9 @@ impl App {
         let clipmap_update = self.update_clipmap_cpu();
         let camera_gpu = self.build_camera_gpu(clipmap_update.time_seconds);
         self.write_overlay_fps();
+        if self.show_primary_profile {
+            self.renderer.clear_primary_profile();
+        }
 
         self.apply_chunk_uploads_and_refresh_grid();
 
@@ -324,6 +330,10 @@ impl App {
                 self.physics.yaw = yaw;
                 self.physics.pitch = pitch;
             }
+        }
+
+        if self.input.take_p_pressed() {
+            self.show_primary_profile = !self.show_primary_profile;
         }
 
         let q = crate::physics::ChunkManagerQuery {
@@ -463,6 +473,9 @@ impl App {
             max_steps,
             frame_index: self.frame_index,
 
+            profile_enabled: if self.show_primary_profile { 1 } else { 0 },
+            _pad_profile: [0; 3],
+
             // [voxel_size_m, time_seconds, ???, ???]
             // NOTE: Keep exact layout/values stable; shader expects this packing.
             voxel_params: [config::VOXEL_SIZE_M_F32, time_seconds, 2.0, 0.002],
@@ -518,6 +531,7 @@ impl App {
             self.surface_config.width,
             self.surface_config.height,
             8,
+            self.show_primary_profile,
         );
         self.renderer.write_overlay(&overlay);
 

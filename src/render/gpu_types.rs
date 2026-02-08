@@ -8,6 +8,8 @@
 use bytemuck::{Pod, Zeroable};
 use crate::app::config;
 
+pub const PRIMARY_PROFILE_COUNTERS: usize = 5;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct NodeGpu {
@@ -63,6 +65,9 @@ pub struct CameraGpu {
     pub chunk_count: u32,
     pub max_steps: u32,
     pub frame_index: u32,
+
+    pub profile_enabled: u32,
+    pub _pad_profile: [u32; 3],
 
     pub voxel_params: [f32; 4],
 
@@ -145,8 +150,10 @@ pub struct OverlayGpu {
     pub text_p1:  u32, // 4 ASCII bytes
     pub text_p2:  u32, // 4 ASCII bytes
 
+    pub profile_enabled: u32,
+
     // pad to 64 bytes (uniform structs are effectively 16-byte aligned)
-    pub _pad0:    u32,
+    pub _pad0:    [u32; 4],
 }
 
 
@@ -179,6 +186,7 @@ impl OverlayGpu {
         width: u32,
         _height: u32,
         scale: u32,
+        profile_enabled: bool,
     ) -> Self {
         // ---- FPS digits ----
         let mut v = fps.min(9999);
@@ -227,7 +235,8 @@ impl OverlayGpu {
             text_p0,
             text_p1,
             text_p2,
-            _pad0: 0,
+            profile_enabled: profile_enabled as u32,
+            _pad0: [0; 4],
         }
     }
 }

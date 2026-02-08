@@ -33,9 +33,24 @@ struct Overlay {
   text_p0    : u32, // 4 chars packed (ASCII)
   text_p1    : u32, // 4 chars packed
   text_p2    : u32, // 4 chars packed
+
+  profile_enabled : u32,
+  _pad0 : vec4<u32>,
 };
 
 @group(0) @binding(2) var<uniform> overlay : Overlay;
+@group(0) @binding(3) var<storage, read> primary_prof : array<u32>;
+
+const PROFILE_LINES: u32 = 5u;
+const PROFILE_LINE_CHARS: u32 = 9u; // "VOX 1234K"
+
+const PROFILE_LABELS: array<u32, 15> = array<u32, 15>(
+  86u, 79u, 88u, // VOX
+  72u, 70u, 84u, // HFT
+  83u, 72u, 68u, // SHD
+  70u, 79u, 71u, // FOG
+  83u, 75u, 89u  // SKY
+);
 
 // -----------------------------------------------------------------------------
 // 3x5 digit font helpers (LUT)
@@ -126,12 +141,17 @@ fn glyph_mask(code: u32) -> u32 {
     case 71u: { return pack3x5(3u,4u,5u,5u,3u); }                // 'G'
     case 72u: { return pack3x5(5u,5u,7u,5u,5u); }                // 'H'
     case 73u: { return pack3x5(7u,2u,2u,2u,7u); }                // 'I'
+    case 70u: { return pack3x5(7u,4u,6u,4u,4u); }                // 'F'
+    case 75u: { return pack3x5(5u,6u,4u,6u,5u); }                // 'K'
     case 76u: { return pack3x5(4u,4u,4u,4u,7u); }                // 'L'
     case 79u: { return pack3x5(2u,5u,5u,5u,2u); }                // 'O'
     case 80u: { return pack3x5(6u,5u,6u,4u,4u); }                // 'P'
     case 82u: { return pack3x5(6u,5u,6u,5u,5u); }                // 'R'
     case 83u: { return pack3x5(3u,4u,2u,1u,6u); }                // 'S'
     case 84u: { return pack3x5(7u,2u,2u,2u,2u); }                // 'T'
+    case 86u: { return pack3x5(5u,5u,5u,5u,2u); }                // 'V'
+    case 88u: { return pack3x5(5u,5u,2u,5u,5u); }                // 'X'
+    case 89u: { return pack3x5(5u,5u,2u,2u,2u); }                // 'Y'
     case 78u: { return pack3x5(5u, 7u, 7u, 7u, 5u); } // 'N'
     case 87u: { return pack3x5(5u, 5u, 5u, 7u, 7u); } // 'W'
     
@@ -143,6 +163,45 @@ fn glyph_bit(mask: u32, x: u32, y: u32) -> bool {
   // IMPORTANT: bit2 is LEFT, bit0 is RIGHT (fixes “mirrored” letters)
   let bit = y * 3u + (2u - x);
   return ((mask >> bit) & 1u) != 0u;
+}
+
+fn profile_value(line: u32) -> u32 {
+  switch (line) {
+    case 0u: { return primary_prof[0]; }
+    case 1u: { return primary_prof[1]; }
+    case 2u: { return primary_prof[2]; }
+    case 3u: { return primary_prof[3]; }
+    default: { return primary_prof[4]; }
+  }
+}
+
+fn profile_digit(val: u32, pos: u32) -> u32 {
+  let thousands = (val / 1000u) % 10u;
+  let hundreds  = (val / 100u) % 10u;
+  let tens      = (val / 10u) % 10u;
+  let ones      = val % 10u;
+  switch (pos) {
+    case 0u: { return thousands; }
+    case 1u: { return hundreds; }
+    case 2u: { return tens; }
+    default: { return ones; }
+  }
+}
+
+fn profile_char(line: u32, ci: u32) -> u32 {
+  if (ci < 3u) {
+    return PROFILE_LABELS[line * 3u + ci];
+  }
+  if (ci == 3u) {
+    return 32u; // space
+  }
+  if (ci < 8u) {
+    let count = profile_value(line);
+    let val_k = min((count + 500u) / 1000u, 9999u);
+    let digit = profile_digit(val_k, ci - 4u);
+    return 48u + digit;
+  }
+  return 75u; // 'K'
 }
 
 
@@ -273,6 +332,53 @@ fn fs_main(
 
           if (glyph_bit(m, cell_x, cell_y)) {
             rgb = vec3<f32>(1.0, 1.0, 1.0);
+          }
+        }
+      }
+    }
+  }
+
+  // ---- Primary profiling overlay (under edit text) ----
+  if (overlay.profile_enabled != 0u) {
+    let scale  = overlay.scale;
+    let char_w = 3u * scale;
+    let char_h = 5u * scale;
+    let gap    = scale;
+    let stride = char_w + gap;
+    let margin = 2u * scale;
+    let line_gap = scale;
+    let line_stride = char_h + line_gap;
+
+    let line_w = PROFILE_LINE_CHARS * stride - gap;
+    let fps_right_i = i32(overlay.origin_x + overlay.total_w);
+    let tox_i = max(0, fps_right_i - i32(line_w));
+    let tox = u32(tox_i);
+
+    let text_offset = select(0u, char_h + margin, text_len > 0u);
+    let base_y = overlay.origin_y + overlay.digit_h + margin + text_offset + margin;
+    let total_h = PROFILE_LINES * line_stride - line_gap;
+
+    if (px.x >= tox && px.x < (tox + line_w) &&
+        px.y >= base_y && px.y < (base_y + total_h)) {
+      let lx = px.x - tox;
+      let ly = px.y - base_y;
+      let line = ly / line_stride;
+      let in_y = ly - line * line_stride;
+
+      if (line < PROFILE_LINES && in_y < char_h) {
+        let ci = lx / stride;
+        let in_x = lx - ci * stride;
+
+        if (ci < PROFILE_LINE_CHARS && in_x < char_w) {
+          let cell_x = in_x / scale;
+          let cell_y = in_y / scale;
+
+          if (cell_y < 5u) {
+            let ch = profile_char(line, ci);
+            let m = glyph_mask(ch);
+            if (glyph_bit(m, cell_x, cell_y)) {
+              rgb = vec3<f32>(1.0, 1.0, 1.0);
+            }
           }
         }
       }

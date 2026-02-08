@@ -8,7 +8,7 @@ pub mod textures;
 
 use crate::app::config;
 use crate::{
-    render::gpu_types::{CameraGpu, OverlayGpu},
+    render::gpu_types::{CameraGpu, OverlayGpu, PRIMARY_PROFILE_COUNTERS},
     streaming::ChunkUpload,
 };
 use bytemuck::{Pod, cast_slice};
@@ -312,6 +312,15 @@ impl Renderer {
     pub fn write_overlay(&self, ov: &OverlayGpu) {
         self.queue
             .write_buffer(&self.buffers.overlay, 0, bytemuck::bytes_of(ov));
+    }
+
+    pub fn clear_primary_profile(&self) {
+        let zeros = [0u32; PRIMARY_PROFILE_COUNTERS];
+        self.queue.write_buffer(
+            &self.buffers.primary_profile,
+            0,
+            bytemuck::cast_slice(&zeros),
+        );
     }
 
     pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) {
