@@ -268,8 +268,8 @@ fn fs_main(
   let scale  = overlay.scale;
   let char_w = 3u * scale;
   let char_h = 5u * scale;
-  let gap    = scale;          // 1 scaled pixel gap
-  let stride = char_w + gap;
+  let text_gap = scale;          // 1 scaled pixel gap
+  let stride = char_w + text_gap;
   let margin = 2u * scale;
 
   // ---- Edit mode overlay text (under FPS) ----
@@ -282,7 +282,7 @@ fn fs_main(
     let toy = profile_base_y;
 
     // total pixel width of the string (don’t count trailing gap)
-    let text_w = text_len * stride - gap;
+    let text_w = text_len * stride - text_gap;
 
     // Right-align to FPS right edge
     let fps_right_i = i32(overlay.origin_x + overlay.total_w);
@@ -353,7 +353,7 @@ fn fs_main(
     }
 
     let toy = profile_base_y + line_i * (char_h + margin);
-    let text_w = text_len_line * stride - gap;
+    let text_w = text_len_line * stride - text_gap;
     let tox_i = max(0, fps_right_i - i32(text_w));
     let tox = u32(tox_i);
 
