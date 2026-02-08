@@ -6,7 +6,9 @@ pub struct Layouts {
     pub primary: wgpu::BindGroupLayout,
     pub scene: wgpu::BindGroupLayout,
     pub godray: wgpu::BindGroupLayout,
+    pub local_taa: wgpu::BindGroupLayout,
     pub composite: wgpu::BindGroupLayout,
+    pub composite_taa: wgpu::BindGroupLayout,
     pub empty: wgpu::BindGroupLayout,
     pub blit: wgpu::BindGroupLayout,
 }
@@ -211,6 +213,24 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         ],
     });
 
+    let local_taa = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("local_taa_bgl"),
+        entries: &[
+            bgl_tex_sample_2d(
+                0,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_tex_sample_2d(
+                1,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba32Float),
+            bgl_sampler_non_filtering(3, cs_vis),
+        ],
+    });
+
     let composite = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("composite_bgl"),
         entries: &[
@@ -248,6 +268,30 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         ],
     });
 
+    let composite_taa = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("composite_taa_bgl"),
+        entries: &[
+            bgl_tex_sample_2d(
+                0,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_tex_sample_2d(
+                1,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_tex_sample_2d(
+                2,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_sampler_non_filtering(3, cs_vis),
+            bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba32Float),
+            bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::Rgba32Float),
+        ],
+    });
+
     let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("empty_bgl"),
         entries: &[],
@@ -275,7 +319,9 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         primary,
         scene,
         godray,
+        local_taa,
         composite,
+        composite_taa,
         empty,
         blit,
     }

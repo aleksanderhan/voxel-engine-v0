@@ -161,7 +161,7 @@ const CLOUD_SILVER_STR : f32       = 0.6;
 
 // How much clouds attenuate SUNLIGHT hitting the world
 const CLOUD_SHADOW_ABSORB   : f32 = 6.0;
-const CLOUD_SHADOW_STRENGTH : f32 = 0.8;
+const CLOUD_SHADOW_STRENGTH : f32 = 0.65;
 
 // Sun-disc dim behavior (keep)
 const CLOUD_DIM_SUN_DISC : bool = true;
@@ -283,14 +283,23 @@ const LIGHT_EARLY_HITS : u32 = 4u;
 const VOXEL_AO_MAX_DIST     : f32 = 40.0;
 const LOCAL_LIGHT_MAX_DIST  : f32 = 50.0;
 const FAR_SHADING_DIST      : f32 = 64.0;
-const PRIMARY_CLOUD_SHADOWS : bool = false;
+const PRIMARY_CLOUD_SHADOWS : bool = true;
 
 //// --------------------------------------------------------------------------
 //// Local TAA
 //// --------------------------------------------------------------------------
 
 // Tune this: lower = steadier but slower response
-const LOCAL_TAA_ALPHA : f32 = 0.12;
+const LOCAL_TAA_ALPHA : f32 = 0.80;
+const LOCAL_TAA_ENABLED : bool = true;
+
+//// --------------------------------------------------------------------------
+//// Composite TAA
+//// --------------------------------------------------------------------------
+
+// Blend factor for full-frame TAA (lower = steadier, higher = faster response).
+const COMPOSITE_TAA_ALPHA : f32 = 0.45;
+const COMPOSITE_TAA_ENABLED : bool = true;
 
 //// --------------------------------------------------------------------------
 //// Grass “hair” (procedural blades)
@@ -453,7 +462,8 @@ fn prev_uv_from_world(p_ws: vec3<f32>) -> vec2<f32> {
   let clip = cam.prev_view_proj * vec4<f32>(p_ws, 1.0);
   let invw = 1.0 / max(clip.w, 1e-6);
   let ndc  = clip.xy * invw;          // -1..+1
-  return ndc * 0.5 + vec2<f32>(0.5);  // 0..1
+  let uv = ndc * 0.5 + vec2<f32>(0.5); // 0..1
+  return vec2<f32>(uv.x, 1.0 - uv.y);
 }
 
 fn in_unit_square(uv: vec2<f32>) -> bool {

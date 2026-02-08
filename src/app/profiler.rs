@@ -386,8 +386,14 @@ impl FrameProf {
 
         if let Some(g) = gpu {
             println!(
-                "  [gpu] primary={:.2}ms godray={:.2}ms composite={:.2}ms blit={:.2}ms total={:.2}ms",
-                g.primary, g.godray, g.composite, g.blit, g.total
+                "  [gpu] primary={:.2}ms local_taa={:.2}ms godray={:.2}ms composite={:.2}ms composite_taa={:.2}ms blit={:.2}ms total={:.2}ms",
+                g.primary,
+                g.local_taa,
+                g.godray,
+                g.composite,
+                g.composite_taa,
+                g.blit,
+                g.total
             );
         }
 

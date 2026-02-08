@@ -18,11 +18,14 @@ pub struct Tex2DArray {
 
 pub struct TextureSet {
     pub output: OutputTex,
+    pub output_pre_taa: Tex2D,
+    pub output_hist: [Tex2D; 2],
     pub color: Tex2D,
     pub depth: Tex2D,
 
     // per-pixel local lighting term (unfogged), written by primary
     pub local: Tex2D,
+    pub local_hist: [Tex2D; 2],
 
     pub primary_hit_hist: [Tex2D; 2],
     pub shadow_hist: Tex2D,
@@ -128,6 +131,32 @@ pub fn create_textures(
         wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
 
     let output = create_output_texture(device, out_w, out_h);
+    let output_pre_taa = make_tex2d(
+        device,
+        "output_pre_taa",
+        out_w,
+        out_h,
+        wgpu::TextureFormat::Rgba32Float,
+        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+    );
+    let output_hist = [
+        make_tex2d(
+            device,
+            "output_hist_a",
+            out_w,
+            out_h,
+            wgpu::TextureFormat::Rgba32Float,
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        ),
+        make_tex2d(
+            device,
+            "output_hist_b",
+            out_w,
+            out_h,
+            wgpu::TextureFormat::Rgba32Float,
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        ),
+    ];
 
     let color = make_tex2d(
         device,
@@ -219,12 +248,34 @@ pub fn create_textures(
         rw_tex_usage,
     );
 
+    let local_hist = [
+        make_tex2d(
+            device,
+            "local_hist_a",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::Rgba32Float,
+            rw_tex_usage,
+        ),
+        make_tex2d(
+            device,
+            "local_hist_b",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::Rgba32Float,
+            rw_tex_usage,
+        ),
+    ];
+
 
     TextureSet {
         output,
+        output_pre_taa,
+        output_hist,
         color,
         depth,
         local,
+        local_hist,
         primary_hit_hist,
         shadow_hist,
         shadow_hist_buf,
