@@ -8,6 +8,7 @@ pub struct Layouts {
     pub godray: wgpu::BindGroupLayout,
     pub local_taa: wgpu::BindGroupLayout,
     pub composite: wgpu::BindGroupLayout,
+    pub composite_taa: wgpu::BindGroupLayout,
     pub empty: wgpu::BindGroupLayout,
     pub blit: wgpu::BindGroupLayout,
 }
@@ -264,17 +265,30 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             // binding 6: sampler (can reuse same sampler type)
             bgl_sampler_non_filtering(6, cs_vis),
 
-            // binding 7: output_hist_tex (sampled)
+        ],
+    });
+
+    let composite_taa = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("composite_taa_bgl"),
+        entries: &[
             bgl_tex_sample_2d(
-                7,
+                0,
                 cs_vis,
                 wgpu::TextureSampleType::Float { filterable: false },
             ),
-            // binding 8: output_hist sampler
-            bgl_sampler_non_filtering(8, cs_vis),
-            // binding 9: output_hist_out (storage write)
-            bgl_storage_tex_wo(9, cs_vis, wgpu::TextureFormat::Rgba32Float),
-
+            bgl_tex_sample_2d(
+                1,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_tex_sample_2d(
+                2,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_sampler_non_filtering(3, cs_vis),
+            bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba32Float),
+            bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::Rgba32Float),
         ],
     });
 
@@ -307,6 +321,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         godray,
         local_taa,
         composite,
+        composite_taa,
         empty,
         blit,
     }
