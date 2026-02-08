@@ -55,7 +55,7 @@ fn grass_wind_dir_xz(p_ws: vec3<f32>, time_s: f32) -> vec2<f32> {
   if (dot(dir, dir) < 1e-4) {
     dir = vec2<f32>(0.7, 0.25);
   }
-  return normalize(dir);
+  return safe_normalize(vec3<f32>(dir, 0.0)).xy;
 }
 
 fn grass_blade_slivers(p_ws: vec3<f32>, time_s: f32, freq: f32, detail: f32) -> f32 {
@@ -167,8 +167,8 @@ fn voxel_ao_local(
   let r = 0.75 * cam.voxel_params.x;
 
   let up_ref = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.9);
-  let t = normalize(cross(up_ref, n));
-  let b = normalize(cross(n, t));
+  let t = safe_normalize(cross(up_ref, n));
+  let b = safe_normalize(cross(n, t));
 
   // 4 taps (same pattern as before, but macro occupancy)
   var occ = 0.0;
@@ -278,7 +278,7 @@ fn shade_hit(
 
       // Strong backscatter / “subsurface-ish” pop when sun is behind grass
       let back = pow(clamp(dot(-SUN_DIR, hg.n), 0.0, 1.0), 1.6);
-      let view_graze = pow(1.0 - max(dot(normalize(-rd), hg.n), 0.0), 2.0);
+      let view_graze = pow(1.0 - max(dot(safe_normalize(-rd), hg.n), 0.0), 2.0);
 
       // Add warm-green transmission
       base += (0.22 * back + 0.10 * view_graze * back) * vec3<f32>(0.18, 0.34, 0.10);
@@ -331,7 +331,7 @@ fn shade_hit(
 
   var spec_col = vec3<f32>(0.0);
   if (hg.t <= FAR_SHADING_DIST) {
-    let v = normalize(-rd);
+    let v = safe_normalize(-rd);
     let h = safe_normalize(v + SUN_DIR);
 
     let ndv = max(dot(hg.n, v), 0.0);
@@ -410,7 +410,7 @@ fn shade_clip_hit(ro: vec3<f32>, rd: vec3<f32>, ch: ClipHit, sky_up: vec3<f32>, 
 
   var spec_col = vec3<f32>(0.0);
   if (ch.t <= FAR_SHADING_DIST) {
-    let vdir = normalize(-rd);
+    let vdir = safe_normalize(-rd);
     let hdir = safe_normalize(vdir + SUN_DIR);
     let ndv  = max(dot(ch.n, vdir), 0.0);
     let ndh  = max(dot(ch.n, hdir), 0.0);

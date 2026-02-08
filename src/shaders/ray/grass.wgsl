@@ -120,7 +120,7 @@ fn sdf_capsule(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r: f32) -> f32 {
 fn make_orthonormal_basis(n: vec3<f32>) -> mat3x3<f32> {
   // n becomes Y axis in this basis; returns columns (x,y,z)
   let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.999);
-  let x = normalize(cross(up, n));
+  let x = safe_normalize(cross(up, n));
   let z = cross(n, x);
   return mat3x3<f32>(x, n, z);
 }
@@ -148,7 +148,7 @@ fn sdf_blade_segment(
   let t = clamp(dot(p - a, ab) / ab2, 0.0, 1.0);
   let c = a + ab * t;
 
-  let T = normalize(ab);
+  let T = safe_normalize(ab);
 
   // Build a stable frame: choose side axis from side_hint, made orthogonal to T.
   var S = side_hint - T * dot(side_hint, T);
@@ -290,7 +290,7 @@ fn grass_sdf_lod(
     // Keep a stable orientation per blade.
     let roll = TAU * (0.15 * ph + 0.10 * wR);
     let roll_dir = vec2<f32>(cos(roll), sin(roll));
-    var side_hint = normalize(vec3<f32>(
+    var side_hint = safe_normalize(vec3<f32>(
       lean_dir.x * roll_dir.x - lean_dir.y * roll_dir.y,
       0.12,
       lean_dir.x * roll_dir.y + lean_dir.y * roll_dir.x
@@ -316,7 +316,7 @@ fn grass_sdf_lod(
       let pa = root + vec3<f32>(offa.x, ya, offa.y);
       let pb = root + vec3<f32>(offb.x, yb, offb.y);
 
-      let T = normalize(pb - pa);
+      let T = safe_normalize(pb - pa);
 
       var S = side_hint - T * dot(side_hint, T);
       let s2 = dot(S, S);
@@ -387,7 +387,7 @@ fn grass_sdf_normal_lod(
 
     // tilt amount tuned small
     let tilt = 0.35;
-    return normalize(vec3<f32>(-w.x * tilt, 1.0, -w.y * tilt));
+    return safe_normalize(vec3<f32>(-w.x * tilt, 1.0, -w.y * tilt));
   }
 
   let e = 0.01 * cam.voxel_params.x;
@@ -404,7 +404,7 @@ fn grass_sdf_normal_lod(
     grass_sdf_lod(p_m + vec3<f32>(0.0, 0.0, e), cell_bmin_m, cell_id_vox, time_s, strength, lod) -
     grass_sdf_lod(p_m - vec3<f32>(0.0, 0.0, e), cell_bmin_m, cell_id_vox, time_s, strength, lod);
 
-  return normalize(vec3<f32>(dx, dy, dz));
+  return safe_normalize(vec3<f32>(dx, dy, dz));
 }
 
 fn grass_self_shadow(

@@ -165,8 +165,8 @@ fn gather_voxel_lights(
   var sum = vec3<f32>(0.0);
 
   for (var i: u32 = 0u; i < LIGHT_RAYS; i = i + 1u) {
-    var ldir = normalize(tbn * normalize(sphere_dir_local(i, LIGHT_RAYS)));
-    ldir = normalize(rot_about_axis(ldir, n, rot));
+    var ldir = safe_normalize(tbn * safe_normalize(sphere_dir_local(i, LIGHT_RAYS)));
+    ldir = safe_normalize(rot_about_axis(ldir, n, rot));
 
     let hit = dda_hit_light(p0, ldir, LIGHT_MAX_DIST_VOX, vs);
     if (hit.w > 0.5) {
