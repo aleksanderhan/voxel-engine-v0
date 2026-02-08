@@ -33,9 +33,10 @@ const PROFILE_VOXEL: u32 = 0u;
 const PROFILE_GRASS: u32 = 1u;
 const PROFILE_HDR: u32 = 2u;
 const PROFILE_FOG: u32 = 3u;
+const PROFILE_SHADOW: u32 = 4u;
 
 struct ProfileCounters {
-  counts: array<atomic<u32>, 4>,
+  counts: array<atomic<u32>, 5>,
 };
 
 @group(0) @binding(15) var shadow_hist_in : texture_2d<f32>;
@@ -414,6 +415,7 @@ fn main_primary(
 
     let shadow_do = (seed & SHADOW_SUBSAMPLE_MASK) == 0u;
     if (shadow_do) {
+      profile_add(PROFILE_SHADOW, 2u);
       var shadow_hist = textureLoad(shadow_hist_in, ip, 0).x;
       let uv_prev = prev_uv_from_world(hp);
       if (in_unit_square(uv_prev)) {
@@ -427,6 +429,7 @@ fn main_primary(
       let shadow_cur = sun_transmittance_geom_only(hp_shadow, SUN_DIR);
       shadow_out = mix(shadow_hist, shadow_cur, SHADOW_TAA_ALPHA);
     } else {
+      profile_add(PROFILE_SHADOW, 1u);
       shadow_out = clamp(textureLoad(shadow_hist_in, ip, 0).x, 0.0, 1.0);
     }
 

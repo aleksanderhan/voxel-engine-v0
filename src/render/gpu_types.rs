@@ -8,7 +8,7 @@
 use bytemuck::{Pod, Zeroable};
 use crate::app::config;
 
-pub const PRIMARY_PROFILE_COUNT: usize = 4;
+pub const PRIMARY_PROFILE_COUNT: usize = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
@@ -159,7 +159,7 @@ pub struct OverlayGpu {
     pub text_p1:  u32, // 4 ASCII bytes
     pub text_p2:  u32, // 4 ASCII bytes
 
-    // Profiling HUD lines (up to 4 lines, 12 chars each)
+    // Profiling HUD lines (up to 5 lines, 12 chars each)
     pub prof0_len: u32,
     pub prof0_p0:  u32,
     pub prof0_p1:  u32,
@@ -179,6 +179,11 @@ pub struct OverlayGpu {
     pub prof3_p0:  u32,
     pub prof3_p1:  u32,
     pub prof3_p2:  u32,
+
+    pub prof4_len: u32,
+    pub prof4_p0:  u32,
+    pub prof4_p1:  u32,
+    pub prof4_p2:  u32,
 
     // pad to 16-byte boundary
     pub _pad0: u32,
@@ -251,8 +256,8 @@ impl OverlayGpu {
 
         let (text_len, text_p0, text_p1, text_p2) = pack_text_12(label);
 
-        let mut prof_lines = [(0u32, 0u32, 0u32, 0u32); 4];
-        for (i, line) in profile_lines.iter().take(4).enumerate() {
+        let mut prof_lines = [(0u32, 0u32, 0u32, 0u32); 5];
+        for (i, line) in profile_lines.iter().take(5).enumerate() {
             prof_lines[i] = pack_text_12(line);
         }
 
@@ -287,6 +292,11 @@ impl OverlayGpu {
             prof3_p0: prof_lines[3].1,
             prof3_p1: prof_lines[3].2,
             prof3_p2: prof_lines[3].3,
+
+            prof4_len: prof_lines[4].0,
+            prof4_p0: prof_lines[4].1,
+            prof4_p1: prof_lines[4].2,
+            prof4_p2: prof_lines[4].3,
 
             _pad0: 0,
         }

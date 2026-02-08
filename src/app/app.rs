@@ -550,6 +550,7 @@ impl App {
             format!("GRS {}", Self::format_profile_count(counts[1])),
             format!("HDR {}", Self::format_profile_count(counts[2])),
             format!("FOG {}", Self::format_profile_count(counts[3])),
+            format!("SHD {}", Self::format_profile_count(counts[4])),
         ]
     }
 
