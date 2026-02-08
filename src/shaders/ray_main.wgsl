@@ -47,7 +47,6 @@
 @group(2) @binding(6) var local_samp     : sampler;
 
 var<workgroup> WG_SKY_UP : vec3<f32>;
-var<workgroup> WG_TILE_COUNT_CACHED : u32;
 
 fn pack_i16x2(a: i32, b: i32) -> u32 {
   return (u32(a) & 0xFFFFu) | ((u32(b) & 0xFFFFu) << 16u);
@@ -90,6 +89,7 @@ fn trace_primary_voxels(
   hist_valid: bool,
   hist_anchor_key: u32,
   hist_anchor_coord: vec3<i32>,
+  tile_index: u32,
   tile_candidate_count: u32,
   seed: u32
 ) -> VoxTraceResult {
@@ -104,6 +104,7 @@ fn trace_primary_voxels(
         hist_anchor_key != INVALID_U32,
         hist_anchor_coord,
         hist_anchor_key,
+        tile_index,
         tile_candidate_count,
         seed
       );
@@ -119,11 +120,66 @@ fn trace_primary_voxels(
       false,
       vec3<i32>(0),
       INVALID_U32,
+      tile_index,
       tile_candidate_count,
       seed
     );
   }
   return vt;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn main_tile_candidates(
+  @builtin(local_invocation_index) lid: u32,
+  @builtin(workgroup_id) wg_id: vec3<u32>
+) {
+  if (cam.tile_settings.y == 0u) { return; }
+
+  let render_dims = vec2<u32>(cam.render_present_px.x, cam.render_present_px.y);
+  let tiles_x = (render_dims.x + TILE_SIZE - 1u) / TILE_SIZE;
+  let tiles_y = (render_dims.y + TILE_SIZE - 1u) / TILE_SIZE;
+
+  if (wg_id.x >= tiles_x || wg_id.y >= tiles_y) { return; }
+
+  if (lid == 0u) {
+    atomicStore(&WG_TILE_COUNT, 0u);
+
+    let tile_index = wg_id.y * tiles_x + wg_id.x;
+
+    if (cam.chunk_count != 0u) {
+      let tile_base = vec2<f32>(
+        f32(wg_id.x * TILE_SIZE),
+        f32(wg_id.y * TILE_SIZE)
+      );
+      let ro_tile = cam.cam_pos.xyz;
+      let dims_f = vec2<f32>(f32(render_dims.x), f32(render_dims.y));
+      let px_min = vec2<f32>(0.5, 0.5);
+      let px_max = max(dims_f - vec2<f32>(0.5, 0.5), px_min);
+
+      let ray_count = clamp(cam.tile_settings.x, 1u, 2u);
+      var px = clamp(tile_base + vec2<f32>(4.5, 4.5), px_min, px_max);
+      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      if (ray_count > 1u) {
+        px = clamp(tile_base + vec2<f32>(1.5, 1.5), px_min, px_max);
+        tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
+      }
+    }
+
+    let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
+    tile_sort_candidates_by_enter(raw_count);
+    let stored_count = min(raw_count, PRIMARY_MAX_TILE_CHUNKS);
+    tile_candidates[tile_index].count = stored_count;
+
+    for (var i: u32 = 0u; i < PRIMARY_MAX_TILE_CHUNKS; i = i + 1u) {
+      if (i < stored_count) {
+        tile_candidates[tile_index].slots[i] = WG_TILE_SLOTS[i];
+        tile_candidates[tile_index].enters[i] = WG_TILE_ENTER[i];
+      } else {
+        tile_candidates[tile_index].slots[i] = INVALID_U32;
+        tile_candidates[tile_index].enters[i] = BIG_F32;
+      }
+    }
+  }
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -141,27 +197,6 @@ fn main_primary(
   }
   workgroupBarrier();
   let sky_up = WG_SKY_UP;
-
-  if (lid == 0u) {
-    atomicStore(&WG_TILE_COUNT, 0u);
-    if (cam.chunk_count != 0u) {
-      let tile_base = vec2<f32>(
-        f32(wg_id.x * TILE_SIZE),
-        f32(wg_id.y * TILE_SIZE)
-      );
-      let ro_tile = cam.cam_pos.xyz;
-
-      // Two candidate rays per tile to stabilize distant voxel selection.
-      var px = tile_base + vec2<f32>(4.5, 4.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-      px = tile_base + vec2<f32>(1.5, 1.5);
-      tile_append_candidates_for_ray(ro_tile, ray_dir_from_pixel(px), 0.0, FOG_MAX_DIST);
-    }
-    let raw_count = min(atomicLoad(&WG_TILE_COUNT), MAX_TILE_CHUNKS);
-    tile_sort_candidates_by_enter(raw_count);
-    WG_TILE_COUNT_CACHED = min(raw_count, PRIMARY_MAX_TILE_CHUNKS);
-  }
-  workgroupBarrier();
 
   let res = vec2<f32>(f32(dims.x), f32(dims.y));
   let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
@@ -240,7 +275,9 @@ fn main_primary(
   var hist_valid : bool = false;
   var hist_anchor_key  : u32 = INVALID_U32;
   var hist_anchor_coord: vec3<i32> = vec3<i32>(0);
-  let tile_candidate_count = WG_TILE_COUNT_CACHED;
+  let tiles_x = (dims.x + TILE_SIZE - 1u) / TILE_SIZE;
+  let tile_index = wg_id.y * tiles_x + wg_id.x;
+  let tile_candidate_count = tile_candidates[tile_index].count;
   let has_tile_candidates = tile_candidate_count != 0u;
   let uv  = px / res;
 
@@ -302,6 +339,7 @@ fn main_primary(
       hist_valid,
       hist_anchor_key,
       hist_anchor_coord,
+      tile_index,
       tile_candidate_count,
       seed
     );

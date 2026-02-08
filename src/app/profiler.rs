@@ -250,22 +250,20 @@ impl FrameProf {
         let avg = |x: f64| x / nf;
 
         // "Render time" average: only the per-slot timings (not profiling overhead).
-        let avg_frame = avg(
-            self.t_cam
-                + self.t_stream
-                + self.t_clipmap_update
-                + self.t_cam_write
-                + self.t_overlay
-                + self.t_chunk_uploads
-                + self.t_acq_swapchain
-                + self.t_encode_clipmap
-                + self.t_encode_compute
-                + self.t_encode_blit
-                + self.t_submit
-                + self.t_poll
-                + self.t_poll_wait
-                + self.t_present,
-        );
+        let avg_frame = avg(self.t_cam
+            + self.t_stream
+            + self.t_clipmap_update
+            + self.t_cam_write
+            + self.t_overlay
+            + self.t_chunk_uploads
+            + self.t_acq_swapchain
+            + self.t_encode_clipmap
+            + self.t_encode_compute
+            + self.t_encode_blit
+            + self.t_submit
+            + self.t_poll
+            + self.t_poll_wait
+            + self.t_present);
 
         println!(
             concat!(
@@ -386,7 +384,8 @@ impl FrameProf {
 
         if let Some(g) = gpu {
             println!(
-                "  [gpu] primary={:.2}ms local_taa={:.2}ms godray={:.2}ms composite={:.2}ms composite_taa={:.2}ms blit={:.2}ms total={:.2}ms",
+                "  [gpu] tile_candidates={:.2}ms primary={:.2}ms local_taa={:.2}ms godray={:.2}ms composite={:.2}ms composite_taa={:.2}ms blit={:.2}ms total={:.2}ms",
+                g.tile_candidates,
                 g.primary,
                 g.local_taa,
                 g.godray,

@@ -2,9 +2,7 @@
 // ----------------------------
 
 use crate::app::config;
-use crate::{
-    render::resources::{create_output_texture, OutputTex},
-};
+use crate::render::resources::{create_output_texture, OutputTex};
 
 pub struct Tex2D {
     pub tex: wgpu::Texture,
@@ -15,6 +13,10 @@ pub struct Tex2DArray {
     pub tex: wgpu::Texture,
     pub view: wgpu::TextureView,
 }
+
+const TILE_SIZE: u32 = 8;
+const PRIMARY_MAX_TILE_CHUNKS: u32 = 24;
+const TILE_CANDIDATE_BYTES: u64 = 16 + (PRIMARY_MAX_TILE_CHUNKS as u64) * 8;
 
 pub struct TextureSet {
     pub output: OutputTex,
@@ -30,11 +32,11 @@ pub struct TextureSet {
     pub primary_hit_hist: [Tex2D; 2],
     pub shadow_hist: Tex2D,
     pub shadow_hist_buf: wgpu::Buffer,
-    
+    pub tile_candidates: wgpu::Buffer,
+
     pub godray: [Tex2D; 2],
     pub clip_height: Tex2DArray,
 }
-
 
 fn make_tex2d(
     device: &wgpu::Device,
@@ -126,9 +128,7 @@ pub fn create_textures(
     internal_w: u32,
     internal_h: u32,
 ) -> TextureSet {
-
-    let rw_tex_usage =
-        wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
+    let rw_tex_usage = wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
 
     let output = create_output_texture(device, out_w, out_h);
     let output_pre_taa = make_tex2d(
@@ -209,6 +209,15 @@ pub fn create_textures(
     let shadow_bytes = (padded_bpr as u64) * (internal_h.max(1) as u64);
     let shadow_hist_buf = make_storage_buffer(device, "shadow_hist_buf", shadow_bytes);
 
+    let tiles_x = (internal_w.max(1) + TILE_SIZE - 1) / TILE_SIZE;
+    let tiles_y = (internal_h.max(1) + TILE_SIZE - 1) / TILE_SIZE;
+    let tile_count = (tiles_x.max(1) as u64) * (tiles_y.max(1) as u64);
+    let tile_candidates = make_storage_buffer(
+        device,
+        "tile_candidates_buf",
+        tile_count * TILE_CANDIDATE_BYTES,
+    );
+
     let godray = [
         make_tex2d(
             device,
@@ -267,7 +276,6 @@ pub fn create_textures(
         ),
     ];
 
-
     TextureSet {
         output,
         output_pre_taa,
@@ -279,6 +287,7 @@ pub fn create_textures(
         primary_hit_hist,
         shadow_hist,
         shadow_hist_buf,
+        tile_candidates,
         godray,
         clip_height,
     }

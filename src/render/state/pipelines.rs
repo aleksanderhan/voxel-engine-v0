@@ -17,6 +17,9 @@
 use super::layout::Layouts;
 
 pub struct Pipelines {
+    /// Compute pipeline for per-tile candidate list generation.
+    pub tile_candidates: wgpu::ComputePipeline,
+
     /// Compute pipeline for the primary full-resolution pass (writes color/depth).
     pub primary: wgpu::ComputePipeline,
 
@@ -96,6 +99,14 @@ pub fn create_pipelines(
         &[&layouts.primary],
     );
 
+    let tile_candidates = make_compute_pipeline(
+        device,
+        "tile_candidates_pipeline",
+        cs_module,
+        "main_tile_candidates",
+        &[&layouts.primary],
+    );
+
     // Godray pass:
     // Uses:
     //   group(0) = layouts.scene  (camera + scene buffers only)
@@ -135,7 +146,12 @@ pub fn create_pipelines(
         cs_module,
         "main_composite_taa",
         // group(0)=scene, group(1)=empty, group(2)=empty, group(3)=composite_taa
-        &[&layouts.scene, &layouts.empty, &layouts.empty, &layouts.composite_taa],
+        &[
+            &layouts.scene,
+            &layouts.empty,
+            &layouts.empty,
+            &layouts.composite_taa,
+        ],
     );
 
     // -------------------------------------------------------------------------
@@ -187,6 +203,7 @@ pub fn create_pipelines(
     });
 
     Pipelines {
+        tile_candidates,
         primary,
         godray,
         local_taa,

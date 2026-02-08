@@ -23,13 +23,13 @@ use super::profiler;
 use crate::app::camera::Camera;
 use crate::app::config;
 use crate::app::input::InputState;
+use crate::world::materials::{AIR, DIRT, LIGHT, STONE, WOOD};
 use crate::{
     clipmap::Clipmap,
     render::{CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
     streaming::ChunkManager,
     world::WorldGen,
 };
-use crate::world::materials::{AIR, DIRT, STONE, WOOD, LIGHT};
 
 pub async fn run(event_loop: EventLoop<()>, window: Arc<Window>) {
     let mut app = App::new(window).await;
@@ -98,6 +98,10 @@ pub struct App {
     // Motion vectors / temporal reprojection needs last frame's VP.
     prev_view_proj: glam::Mat4,
     has_prev_view_proj: bool,
+    last_cam_pos: glam::Vec3,
+    last_cam_forward: glam::Vec3,
+    last_chunk_count: u32,
+    has_tile_cam_state: bool,
 
     // Streaming update throttle.
     last_stream_update: Instant,
@@ -108,7 +112,6 @@ pub struct App {
 
     edit_mode: usize,
     edit_modes: Vec<EditMode>,
-
 }
 
 #[derive(Clone, Copy)]
@@ -151,9 +154,13 @@ impl App {
             desired_maximum_frame_latency: 2,
         };
 
-        let renderer =
-            Renderer::new(&adapter, surface_format, surface_config.width, surface_config.height)
-                .await;
+        let renderer = Renderer::new(
+            &adapter,
+            surface_format,
+            surface_config.width,
+            surface_config.height,
+        )
+        .await;
 
         surface.configure(renderer.device(), &surface_config);
 
@@ -207,6 +214,10 @@ impl App {
             last_frame_time: Instant::now(),
             prev_view_proj: glam::Mat4::IDENTITY,
             has_prev_view_proj: false,
+            last_cam_pos: camera.position(),
+            last_cam_forward: camera.forward(),
+            last_chunk_count: 0,
+            has_tile_cam_state: false,
             last_stream_update: Instant::now(),
             stream_period: Duration::from_millis(33), // 30 Hz
             physics,
@@ -319,7 +330,8 @@ impl App {
             if self.free_cam {
                 let eye = self.physics.player.pos + self.physics.eye_offset;
                 self.camera.set_position(eye);
-                self.camera.set_yaw_pitch(self.physics.yaw, self.physics.pitch);
+                self.camera
+                    .set_yaw_pitch(self.physics.yaw, self.physics.pitch);
             } else {
                 let (yaw, pitch) = self.camera.yaw_pitch();
                 self.physics.yaw = yaw;
@@ -383,7 +395,8 @@ impl App {
         let camera_position = self.camera.position();
 
         let (clip_params_cpu, clip_uploads) =
-            self.clipmap.update(self.world.as_ref(), camera_position, time_seconds);
+            self.clipmap
+                .update(self.world.as_ref(), camera_position, time_seconds);
         let clip_gpu = ClipmapGpu::from_cpu(&clip_params_cpu);
 
         // R16 = 2 bytes per texel.
@@ -392,8 +405,7 @@ impl App {
             .map(|upload| (upload.w as usize) * (upload.h as usize) * 2)
             .sum::<usize>();
 
-        self.profiler
-            .clip_update(profiler::FrameProf::end_ms(t0));
+        self.profiler.clip_update(profiler::FrameProf::end_ms(t0));
         self.profiler
             .add_clip_uploads(clip_uploads.len(), upload_bytes);
 
@@ -453,6 +465,26 @@ impl App {
         let ray_dx = ray10 - ray00;
         let ray_dy = ray01 - ray00;
 
+        let cam_forward = self.camera.forward();
+        let chunk_count = self.chunks.chunk_count();
+        let mut tile_rebuild = 1u32;
+        let mut tile_ray_count = 2u32;
+        if self.has_tile_cam_state {
+            let pos_delta = camera_frame.pos.distance(self.last_cam_pos);
+            let forward_dot = cam_forward.dot(self.last_cam_forward);
+            let stable =
+                pos_delta < 0.02 && forward_dot > 0.9995 && chunk_count == self.last_chunk_count;
+            if stable {
+                tile_rebuild = 0u32;
+                tile_ray_count = 1u32;
+            }
+        }
+
+        self.last_cam_pos = camera_frame.pos;
+        self.last_cam_forward = cam_forward;
+        self.last_chunk_count = chunk_count;
+        self.has_tile_cam_state = true;
+
         let camera_gpu = CameraGpu {
             view_inv: camera_frame.view_inv.to_cols_array_2d(),
             proj_inv: camera_frame.proj_inv.to_cols_array_2d(),
@@ -460,13 +492,18 @@ impl App {
             view_proj: view_proj.to_cols_array_2d(),
             prev_view_proj: previous_view_proj.to_cols_array_2d(),
 
-            cam_pos: [camera_frame.pos.x, camera_frame.pos.y, camera_frame.pos.z, 1.0],
+            cam_pos: [
+                camera_frame.pos.x,
+                camera_frame.pos.y,
+                camera_frame.pos.z,
+                1.0,
+            ],
             ray00: [ray00.x, ray00.y, ray00.z, 0.0],
             ray_dx: [ray_dx.x, ray_dx.y, ray_dx.z, 0.0],
             ray_dy: [ray_dy.x, ray_dy.y, ray_dy.z, 0.0],
 
             chunk_size: config::CHUNK_SIZE,
-            chunk_count: self.chunks.chunk_count(),
+            chunk_count,
             max_steps,
             frame_index: self.frame_index,
 
@@ -492,6 +529,7 @@ impl App {
                 self.surface_config.width,
                 self.surface_config.height,
             ],
+            tile_settings: [tile_ray_count, tile_rebuild, 0, 0],
         };
 
         self.renderer.write_camera(&camera_gpu);
@@ -515,7 +553,7 @@ impl App {
         }
 
         let edit_value = match self.edit_modes[self.edit_mode] {
-            EditMode::Dig => crate::world::materials::AIR,   // or keep a dedicated “DIG” path if you prefer
+            EditMode::Dig => crate::world::materials::AIR, // or keep a dedicated “DIG” path if you prefer
             EditMode::Place(m) => m,
         };
 
@@ -530,7 +568,6 @@ impl App {
 
         self.profiler.overlay(profiler::FrameProf::end_ms(t0));
     }
-
 
     fn apply_chunk_uploads_and_refresh_grid(&mut self) {
         let t0 = self.profiler.start();
@@ -612,8 +649,7 @@ impl App {
             }
         };
 
-        self.profiler
-            .acq_swapchain(profiler::FrameProf::end_ms(t0));
+        self.profiler.acq_swapchain(profiler::FrameProf::end_ms(t0));
 
         Some(frame)
     }
@@ -667,9 +703,9 @@ impl App {
         };
 
         let prof_overhead_ms = prof_start.elapsed().as_secs_f64() * 1000.0;
-        self.profiler.end_frame(render_ms, prof_overhead_ms, streaming_stats, gpu_timings_ms);
+        self.profiler
+            .end_frame(render_ms, prof_overhead_ms, streaming_stats, gpu_timings_ms);
     }
-
 
     fn update_editor(&mut self) {
         // scroll wheel selects mode
@@ -688,7 +724,9 @@ impl App {
     }
 
     fn enqueue_chunk_rebuild_now(&mut self, key: crate::streaming::types::ChunkKey) {
-        let Some(center) = self.chunks.build.last_center else { return; };
+        let Some(center) = self.chunks.build.last_center else {
+            return;
+        };
 
         crate::streaming::manager::build::request_edit_refresh(&mut self.chunks, key);
         crate::streaming::manager::build::dispatch_builds(&mut self.chunks, center);
@@ -701,12 +739,21 @@ impl App {
         let max_dist_m = 80.0;
         let voxel = config::VOXEL_SIZE_M_F32;
 
-        let Some((hit_w, place_w, enter_n)) = self.raycast_voxel(eye, dir, max_dist_m, voxel) else {
+        let Some((hit_w, place_w, enter_n)) = self.raycast_voxel(eye, dir, max_dist_m, voxel)
+        else {
             return;
         };
 
-        println!("HIT  = {:?} mat={}", hit_w, self.sample_voxel_material(hit_w.0, hit_w.1, hit_w.2));
-        println!("PLACE= {:?} mat={}", place_w, self.sample_voxel_material(place_w.0, place_w.1, place_w.2));
+        println!(
+            "HIT  = {:?} mat={}",
+            hit_w,
+            self.sample_voxel_material(hit_w.0, hit_w.1, hit_w.2)
+        );
+        println!(
+            "PLACE= {:?} mat={}",
+            place_w,
+            self.sample_voxel_material(place_w.0, place_w.1, place_w.2)
+        );
         println!("enter_n = {:?}", enter_n);
 
         // Decide edit operation.
@@ -719,25 +766,34 @@ impl App {
             EditMode::Place(m) => {
                 // Absolute guarantee: we never write into hit voxel when placing.
                 if place_w == hit_w {
-                    panic!("BUG: place_w == hit_w  hit={:?} place={:?} enter_n={:?}", hit_w, place_w, enter_n);
+                    panic!(
+                        "BUG: place_w == hit_w  hit={:?} place={:?} enter_n={:?}",
+                        hit_w, place_w, enter_n
+                    );
                 }
 
                 // Only place into empty.
                 let place_mat = self.sample_voxel_material(place_w.0, place_w.1, place_w.2);
                 if place_mat != AIR {
-                    println!("blocked: place_w {:?} is not AIR (mat={})", place_w, place_mat);
+                    println!(
+                        "blocked: place_w {:?} is not AIR (mat={})",
+                        place_w, place_mat
+                    );
                     return;
                 }
 
                 (place_w.0, place_w.1, place_w.2, m)
             }
-
         };
 
         // chunk key + local coords
         let (key, lx, ly, lz) = crate::world::edits::voxel_to_chunk_local(&self.world, tx, ty, tz);
 
-        println!("edit key={:?} state={:?}", key, self.chunks.build.chunks.get(&key));
+        println!(
+            "edit key={:?} state={:?}",
+            key,
+            self.chunks.build.chunks.get(&key)
+        );
 
         // pin so it will never unload
         self.chunks.pinned.insert(key);
@@ -750,12 +806,20 @@ impl App {
         let (pl_key, pl_lx, pl_ly, pl_lz) =
             crate::world::edits::voxel_to_chunk_local(&self.world, tx, ty, tz);
 
-        let hit_override = self.chunks.edits.get_override(hit_key, hit_lx, hit_ly, hit_lz);
-        let pl_override  = self.chunks.edits.get_override(pl_key, pl_lx, pl_ly, pl_lz);
+        let hit_override = self
+            .chunks
+            .edits
+            .get_override(hit_key, hit_lx, hit_ly, hit_lz);
+        let pl_override = self.chunks.edits.get_override(pl_key, pl_lx, pl_ly, pl_lz);
 
-        println!("override hit  {:?} local=({}, {}, {}) -> {:?}", hit_key, hit_lx, hit_ly, hit_lz, hit_override);
-        println!("override place {:?} local=({}, {}, {}) -> {:?}", pl_key, pl_lx, pl_ly, pl_lz, pl_override);
-
+        println!(
+            "override hit  {:?} local=({}, {}, {}) -> {:?}",
+            hit_key, hit_lx, hit_ly, hit_lz, hit_override
+        );
+        println!(
+            "override place {:?} local=({}, {}, {}) -> {:?}",
+            pl_key, pl_lx, pl_ly, pl_lz, pl_override
+        );
 
         let verify = self.chunks.edits.get_override(key, lx, ly, lz);
         println!(
@@ -883,7 +947,6 @@ impl App {
         None
     }
 
-
     fn sample_voxel_material(&self, wx: i32, wy: i32, wz: i32) -> u32 {
         let cs = config::CHUNK_SIZE as i32;
         let cx = wx.div_euclid(cs);
@@ -894,7 +957,11 @@ impl App {
         let ly = wy.rem_euclid(cs);
         let lz = wz.rem_euclid(cs);
 
-        let key = crate::streaming::types::ChunkKey { x: cx, y: cy, z: cz };
+        let key = crate::streaming::types::ChunkKey {
+            x: cx,
+            y: cy,
+            z: cz,
+        };
 
         if let Some(m) = self.chunks.edits.get_override(key, lx, ly, lz) {
             return m;
@@ -904,7 +971,6 @@ impl App {
         self.world
             .material_at_voxel_with_edits(&self.chunks.edits, wx, wy, wz)
     }
-
 }
 
 fn halton(mut index: u32, base: u32) -> f32 {

@@ -11,7 +11,7 @@ use crate::{
     render::gpu_types::{CameraGpu, OverlayGpu},
     streaming::ChunkUpload,
 };
-use bytemuck::{Pod, cast_slice};
+use bytemuck::{cast_slice, Pod};
 
 use bindgroups::{create_bind_groups, BindGroups};
 use buffers::{create_persistent_buffers, Buffers};
@@ -21,6 +21,7 @@ use textures::{create_textures, TextureSet};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuTimingsMs {
+    pub tile_candidates: f64,
     pub primary: f64,
     pub local_taa: f64,
     pub godray: f64,
@@ -29,7 +30,6 @@ pub struct GpuTimingsMs {
     pub blit: f64,
     pub total: f64,
 }
-
 
 pub struct Renderer {
     device: wgpu::Device,
@@ -53,11 +53,10 @@ pub struct Renderer {
 
     // --- GPU timestamp profiling (optional) ---
     ts_enabled: bool,
-    ts_period_ns: f64,              // ns per timestamp tick
+    ts_period_ns: f64, // ns per timestamp tick
     ts_qs: Option<wgpu::QuerySet>,
-    ts_resolve: Option<wgpu::Buffer>,   // QUERY_RESOLVE | COPY_SRC
-    ts_readback: Option<wgpu::Buffer>,  // COPY_DST | MAP_READ
-
+    ts_resolve: Option<wgpu::Buffer>,  // QUERY_RESOLVE | COPY_SRC
+    ts_readback: Option<wgpu::Buffer>, // COPY_DST | MAP_READ
 }
 
 #[derive(Clone)]
@@ -67,7 +66,9 @@ struct Region {
 }
 
 fn merge_adjacent(mut regions: Vec<Region>) -> Vec<Region> {
-    if regions.is_empty() { return regions; }
+    if regions.is_empty() {
+        return regions;
+    }
     regions.sort_by_key(|r| r.off);
 
     let mut out: Vec<Region> = Vec::with_capacity(regions.len());
@@ -88,12 +89,16 @@ fn merge_adjacent(mut regions: Vec<Region>) -> Vec<Region> {
 
 // T must be Pod so we can cast to bytes safely.
 fn push_typed_region<T: Pod>(regions: &mut Vec<Region>, off_elems: u32, stride: u64, slice: &[T]) {
-    if slice.is_empty() { return; }
+    if slice.is_empty() {
+        return;
+    }
     let off = (off_elems as u64) * stride;
     let bytes: &[u8] = bytemuck::cast_slice(slice);
-    regions.push(Region { off, data: bytes.to_vec() });
+    regions.push(Region {
+        off,
+        data: bytes.to_vec(),
+    });
 }
-
 
 fn align_up(v: usize, a: usize) -> usize {
     (v + (a - 1)) & !(a - 1)
@@ -107,13 +112,16 @@ fn batch_write_meta(
     chunk_capacity: u32,
 ) {
     // Collect (slot, meta)
-    let mut items: Vec<(u32, crate::render::gpu_types::ChunkMetaGpu)> = Vec::with_capacity(uploads.len());
+    let mut items: Vec<(u32, crate::render::gpu_types::ChunkMetaGpu)> =
+        Vec::with_capacity(uploads.len());
     for u in uploads {
         if u.slot < chunk_capacity {
             items.push((u.slot, u.meta));
         }
     }
-    if items.is_empty() { return; }
+    if items.is_empty() {
+        return;
+    }
 
     // Sort by slot so we can find contiguous runs
     items.sort_by_key(|(slot, _)| *slot);
@@ -158,7 +166,11 @@ impl Renderer {
         let adapter_features = adapter.features();
         let want = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         let use_ts = adapter_features.contains(want);
-        let required_features = if use_ts { want } else { wgpu::Features::empty() };
+        let required_features = if use_ts {
+            want
+        } else {
+            wgpu::Features::empty()
+        };
 
         let (device, queue) = adapter
             .request_device(
@@ -172,7 +184,7 @@ impl Renderer {
             .await
             .unwrap();
 
-        const TS_COUNT: u32 = 12;
+        const TS_COUNT: u32 = 14;
         let (ts_qs, ts_resolve, ts_readback, ts_period_ns) = if use_ts {
             let qs = device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("ts_qs"),
@@ -230,7 +242,7 @@ impl Renderer {
         let render_scale = config::RENDER_SCALE;
         let internal_w = ((width as f32) * render_scale).round().max(1.0) as u32;
         let internal_h = ((height as f32) * render_scale).round().max(1.0) as u32;
-        
+
         let textures = create_textures(&device, width, height, internal_w, internal_h);
         let bind_groups = create_bind_groups(&device, &layouts, &buffers, &textures, &sampler);
 
@@ -258,7 +270,9 @@ impl Renderer {
 
     #[inline]
     fn ts_pair(&self, begin: u32, end: u32) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
-        if !self.ts_enabled { return None; }
+        if !self.ts_enabled {
+            return None;
+        }
         Some(wgpu::ComputePassTimestampWrites {
             query_set: self.ts_qs.as_ref().unwrap(),
             beginning_of_pass_write_index: Some(begin),
@@ -268,7 +282,9 @@ impl Renderer {
 
     #[inline]
     fn ts_pair_rp(&self, begin: u32, end: u32) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
-        if !self.ts_enabled { return None; }
+        if !self.ts_enabled {
+            return None;
+        }
         Some(wgpu::RenderPassTimestampWrites {
             query_set: self.ts_qs.as_ref().unwrap(),
             beginning_of_pass_write_index: Some(begin),
@@ -288,10 +304,20 @@ impl Renderer {
         self.internal_w = ((width as f32) * self.render_scale).round().max(1.0) as u32;
         self.internal_h = ((height as f32) * self.render_scale).round().max(1.0) as u32;
 
-        self.textures = create_textures(&self.device, width, height, self.internal_w, self.internal_h);
+        self.textures = create_textures(
+            &self.device,
+            width,
+            height,
+            self.internal_w,
+            self.internal_h,
+        );
 
         self.bind_groups = create_bind_groups(
-            &self.device, &self.layouts, &self.buffers, &self.textures, &self.sampler,
+            &self.device,
+            &self.layouts,
+            &self.buffers,
+            &self.textures,
+            &self.sampler,
         );
 
         self.ping = 0;
@@ -322,8 +348,22 @@ impl Renderer {
 
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("primary_pass"),
+                label: Some("tile_candidates_pass"),
                 timestamp_writes: self.ts_pair(0, 1),
+            });
+
+            cpass.set_pipeline(&self.pipelines.tile_candidates);
+            cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
+
+            let gx = (self.internal_w + 7) / 8;
+            let gy = (self.internal_h + 7) / 8;
+            cpass.dispatch_workgroups(gx, gy, 1);
+        }
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("primary_pass"),
+                timestamp_writes: self.ts_pair(2, 3),
             });
 
             cpass.set_pipeline(&self.pipelines.primary);
@@ -332,13 +372,12 @@ impl Renderer {
             let gx = (self.internal_w + 7) / 8;
             let gy = (self.internal_h + 7) / 8;
             cpass.dispatch_workgroups(gx, gy, 1);
-
         }
 
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("local_taa_pass"),
-                timestamp_writes: self.ts_pair(2, 3),
+                timestamp_writes: self.ts_pair(4, 5),
             });
 
             cpass.set_pipeline(&self.pipelines.local_taa);
@@ -380,7 +419,7 @@ impl Renderer {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("godray_pass"),
-                timestamp_writes: self.ts_pair(4, 5),
+                timestamp_writes: self.ts_pair(6, 7),
             });
 
             cpass.set_pipeline(&self.pipelines.godray);
@@ -395,7 +434,7 @@ impl Renderer {
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("composite_pass"),
-                timestamp_writes: self.ts_pair(6, 7),
+                timestamp_writes: self.ts_pair(8, 9),
             });
 
             cpass.set_pipeline(&self.pipelines.composite);
@@ -412,13 +451,12 @@ impl Renderer {
             let gx = (width + 7) / 8;
             let gy = (height + 7) / 8;
             cpass.dispatch_workgroups(gx, gy, 1);
-
         }
 
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("composite_taa_pass"),
-                timestamp_writes: self.ts_pair(8, 9),
+                timestamp_writes: self.ts_pair(10, 11),
             });
 
             cpass.set_pipeline(&self.pipelines.composite_taa);
@@ -447,7 +485,7 @@ impl Renderer {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: self.ts_pair_rp(10, 11),
+            timestamp_writes: self.ts_pair_rp(12, 13),
             occlusion_query_set: None,
         });
 
@@ -459,7 +497,7 @@ impl Renderer {
     pub fn apply_chunk_uploads(&self, uploads: &[ChunkUpload]) {
         let node_stride = std::mem::size_of::<crate::render::gpu_types::NodeGpu>() as u64;
         let meta_stride = std::mem::size_of::<crate::render::gpu_types::ChunkMetaGpu>() as u64;
-        let u32_stride  = std::mem::size_of::<u32>() as u64;
+        let u32_stride = std::mem::size_of::<u32>() as u64;
         let rope_stride = std::mem::size_of::<crate::render::gpu_types::NodeRopesGpu>() as u64;
 
         // 1) Meta in big runs
@@ -482,7 +520,12 @@ impl Renderer {
             if !u.nodes.is_empty() {
                 let needed = u.nodes.len() as u32;
                 if u.node_base + needed <= self.buffers.node_capacity {
-                    push_typed_region(&mut node_regions, u.node_base, node_stride, u.nodes.as_ref());
+                    push_typed_region(
+                        &mut node_regions,
+                        u.node_base,
+                        node_stride,
+                        u.nodes.as_ref(),
+                    );
                 }
             }
 
@@ -490,7 +533,12 @@ impl Renderer {
             if !u.macro_words.is_empty() {
                 let needed = u.macro_words.len() as u32;
                 if u.meta.macro_base + needed <= self.buffers.macro_capacity_u32 {
-                    push_typed_region(&mut macro_regions, u.meta.macro_base, u32_stride, u.macro_words.as_ref());
+                    push_typed_region(
+                        &mut macro_regions,
+                        u.meta.macro_base,
+                        u32_stride,
+                        u.macro_words.as_ref(),
+                    );
                 }
             }
 
@@ -498,7 +546,12 @@ impl Renderer {
             if !u.ropes.is_empty() {
                 let needed = u.ropes.len() as u32;
                 if u.node_base + needed <= self.buffers.rope_capacity {
-                    push_typed_region(&mut rope_regions, u.node_base, rope_stride, u.ropes.as_ref());
+                    push_typed_region(
+                        &mut rope_regions,
+                        u.node_base,
+                        rope_stride,
+                        u.ropes.as_ref(),
+                    );
                 }
             }
 
@@ -506,7 +559,12 @@ impl Renderer {
             if !u.colinfo_words.is_empty() {
                 let needed = u.colinfo_words.len() as u32;
                 if u.meta.colinfo_base + needed <= self.buffers.colinfo_capacity_u32 {
-                    push_typed_region(&mut colinfo_regions, u.meta.colinfo_base, u32_stride, u.colinfo_words.as_ref());
+                    push_typed_region(
+                        &mut colinfo_regions,
+                        u.meta.colinfo_base,
+                        u32_stride,
+                        u.colinfo_words.as_ref(),
+                    );
                 }
             }
         }
@@ -516,17 +574,18 @@ impl Renderer {
             self.queue.write_buffer(&self.buffers.node, r.off, &r.data);
         }
         for r in merge_adjacent(macro_regions) {
-            self.queue.write_buffer(&self.buffers.macro_occ, r.off, &r.data);
+            self.queue
+                .write_buffer(&self.buffers.macro_occ, r.off, &r.data);
         }
         for r in merge_adjacent(rope_regions) {
-            self.queue.write_buffer(&self.buffers.node_ropes, r.off, &r.data);
+            self.queue
+                .write_buffer(&self.buffers.node_ropes, r.off, &r.data);
         }
         for r in merge_adjacent(colinfo_regions) {
-            self.queue.write_buffer(&self.buffers.colinfo, r.off, &r.data);
+            self.queue
+                .write_buffer(&self.buffers.colinfo, r.off, &r.data);
         }
     }
-
-
 
     pub fn write_clipmap_updates(
         &mut self,
@@ -539,9 +598,11 @@ impl Renderer {
         for u in uploads {
             let w = u.w as usize;
             let h = u.h as usize;
-            if w == 0 || h == 0 { continue; }
+            if w == 0 || h == 0 {
+                continue;
+            }
 
-            let row_bytes = w * 4;                 // R32Float => 4 bytes/texel
+            let row_bytes = w * 4; // R32Float => 4 bytes/texel
             let padded = align_up(row_bytes, 256); // required
             let needed = padded * h;
 
@@ -556,12 +617,15 @@ impl Renderer {
                 scratch[d0..d0 + row_bytes].copy_from_slice(&src[s0..s0 + row_bytes]);
             }
 
-
             self.queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: &self.textures.clip_height.tex,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x: u.x, y: u.y, z: u.level },
+                    origin: wgpu::Origin3d {
+                        x: u.x,
+                        y: u.y,
+                        z: u.level,
+                    },
                     aspect: wgpu::TextureAspect::All,
                 },
                 &scratch,
@@ -570,12 +634,17 @@ impl Renderer {
                     bytes_per_row: Some(padded as u32),
                     rows_per_image: Some(u.h),
                 },
-                wgpu::Extent3d { width: u.w, height: u.h, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width: u.w,
+                    height: u.h,
+                    depth_or_array_layers: 1,
+                },
             );
         }
 
         // 2) uniform
-        self.queue.write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
+        self.queue
+            .write_buffer(&self.buffers.clipmap, 0, bytemuck::bytes_of(clip));
     }
 
     pub fn internal_dims(&self) -> (u32, u32) {
@@ -583,16 +652,20 @@ impl Renderer {
     }
 
     pub fn encode_timestamp_resolve(&self, encoder: &mut wgpu::CommandEncoder) {
-        if !self.ts_enabled { return; }
+        if !self.ts_enabled {
+            return;
+        }
         let qs = self.ts_qs.as_ref().unwrap();
         let resolve = self.ts_resolve.as_ref().unwrap();
         let readback = self.ts_readback.as_ref().unwrap();
-        encoder.resolve_query_set(qs, 0..10, resolve, 0);
-        encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, 10 * 8);
+        encoder.resolve_query_set(qs, 0..14, resolve, 0);
+        encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, 14 * 8);
     }
 
     pub fn read_gpu_timings_ms_blocking(&self) -> Option<GpuTimingsMs> {
-        if !self.ts_enabled { return None; }
+        if !self.ts_enabled {
+            return None;
+        }
 
         // Kick off an async map on the readback buffer
         let readback = self.ts_readback.as_ref().unwrap();
@@ -613,18 +686,18 @@ impl Renderer {
             .expect("map_async dropped")
             .expect("map_async failed");
 
-        // Read 12 u64 timestamps
+        // Read 14 u64 timestamps
         let data = slice.get_mapped_range();
         let words: &[u64] = bytemuck::cast_slice(&data);
-        if words.len() < 12 {
+        if words.len() < 14 {
             drop(data);
             readback.unmap();
             return None;
         }
 
         let ts = [
-            words[0], words[1], words[2], words[3], words[4], words[5],
-            words[6], words[7], words[8], words[9], words[10], words[11],
+            words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
+            words[8], words[9], words[10], words[11], words[12], words[13],
         ];
 
         drop(data);
@@ -635,23 +708,29 @@ impl Renderer {
         let ns = self.ts_period_ns;
         let to_ms = |a: u64, b: u64| -> f64 { (b.saturating_sub(a) as f64) * ns * 1e-6 };
 
-        let primary   = to_ms(ts[0], ts[1]);
-        let local_taa = to_ms(ts[2], ts[3]);
-        let godray    = to_ms(ts[4], ts[5]);
-        let composite = to_ms(ts[6], ts[7]);
-        let composite_taa = to_ms(ts[8], ts[9]);
-        let blit      = to_ms(ts[10], ts[11]);
+        let tile_candidates = to_ms(ts[0], ts[1]);
+        let primary = to_ms(ts[2], ts[3]);
+        let local_taa = to_ms(ts[4], ts[5]);
+        let godray = to_ms(ts[6], ts[7]);
+        let composite = to_ms(ts[8], ts[9]);
+        let composite_taa = to_ms(ts[10], ts[11]);
+        let blit = to_ms(ts[12], ts[13]);
 
         Some(GpuTimingsMs {
+            tile_candidates,
             primary,
             local_taa,
             godray,
             composite,
             composite_taa,
             blit,
-            total: primary + local_taa + godray + composite + composite_taa + blit,
+            total: tile_candidates
+                + primary
+                + local_taa
+                + godray
+                + composite
+                + composite_taa
+                + blit,
         })
     }
-
-
 }

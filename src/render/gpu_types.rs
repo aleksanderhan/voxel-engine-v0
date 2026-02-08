@@ -5,8 +5,8 @@
 // `inv_cell_size_m` field on CPU side.
 // GPU uniform uses vec4 per level with packed offsets in .w.
 
-use bytemuck::{Pod, Zeroable};
 use crate::app::config;
+use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
@@ -29,7 +29,6 @@ pub struct NodeRopesGpu {
     pub _pad0: u32,
     pub _pad1: u32,
 }
-
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -71,9 +70,9 @@ pub struct CameraGpu {
 
     pub render_present_px: [u32; 4],
 
+    pub tile_settings: [u32; 4],
     // No trailing padding needed (struct ends on 16B boundary).
 }
-
 
 /// Clipmap uniform payload.
 ///
@@ -97,13 +96,13 @@ pub struct ClipmapGpu {
     pub base_cell_m: f32,
     pub _pad0: f32,
 
-    pub level:  [[f32; 4]; config::CLIPMAP_LEVELS_USIZE],
+    pub level: [[f32; 4]; config::CLIPMAP_LEVELS_USIZE],
     pub offset: [[u32; 4]; config::CLIPMAP_LEVELS_USIZE],
 }
 
 impl ClipmapGpu {
     pub fn from_cpu(cpu: &crate::clipmap::ClipmapParamsCpu) -> Self {
-        let mut level  = [[0.0f32; 4]; config::CLIPMAP_LEVELS_USIZE];
+        let mut level = [[0.0f32; 4]; config::CLIPMAP_LEVELS_USIZE];
         let mut offset = [[0u32; 4]; config::CLIPMAP_LEVELS_USIZE];
 
         for i in 0..config::CLIPMAP_LEVELS_USIZE {
@@ -126,7 +125,6 @@ impl ClipmapGpu {
     }
 }
 
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct OverlayGpu {
@@ -136,37 +134,37 @@ pub struct OverlayGpu {
     // HUD rectangle in framebuffer pixel coords (top-left origin)
     pub origin_x: u32,
     pub origin_y: u32,
-    pub total_w:  u32,
+    pub total_w: u32,
 
-    pub digit_h:  u32,
-    pub scale:    u32,
-    pub stride:   u32,
+    pub digit_h: u32,
+    pub scale: u32,
+    pub stride: u32,
 
     // --- NEW: mode label ("DIG", "DIRT", "STONE", ...)
     pub text_len: u32, // number of chars <= 20
-    pub text_p0:  u32, // 4 ASCII bytes packed little-endian
-    pub text_p1:  u32, // 4 ASCII bytes
-    pub text_p2:  u32, // 4 ASCII bytes
-    pub text_p3:  u32, // 4 ASCII bytes
-    pub text_p4:  u32, // 4 ASCII bytes
+    pub text_p0: u32,  // 4 ASCII bytes packed little-endian
+    pub text_p1: u32,  // 4 ASCII bytes
+    pub text_p2: u32,  // 4 ASCII bytes
+    pub text_p3: u32,  // 4 ASCII bytes
+    pub text_p4: u32,  // 4 ASCII bytes
 
     // pad to 80 bytes (WGSL uniform structs round to 16-byte alignment)
     pub _pad0: [u32; 4],
 }
 
-
 fn pack4(a: u8, b: u8, c: u8, d: u8) -> u32 {
-    (a as u32)
-        | ((b as u32) << 8)
-        | ((c as u32) << 16)
-        | ((d as u32) << 24)
+    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
 }
 
 fn pack_text_20(s: &str) -> (u32, u32, u32, u32, u32, u32) {
     // Uppercase, ASCII only, pad with spaces, clamp to 20 chars.
     let mut buf = [b' '; 20];
     for (i, ch) in s.bytes().take(20).enumerate() {
-        let u = if (b'a'..=b'z').contains(&ch) { ch - 32 } else { ch };
+        let u = if (b'a'..=b'z').contains(&ch) {
+            ch - 32
+        } else {
+            ch
+        };
         buf[i] = u;
     }
 
@@ -180,18 +178,15 @@ fn pack_text_20(s: &str) -> (u32, u32, u32, u32, u32, u32) {
 }
 
 impl OverlayGpu {
-    pub fn from_fps_edit(
-        fps: u32,
-        edit_mat: u32,
-        width: u32,
-        _height: u32,
-        scale: u32,
-    ) -> Self {
+    pub fn from_fps_edit(fps: u32, edit_mat: u32, width: u32, _height: u32, scale: u32) -> Self {
         // ---- FPS digits ----
         let mut v = fps.min(9999);
-        let d0 = (v % 10) as u32; v /= 10;
-        let d1 = (v % 10) as u32; v /= 10;
-        let d2 = (v % 10) as u32; v /= 10;
+        let d0 = (v % 10) as u32;
+        v /= 10;
+        let d1 = (v % 10) as u32;
+        v /= 10;
+        let d2 = (v % 10) as u32;
+        v /= 10;
         let d3 = (v % 10) as u32;
         let digits_packed = d0 | (d1 << 8) | (d2 << 16) | (d3 << 24);
 
@@ -199,8 +194,8 @@ impl OverlayGpu {
         let margin: u32 = 12;
         let digit_w = 3 * scale;
         let digit_h = 5 * scale;
-        let gap     = 1 * scale;
-        let stride  = digit_w + gap;
+        let gap = 1 * scale;
+        let stride = digit_w + gap;
         let total_w = 4 * digit_w + 3 * gap;
 
         let ox_i = width as i32 - margin as i32 - total_w as i32;
@@ -212,10 +207,10 @@ impl OverlayGpu {
         // ---- Label ----
         // IMPORTANT: use material IDs -> strings (NOT raw ID bytes).
         let label: &str = match edit_mat {
-            crate::world::materials::AIR   => "AIR",
-            crate::world::materials::DIRT  => "DIRT",
+            crate::world::materials::AIR => "AIR",
+            crate::world::materials::DIRT => "DIRT",
             crate::world::materials::STONE => "STONE",
-            crate::world::materials::WOOD  => "WOOD",
+            crate::world::materials::WOOD => "WOOD",
             crate::world::materials::LIGHT => "LIGHT",
             _ => "UNKNOWN", // fallback;
         };

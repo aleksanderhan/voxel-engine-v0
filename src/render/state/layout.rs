@@ -151,27 +151,24 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     // 14 primary hit history sampler
     // 15 sun-shadow history (sampled)
     // 16 sun-shadow history output (storage buffer write)
-    let primary_entries: [wgpu::BindGroupLayoutEntry; 17] = [
+    // 17 tile candidate lists (storage read/write)
+    let primary_entries: [wgpu::BindGroupLayoutEntry; 18] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
         bgl_storage_ro(3, cs_vis),
-
         bgl_storage_tex_wo(4, cs_vis, wgpu::TextureFormat::Rgba32Float),
         bgl_storage_tex_wo(5, cs_vis, wgpu::TextureFormat::R32Float),
         bgl_storage_tex_wo(6, cs_vis, wgpu::TextureFormat::Rgba32Float), // local
-
         bgl_uniform(7, cs_vis),
         bgl_tex_sample_2d_array(
             8,
             cs_vis,
             wgpu::TextureSampleType::Float { filterable: false },
         ),
-
         bgl_storage_ro(9, cs_vis),
         bgl_storage_ro(10, cs_vis),
         bgl_storage_ro(11, cs_vis),
-
         bgl_tex_sample_2d(
             12,
             cs_vis,
@@ -185,13 +182,13 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             wgpu::TextureSampleType::Float { filterable: false },
         ),
         bgl_storage_rw(16, cs_vis),
+        bgl_storage_rw(17, cs_vis),
     ];
 
     let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("primary_bgl"),
         entries: &primary_entries,
     });
-
 
     let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("godray_bgl"),
@@ -243,17 +240,14 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
                 wgpu::TextureSampleType::Float { filterable: false },
             ),
             bgl_storage_tex_wo(2, cs_vis, wgpu::TextureFormat::Rgba32Float),
-
             // full-res depth for depth-aware upsample
             bgl_tex_sample_2d(
                 3,
                 cs_vis,
                 wgpu::TextureSampleType::Float { filterable: false },
             ),
-
             // NEW: sampler for godray_tex (used by textureSampleLevel)
             bgl_sampler_non_filtering(4, cs_vis),
-
             // binding 5: local_hist_tex (sampled)
             bgl_tex_sample_2d(
                 5,
@@ -262,7 +256,6 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
             ),
             // binding 6: sampler (can reuse same sampler type)
             bgl_sampler_non_filtering(6, cs_vis),
-
         ],
     });
 

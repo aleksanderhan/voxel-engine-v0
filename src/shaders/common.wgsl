@@ -353,6 +353,13 @@ struct NodeRopes {
   _pad1: u32,
 };
 
+struct TileCandidateList {
+  count : u32,
+  _pad0 : vec3<u32>,
+  slots : array<u32, PRIMARY_MAX_TILE_CHUNKS>,
+  enters: array<f32, PRIMARY_MAX_TILE_CHUNKS>,
+};
+
 struct Camera {
   view_inv    : mat4x4<f32>,
   proj_inv    : mat4x4<f32>,
@@ -378,6 +385,8 @@ struct Camera {
   // xy = render size in pixels, zw = present size in pixels
   render_present_px : vec4<u32>,
 
+  // x = tile candidate ray count, y = tile candidate rebuild (0/1), zw reserved
+  tile_settings : vec4<u32>,
 };
 
 struct ChunkMeta {
@@ -403,6 +412,7 @@ struct ChunkMeta {
 @group(0) @binding(9)  var<storage, read> macro_occ : array<u32>;
 @group(0) @binding(10) var<storage, read> node_ropes: array<NodeRopes>;
 @group(0) @binding(11) var<storage, read> chunk_colinfo : array<u32>;
+@group(0) @binding(17) var<storage, read_write> tile_candidates : array<TileCandidateList>;
 
 
 //// --------------------------------------------------------------------------

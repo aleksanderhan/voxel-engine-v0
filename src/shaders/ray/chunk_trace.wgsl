@@ -1182,6 +1182,7 @@ fn trace_scene_voxels_candidates(
   anchor_valid_in: bool,
   anchor_chunk_in: vec3<i32>,
   anchor_key_in: u32,
+  tile_index: u32,
   candidate_count: u32,
   grass_seed: u32
 ) -> VoxTraceResult {
@@ -1213,11 +1214,12 @@ fn trace_scene_voxels_candidates(
 
   let inv = vec3<f32>(safe_inv(rd.x), safe_inv(rd.y), safe_inv(rd.z));
   let root_size = f32(cam.chunk_size) * voxel_size;
-  let max_candidates = min(candidate_count, MAX_TILE_CHUNKS);
+  let max_candidates = min(candidate_count, PRIMARY_MAX_TILE_CHUNKS);
+  let tile_list = tile_candidates[tile_index];
 
   for (var i: u32 = 0u; i < max_candidates; i = i + 1u) {
-    if (best.hit != 0u && WG_TILE_ENTER[i] >= best.t) { break; }
-    let slot = WG_TILE_SLOTS[i];
+    if (best.hit != 0u && tile_list.enters[i] >= best.t) { break; }
+    let slot = tile_list.slots[i];
     if (slot == INVALID_U32 || slot >= cam.chunk_count) { continue; }
 
     let ch = chunks[slot];
