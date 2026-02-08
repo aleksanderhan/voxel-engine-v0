@@ -191,6 +191,8 @@ impl App {
         // --- Profiling (default off) ---------------------------------------------------------
         let (prof_enabled, prof_every) = profiler::settings_from_args();
         let profiler = profiler::FrameProf::new(prof_enabled, prof_every);
+        let camera_pos = camera.position();
+        let camera_forward = camera.forward();
 
         Self {
             window,
@@ -214,8 +216,8 @@ impl App {
             last_frame_time: Instant::now(),
             prev_view_proj: glam::Mat4::IDENTITY,
             has_prev_view_proj: false,
-            last_cam_pos: camera.position(),
-            last_cam_forward: camera.forward(),
+            last_cam_pos: camera_pos,
+            last_cam_forward: camera_forward,
             last_chunk_count: 0,
             has_tile_cam_state: false,
             last_stream_update: Instant::now(),
