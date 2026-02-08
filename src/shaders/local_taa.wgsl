@@ -27,13 +27,20 @@ fn main_local_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ip = vec2<i32>(i32(gid.x), i32(gid.y));
   let uv = (vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5)) / vec2<f32>(f32(dims.x), f32(dims.y));
 
-  let cur4  = textureSampleLevel(local_in_tex,   local_taa_samp, uv, 0.0);
+  let cur4  = textureSampleLevel(local_in_tex,      local_taa_samp, uv, 0.0);
   let hist4 = textureSampleLevel(local_hist_in_tex, local_taa_samp, uv, 0.0);
 
   let cur   = cur4.xyz;
   let w_in  = cur4.w;          // local_w in [0,1] meaning “valid this frame”
-  let hist  = hist4.xyz;
-  let conf0 = hist4.w;         // history confidence in [0,1] (we’ll maintain it)
+  let hist_ok = !(is_bad_vec3(hist4.xyz));
+  let hist  = select(vec3<f32>(0.0), hist4.xyz, hist_ok);
+  let conf0 = select(0.0, hist4.w, hist_ok); // history confidence in [0,1]
+
+  if (!LOCAL_TAA_ENABLED) {
+    let out = vec4<f32>(cur, select(0.0, 1.0, w_in > 0.0));
+    textureStore(local_hist_out, ip, out);
+    return;
+  }
 
   // 1) Strong validity gate: reject bogus inputs even if w_in > 0
   //    (NaNs/Infs propagate horribly through TAA).

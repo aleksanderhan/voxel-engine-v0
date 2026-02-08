@@ -291,6 +291,7 @@ const PRIMARY_CLOUD_SHADOWS : bool = false;
 
 // Tune this: lower = steadier but slower response
 const LOCAL_TAA_ALPHA : f32 = 0.12;
+const LOCAL_TAA_ENABLED : bool = true;
 
 //// --------------------------------------------------------------------------
 //// Grass “hair” (procedural blades)
