@@ -63,8 +63,9 @@ fn sphere_dir_local(i: u32, count: u32) -> vec3<f32> {
 // hitFlag = 1: hit a light voxel
 // hitFlag = 0: no light (either blocked by solid or ran out of steps)
 fn march_hit_light(p0: vec3<f32>, dir: vec3<f32>, max_steps: u32, vs: f32) -> vec4<f32> {
-  let step_len = max(vs, 1e-6);
-  for (var s: u32 = 0u; s < max_steps; s = s + 1u) {
+  let step_len = max(0.5 * vs, 1e-6);
+  let step_count = max_steps * 2u;
+  for (var s: u32 = 0u; s < step_count; s = s + 1u) {
     let t = (f32(s) + 0.5) * step_len;
     let pos = p0 + dir * t;
     let leaf = query_leaf_world(pos);
