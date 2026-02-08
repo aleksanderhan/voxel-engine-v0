@@ -277,7 +277,10 @@ fn main_primary(
   let t_start = max(t_hist - PRIMARY_HIT_MARGIN, 0.0);
   let t_end   = min(t_hist + PRIMARY_HIT_WINDOW, FOG_MAX_DIST);
   var vt = VoxTraceResult(false, miss_hitgeom(), 0.0, false, INVALID_U32, vec3<i32>(0));
-  if (hist_valid) {
+  // When history is valid and we have a stable anchor, reuse the prior hit window and
+  // avoid the full candidate trace. Only fall back to full tracing when history/anchor fail.
+  let hist_anchor_ok = hist_valid && (hist_anchor_key != INVALID_U32);
+  if (hist_anchor_ok) {
     let vt_anchor = trace_scene_voxels_anchor(
       ro,
       rd,
@@ -287,12 +290,10 @@ fn main_primary(
       hist_anchor_key,
       seed
     );
-    if (vt_anchor.best.hit != 0u) {
-      vt = vt_anchor;
-    }
+    vt = vt_anchor;
   }
 
-  if (vt.best.hit == 0u) {
+  if (vt.best.hit == 0u && (!hist_anchor_ok)) {
     vt = trace_primary_voxels(
       ro,
       rd,
