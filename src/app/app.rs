@@ -491,9 +491,11 @@ impl App {
                 self.surface_config.height,
             ],
             profile_flags: if self.show_profile_hud { 1 } else { 0 },
-            _pad0: [0; 3],
+            _pad_profile: [0; 3],
+            _pad0: [0; 4],
             _pad1: [0; 4],
             _pad2: [0; 4],
+
         };
 
         self.renderer.write_camera(&camera_gpu);
