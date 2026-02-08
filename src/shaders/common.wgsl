@@ -462,7 +462,8 @@ fn prev_uv_from_world(p_ws: vec3<f32>) -> vec2<f32> {
   let clip = cam.prev_view_proj * vec4<f32>(p_ws, 1.0);
   let invw = 1.0 / max(clip.w, 1e-6);
   let ndc  = clip.xy * invw;          // -1..+1
-  return ndc * 0.5 + vec2<f32>(0.5);  // 0..1
+  let uv = ndc * 0.5 + vec2<f32>(0.5); // 0..1
+  return vec2<f32>(uv.x, 1.0 - uv.y);
 }
 
 fn in_unit_square(uv: vec2<f32>) -> bool {
