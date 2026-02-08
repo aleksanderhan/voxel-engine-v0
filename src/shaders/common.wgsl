@@ -297,8 +297,8 @@ const LOCAL_TAA_ALPHA : f32 = 0.12;
 //// --------------------------------------------------------------------------
 
 const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.75;
-const GRASS_BLADE_COUNT           : u32 = 9u;
-const GRASS_TRACE_STEPS           : u32 = 10u;
+const GRASS_BLADE_COUNT           : u32 = 2u;
+const GRASS_TRACE_STEPS           : u32 = 7u;
 const GRASS_HIT_EPS_VOX           : f32 = 0.015;
 const GRASS_STEP_MIN_VOX          : f32 = 0.02;
 
@@ -310,14 +310,14 @@ const GRASS_OVERHANG_VOX          : f32 = 0.35;
 const GRASS_LOD_MID_START : f32 = 18.0;
 const GRASS_LOD_FAR_START : f32 = 45.0;
 
-const GRASS_BLADE_COUNT_MID : u32 = 5u;
-const GRASS_BLADE_COUNT_FAR : u32 = 2u;
+const GRASS_BLADE_COUNT_MID : u32 = 1u;
+const GRASS_BLADE_COUNT_FAR : u32 = 1u;
 
 const GRASS_SEGS_MID : u32 = 4u;
 const GRASS_SEGS_FAR : u32 = 2u;
 
-const GRASS_TRACE_STEPS_MID : u32 = 8u;
-const GRASS_TRACE_STEPS_FAR : u32 = 4u;
+const GRASS_TRACE_STEPS_MID : u32 = 5u;
+const GRASS_TRACE_STEPS_FAR : u32 = 3u;
 
 // Misc
 const ALBEDO_VAR_GAIN = 3.5;
