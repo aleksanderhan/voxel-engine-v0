@@ -133,23 +133,6 @@ fn uploads_len_total(mgr: &ChunkManager) -> usize {
 }
 
 
-pub fn take_all(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
-    let mut out = Vec::new();
-
-    while let Some(slot) = mgr.uploads.slot_rewrite_q.pop_front() {
-        mgr.uploads.slot_rewrite_set.remove(&slot);
-        if let Some(u) = make_slot_rewrite_upload(mgr, slot) {
-            out.push(u);
-        }
-    }
-
-    out.extend(mgr.uploads.uploads_rewrite.drain(..));
-    out.extend(mgr.uploads.uploads_active.drain(..));
-    out.extend(mgr.uploads.uploads_other.drain(..));
-    out
-}
-
-
 // src/streaming/manager/uploads.rs
 
 pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
@@ -222,10 +205,6 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
         }
     };
 
-    // Prevent infinite scan when gate is closed and almost everything is non-priority.
-    let mut deferred = 0usize;
-    let defer_cap = uploads_len_total(mgr).max(1);
-
     while let Some((which, mut u)) = pop_next(mgr) {
         if out.len() >= max_uploads {
             push_back_same(mgr, which, u);
@@ -257,4 +236,3 @@ pub fn take_budgeted(mgr: &mut ChunkManager) -> Vec<ChunkUpload> {
 
     out
 }
-

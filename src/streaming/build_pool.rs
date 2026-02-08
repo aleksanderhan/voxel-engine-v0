@@ -18,7 +18,7 @@ thread_local! {
 
 pub static BUILD_POOL: Lazy<ThreadPool> = Lazy::new(|| {
     ThreadPoolBuilder::new()
-        .num_threads(4) // tune: start with 2..(num cores / 2)
+        .num_threads(config::WORKER_THREADS) // tune: start with 2..(num cores / 2)
         .thread_name(|i| format!("chunk-build-{}", i))
         .build()
         .expect("failed to build chunk build thread pool")

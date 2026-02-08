@@ -211,7 +211,19 @@ const TAU             : f32        = 6.28318530718;
 //// Ray / post
 //// --------------------------------------------------------------------------
 
-const PRIMARY_NUDGE_VOXEL_FRAC : f32 = 1e-4;
+const PRIMARY_NUDGE_VOXEL_FRAC : f32 = 1e-3;
+
+// Primary hit cache (temporal reprojection) tuning.
+const PRIMARY_HIT_MARGIN        : f32 = 0.08;
+const PRIMARY_HIT_WINDOW        : f32 = 0.60;
+const PRIMARY_HIT_DEPTH_REL0    : f32 = 0.04;
+const PRIMARY_HIT_DEPTH_REL1    : f32 = 0.12;
+
+// Sun shadow temporal reuse (primary shading).
+const SHADOW_TAA_ALPHA      : f32 = 0.20;
+const SHADOW_SUBSAMPLE_MASK : u32 = 7u; // 0b111 => 1/8 pixels per frame (blue-noise via seed)
+const PRIMARY_HIT_MOTION_PX0    : f32 = 0.50;
+const PRIMARY_HIT_MOTION_PX1    : f32 = 1.75;
 
 const J0_SCALE : f32 = 1.31;
 const J1_SCALE : f32 = 2.11;
@@ -229,8 +241,8 @@ const POST_EXPOSURE : f32 = 0.15;
 const CLIP_LEVELS_MAX : u32 = 16u;
 
 // March tuning
-const HF_MAX_STEPS : u32 = 96u;
-const HF_BISECT    : u32 = 5u;
+const HF_MAX_STEPS : u32 = 48u;  // 32..64 usually fine
+const HF_BISECT    : u32 = 3u;   // 2..3 is enough once stepping is stable
 
 // dt clamp (meters along ray)
 const HF_DT_MAX : f32 = 48.0;
@@ -240,10 +252,10 @@ const HF_DT_MAX : f32 = 48.0;
 //// --------------------------------------------------------------------------
 
 // How far rays march in voxels (controls “search radius” for lights)
-const LIGHT_MAX_DIST_VOX : u32 = 32u;   // try 16..64
+const LIGHT_MAX_DIST_VOX : u32 = 16u;   // try 16..64
 
 // Number of rays
-const LIGHT_RAYS : u32 = 24u;          // try 16..32
+const LIGHT_RAYS : u32 = 8u;           // try 8..16
 
 // Softens inverse-square near the light (in voxels)
 const LIGHT_SOFT_RADIUS_VOX : f32 = 3.0;
@@ -262,7 +274,7 @@ const LIGHT_DIRECT_GAIN   : f32 = 1.00;
 const LIGHT_INDIRECT_GAIN : f32 = 0.65; // cheap “bounce fill”
 
 // Stop after N light hits (perf only; output is normalized with LIGHT_RAYS)
-const LIGHT_EARLY_HITS : u32 = 24u;
+const LIGHT_EARLY_HITS : u32 = 4u;
 
 //// --------------------------------------------------------------------------
 //// Shading gates (world-space distance)
@@ -270,7 +282,7 @@ const LIGHT_EARLY_HITS : u32 = 24u;
 
 const VOXEL_AO_MAX_DIST     : f32 = 40.0;
 const LOCAL_LIGHT_MAX_DIST  : f32 = 50.0;
-const FAR_SHADING_DIST      : f32 = 80.0;
+const FAR_SHADING_DIST      : f32 = 64.0;
 const PRIMARY_CLOUD_SHADOWS : bool = false;
 
 //// --------------------------------------------------------------------------
@@ -284,34 +296,28 @@ const LOCAL_TAA_ALPHA : f32 = 0.12;
 //// Grass “hair” (procedural blades)
 //// --------------------------------------------------------------------------
 
-const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.20;
-const GRASS_BLADE_COUNT           : u32 = 2u;
+const GRASS_LAYER_HEIGHT_VOX      : f32 = 1.55;
+const GRASS_BLADE_COUNT           : u32 = 3u;
 const GRASS_TRACE_STEPS           : u32 = 7u;
-const GRASS_HIT_EPS_VOX           : f32 = 0.02;
-const GRASS_STEP_MIN_VOX          : f32 = 0.03;
+const GRASS_HIT_EPS_VOX           : f32 = 0.008;
+const GRASS_STEP_MIN_VOX          : f32 = 0.02;
 
-const GRASS_VOXEL_SEGS            : f32 = 3.0;
-const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.08;
-const GRASS_VOXEL_TAPER           : f32 = 0.70;
-const GRASS_OVERHANG_VOX          : f32 = 0.20;
+const GRASS_VOXEL_SEGS            : f32 = 6.0;
+const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.15;
+const GRASS_VOXEL_TAPER           : f32 = 0.25; // higher keeps tips blockier
+const GRASS_OVERHANG_VOX          : f32 = 0.6;
 
-const GRASS_LOD_MID_START : f32 = 15.0;
-const GRASS_LOD_FAR_START : f32 = 40.0;
+const GRASS_LOD_MID_START : f32 = 18.0;
+const GRASS_LOD_FAR_START : f32 = 45.0;
 
 const GRASS_BLADE_COUNT_MID : u32 = 2u;
 const GRASS_BLADE_COUNT_FAR : u32 = 1u;
 
-const GRASS_SEGS_MID : u32 = 2u;
-const GRASS_SEGS_FAR : u32 = 1u;
+const GRASS_SEGS_MID : u32 = 4u;
+const GRASS_SEGS_FAR : u32 = 2u;
 
-const GRASS_TRACE_STEPS_MID : u32 = 6u;
-const GRASS_TRACE_STEPS_FAR : u32 = 4u;
-
-// Primary-pass grass gating (tune these)
-const GRASS_PRIMARY_MAX_DIST : f32 = 20.0; // meters-ish
-const GRASS_PRIMARY_MIN_NY   : f32 = 0.60; // only fairly upward normals
-const GRASS_PRIMARY_RATE_MASK: u32 = 3u;   // 0 => all pixels, 1 => 1/2, 3 => 1/4, 7 => 1/8 ...
-
+const GRASS_TRACE_STEPS_MID : u32 = 5u;
+const GRASS_TRACE_STEPS_FAR : u32 = 3u;
 
 // Misc
 const ALBEDO_VAR_GAIN = 3.5;
@@ -346,6 +352,9 @@ struct Camera {
   prev_view_proj: mat4x4<f32>,
 
   cam_pos     : vec4<f32>,
+  ray00       : vec4<f32>,
+  ray_dx      : vec4<f32>,
+  ray_dy      : vec4<f32>,
 
   chunk_size  : u32,
   chunk_count : u32,
@@ -392,6 +401,13 @@ struct ChunkMeta {
 
 const MACRO_DIM : u32 = 8u;              // 8x8x8 macro cells per chunk
 const MACRO_WORDS_PER_CHUNK : u32 = 16u; // 512 bits / 32
+const TILE_SIZE: u32 = 8u;
+const MAX_TILE_CHUNKS: u32 = 192u;
+const PRIMARY_MAX_TILE_CHUNKS: u32 = 24u;
+
+var<workgroup> WG_TILE_COUNT : atomic<u32>;
+var<workgroup> WG_TILE_SLOTS : array<u32, MAX_TILE_CHUNKS>;
+var<workgroup> WG_TILE_ENTER : array<f32, MAX_TILE_CHUNKS>;
 
 fn macro_cell_size(root_size: f32) -> f32 {
   return root_size / f32(MACRO_DIM);
@@ -423,18 +439,20 @@ fn safe_normalize(v: vec3<f32>) -> vec3<f32> {
 }
 
 
-fn ray_dir_from_pixel(px: vec2<f32>, res: vec2<f32>) -> vec3<f32> {
-  let ndc = vec4<f32>(
-    2.0 * px.x / res.x - 1.0,
-    1.0 - 2.0 * px.y / res.y,
-    1.0,
-    1.0
-  );
+fn ray_dir_from_pixel(px: vec2<f32>) -> vec3<f32> {
+  let d = cam.ray00.xyz + px.x * cam.ray_dx.xyz + px.y * cam.ray_dy.xyz;
+  return normalize(d);
+}
 
-  let view = cam.proj_inv * ndc;
-  let vdir = vec4<f32>(view.xyz / view.w, 0.0);
-  let wdir = (cam.view_inv * vdir).xyz;
-  return normalize(wdir);
+fn prev_uv_from_world(p_ws: vec3<f32>) -> vec2<f32> {
+  let clip = cam.prev_view_proj * vec4<f32>(p_ws, 1.0);
+  let invw = 1.0 / max(clip.w, 1e-6);
+  let ndc  = clip.xy * invw;          // -1..+1
+  return ndc * 0.5 + vec2<f32>(0.5);  // 0..1
+}
+
+fn in_unit_square(uv: vec2<f32>) -> bool {
+  return all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
 }
 
 fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {

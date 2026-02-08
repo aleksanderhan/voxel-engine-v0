@@ -22,18 +22,12 @@ pub struct TextureSet {
 
     // per-pixel local lighting term (unfogged), written by primary
     pub local: Tex2D,
+
+    pub primary_hit_hist: [Tex2D; 2],
+    pub shadow_hist: [wgpu::Buffer; 2],
     
     pub godray: [Tex2D; 2],
     pub clip_height: Tex2DArray,
-}
-
-
-pub fn quarter_dim(x: u32) -> u32 {
-    (x + 3) / 4
-}
-
-pub fn half_dim(x: u32) -> u32 {
-    (x + 1) / 2
 }
 
 
@@ -65,6 +59,15 @@ fn make_tex2d(
 
     let view = tex.create_view(&Default::default());
     Tex2D { view }
+}
+
+fn make_storage_buffer(device: &wgpu::Device, label: &str, size_bytes: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size_bytes.max(4),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 fn make_tex2d_array(
@@ -140,6 +143,33 @@ pub fn create_textures(
         rw_tex_usage,
     );
 
+    let primary_hit_hist = [
+        make_tex2d(
+            device,
+            "primary_hit_hist_a",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::Rgba32Float,
+            rw_tex_usage,
+        ),
+        make_tex2d(
+            device,
+            "primary_hit_hist_b",
+            internal_w,
+            internal_h,
+            wgpu::TextureFormat::Rgba32Float,
+            rw_tex_usage,
+        ),
+    ];
+
+    let shadow_bytes = (internal_w.max(1) as u64)
+        * (internal_h.max(1) as u64)
+        * std::mem::size_of::<f32>() as u64;
+    let shadow_hist = [
+        make_storage_buffer(device, "shadow_hist_a", shadow_bytes),
+        make_storage_buffer(device, "shadow_hist_b", shadow_bytes),
+    ];
+
     let godray = [
         make_tex2d(
             device,
@@ -185,6 +215,8 @@ pub fn create_textures(
         color,
         depth,
         local,
+        primary_hit_hist,
+        shadow_hist,
         godray,
         clip_height,
     }

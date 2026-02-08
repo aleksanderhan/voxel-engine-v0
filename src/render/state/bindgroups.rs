@@ -5,7 +5,7 @@
 use super::{buffers::Buffers, layout::Layouts, textures::TextureSet};
 
 pub struct BindGroups {
-    pub primary: wgpu::BindGroup,
+    pub primary: [wgpu::BindGroup; 2],
     pub scene: wgpu::BindGroup,
     pub godray: [wgpu::BindGroup; 2],
     pub composite: [wgpu::BindGroup; 2],
@@ -18,9 +18,15 @@ fn make_primary_bg(
     layout: &wgpu::BindGroupLayout,
     buffers: &Buffers,
     textures: &TextureSet,
+    hist_in: &wgpu::TextureView,
+    hist_out: &wgpu::TextureView,
+    shadow_hist_in: &wgpu::Buffer,
+    shadow_hist_out: &wgpu::Buffer,
+    sampler: &wgpu::Sampler,
+    label: &str,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("primary_bg"),
+        label: Some(label),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -74,6 +80,26 @@ fn make_primary_bg(
             wgpu::BindGroupEntry {
                 binding: 11,
                 resource: buffers.colinfo.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: wgpu::BindingResource::TextureView(hist_in),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::TextureView(hist_out),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 15,
+                resource: shadow_hist_in.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 16,
+                resource: shadow_hist_out.as_entire_binding(),
             },
 
 
@@ -220,7 +246,32 @@ pub fn create_bind_groups(
     textures: &TextureSet,
     sampler: &wgpu::Sampler,
 ) -> BindGroups {
-    let primary = make_primary_bg(device, &layouts.primary, buffers, textures);
+    let primary = [
+        make_primary_bg(
+            device,
+            &layouts.primary,
+            buffers,
+            textures,
+            &textures.primary_hit_hist[0].view,
+            &textures.primary_hit_hist[1].view,
+            &textures.shadow_hist[0],
+            &textures.shadow_hist[1],
+            sampler,
+            "primary_bg_hist_a_to_b",
+        ),
+        make_primary_bg(
+            device,
+            &layouts.primary,
+            buffers,
+            textures,
+            &textures.primary_hit_hist[1].view,
+            &textures.primary_hit_hist[0].view,
+            &textures.shadow_hist[1],
+            &textures.shadow_hist[0],
+            sampler,
+            "primary_bg_hist_b_to_a",
+        ),
+    ];
     let scene = make_scene_bg(device, &layouts.scene, buffers);
 
     let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {

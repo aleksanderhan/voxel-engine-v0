@@ -74,12 +74,9 @@ fn sphere_aabb_contact(center: Vec3, r: f32, bmin: Vec3, bmax: Vec3) -> Option<(
 
     // pick axis with minimal distance to face
     let (n, depth) = {
-        let mut best_n = Vec3::X;
-        let mut best_d = to_min.x;
-
         // x-
-        best_n = -Vec3::X;
-        best_d = to_min.x;
+        let mut best_n = -Vec3::X;
+        let mut best_d = to_min.x;
 
         // x+
         if to_max.x < best_d { best_d = to_max.x; best_n = Vec3::X; }

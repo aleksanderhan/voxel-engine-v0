@@ -112,16 +112,11 @@ impl<'a> MinMaxMipView<'a> {
     }
 }
 
-pub struct MaxMipView<'a> {
-    pub root_side: u32,
-    pub levels: &'a [Vec<i32>],
-}
-
 pub fn build_max_mip_inplace<'a>(
     base: &[i32],
     side: u32,
     levels: &'a mut Vec<Vec<i32>>,
-) -> MaxMipView<'a> {
+) {
     debug_assert!(side.is_power_of_two());
     debug_assert_eq!(base.len(), (side * side) as usize);
 
@@ -174,8 +169,4 @@ pub fn build_max_mip_inplace<'a>(
         cur_side = next_side;
     }
 
-    MaxMipView {
-        root_side: side,
-        levels: &levels[..],
-    }
 }
