@@ -245,8 +245,8 @@ fn main_primary(
   let px  = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
   let frame = cam.frame_index;
   let seed  = (u32(gid.x) * 1973u) ^ (u32(gid.y) * 9277u) ^ (frame * 26699u);
-  let hist_read_offset = primary_hist_offset(frame, dims);
-  let hist_write_offset = primary_hist_offset(frame + 1u, dims);
+  let hist_read_offset = primary_hist_offset(frame + 1u, dims);
+  let hist_write_offset = primary_hist_offset(frame, dims);
 
   let ro  = cam.cam_pos.xyz;
   let rd  = ray_dir_from_pixel(px);
