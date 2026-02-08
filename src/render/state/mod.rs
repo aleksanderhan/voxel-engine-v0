@@ -8,7 +8,7 @@ pub mod textures;
 
 use crate::app::config;
 use crate::{
-    render::gpu_types::{CameraGpu, OverlayGpu},
+    render::gpu_types::{CameraGpu, OverlayGpu, PRIMARY_PROFILE_COUNT},
     streaming::ChunkUpload,
 };
 use bytemuck::{Pod, cast_slice};
@@ -55,6 +55,8 @@ pub struct Renderer {
     ts_qs: Option<wgpu::QuerySet>,
     ts_resolve: Option<wgpu::Buffer>,   // QUERY_RESOLVE | COPY_SRC
     ts_readback: Option<wgpu::Buffer>,  // COPY_DST | MAP_READ
+
+    primary_profile_readback: wgpu::Buffer,
 
 }
 
@@ -223,6 +225,13 @@ impl Renderer {
         let layouts = create_layouts(&device);
         let buffers = create_persistent_buffers(&device);
 
+        let primary_profile_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("primary_profile_readback"),
+            size: (PRIMARY_PROFILE_COUNT as u64) * (std::mem::size_of::<u32>() as u64),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
         let pipelines = create_pipelines(&device, &layouts, &cs_module, &fs_module, surface_format);
 
         let render_scale = config::RENDER_SCALE;
@@ -251,6 +260,7 @@ impl Renderer {
             ts_qs,
             ts_resolve,
             ts_readback,
+            primary_profile_readback,
         }
     }
 
@@ -334,6 +344,34 @@ impl Renderer {
         }
 
         {
+            let bytes_per_row = self.internal_w.max(1) * std::mem::size_of::<f32>() as u32;
+            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let padded_bpr = ((bytes_per_row + align - 1) / align) * align;
+
+            encoder.copy_buffer_to_texture(
+                wgpu::ImageCopyBuffer {
+                    buffer: &self.textures.shadow_hist_buf,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bpr),
+                        rows_per_image: Some(self.internal_h.max(1)),
+                    },
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self.textures.shadow_hist.tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.internal_w.max(1),
+                    height: self.internal_h.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("godray_pass"),
                 timestamp_writes: self.ts_pair(2, 3),
@@ -372,6 +410,51 @@ impl Renderer {
         }
 
         self.ping = pong;
+    }
+
+    pub fn reset_primary_profile_counts(&self) {
+        let zeros = [0u32; PRIMARY_PROFILE_COUNT];
+        self.queue.write_buffer(
+            &self.buffers.primary_profile,
+            0,
+            bytemuck::cast_slice(&zeros),
+        );
+    }
+
+    pub fn encode_primary_profile_readback(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.copy_buffer_to_buffer(
+            &self.buffers.primary_profile,
+            0,
+            &self.primary_profile_readback,
+            0,
+            (PRIMARY_PROFILE_COUNT as u64) * (std::mem::size_of::<u32>() as u64),
+        );
+    }
+
+    pub fn read_primary_profile_counts_blocking(&self) -> Option<[u32; PRIMARY_PROFILE_COUNT]> {
+        let slice = self.primary_profile_readback.slice(..);
+        let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        let _map_ok = pollster::block_on(async { rx.receive().await })
+            .expect("map_async dropped")
+            .expect("map_async failed");
+
+        let data = slice.get_mapped_range();
+        let words: &[u32] = bytemuck::cast_slice(&data);
+        if words.len() < PRIMARY_PROFILE_COUNT {
+            drop(data);
+            self.primary_profile_readback.unmap();
+            return None;
+        }
+
+        let mut out = [0u32; PRIMARY_PROFILE_COUNT];
+        out.copy_from_slice(&words[..PRIMARY_PROFILE_COUNT]);
+        drop(data);
+        self.primary_profile_readback.unmap();
+        Some(out)
     }
 
     pub fn encode_blit(&self, encoder: &mut wgpu::CommandEncoder, frame_view: &wgpu::TextureView) {

@@ -25,7 +25,7 @@ use crate::app::config;
 use crate::app::input::InputState;
 use crate::{
     clipmap::Clipmap,
-    render::{CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
+    render::{gpu_types::PRIMARY_PROFILE_COUNT, CameraGpu, ClipmapGpu, OverlayGpu, Renderer},
     streaming::ChunkManager,
     world::WorldGen,
 };
@@ -108,6 +108,9 @@ pub struct App {
 
     edit_mode: usize,
     edit_modes: Vec<EditMode>,
+
+    show_profile_hud: bool,
+    primary_profile_counts: [u32; PRIMARY_PROFILE_COUNT],
 }
 
 #[derive(Clone, Copy)]
@@ -212,6 +215,8 @@ impl App {
             free_cam: false,
             edit_mode: 0,
             edit_modes,
+            show_profile_hud: false,
+            primary_profile_counts: [0; PRIMARY_PROFILE_COUNT],
         }
     }
 
@@ -485,6 +490,12 @@ impl App {
                 self.surface_config.width,
                 self.surface_config.height,
             ],
+            profile_flags: if self.show_profile_hud { 1 } else { 0 },
+            _pad_profile: [0; 3],
+            _pad0: [0; 4],
+            _pad1: [0; 4],
+            _pad2: [0; 4],
+
         };
 
         self.renderer.write_camera(&camera_gpu);
@@ -512,16 +523,34 @@ impl App {
             EditMode::Place(m) => m,
         };
 
-        let overlay = OverlayGpu::from_fps_and_edit(
+        let profile_lines = if self.show_profile_hud {
+            self.build_profile_lines()
+        } else {
+            Vec::new()
+        };
+        let profile_refs: Vec<&str> = profile_lines.iter().map(String::as_str).collect();
+
+        let overlay = OverlayGpu::from_fps_edit_profile(
             self.fps_value,
             edit_value,
             self.surface_config.width,
             self.surface_config.height,
             8,
+            &profile_refs,
         );
         self.renderer.write_overlay(&overlay);
 
         self.profiler.overlay(profiler::FrameProf::end_ms(t0));
+    }
+
+    fn build_profile_lines(&self) -> Vec<String> {
+        let counts = self.primary_profile_counts;
+        vec![
+            format!("VOX {}", counts[0]),
+            format!("GRS {}", counts[1]),
+            format!("HDR {}", counts[2]),
+            format!("FOG {}", counts[3]),
+        ]
     }
 
 
@@ -570,11 +599,19 @@ impl App {
     fn encode_compute_pass(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let t0 = self.profiler.start();
 
+        if self.show_profile_hud {
+            self.renderer.reset_primary_profile_counts();
+        }
+
         self.renderer.encode_compute(
             encoder,
             self.surface_config.width,
             self.surface_config.height,
         );
+
+        if self.show_profile_hud {
+            self.renderer.encode_primary_profile_readback(encoder);
+        }
 
         self.profiler.enc_comp(profiler::FrameProf::end_ms(t0));
     }
@@ -641,6 +678,12 @@ impl App {
     }
 
     fn finish_frame_profiling(&mut self, render_ms: f64) {
+        if self.show_profile_hud {
+            if let Some(counts) = self.renderer.read_primary_profile_counts_blocking() {
+                self.primary_profile_counts = counts;
+            }
+        }
+
         if !self.profiler.enabled() {
             return;
         }
@@ -665,6 +708,10 @@ impl App {
 
 
     fn update_editor(&mut self) {
+        if self.input.take_p_pressed() {
+            self.show_profile_hud = !self.show_profile_hud;
+        }
+
         // scroll wheel selects mode
         let steps = self.input.take_wheel_steps();
         if steps != 0 {

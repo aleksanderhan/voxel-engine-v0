@@ -7,6 +7,7 @@ use crate::{
 };
 
 pub struct Tex2D {
+    pub tex: wgpu::Texture,
     pub view: wgpu::TextureView,
 }
 
@@ -24,7 +25,8 @@ pub struct TextureSet {
     pub local: Tex2D,
 
     pub primary_hit_hist: [Tex2D; 2],
-    pub shadow_hist: [wgpu::Buffer; 2],
+    pub shadow_hist: Tex2D,
+    pub shadow_hist_buf: wgpu::Buffer,
     
     pub godray: [Tex2D; 2],
     pub clip_height: Tex2DArray,
@@ -58,14 +60,16 @@ fn make_tex2d(
     });
 
     let view = tex.create_view(&Default::default());
-    Tex2D { view }
+    Tex2D { tex, view }
 }
 
 fn make_storage_buffer(device: &wgpu::Device, label: &str, size_bytes: u64) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: size_bytes.max(4),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
 }
@@ -162,13 +166,19 @@ pub fn create_textures(
         ),
     ];
 
-    let shadow_bytes = (internal_w.max(1) as u64)
-        * (internal_h.max(1) as u64)
-        * std::mem::size_of::<f32>() as u64;
-    let shadow_hist = [
-        make_storage_buffer(device, "shadow_hist_a", shadow_bytes),
-        make_storage_buffer(device, "shadow_hist_b", shadow_bytes),
-    ];
+    let shadow_hist = make_tex2d(
+        device,
+        "shadow_hist",
+        internal_w,
+        internal_h,
+        wgpu::TextureFormat::R32Float,
+        rw_tex_usage | wgpu::TextureUsages::COPY_DST,
+    );
+    let bytes_per_row = internal_w.max(1) * std::mem::size_of::<f32>() as u32;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_bpr = ((bytes_per_row + align - 1) / align) * align;
+    let shadow_bytes = (padded_bpr as u64) * (internal_h.max(1) as u64);
+    let shadow_hist_buf = make_storage_buffer(device, "shadow_hist_buf", shadow_bytes);
 
     let godray = [
         make_tex2d(
@@ -217,6 +227,7 @@ pub fn create_textures(
         local,
         primary_hit_hist,
         shadow_hist,
+        shadow_hist_buf,
         godray,
         clip_height,
     }
