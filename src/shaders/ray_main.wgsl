@@ -202,8 +202,9 @@ fn main_primary(
   let shadow_idx = u32(ip.y) * shadow_stride + u32(ip.x);
   let pixel_count = u32(dims.x) * u32(dims.y);
   let payload_idx = u32(ip.y) * u32(dims.x) + u32(ip.x);
-  let payload_read_base = (cam.frame_index & 1u) * pixel_count;
-  let payload_write_base = (1u - (cam.frame_index & 1u)) * pixel_count;
+  let payload_parity = (cam.frame_index + 1u) & 1u;
+  let payload_read_base = payload_parity * pixel_count;
+  let payload_write_base = (1u - payload_parity) * pixel_count;
 
   if (cam.chunk_count == 0u) {
     var hf = clip_trace_heightfield(ro, rd, 0.0, FOG_MAX_DIST);
