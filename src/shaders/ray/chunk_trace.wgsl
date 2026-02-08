@@ -892,11 +892,13 @@ fn trace_chunk_rope_interval_nomacro(
           i32(cam.chunk_size)
         );
 
-        let tmax_probe = min(bh.t, t_exit);
+        let probe_pad = (GRASS_LAYER_HEIGHT_VOX + 1.0) * vs;
+        let tmin_probe = max(t_enter, bh.t - 0.01 * vs);
+        let tmax_probe = min(bh.t + probe_pad, t_exit + probe_pad);
 
         let gh = try_grass_slab_hit(
           ro, rd,
-          t_enter, tmax_probe,
+          tmin_probe, tmax_probe,
           cell.bmin_m, cell.id_vox,
           vs, time_s, strength
         );
