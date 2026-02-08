@@ -318,8 +318,8 @@ fn grass_sdf_lod(
       let taper_shape = pow(clamp(1.0 - tmid, 0.0, 1.0), k);
       let taper = mix(GRASS_VOXEL_TAPER, 1.0, taper_shape);
 
-      let half_w = r0 * taper;
-      let half_t = max(0.03 * half_w, 0.006 * vs);
+      let half_w = r0 * taper * 0.7;
+      let half_t = half_w;
 
       let dbox = sdf_box(local, vec3<f32>(0.0), vec3<f32>(half_w, 0.5 * seg_h, half_t));
       dmin = min(dmin, dbox);
@@ -370,7 +370,7 @@ fn grass_sdf_normal_lod(
     return normalize(vec3<f32>(-w.x * tilt, 1.0, -w.y * tilt));
   }
 
-  let e = 0.02 * cam.voxel_params.x;
+  let e = 0.01 * cam.voxel_params.x;
 
   let dx =
     grass_sdf_lod(p_m + vec3<f32>(e, 0.0, 0.0), cell_bmin_m, cell_id_vox, time_s, strength, lod) -
