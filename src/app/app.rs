@@ -546,11 +546,25 @@ impl App {
     fn build_profile_lines(&self) -> Vec<String> {
         let counts = self.primary_profile_counts;
         vec![
-            format!("VOX {}", counts[0]),
-            format!("GRS {}", counts[1]),
-            format!("HDR {}", counts[2]),
-            format!("FOG {}", counts[3]),
+            format!("VOX {}", Self::format_profile_count(counts[0])),
+            format!("GRS {}", Self::format_profile_count(counts[1])),
+            format!("HDR {}", Self::format_profile_count(counts[2])),
+            format!("FOG {}", Self::format_profile_count(counts[3])),
         ]
+    }
+
+    fn format_profile_count(value: u32) -> String {
+        let raw = value.to_string();
+        let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+        let mut count = 0usize;
+        for ch in raw.chars().rev() {
+            if count != 0 && count % 3 == 0 {
+                out.push('.');
+            }
+            out.push(ch);
+            count += 1;
+        }
+        out.chars().rev().collect()
     }
 
 
