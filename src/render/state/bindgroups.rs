@@ -8,6 +8,7 @@ pub struct BindGroups {
     pub primary: [wgpu::BindGroup; 2],
     pub scene: wgpu::BindGroup,
     pub godray: [wgpu::BindGroup; 2],
+    pub grass: wgpu::BindGroup,
     pub local_taa: [wgpu::BindGroup; 2],
     pub composite: [wgpu::BindGroup; 2],
     pub composite_taa: [wgpu::BindGroup; 2],
@@ -107,16 +108,39 @@ fn make_primary_bg(
                 binding: 17,
                 resource: buffers.primary_profile.as_entire_binding(),
             },
-            wgpu::BindGroupEntry {
-                binding: 18,
-                resource: wgpu::BindingResource::TextureView(&textures.grass.view),
-            },
-
-
         ],
     })
 }
 
+fn make_grass_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    buffers: &Buffers,
+    textures: &TextureSet,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("grass_bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffers.camera.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: buffers.clipmap.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(&textures.clip_height.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 18,
+                resource: wgpu::BindingResource::TextureView(&textures.grass.view),
+            },
+        ],
+    })
+}
 fn make_scene_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -344,6 +368,7 @@ pub fn create_bind_groups(
         ),
     ];
     let scene = make_scene_bg(device, &layouts.scene, buffers);
+    let grass = make_grass_bg(device, &layouts.grass, buffers, textures);
 
     let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("empty_bg"),
@@ -462,6 +487,7 @@ pub fn create_bind_groups(
         primary,
         scene,
         godray,
+        grass,
         local_taa,
         composite,
         composite_taa,

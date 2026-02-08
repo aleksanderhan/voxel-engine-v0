@@ -104,7 +104,7 @@ pub fn create_pipelines(
         "grass_pipeline",
         cs_module,
         "main_grass",
-        &[&layouts.primary],
+        &[&layouts.grass],
     );
 
     // Godray pass:

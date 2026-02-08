@@ -153,8 +153,7 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
     // 15 sun-shadow history (sampled)
     // 16 sun-shadow history output (storage buffer write)
     // 17 primary pass profiling counters (storage read-write)
-    // 18 grass pass output (storage write)
-    let primary_entries: [wgpu::BindGroupLayoutEntry; 19] = [
+    let primary_entries: [wgpu::BindGroupLayoutEntry; 18] = [
         bgl_uniform(0, cs_vis),
         bgl_storage_ro(1, cs_vis),
         bgl_storage_ro(2, cs_vis),
@@ -189,7 +188,6 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
         ),
         bgl_storage_rw(16, cs_vis),
         bgl_storage_rw(17, cs_vis),
-        bgl_storage_tex_wo(18, cs_vis, wgpu::TextureFormat::Rgba32Float),
     ];
 
     let primary = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -199,7 +197,16 @@ pub fn create_layouts(device: &wgpu::Device) -> Layouts {
 
     let grass = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("grass_bgl"),
-        entries: &primary_entries,
+        entries: &[
+            bgl_uniform(0, cs_vis),
+            bgl_uniform(7, cs_vis),
+            bgl_tex_sample_2d_array(
+                8,
+                cs_vis,
+                wgpu::TextureSampleType::Float { filterable: false },
+            ),
+            bgl_storage_tex_wo(18, cs_vis, wgpu::TextureFormat::Rgba32Float),
+        ],
     });
 
     let godray = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

@@ -360,7 +360,7 @@ impl Renderer {
             });
 
             cpass.set_pipeline(&self.pipelines.grass);
-            cpass.set_bind_group(0, &self.bind_groups.primary[ping], &[]);
+            cpass.set_bind_group(0, &self.bind_groups.grass, &[]);
 
             let gx = (self.grass_w + 7) / 8;
             let gy = (self.grass_h + 7) / 8;
