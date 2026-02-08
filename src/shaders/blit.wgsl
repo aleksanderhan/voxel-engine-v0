@@ -29,10 +29,50 @@ struct Overlay {
   stride   : u32,
 
   // --- NEW: mode label ("DIG", "PLACE DIRT", ...)
-  text_len   : u32, // number of chars (<= 12)
+  text_len   : u32, // number of chars (<= 20)
   text_p0    : u32, // 4 chars packed (ASCII)
   text_p1    : u32, // 4 chars packed
   text_p2    : u32, // 4 chars packed
+  text_p3    : u32, // 4 chars packed
+  text_p4    : u32, // 4 chars packed
+
+  // Profiling HUD lines (up to 5)
+  prof0_len  : u32,
+  prof0_p0   : u32,
+  prof0_p1   : u32,
+  prof0_p2   : u32,
+  prof0_p3   : u32,
+  prof0_p4   : u32,
+
+  prof1_len  : u32,
+  prof1_p0   : u32,
+  prof1_p1   : u32,
+  prof1_p2   : u32,
+  prof1_p3   : u32,
+  prof1_p4   : u32,
+
+  prof2_len  : u32,
+  prof2_p0   : u32,
+  prof2_p1   : u32,
+  prof2_p2   : u32,
+  prof2_p3   : u32,
+  prof2_p4   : u32,
+
+  prof3_len  : u32,
+  prof3_p0   : u32,
+  prof3_p1   : u32,
+  prof3_p2   : u32,
+  prof3_p3   : u32,
+  prof3_p4   : u32,
+
+  prof4_len  : u32,
+  prof4_p0   : u32,
+  prof4_p1   : u32,
+  prof4_p2   : u32,
+  prof4_p3   : u32,
+  prof4_p4   : u32,
+
+  _pad0      : u32,
 };
 
 @group(0) @binding(2) var<uniform> overlay : Overlay;
@@ -77,10 +117,21 @@ fn pack_get_byte(p: u32, i: u32) -> u32 {
 }
 
 fn unpack_char(i: u32) -> u32 {
-  // up to 12 chars from text_p0..p2
+  // up to 20 chars from text_p0..p4
   if (i < 4u)  { return pack_get_byte(overlay.text_p0, i); }
   if (i < 8u)  { return pack_get_byte(overlay.text_p1, i - 4u); }
   if (i < 12u) { return pack_get_byte(overlay.text_p2, i - 8u); }
+  if (i < 16u) { return pack_get_byte(overlay.text_p3, i - 12u); }
+  if (i < 20u) { return pack_get_byte(overlay.text_p4, i - 16u); }
+  return 0u;
+}
+
+fn unpack_char_from(p0: u32, p1: u32, p2: u32, p3: u32, p4: u32, i: u32) -> u32 {
+  if (i < 4u)  { return pack_get_byte(p0, i); }
+  if (i < 8u)  { return pack_get_byte(p1, i - 4u); }
+  if (i < 12u) { return pack_get_byte(p2, i - 8u); }
+  if (i < 16u) { return pack_get_byte(p3, i - 12u); }
+  if (i < 20u) { return pack_get_byte(p4, i - 16u); }
   return 0u;
 }
 
@@ -104,6 +155,7 @@ fn glyph_mask(code: u32) -> u32 {
     // space / punctuation
     case 32u: { return pack3x5(0u,0u,0u,0u,0u); }                // ' '
     case 45u: { return pack3x5(0u,0u,7u,0u,0u); }                // '-'
+    case 46u: { return pack3x5(0u,0u,0u,0u,2u); }                // '.'
     case 58u: { return pack3x5(0u,2u,0u,2u,0u); }                // ':'
 
     // digits (optional; you already draw FPS with digit_mask)
@@ -126,6 +178,7 @@ fn glyph_mask(code: u32) -> u32 {
     case 71u: { return pack3x5(3u,4u,5u,5u,3u); }                // 'G'
     case 72u: { return pack3x5(5u,5u,7u,5u,5u); }                // 'H'
     case 73u: { return pack3x5(7u,2u,2u,2u,7u); }                // 'I'
+    case 70u: { return pack3x5(7u,4u,6u,4u,4u); }                // 'F'
     case 76u: { return pack3x5(4u,4u,4u,4u,7u); }                // 'L'
     case 79u: { return pack3x5(2u,5u,5u,5u,2u); }                // 'O'
     case 80u: { return pack3x5(6u,5u,6u,4u,4u); }                // 'P'
@@ -134,6 +187,8 @@ fn glyph_mask(code: u32) -> u32 {
     case 84u: { return pack3x5(7u,2u,2u,2u,2u); }                // 'T'
     case 78u: { return pack3x5(5u, 7u, 7u, 7u, 5u); } // 'N'
     case 87u: { return pack3x5(5u, 5u, 5u, 7u, 7u); } // 'W'
+    case 86u: { return pack3x5(5u,5u,5u,5u,2u); }                // 'V'
+    case 88u: { return pack3x5(5u,5u,2u,5u,5u); }                // 'X'
     
     default: { return 0u; }
   }
@@ -232,22 +287,24 @@ fn fs_main(
     }
   }
 
+  let scale  = overlay.scale;
+  let char_w = 3u * scale;
+  let char_h = 5u * scale;
+  let text_gap = scale;          // 1 scaled pixel gap
+  let stride = char_w + text_gap;
+  let margin = 2u * scale;
+
   // ---- Edit mode overlay text (under FPS) ----
   let text_len_raw = overlay.text_len;
-  let text_len = min(text_len_raw, 12u);
+  let text_len = min(text_len_raw, 20u);
+
+  var profile_base_y = overlay.origin_y + overlay.digit_h + margin;
 
   if (text_len > 0u) {
-    let scale  = overlay.scale;
-    let char_w = 3u * scale;
-    let char_h = 5u * scale;
-    let gap    = scale;          // 1 scaled pixel gap
-    let stride = char_w + gap;
-    let margin = 2u * scale;
-
-    let toy = overlay.origin_y + overlay.digit_h + margin;
+    let toy = profile_base_y;
 
     // total pixel width of the string (don’t count trailing gap)
-    let text_w = text_len * stride - gap;
+    let text_w = text_len * stride - text_gap;
 
     // Right-align to FPS right edge
     let fps_right_i = i32(overlay.origin_x + overlay.total_w);
@@ -269,6 +326,90 @@ fn fs_main(
 
         if (cell_y < 5u) {
           let cch = unpack_char(ci); // ASCII
+          let m   = glyph_mask(cch);
+
+          if (glyph_bit(m, cell_x, cell_y)) {
+            rgb = vec3<f32>(1.0, 1.0, 1.0);
+          }
+        }
+      }
+    }
+
+    profile_base_y = profile_base_y + char_h + margin;
+  }
+
+  // ---- Profiling overlay lines ----
+  let fps_right_i = i32(overlay.origin_x + overlay.total_w);
+
+  for (var line_i: u32 = 0u; line_i < 5u; line_i = line_i + 1u) {
+    var line_len: u32 = 0u;
+    var p0: u32 = 0u;
+    var p1: u32 = 0u;
+    var p2: u32 = 0u;
+    var p3: u32 = 0u;
+    var p4: u32 = 0u;
+
+    if (line_i == 0u) {
+      line_len = overlay.prof0_len;
+      p0 = overlay.prof0_p0;
+      p1 = overlay.prof0_p1;
+      p2 = overlay.prof0_p2;
+      p3 = overlay.prof0_p3;
+      p4 = overlay.prof0_p4;
+    } else if (line_i == 1u) {
+      line_len = overlay.prof1_len;
+      p0 = overlay.prof1_p0;
+      p1 = overlay.prof1_p1;
+      p2 = overlay.prof1_p2;
+      p3 = overlay.prof1_p3;
+      p4 = overlay.prof1_p4;
+    } else if (line_i == 2u) {
+      line_len = overlay.prof2_len;
+      p0 = overlay.prof2_p0;
+      p1 = overlay.prof2_p1;
+      p2 = overlay.prof2_p2;
+      p3 = overlay.prof2_p3;
+      p4 = overlay.prof2_p4;
+    } else if (line_i == 3u) {
+      line_len = overlay.prof3_len;
+      p0 = overlay.prof3_p0;
+      p1 = overlay.prof3_p1;
+      p2 = overlay.prof3_p2;
+      p3 = overlay.prof3_p3;
+      p4 = overlay.prof3_p4;
+    } else {
+      line_len = overlay.prof4_len;
+      p0 = overlay.prof4_p0;
+      p1 = overlay.prof4_p1;
+      p2 = overlay.prof4_p2;
+      p3 = overlay.prof4_p3;
+      p4 = overlay.prof4_p4;
+    }
+
+    let text_len_line = min(line_len, 20u);
+    if (text_len_line == 0u) {
+      continue;
+    }
+
+    let toy = profile_base_y + line_i * (char_h + margin);
+    let text_w = text_len_line * stride - text_gap;
+    let tox_i = max(0, fps_right_i - i32(text_w));
+    let tox = u32(tox_i);
+
+    if (px.x >= tox && px.x < (tox + text_w) &&
+        px.y >= toy && px.y < (toy + char_h)) {
+      let lx = px.x - tox;
+      let ly = px.y - toy;
+
+      let ci   = lx / stride;        // char index
+      let in_x = lx - ci * stride;   // x within char+gap
+
+      if (ci < text_len_line && in_x < char_w) {
+        let cell_x = in_x / scale;   // 0..2
+        let cell_y = ly   / scale;   // 0..4
+
+        if (cell_y < 5u) {
+          let cch = unpack_char_from(p0, p1, p2, p3, p4, ci);
           let m   = glyph_mask(cch);
 
           if (glyph_bit(m, cell_x, cell_y)) {

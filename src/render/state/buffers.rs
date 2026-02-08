@@ -4,7 +4,7 @@
 
 use crate::app::config;
 use crate::{
-    render::gpu_types::{ChunkMetaGpu, ClipmapGpu, NodeGpu, NodeRopesGpu},
+    render::gpu_types::{ChunkMetaGpu, ClipmapGpu, NodeGpu, NodeRopesGpu, PRIMARY_PROFILE_COUNT},
 };
 
 pub struct Buffers {
@@ -34,6 +34,8 @@ pub struct Buffers {
     pub colinfo: wgpu::Buffer,
     pub colinfo_capacity_u32: u32,
 
+    pub primary_profile: wgpu::Buffer,
+
 }
 
 fn make_uniform_buffer<T: Sized>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
@@ -50,6 +52,20 @@ fn make_storage_buffer(device: &wgpu::Device, label: &str, size_bytes: u64) -> w
         label: Some(label),
         size: size_bytes,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn make_storage_buffer_with_usage(
+    device: &wgpu::Device,
+    label: &str,
+    size_bytes: u64,
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size_bytes,
+        usage,
         mapped_at_creation: false,
     })
 }
@@ -110,6 +126,13 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         (colinfo_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
     );
 
+    let primary_profile = make_storage_buffer_with_usage(
+        device,
+        "primary_profile_buf",
+        (PRIMARY_PROFILE_COUNT as u64) * (std::mem::size_of::<u32>() as u64),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+    );
+
     Buffers {
         camera,
         overlay,
@@ -126,5 +149,6 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         rope_capacity,
         colinfo,
         colinfo_capacity_u32,
+        primary_profile,
     }
 }

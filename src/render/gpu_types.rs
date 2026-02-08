@@ -8,6 +8,8 @@
 use bytemuck::{Pod, Zeroable};
 use crate::app::config;
 
+pub const PRIMARY_PROFILE_COUNT: usize = 5;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct NodeGpu {
@@ -53,7 +55,7 @@ pub struct CameraGpu {
 
     pub view_proj: [[f32; 4]; 4],
     pub prev_view_proj: [[f32; 4]; 4],
-    
+
     pub cam_pos: [f32; 4],
     pub ray00: [f32; 4],
     pub ray_dx: [f32; 4],
@@ -70,7 +72,19 @@ pub struct CameraGpu {
     pub grid_dims: [u32; 4],
 
     pub render_present_px: [u32; 4],
+
+    pub profile_flags: u32,
+
+    // IMPORTANT: WGSL uniform layout aligns the next vec3<u32> to 16 bytes.
+    // So we must add 12 bytes here to reach offset 416.
+    pub _pad_profile: [u32; 3],
+
+    // Now keep the rest 16B-aligned blocks.
+    pub _pad0: [u32; 4],
+    pub _pad1: [u32; 4],
+    pub _pad2: [u32; 4],
 }
+
 
 /// Clipmap uniform payload.
 ///
@@ -140,13 +154,51 @@ pub struct OverlayGpu {
     pub stride:   u32,
 
     // --- NEW: mode label ("DIG", "DIRT", "STONE", ...)
-    pub text_len: u32, // number of chars <= 12
+    pub text_len: u32, // number of chars <= 20
     pub text_p0:  u32, // 4 ASCII bytes packed little-endian
     pub text_p1:  u32, // 4 ASCII bytes
     pub text_p2:  u32, // 4 ASCII bytes
+    pub text_p3:  u32, // 4 ASCII bytes
+    pub text_p4:  u32, // 4 ASCII bytes
 
-    // pad to 64 bytes (uniform structs are effectively 16-byte aligned)
-    pub _pad0:    u32,
+    // Profiling HUD lines (up to 5 lines, 20 chars each)
+    pub prof0_len: u32,
+    pub prof0_p0:  u32,
+    pub prof0_p1:  u32,
+    pub prof0_p2:  u32,
+    pub prof0_p3:  u32,
+    pub prof0_p4:  u32,
+
+    pub prof1_len: u32,
+    pub prof1_p0:  u32,
+    pub prof1_p1:  u32,
+    pub prof1_p2:  u32,
+    pub prof1_p3:  u32,
+    pub prof1_p4:  u32,
+
+    pub prof2_len: u32,
+    pub prof2_p0:  u32,
+    pub prof2_p1:  u32,
+    pub prof2_p2:  u32,
+    pub prof2_p3:  u32,
+    pub prof2_p4:  u32,
+
+    pub prof3_len: u32,
+    pub prof3_p0:  u32,
+    pub prof3_p1:  u32,
+    pub prof3_p2:  u32,
+    pub prof3_p3:  u32,
+    pub prof3_p4:  u32,
+
+    pub prof4_len: u32,
+    pub prof4_p0:  u32,
+    pub prof4_p1:  u32,
+    pub prof4_p2:  u32,
+    pub prof4_p3:  u32,
+    pub prof4_p4:  u32,
+
+    // pad to 16-byte boundary
+    pub _pad0: u32,
 }
 
 
@@ -157,28 +209,31 @@ fn pack4(a: u8, b: u8, c: u8, d: u8) -> u32 {
         | ((d as u32) << 24)
 }
 
-fn pack_text_12(s: &str) -> (u32, u32, u32, u32) {
-    // Uppercase, ASCII only, pad with spaces, clamp to 12 chars.
-    let mut buf = [b' '; 12];
-    for (i, ch) in s.bytes().take(12).enumerate() {
+fn pack_text_20(s: &str) -> (u32, u32, u32, u32, u32, u32) {
+    // Uppercase, ASCII only, pad with spaces, clamp to 20 chars.
+    let mut buf = [b' '; 20];
+    for (i, ch) in s.bytes().take(20).enumerate() {
         let u = if (b'a'..=b'z').contains(&ch) { ch - 32 } else { ch };
         buf[i] = u;
     }
 
-    let len = s.len().min(12) as u32;
+    let len = s.len().min(20) as u32;
     let p0 = pack4(buf[0], buf[1], buf[2], buf[3]);
     let p1 = pack4(buf[4], buf[5], buf[6], buf[7]);
     let p2 = pack4(buf[8], buf[9], buf[10], buf[11]);
-    (len, p0, p1, p2)
+    let p3 = pack4(buf[12], buf[13], buf[14], buf[15]);
+    let p4 = pack4(buf[16], buf[17], buf[18], buf[19]);
+    (len, p0, p1, p2, p3, p4)
 }
 
 impl OverlayGpu {
-    pub fn from_fps_and_edit(
+    pub fn from_fps_edit_profile(
         fps: u32,
         edit_mat: u32,
         width: u32,
         _height: u32,
         scale: u32,
+        profile_lines: &[&str],
     ) -> Self {
         // ---- FPS digits ----
         let mut v = fps.min(9999);
@@ -213,7 +268,12 @@ impl OverlayGpu {
             _ => "UNKNOWN", // fallback;
         };
 
-        let (text_len, text_p0, text_p1, text_p2) = pack_text_12(label);
+        let (text_len, text_p0, text_p1, text_p2, text_p3, text_p4) = pack_text_20(label);
+
+        let mut prof_lines = [(0u32, 0u32, 0u32, 0u32, 0u32, 0u32); 5];
+        for (i, line) in profile_lines.iter().take(5).enumerate() {
+            prof_lines[i] = pack_text_20(line);
+        }
 
         Self {
             digits_packed,
@@ -227,6 +287,43 @@ impl OverlayGpu {
             text_p0,
             text_p1,
             text_p2,
+            text_p3,
+            text_p4,
+            prof0_len: prof_lines[0].0,
+            prof0_p0: prof_lines[0].1,
+            prof0_p1: prof_lines[0].2,
+            prof0_p2: prof_lines[0].3,
+            prof0_p3: prof_lines[0].4,
+            prof0_p4: prof_lines[0].5,
+
+            prof1_len: prof_lines[1].0,
+            prof1_p0: prof_lines[1].1,
+            prof1_p1: prof_lines[1].2,
+            prof1_p2: prof_lines[1].3,
+            prof1_p3: prof_lines[1].4,
+            prof1_p4: prof_lines[1].5,
+
+            prof2_len: prof_lines[2].0,
+            prof2_p0: prof_lines[2].1,
+            prof2_p1: prof_lines[2].2,
+            prof2_p2: prof_lines[2].3,
+            prof2_p3: prof_lines[2].4,
+            prof2_p4: prof_lines[2].5,
+
+            prof3_len: prof_lines[3].0,
+            prof3_p0: prof_lines[3].1,
+            prof3_p1: prof_lines[3].2,
+            prof3_p2: prof_lines[3].3,
+            prof3_p3: prof_lines[3].4,
+            prof3_p4: prof_lines[3].5,
+
+            prof4_len: prof_lines[4].0,
+            prof4_p0: prof_lines[4].1,
+            prof4_p1: prof_lines[4].2,
+            prof4_p2: prof_lines[4].3,
+            prof4_p3: prof_lines[4].4,
+            prof4_p4: prof_lines[4].5,
+
             _pad0: 0,
         }
     }
