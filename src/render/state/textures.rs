@@ -16,15 +16,20 @@ pub struct Tex2DArray {
     pub view: wgpu::TextureView,
 }
 
+pub struct Tex2DArrayLayers<const N: usize> {
+    pub tex: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    pub layers: [wgpu::TextureView; N],
+}
+
 pub struct TextureSet {
     pub output: OutputTex,
     pub output_pre_taa: Tex2D,
     pub output_hist: [Tex2D; 2],
-    pub color: Tex2D,
+    pub primary_outputs: Tex2DArrayLayers<2>,
     pub depth: Tex2D,
 
     // per-pixel local lighting term (unfogged), written by primary
-    pub local: Tex2D,
     pub local_hist: [Tex2D; 2],
 
     pub primary_hit_hist: [Tex2D; 2],
@@ -34,6 +39,9 @@ pub struct TextureSet {
     pub godray: [Tex2D; 2],
     pub clip_height: Tex2DArray,
 }
+
+pub const PRIMARY_OUT_COLOR: usize = 0;
+pub const PRIMARY_OUT_LOCAL: usize = 1;
 
 
 fn make_tex2d(
@@ -119,6 +127,64 @@ fn make_tex2d_array(
     Tex2DArray { tex, view }
 }
 
+fn make_tex2d_array_layers<const N: usize>(
+    device: &wgpu::Device,
+    label: &str,
+    w: u32,
+    h: u32,
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+) -> Tex2DArrayLayers<N> {
+    let w = w.max(1);
+    let h = h.max(1);
+    let layers = (N as u32).max(1);
+
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: layers,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    });
+
+    let view = tex.create_view(&wgpu::TextureViewDescriptor {
+        label: Some(&format!("{label}_array_view")),
+        format: Some(format),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        aspect: wgpu::TextureAspect::All,
+        base_mip_level: 0,
+        mip_level_count: Some(1),
+        base_array_layer: 0,
+        array_layer_count: Some(layers),
+    });
+
+    let layer_views = std::array::from_fn(|layer| {
+        tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some(&format!("{label}_layer_{layer}")),
+            format: Some(format),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            base_array_layer: layer as u32,
+            array_layer_count: Some(1),
+        })
+    });
+
+    Tex2DArrayLayers {
+        tex,
+        view,
+        layers: layer_views,
+    }
+}
+
 pub fn create_textures(
     device: &wgpu::Device,
     out_w: u32,
@@ -158,9 +224,9 @@ pub fn create_textures(
         ),
     ];
 
-    let color = make_tex2d(
+    let primary_outputs = make_tex2d_array_layers::<2>(
         device,
-        "color_tex",
+        "primary_outputs",
         internal_w,
         internal_h,
         wgpu::TextureFormat::Rgba32Float,
@@ -239,15 +305,6 @@ pub fn create_textures(
         wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
     );
 
-    let local = make_tex2d(
-        device,
-        "local_tex",
-        internal_w,
-        internal_h,
-        wgpu::TextureFormat::Rgba32Float,
-        rw_tex_usage,
-    );
-
     let local_hist = [
         make_tex2d(
             device,
@@ -272,9 +329,8 @@ pub fn create_textures(
         output,
         output_pre_taa,
         output_hist,
-        color,
+        primary_outputs,
         depth,
-        local,
         local_hist,
         primary_hit_hist,
         shadow_hist,

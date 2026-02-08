@@ -23,13 +23,13 @@ pub struct Buffers {
     pub chunk_capacity: u32,
     pub grid_capacity: u32,
 
-    pub macro_occ: wgpu::Buffer,
+    pub chunk_aux: wgpu::Buffer,
     pub macro_capacity_u32: u32,
+    pub colinfo_offset_u32: u32,
 
     pub node_ropes: wgpu::Buffer,
     pub rope_capacity: u32, // in nodes
 
-    pub colinfo: wgpu::Buffer,
     pub colinfo_capacity_u32: u32,
 
 }
@@ -86,12 +86,6 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
     // ---- macro occupancy: 8^3 bits = 512 bits = 16 u32 words per chunk ----
     const MACRO_WORDS_PER_CHUNK: u32 = 16;
     let macro_capacity_u32 = chunk_capacity * MACRO_WORDS_PER_CHUNK;
-    let macro_occ = make_storage_buffer(
-        device,
-        "macro_occ_buf",
-        (macro_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
-    );
-
     let rope_capacity = node_capacity;
     let node_ropes = make_storage_buffer(
         device,
@@ -102,10 +96,12 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
     // ---- column info: 64*64 columns packed => 2048 u32 per chunk ----
     const COLINFO_WORDS_PER_CHUNK: u32 = 2048;
     let colinfo_capacity_u32 = chunk_capacity * COLINFO_WORDS_PER_CHUNK;
-    let colinfo = make_storage_buffer(
+    let colinfo_offset_u32 = macro_capacity_u32;
+    let chunk_aux = make_storage_buffer(
         device,
-        "chunk_colinfo_buf",
-        (colinfo_capacity_u32 as u64) * (std::mem::size_of::<u32>() as u64),
+        "chunk_aux_buf",
+        ((macro_capacity_u32 + colinfo_capacity_u32) as u64)
+            * (std::mem::size_of::<u32>() as u64),
     );
 
     Buffers {
@@ -118,11 +114,11 @@ pub fn create_persistent_buffers(device: &wgpu::Device) -> Buffers {
         node_capacity,
         chunk_capacity,
         grid_capacity,
-        macro_occ,
+        chunk_aux,
         macro_capacity_u32,
+        colinfo_offset_u32,
         node_ropes,
         rope_capacity,
-        colinfo,
         colinfo_capacity_u32,
     }
 }

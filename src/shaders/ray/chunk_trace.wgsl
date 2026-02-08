@@ -1365,7 +1365,7 @@ fn colinfo_entry_u16(colinfo_base: u32, lx: u32, lz: u32) -> u32 {
   // idx in [0..4095]
   let idx = lz * 64u + lx;
   let w = idx >> 1u;          // 0..2047
-  let word = chunk_colinfo[colinfo_base + w];
+  let word = chunk_aux[colinfo_base + w];
   if ((idx & 1u) == 0u) {
     return word & 0xFFFFu;
   }
