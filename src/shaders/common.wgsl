@@ -303,8 +303,8 @@ const GRASS_HIT_EPS_VOX           : f32 = 0.008;
 const GRASS_STEP_MIN_VOX          : f32 = 0.02;
 
 const GRASS_VOXEL_SEGS            : f32 = 6.0;
-const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.22;
-const GRASS_VOXEL_TAPER           : f32 = 0.35; // higher keeps tips blockier
+const GRASS_VOXEL_THICKNESS_VOX   : f32 = 0.15;
+const GRASS_VOXEL_TAPER           : f32 = 0.25; // higher keeps tips blockier
 const GRASS_OVERHANG_VOX          : f32 = 0.6;
 
 const GRASS_LOD_MID_START : f32 = 18.0;
